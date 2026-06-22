@@ -150,12 +150,26 @@ incomplete uploads from looking safe.
 
 ## Development
 
-Run the local checks before opening a pull request:
+Install `just` first, using your platform package manager or Cargo:
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo install just
+```
+
+Then prepare your local checkout:
+
+```sh
+just setup
+```
+
+`just setup` checks Rust tooling, builds the CLI, runs `icloudpd-optimizer doctor
+--json`, and prints install commands for missing runtime tools such as `vips`,
+`vipsheader`, and `exiftool`.
+
+Run the normal project gate before opening a pull request:
+
+```sh
+just check
 ```
 
 ## Contributing
