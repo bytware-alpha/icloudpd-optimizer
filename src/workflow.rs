@@ -238,6 +238,20 @@ pub fn record_upload_proof<'a>(
     )
 }
 
+pub fn upload_ready_heic_proof(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<HeicVerificationProof, WorkflowError> {
+    let record = manifest.get(asset_id)?;
+    if record.state != State::ConversionVerified {
+        return Err(WorkflowError::UploadUnavailable {
+            asset_id: asset_id.to_string(),
+            state: record.state,
+        });
+    }
+    stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)
+}
+
 pub fn record_source_age_proof<'a>(
     manifest: &'a mut Manifest,
     asset_id: &str,
@@ -865,6 +879,10 @@ pub enum WorkflowError {
         "delete eligibility unavailable for {asset_id}: state is {state}; upload proof required"
     )]
     DeleteEligibilityUnavailable { asset_id: String, state: State },
+    #[error(
+        "upload unavailable for {asset_id}: state is {state}; conversion verification required"
+    )]
+    UploadUnavailable { asset_id: String, state: State },
     #[error("delete plan unavailable for {asset_id}: state is {state}; delete approval required")]
     DeletePlanUnavailable { asset_id: String, state: State },
     #[error("delete approval operator is required")]

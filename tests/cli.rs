@@ -12,6 +12,7 @@ use icloudpd_optimizer::workflow::{
 };
 use predicates::prelude::*;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const DAY: u64 = 24 * 60 * 60;
 
@@ -31,9 +32,14 @@ fn missing_tools_json() -> Value {
 
 #[cfg(unix)]
 fn write_executable(path: &std::path::Path) {
+    write_executable_with_body(path, "#!/bin/sh\nexit 0\n");
+}
+
+#[cfg(unix)]
+fn write_executable_with_body(path: &std::path::Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::write(path, "#!/bin/sh\nexit 0\n").expect("executable test file should be written");
+    fs::write(path, body).expect("executable test file should be written");
     let mut permissions = fs::metadata(path)
         .expect("executable test file metadata should be readable")
         .permissions();
@@ -118,6 +124,10 @@ fn source_captured_days_ago(days: u64) -> String {
     (now - days * DAY).to_string()
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 fn manifest_with_nas_verified(path: &std::path::Path) {
     let mut manifest = Manifest::new();
     discover_raw_asset(
@@ -150,6 +160,42 @@ fn manifest_with_conversion_verified(path: &std::path::Path) {
         .expect("conversion should record");
     record_heic_verification(&mut manifest, "asset-1", heic_proof())
         .expect("heic verification should record");
+    record_source_age_proof(&mut manifest, "asset-1", old_source_age_proof())
+        .expect("source age proof should record");
+    manifest.save_atomic(path).expect("manifest should save");
+}
+
+fn manifest_with_real_conversion_verified(path: &std::path::Path, heic_path: PathBuf, body: &[u8]) {
+    let mut manifest = Manifest::new();
+    discover_raw_asset(
+        &mut manifest,
+        "asset-1",
+        PathBuf::from("/nas/photos/IMG_0001.dng"),
+    )
+    .expect("asset should be discovered");
+    record_nas_proof(&mut manifest, "asset-1", nas_proof()).expect("nas proof should record");
+    record_conversion_result(
+        &mut manifest,
+        "asset-1",
+        ConversionResultProof {
+            heic_path: heic_path.clone(),
+            heic_sha256: sha256_hex(body),
+            size_bytes: body.len() as u64,
+        },
+    )
+    .expect("conversion should record");
+    record_heic_verification(
+        &mut manifest,
+        "asset-1",
+        HeicVerificationProof {
+            heic_path,
+            heic_sha256: sha256_hex(body),
+            size_bytes: body.len() as u64,
+            vipsheader_ok: true,
+            metadata_copied: true,
+        },
+    )
+    .expect("heic verification should record");
     record_source_age_proof(&mut manifest, "asset-1", old_source_age_proof())
         .expect("source age proof should record");
     manifest.save_atomic(path).expect("manifest should save");
@@ -716,6 +762,140 @@ fn workflow_upload_verified_records_uploaded_heic_identity() {
         record.proofs["upload"]["uploaded_heic_sha256"],
         "heic-sha256"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn workflow_upload_heic_invokes_helper_and_records_upload_proof() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let heic_path = tempdir.path().join("IMG_0001.heic");
+    fs::write(&heic_path, b"heic-bytes").expect("heic should be written");
+    manifest_with_real_conversion_verified(&manifest_path, heic_path.clone(), b"heic-bytes");
+
+    let fake_python = tempdir.path().join("python");
+    write_executable_with_body(
+        &fake_python,
+        "#!/bin/sh\nprintf '{\"asset_id\":\"icloud-uploaded-1\",\"filename\":\"IMG_0001.heic\"}\\n'\n",
+    );
+
+    binary()
+        .args([
+            "workflow",
+            "upload-heic",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--asset-id",
+            "asset-1",
+            "--apple-id",
+            "person@example.com",
+            "--python",
+            fake_python.to_str().expect("python path should be utf8"),
+        ])
+        .assert()
+        .success();
+
+    let manifest = Manifest::load(&manifest_path).expect("manifest should load");
+    let record = manifest.get("asset-1").expect("asset should exist");
+    assert_eq!(record.state, State::UploadVerified);
+    assert_eq!(
+        record.proofs["upload"]["uploaded_heic_asset_id"],
+        "icloud-uploaded-1"
+    );
+    assert_eq!(
+        record.proofs["upload"]["uploaded_heic_sha256"],
+        sha256_hex(b"heic-bytes")
+    );
+    assert_eq!(
+        record.proofs["upload"]["uploaded_heic_path"],
+        heic_path.to_string_lossy().as_ref()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workflow_upload_heic_failure_does_not_mutate_manifest() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let heic_path = tempdir.path().join("IMG_0001.heic");
+    fs::write(&heic_path, b"heic-bytes").expect("heic should be written");
+    manifest_with_real_conversion_verified(&manifest_path, heic_path, b"heic-bytes");
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    let fake_python = tempdir.path().join("python");
+    write_executable_with_body(
+        &fake_python,
+        "#!/bin/sh\nprintf '{\"error\":\"auth\",\"message\":\"2FA required\"}\\n' >&2\nexit 9\n",
+    );
+
+    binary()
+        .args([
+            "workflow",
+            "upload-heic",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--asset-id",
+            "asset-1",
+            "--apple-id",
+            "person@example.com",
+            "--python",
+            fake_python.to_str().expect("python path should be utf8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("iCloud upload helper failed"));
+
+    let after = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+    assert_eq!(after, before);
+}
+
+#[cfg(unix)]
+#[test]
+fn workflow_upload_heic_rechecks_heic_before_invoking_helper() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let heic_path = tempdir.path().join("IMG_0001.heic");
+    let marker_path = tempdir.path().join("helper-ran");
+    fs::write(&heic_path, b"heic-bytes").expect("heic should be written");
+    manifest_with_real_conversion_verified(&manifest_path, heic_path.clone(), b"heic-bytes");
+    fs::write(&heic_path, b"HEIC-BYTES").expect("heic should be changed");
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    let fake_python = tempdir.path().join("python");
+    write_executable_with_body(
+        &fake_python,
+        &format!(
+            "#!/bin/sh\ntouch {}\nprintf '{{\"asset_id\":\"icloud-uploaded-1\"}}\\n'\n",
+            marker_path.display()
+        ),
+    );
+
+    binary()
+        .args([
+            "workflow",
+            "upload-heic",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--asset-id",
+            "asset-1",
+            "--apple-id",
+            "person@example.com",
+            "--python",
+            fake_python.to_str().expect("python path should be utf8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("HEIC SHA-256 mismatch"));
+
+    assert!(!marker_path.exists());
+    let after = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+    assert_eq!(after, before);
 }
 
 #[test]

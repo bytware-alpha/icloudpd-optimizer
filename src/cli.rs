@@ -9,11 +9,14 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::manifest::{AssetRecord, Manifest, ManifestError};
+use crate::upload::{
+    IcloudUploadRequest, UploadError, build_upload_proof, run_icloud_upload, verify_local_heic,
+};
 use crate::workflow::{
     ConversionResultProof, HeicVerificationProof, SourceAgeProof, UploadProof, WorkflowError,
     approve_delete, build_delete_plan, mark_delete_eligible, prove_and_record_nas,
     record_conversion_result, record_heic_verification, record_source_age_proof,
-    record_stage_failure, record_upload_proof,
+    record_stage_failure, record_upload_proof, upload_ready_heic_proof,
 };
 
 const REQUIRED_TOOLS: [&str; 3] = ["vips", "vipsheader", "exiftool"];
@@ -72,6 +75,7 @@ enum WorkflowCommand {
     #[command(name = "conversion-recorded", alias = "conversion-result")]
     ConversionResult(WorkflowConversionResultArgs),
     HeicVerified(WorkflowHeicVerifiedArgs),
+    UploadHeic(WorkflowUploadHeicArgs),
     UploadVerified(WorkflowUploadVerifiedArgs),
     MarkDeleteEligible(WorkflowAssetArgs),
     ApproveDelete(WorkflowApproveDeleteArgs),
@@ -125,6 +129,24 @@ struct WorkflowHeicVerifiedArgs {
     vipsheader_ok: bool,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     metadata_copied: bool,
+}
+
+#[derive(Debug, Args)]
+struct WorkflowUploadHeicArgs {
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+    #[arg(long)]
+    asset_id: String,
+    #[arg(long)]
+    apple_id: String,
+    #[arg(long, value_name = "PYTHON", default_value = "python3")]
+    python: PathBuf,
+    #[arg(long)]
+    album: Option<String>,
+    #[arg(long, value_name = "DIR")]
+    cookie_directory: Option<PathBuf>,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    accept_terms: bool,
 }
 
 #[derive(Debug, Args)]
@@ -185,6 +207,8 @@ pub enum CliError {
     },
     #[error("workflow failed: {0}")]
     Workflow(#[from] WorkflowError),
+    #[error("upload failed: {0}")]
+    Upload(#[from] UploadError),
     #[error("failed to write JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("failed to write output: {0}")]
@@ -244,6 +268,7 @@ fn run_workflow<W: Write>(args: WorkflowArgs, writer: &mut W) -> Result<(), CliE
         WorkflowCommand::NasVerified(args) => workflow_nas_verified(args),
         WorkflowCommand::ConversionResult(args) => workflow_conversion_result(args),
         WorkflowCommand::HeicVerified(args) => workflow_heic_verified(args),
+        WorkflowCommand::UploadHeic(args) => workflow_upload_heic(args),
         WorkflowCommand::UploadVerified(args) => workflow_upload_verified(args),
         WorkflowCommand::MarkDeleteEligible(args) => workflow_mark_delete_eligible(args),
         WorkflowCommand::ApproveDelete(args) => workflow_approve_delete(args),
@@ -304,6 +329,23 @@ fn workflow_heic_verified(args: WorkflowHeicVerifiedArgs) -> Result<(), CliError
             metadata_copied: args.metadata_copied,
         },
     )?;
+    save_manifest(&manifest, &args.manifest)
+}
+
+fn workflow_upload_heic(args: WorkflowUploadHeicArgs) -> Result<(), CliError> {
+    let mut manifest = load_manifest_for_write(&args.manifest)?;
+    let heic = upload_ready_heic_proof(&manifest, &args.asset_id)?;
+    verify_local_heic(&heic)?;
+    let response = run_icloud_upload(&IcloudUploadRequest {
+        python: args.python,
+        apple_id: args.apple_id,
+        heic_path: heic.heic_path.clone(),
+        album: args.album,
+        cookie_directory: args.cookie_directory,
+        accept_terms: args.accept_terms,
+    })?;
+    let proof = build_upload_proof(&heic, &response)?;
+    record_upload_proof(&mut manifest, &args.asset_id, proof)?;
     save_manifest(&manifest, &args.manifest)
 }
 
