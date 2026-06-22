@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use filetime::{FileTime, set_file_mtime};
-use icloudpd_raw_compactor::proof::{ProofError, prove_nas_raw};
+use icloudpd_optimizer::proof::{ProofError, prove_nas_raw};
 
 const DAY: u64 = 24 * 60 * 60;
 const NOW_SECS: u64 = 1_700_000_000;

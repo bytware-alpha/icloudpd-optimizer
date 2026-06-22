@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use filetime::{FileTime, set_file_mtime};
-use icloudpd_raw_compactor::manifest::{AssetRecord, Manifest, State};
-use icloudpd_raw_compactor::proof::{NasRawProof, ProofError, prove_nas_raw};
-use icloudpd_raw_compactor::workflow::{
+use icloudpd_optimizer::manifest::{AssetRecord, Manifest, State};
+use icloudpd_optimizer::proof::{NasRawProof, ProofError, prove_nas_raw};
+use icloudpd_optimizer::workflow::{
     ConversionResultProof, HeicVerificationProof, SourceAgeProof, UploadProof, WorkflowError,
     approve_delete, build_delete_plan, discover_raw_asset, mark_delete_eligible,
     prove_and_record_nas, record_conversion_result, record_heic_verification, record_nas_proof,

@@ -29,7 +29,7 @@ pub struct ConversionPlan {
 /// Builds non-destructive command plans for RAW-to-HEIC conversion and verification.
 ///
 /// ```
-/// # use icloudpd_raw_compactor::conversion::plan_conversion;
+/// # use icloudpd_optimizer::conversion::plan_conversion;
 /// let plan = plan_conversion("/nas/photo.dng", "/tmp/photo.heic", 90)?;
 /// assert_eq!(plan.convert.program, "vips");
 /// # Ok::<(), Box<dyn std::error::Error>>(())

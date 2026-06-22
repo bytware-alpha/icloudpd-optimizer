@@ -1,10 +1,10 @@
 [package]
-name = "icloudpd-raw-compactor"
+name = "icloudpd-optimizer"
 version = "0.1.0"
 edition = "2024"
-description = "Fail-closed iCloudPD RAW original compaction helper"
+description = "Fail-closed iCloudPD RAW optimization helper"
 license = "MIT"
-repository = "https://github.com/bytware-alpha/icloudpd-raw-compactor"
+repository = "https://github.com/bytware-alpha/icloudpd-optimizer"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

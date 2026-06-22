@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use icloudpd_raw_compactor::manifest::{AssetRecord, Manifest, ManifestError, State};
+use icloudpd_optimizer::manifest::{AssetRecord, Manifest, ManifestError, State};
 use serde_json::json;
 
 #[test]

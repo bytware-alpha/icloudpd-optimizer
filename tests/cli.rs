@@ -4,9 +4,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use assert_cmd::Command;
 use filetime::{FileTime, set_file_mtime};
-use icloudpd_raw_compactor::manifest::{AssetRecord, Manifest, State};
-use icloudpd_raw_compactor::proof::NasRawProof;
-use icloudpd_raw_compactor::workflow::{
+use icloudpd_optimizer::manifest::{AssetRecord, Manifest, State};
+use icloudpd_optimizer::proof::NasRawProof;
+use icloudpd_optimizer::workflow::{
     ConversionResultProof, HeicVerificationProof, SourceAgeProof, discover_raw_asset,
     record_conversion_result, record_heic_verification, record_nas_proof, record_source_age_proof,
 };
@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 const DAY: u64 = 24 * 60 * 60;
 
 fn binary() -> Command {
-    Command::cargo_bin("icloudpd-raw-compactor").expect("binary should build")
+    Command::cargo_bin("icloudpd-optimizer").expect("binary should build")
 }
 
 fn missing_tools_json() -> Value {
@@ -278,7 +278,7 @@ fn version_and_help_succeed_through_parser() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("icloudpd-raw-compactor"));
+        .stdout(predicate::str::contains("icloudpd-optimizer"));
 
     binary()
         .arg("--help")

@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
-use icloudpd_raw_compactor::conversion::{CommandPlan, ConversionError, plan_conversion};
+use icloudpd_optimizer::conversion::{CommandPlan, ConversionError, plan_conversion};
 
 fn args(plan: &CommandPlan) -> Vec<String> {
     plan.args

@@ -32,7 +32,7 @@ pub struct NasRawProof {
 ///
 /// ```no_run
 /// # use std::time::SystemTime;
-/// # use icloudpd_raw_compactor::proof::prove_nas_raw;
+/// # use icloudpd_optimizer::proof::prove_nas_raw;
 /// let proof = prove_nas_raw("/nas/photos", "/nas/photos/camera/IMG_0001.dng", 30, SystemTime::now())?;
 /// assert!(proof.relative_path.ends_with("camera/IMG_0001.dng"));
 /// # Ok::<(), Box<dyn std::error::Error>>(())

@@ -21,9 +21,9 @@ const DAY_SECONDS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "icloudpd-raw-compactor",
+    name = "icloudpd-optimizer",
     version,
-    about = "Fail-closed iCloudPD RAW original compaction helper"
+    about = "Fail-closed iCloudPD RAW optimization helper"
 )]
 struct Cli {
     #[command(subcommand)]
