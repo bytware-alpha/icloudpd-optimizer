@@ -1,0 +1,20 @@
+[package]
+name = "icloudpd-raw-compactor"
+version = "0.1.0"
+edition = "2024"
+description = "Fail-closed iCloudPD RAW original compaction helper"
+license = "MIT"
+repository = "https://github.com/bytware-alpha/icloudpd-raw-compactor"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+assert_cmd = "2"
+filetime = "0.2"
+predicates = "3"
+tempfile = "3"
