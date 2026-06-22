@@ -124,7 +124,8 @@ including `X-APPLE-WEBAUTH-TOKEN`:
 
 The upload URL may also be supplied as `webservices.uploadimagews.url`. Upload URLs must
 be HTTPS iCloud hosts and must not include credentials, query strings, or fragments.
-Cookie names and values are validated before any request is sent.
+The DSID must be numeric. Cookie names and values are validated before any request is
+sent; values must be printable ASCII without whitespace or semicolons.
 
 ```sh
 icloudpd-optimizer workflow upload-heic \

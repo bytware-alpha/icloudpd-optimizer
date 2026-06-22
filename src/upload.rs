@@ -93,6 +93,7 @@ pub fn upload_with_transport(
     heic_path: &Path,
     transport: &dyn UploadTransport,
 ) -> Result<IcloudUploadResponse, UploadError> {
+    let filename = heic_filename(heic_path)?;
     let metadata = std::fs::metadata(heic_path).map_err(|source| UploadError::ReadHeic {
         path: heic_path.to_path_buf(),
         source,
@@ -102,7 +103,6 @@ pub fn upload_with_transport(
             path: heic_path.to_path_buf(),
         });
     }
-    let filename = heic_filename(heic_path)?;
     let request = UploadHttpRequest {
         url: upload_endpoint(session, &filename)?,
         cookie_header: cookie_header(session),
@@ -212,6 +212,11 @@ impl RawUploadSession {
     fn validate(self) -> Result<UploadSession, UploadError> {
         let dsid = required_nonempty(self.dsid, "dsid")?;
         reject_control_chars(&dsid, "dsid")?;
+        if !dsid.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(UploadError::InvalidSession(
+                "dsid must contain only ASCII digits".to_string(),
+            ));
+        }
         let upload_url = self
             .upload_url
             .or_else(|| {
@@ -271,14 +276,14 @@ impl RawCookie {
         let value = required_nonempty(self.value, "cookie value")?;
         reject_control_chars(&name, "cookie name")?;
         reject_control_chars(&value, "cookie value")?;
-        if name.contains(';') || name.contains('=') {
+        if !name.bytes().all(is_cookie_name_byte) {
             return Err(UploadError::InvalidSession(
-                "cookie name contains an invalid delimiter".to_string(),
+                "cookie name contains an invalid character".to_string(),
             ));
         }
-        if value.contains(';') {
+        if !value.bytes().all(is_cookie_value_byte) {
             return Err(UploadError::InvalidSession(
-                "cookie value contains an invalid delimiter".to_string(),
+                "cookie value contains an invalid character".to_string(),
             ));
         }
         Ok(UploadCookie { name, value })
@@ -356,6 +361,31 @@ fn reject_control_chars(value: &str, field: &str) -> Result<(), UploadError> {
         )));
     }
     Ok(())
+}
+
+fn is_cookie_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn is_cookie_value_byte(byte: u8) -> bool {
+    (0x21..=0x7e).contains(&byte) && byte != b';'
 }
 
 fn heic_filename(path: &Path) -> Result<String, UploadError> {

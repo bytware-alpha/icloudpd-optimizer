@@ -127,6 +127,12 @@ fn load_upload_session_rejects_hostile_cookies_and_missing_auth_cookie() {
         vec![("X-APPLE-WEBAUTH-TOKEN", "token\r\nInjected: yes")],
         vec![("X-APPLE-WEBAUTH-TOKEN", "token; admin=true")],
         vec![("bad\nname", "token")],
+        vec![("bad name", "token")],
+        vec![("bad,name", "token")],
+        vec![(" bad", "token")],
+        vec![("bad ", "token")],
+        vec![("X-APPLE-WEBAUTH-TOKEN", " token")],
+        vec![("X-APPLE-WEBAUTH-TOKEN", "token ")],
         vec![("session", "abc123")],
     ];
 
@@ -145,6 +151,27 @@ fn load_upload_session_rejects_hostile_cookies_and_missing_auth_cookie() {
         let error = UploadSession::from_json(&json).expect_err("cookie should be rejected");
 
         assert!(matches!(error, UploadError::InvalidSession(_)));
+    }
+}
+
+#[test]
+fn load_upload_session_rejects_non_numeric_or_padded_dsid() {
+    let cases = ["", "   ", "123 456", "abc123", "123\n456"];
+
+    for dsid in cases {
+        let json = serde_json::json!({
+            "dsid": dsid,
+            "upload_url": "https://upload.icloud.com/uploadimagews",
+            "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "token"}]
+        })
+        .to_string();
+
+        let error = UploadSession::from_json(&json).expect_err("DSID should be rejected");
+
+        assert!(
+            matches!(error, UploadError::InvalidSession(_)),
+            "{dsid:?} returned {error:?}"
+        );
     }
 }
 
@@ -227,7 +254,7 @@ fn upload_with_transport_rejects_bad_local_file_inputs() {
     assert!(transport.requests.borrow().is_empty());
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 #[test]
 fn upload_with_transport_rejects_non_utf8_filename_without_posting() {
     use std::ffi::OsString;
@@ -238,12 +265,11 @@ fn upload_with_transport_rejects_non_utf8_filename_without_posting() {
         b'I', b'M', b'G', b'_', 0xff, b'.', b'h', b'e', b'i', b'c',
     ]);
     let heic_path = tempdir.path().join(name);
-    fs::write(&heic_path, b"heic-bytes").expect("heic should be written");
     let session = UploadSession::from_json(&valid_session_json()).expect("session should load");
     let transport = FakeTransport::default();
 
     let error = upload_with_transport(&session, &heic_path, &transport)
-        .expect_err("non-UTF8 filename should fail");
+        .expect_err("non-UTF8 filename should fail before filesystem access");
 
     assert!(matches!(error, UploadError::InvalidFilename { .. }));
     assert!(transport.requests.borrow().is_empty());
