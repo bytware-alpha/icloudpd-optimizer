@@ -764,72 +764,40 @@ fn workflow_upload_verified_records_uploaded_heic_identity() {
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn workflow_upload_heic_invokes_helper_and_records_upload_proof() {
-    let tempdir = tempfile::tempdir().expect("tempdir should be created");
-    let manifest_path = tempdir.path().join("manifest.json");
-    let heic_path = tempdir.path().join("IMG_0001.heic");
-    fs::write(&heic_path, b"heic-bytes").expect("heic should be written");
-    manifest_with_real_conversion_verified(&manifest_path, heic_path.clone(), b"heic-bytes");
-
-    let fake_python = tempdir.path().join("python");
-    write_executable_with_body(
-        &fake_python,
-        "#!/bin/sh\nprintf '{\"asset_id\":\"icloud-uploaded-1\",\"filename\":\"IMG_0001.heic\"}\\n'\n",
-    );
-
+fn workflow_upload_heic_help_shows_session_not_python_credentials() {
     binary()
-        .args([
-            "workflow",
-            "upload-heic",
-            "--manifest",
-            manifest_path
-                .to_str()
-                .expect("manifest path should be utf8"),
-            "--asset-id",
-            "asset-1",
-            "--apple-id",
-            "person@example.com",
-            "--python",
-            fake_python.to_str().expect("python path should be utf8"),
-        ])
+        .args(["workflow", "upload-heic", "--help"])
         .assert()
-        .success();
-
-    let manifest = Manifest::load(&manifest_path).expect("manifest should load");
-    let record = manifest.get("asset-1").expect("asset should exist");
-    assert_eq!(record.state, State::UploadVerified);
-    assert_eq!(
-        record.proofs["upload"]["uploaded_heic_asset_id"],
-        "icloud-uploaded-1"
-    );
-    assert_eq!(
-        record.proofs["upload"]["uploaded_heic_sha256"],
-        sha256_hex(b"heic-bytes")
-    );
-    assert_eq!(
-        record.proofs["upload"]["uploaded_heic_path"],
-        heic_path.to_string_lossy().as_ref()
-    );
+        .success()
+        .stdout(predicate::str::contains("--session"))
+        .stdout(predicate::str::contains("--python").not())
+        .stdout(predicate::str::contains("--apple-id").not())
+        .stdout(predicate::str::contains("--cookie-directory").not())
+        .stdout(predicate::str::contains("--accept-terms").not())
+        .stdout(predicate::str::contains("--album").not());
 }
 
-#[cfg(unix)]
 #[test]
-fn workflow_upload_heic_failure_does_not_mutate_manifest() {
+fn workflow_upload_heic_session_failure_does_not_mutate_manifest() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let manifest_path = tempdir.path().join("manifest.json");
+    let session_path = tempdir.path().join("session.json");
     let heic_path = tempdir.path().join("IMG_0001.heic");
     fs::write(&heic_path, b"heic-bytes").expect("heic should be written");
+    fs::write(
+        &session_path,
+        serde_json::json!({
+            "dsid": "123456789",
+            "upload_url": "https://evil.example/uploadimagews",
+            "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "token"}]
+        })
+        .to_string(),
+    )
+    .expect("session should be written");
     manifest_with_real_conversion_verified(&manifest_path, heic_path, b"heic-bytes");
     let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
 
-    let fake_python = tempdir.path().join("python");
-    write_executable_with_body(
-        &fake_python,
-        "#!/bin/sh\nprintf '{\"error\":\"auth\",\"message\":\"2FA required\"}\\n' >&2\nexit 9\n",
-    );
-
     binary()
         .args([
             "workflow",
@@ -840,39 +808,27 @@ fn workflow_upload_heic_failure_does_not_mutate_manifest() {
                 .expect("manifest path should be utf8"),
             "--asset-id",
             "asset-1",
-            "--apple-id",
-            "person@example.com",
-            "--python",
-            fake_python.to_str().expect("python path should be utf8"),
+            "--session",
+            session_path.to_str().expect("session path should be utf8"),
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("iCloud upload helper failed"));
+        .stderr(predicate::str::contains("invalid upload session"));
 
     let after = fs::read_to_string(&manifest_path).expect("manifest should be readable");
     assert_eq!(after, before);
 }
 
-#[cfg(unix)]
 #[test]
-fn workflow_upload_heic_rechecks_heic_before_invoking_helper() {
+fn workflow_upload_heic_rechecks_heic_before_loading_session() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let manifest_path = tempdir.path().join("manifest.json");
     let heic_path = tempdir.path().join("IMG_0001.heic");
-    let marker_path = tempdir.path().join("helper-ran");
     fs::write(&heic_path, b"heic-bytes").expect("heic should be written");
     manifest_with_real_conversion_verified(&manifest_path, heic_path.clone(), b"heic-bytes");
     fs::write(&heic_path, b"HEIC-BYTES").expect("heic should be changed");
     let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
-
-    let fake_python = tempdir.path().join("python");
-    write_executable_with_body(
-        &fake_python,
-        &format!(
-            "#!/bin/sh\ntouch {}\nprintf '{{\"asset_id\":\"icloud-uploaded-1\"}}\\n'\n",
-            marker_path.display()
-        ),
-    );
+    let missing_session = tempdir.path().join("missing-session.json");
 
     binary()
         .args([
@@ -884,16 +840,15 @@ fn workflow_upload_heic_rechecks_heic_before_invoking_helper() {
                 .expect("manifest path should be utf8"),
             "--asset-id",
             "asset-1",
-            "--apple-id",
-            "person@example.com",
-            "--python",
-            fake_python.to_str().expect("python path should be utf8"),
+            "--session",
+            missing_session
+                .to_str()
+                .expect("session path should be utf8"),
         ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("HEIC SHA-256 mismatch"));
 
-    assert!(!marker_path.exists());
     let after = fs::read_to_string(&manifest_path).expect("manifest should be readable");
     assert_eq!(after, before);
 }

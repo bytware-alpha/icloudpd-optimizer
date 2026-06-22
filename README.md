@@ -38,7 +38,7 @@ The current CLI can:
 - verify RAW files under a storage root;
 - plan RAW-to-HEIC conversion commands;
 - record conversion, upload, and verification proofs;
-- upload a verified HEIC through `pyicloud` and record the resulting iCloud asset id;
+- upload a verified HEIC through the Rust upload client and record the resulting iCloud asset id;
 - reject incomplete or inconsistent workflow states;
 - print a JSON delete plan for manual review.
 
@@ -59,13 +59,6 @@ You will also need these tools available on `PATH`:
 - `vips`
 - `vipsheader`
 - `exiftool`
-- `python3` with `pyicloud` installed for `workflow upload-heic`
-
-For upload support:
-
-```sh
-python3 -m pip install "pyicloud>=2.6.5"
-```
 
 Check your environment:
 
@@ -110,20 +103,40 @@ The delete plan is JSON output. It does not remove files.
 
 ## Uploading HEICs
 
-`workflow upload-heic` uploads the verified HEIC using `pyicloud` and records the
-uploaded iCloud asset id in the manifest. The command expects an existing iCloud session
-or keyring entry that `pyicloud` can use. It does not accept an Apple account password.
+`workflow upload-heic` uploads the verified HEIC using the Rust upload client and records
+the uploaded iCloud asset id in the manifest. The command requires an explicit
+pre-authenticated upload session JSON file. It does not accept an Apple ID, Apple account
+password, or MFA input.
+
+The session file must contain a DSID, an iCloud Photos upload service URL, and cookies
+including `X-APPLE-WEBAUTH-TOKEN`:
+
+```json
+{
+  "dsid": "123456789",
+  "upload_url": "https://upload.icloud.com/uploadimagews",
+  "cookies": [
+    { "name": "X-APPLE-WEBAUTH-TOKEN", "value": "..." },
+    { "name": "session", "value": "..." }
+  ]
+}
+```
+
+The upload URL may also be supplied as `webservices.uploadimagews.url`. Upload URLs must
+be HTTPS iCloud hosts and must not include credentials, query strings, or fragments.
+Cookie names and values are validated before any request is sent.
 
 ```sh
 icloudpd-optimizer workflow upload-heic \
   --manifest manifest.json \
   --asset-id IMG_0001 \
-  --apple-id person@example.com \
-  --cookie-directory /path/to/pyicloud/session
+  --session /path/to/upload-session.json
 ```
 
 Before upload, the tool rechecks the local HEIC size and SHA-256 against the verified
-manifest proof. If the file changed, the upload is not attempted.
+manifest proof. It also verifies the HEIC again before recording upload proof. If the
+session is invalid, the HTTP request fails, the response is malformed, or the local file
+changes, the manifest is not updated.
 
 ## Safety Model
 

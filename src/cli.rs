@@ -137,16 +137,8 @@ struct WorkflowUploadHeicArgs {
     manifest: PathBuf,
     #[arg(long)]
     asset_id: String,
-    #[arg(long)]
-    apple_id: String,
-    #[arg(long, value_name = "PYTHON", default_value = "python3")]
-    python: PathBuf,
-    #[arg(long)]
-    album: Option<String>,
-    #[arg(long, value_name = "DIR")]
-    cookie_directory: Option<PathBuf>,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
-    accept_terms: bool,
+    #[arg(long, value_name = "PATH")]
+    session: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -337,12 +329,8 @@ fn workflow_upload_heic(args: WorkflowUploadHeicArgs) -> Result<(), CliError> {
     let heic = upload_ready_heic_proof(&manifest, &args.asset_id)?;
     verify_local_heic(&heic)?;
     let response = run_icloud_upload(&IcloudUploadRequest {
-        python: args.python,
-        apple_id: args.apple_id,
+        session_path: args.session,
         heic_path: heic.heic_path.clone(),
-        album: args.album,
-        cookie_directory: args.cookie_directory,
-        accept_terms: args.accept_terms,
     })?;
     let proof = build_upload_proof(&heic, &response)?;
     record_upload_proof(&mut manifest, &args.asset_id, proof)?;
