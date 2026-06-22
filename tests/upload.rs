@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use icloudpd_optimizer::upload::{
@@ -55,8 +56,46 @@ impl FakeTransport {
 }
 
 impl UploadTransport for FakeTransport {
-    fn post(&self, request: UploadHttpRequest) -> Result<UploadHttpResponse, UploadError> {
+    fn post(
+        &self,
+        request: UploadHttpRequest,
+        mut body: Box<dyn Read + Send>,
+    ) -> Result<UploadHttpResponse, UploadError> {
+        let mut uploaded = Vec::new();
+        body.read_to_end(&mut uploaded)
+            .expect("fake transport should read upload body");
         self.requests.borrow_mut().push(request);
+        Ok(UploadHttpResponse {
+            status: 200,
+            body: self.response_body.clone(),
+        })
+    }
+}
+
+struct BodyCapturingTransport {
+    response_body: String,
+    uploaded_bodies: RefCell<Vec<Vec<u8>>>,
+}
+
+impl BodyCapturingTransport {
+    fn with_response(response_body: impl Into<String>) -> Self {
+        Self {
+            response_body: response_body.into(),
+            uploaded_bodies: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl UploadTransport for BodyCapturingTransport {
+    fn post(
+        &self,
+        _request: UploadHttpRequest,
+        mut body: Box<dyn Read + Send>,
+    ) -> Result<UploadHttpResponse, UploadError> {
+        let mut uploaded = Vec::new();
+        body.read_to_end(&mut uploaded)
+            .expect("fake transport should read upload body");
+        self.uploaded_bodies.borrow_mut().push(uploaded);
         Ok(UploadHttpResponse {
             status: 200,
             body: self.response_body.clone(),
@@ -83,6 +122,9 @@ fn load_upload_session_rejects_insecure_or_smuggled_endpoints() {
         "https://upload.icloud.com/uploadimagews?next=https://evil.example",
         "https://upload.icloud.com/uploadimagews#fragment",
         "https://evil.example/uploadimagews",
+        "https://setup.icloud.com/setup/ws/1/accountLogin",
+        "https://www.icloud.com/",
+        "https://upload.icloud.com/uploadimagews/other",
     ];
 
     for upload_url in cases {
@@ -195,13 +237,15 @@ fn upload_with_transport_posts_encoded_filename_and_parses_records() {
         upload_with_transport(&session, &heic_path, &transport).expect("upload should parse");
 
     assert_eq!(
-        response,
+        response.response,
         IcloudUploadResponse {
             asset_id: "asset-1".to_string(),
             filename: Some("IMG 0001+#.heic".to_string()),
             master_id: Some("master-1".to_string()),
         }
     );
+    assert_eq!(response.streamed_heic_sha256, sha256_hex(b"heic-bytes"));
+    assert_eq!(response.streamed_size_bytes, b"heic-bytes".len() as u64);
     let requests = transport.requests.borrow();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].content_len, b"heic-bytes".len() as u64);
@@ -224,11 +268,21 @@ fn upload_with_transport_fails_on_response_errors_or_missing_asset_record() {
     let session = UploadSession::from_json(&valid_session_json()).expect("session should load");
 
     let upload_error = FakeTransport::with_response(
-        serde_json::json!({"errors": [{"reason": "quota", "message": "full"}]}).to_string(),
+        serde_json::json!({
+            "errors": [{
+                "reason": "quota",
+                "message": "secret-response-token 123456789 IMG_0001.heic"
+            }]
+        })
+        .to_string(),
     );
     let error = upload_with_transport(&session, &heic_path, &upload_error)
         .expect_err("upload errors should fail");
     assert!(matches!(error, UploadError::UploadResponseErrors(_)));
+    let shown = error.to_string();
+    assert!(!shown.contains("secret-response-token"));
+    assert!(!shown.contains("123456789"));
+    assert!(!shown.contains("IMG_0001.heic"));
 
     let no_asset = FakeTransport::with_response(
         serde_json::json!({"records": [{"recordType": "CPLMaster", "recordName": "master-1"}]})
@@ -237,6 +291,59 @@ fn upload_with_transport_fails_on_response_errors_or_missing_asset_record() {
     let error = upload_with_transport(&session, &heic_path, &no_asset)
         .expect_err("missing CPLAsset should fail");
     assert!(matches!(error, UploadError::MissingUploadedAssetId));
+}
+
+#[test]
+fn upload_with_transport_redacts_invalid_and_oversized_response_bodies() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let heic_path = tempdir.path().join("IMG_0001.heic");
+    fs::write(&heic_path, b"heic-bytes").expect("heic should be written");
+    let session = UploadSession::from_json(&valid_session_json()).expect("session should load");
+
+    let invalid = FakeTransport::with_response("not-json secret-response-token 123456789");
+    let error = upload_with_transport(&session, &heic_path, &invalid)
+        .expect_err("invalid response JSON should fail");
+    assert!(matches!(error, UploadError::DecodeUploadJson { .. }));
+    let shown = error.to_string();
+    assert!(!shown.contains("secret-response-token"));
+    assert!(!shown.contains("123456789"));
+
+    let oversized_body = format!("{}{}", "secret-response-token", "x".repeat(70 * 1024));
+    let oversized = FakeTransport::with_response(oversized_body);
+    let error = upload_with_transport(&session, &heic_path, &oversized)
+        .expect_err("oversized response should fail");
+    assert!(matches!(error, UploadError::UploadResponseTooLarge { .. }));
+    assert!(!error.to_string().contains("secret-response-token"));
+}
+
+#[test]
+fn build_upload_proof_rejects_when_streamed_bytes_differ_even_if_path_is_restored() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let heic_path = tempdir.path().join("IMG_0001.heic");
+    fs::write(&heic_path, b"verified-bytes").expect("heic should be written");
+    let proof = heic_proof(heic_path.clone(), b"verified-bytes");
+    fs::write(&heic_path, b"swapped!-bytes").expect("race should swap heic before upload");
+    let transport = BodyCapturingTransport::with_response(
+        serde_json::json!({
+            "records": [{"recordType": "CPLAsset", "recordName": "asset-1"}]
+        })
+        .to_string(),
+    );
+    let session = UploadSession::from_json(&valid_session_json()).expect("session should load");
+
+    let upload = upload_with_transport(&session, &heic_path, &transport)
+        .expect("swapped bytes can still produce an upload response");
+    fs::write(&heic_path, b"verified-bytes").expect("race should restore heic after upload");
+
+    assert_eq!(transport.uploaded_bodies.borrow()[0], b"swapped!-bytes");
+    let error = build_upload_proof(&proof, &upload)
+        .expect_err("streamed bytes must match verified HEIC proof");
+    assert!(matches!(
+        error,
+        UploadError::StreamedHeicHashMismatch { .. }
+    ));
+    assert!(!error.to_string().contains(&sha256_hex(b"verified-bytes")));
+    assert!(!error.to_string().contains(&sha256_hex(b"swapped!-bytes")));
 }
 
 #[test]
@@ -284,11 +391,7 @@ fn build_upload_proof_requires_local_heic_to_match_verified_proof() {
 
     let upload_proof = build_upload_proof(
         &proof,
-        &IcloudUploadResponse {
-            asset_id: "icloud-asset-1".to_string(),
-            filename: Some("IMG_0001.heic".to_string()),
-            master_id: None,
-        },
+        &icloud_upload_for_bytes("icloud-asset-1", b"heic-bytes"),
     )
     .expect("matching HEIC should produce upload proof");
 
@@ -306,11 +409,7 @@ fn build_upload_proof_rejects_changed_heic_bytes() {
 
     let error = build_upload_proof(
         &proof,
-        &IcloudUploadResponse {
-            asset_id: "icloud-asset-1".to_string(),
-            filename: Some("IMG_0001.heic".to_string()),
-            master_id: None,
-        },
+        &icloud_upload_for_bytes("icloud-asset-1", b"HEIC-BYTES"),
     )
     .expect_err("changed HEIC bytes should fail closed");
 
@@ -324,15 +423,23 @@ fn build_upload_proof_rejects_empty_uploaded_asset_id() {
     fs::write(&heic_path, b"heic-bytes").expect("heic should be written");
     let proof = heic_proof(heic_path, b"heic-bytes");
 
-    let error = build_upload_proof(
-        &proof,
-        &IcloudUploadResponse {
-            asset_id: "   ".to_string(),
+    let error = build_upload_proof(&proof, &icloud_upload_for_bytes("   ", b"heic-bytes"))
+        .expect_err("empty uploaded asset id should fail closed");
+
+    assert!(matches!(error, UploadError::MissingUploadedAssetId));
+}
+
+fn icloud_upload_for_bytes(
+    asset_id: impl Into<String>,
+    bytes: &[u8],
+) -> icloudpd_optimizer::upload::IcloudUploadOutcome {
+    icloudpd_optimizer::upload::IcloudUploadOutcome {
+        response: IcloudUploadResponse {
+            asset_id: asset_id.into(),
             filename: Some("IMG_0001.heic".to_string()),
             master_id: None,
         },
-    )
-    .expect_err("empty uploaded asset id should fail closed");
-
-    assert!(matches!(error, UploadError::MissingUploadedAssetId));
+        streamed_heic_sha256: sha256_hex(bytes),
+        streamed_size_bytes: bytes.len() as u64,
+    }
 }

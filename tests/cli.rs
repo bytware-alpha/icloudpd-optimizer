@@ -820,6 +820,44 @@ fn workflow_upload_heic_session_failure_does_not_mutate_manifest() {
 }
 
 #[test]
+fn workflow_upload_heic_session_error_does_not_echo_cookie_value() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let session_path = tempdir.path().join("session.json");
+    let heic_path = tempdir.path().join("IMG_0001.heic");
+    fs::write(&heic_path, b"heic-bytes").expect("heic should be written");
+    fs::write(
+        &session_path,
+        serde_json::json!({
+            "dsid": "123456789",
+            "upload_url": "https://upload.icloud.com/uploadimagews",
+            "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "secret-cookie-token\n"}]
+        })
+        .to_string(),
+    )
+    .expect("session should be written");
+    manifest_with_real_conversion_verified(&manifest_path, heic_path, b"heic-bytes");
+
+    binary()
+        .args([
+            "workflow",
+            "upload-heic",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--asset-id",
+            "asset-1",
+            "--session",
+            session_path.to_str().expect("session path should be utf8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid upload session"))
+        .stderr(predicate::str::contains("secret-cookie-token").not());
+}
+
+#[test]
 fn workflow_upload_heic_rechecks_heic_before_loading_session() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let manifest_path = tempdir.path().join("manifest.json");
