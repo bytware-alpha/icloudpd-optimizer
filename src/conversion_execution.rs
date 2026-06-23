@@ -39,6 +39,7 @@ pub fn execute_measured_conversion(
 
     let raw_path = record.raw_path.clone();
     let plan = plan_conversion(&raw_path, &request.output_path, request.heic_quality)?;
+    refuse_preexisting_output(&request.output_path)?;
     let total_started = Instant::now();
     let convert_started = Instant::now();
     let convert_usage = run_planned_command("conversion", &plan.convert)?;
@@ -75,6 +76,19 @@ pub fn execute_measured_conversion(
     )?;
 
     Ok(updated)
+}
+
+fn refuse_preexisting_output(path: &Path) -> Result<(), ConversionExecutionError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(ConversionExecutionError::OutputAlreadyExists {
+            path: path.to_path_buf(),
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ConversionExecutionError::OutputUnreadable {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn run_planned_command(
@@ -138,11 +152,24 @@ fn wait_for_command_with_usage(
 }
 
 fn inspect_output(path: &Path) -> Result<ConvertedOutput, ConversionExecutionError> {
+    inspect_output_with_optional_post_hash(path, Option::<fn(&Path) -> io::Result<()>>::None)
+}
+
+fn inspect_output_with_optional_post_hash(
+    path: &Path,
+    post_hash: Option<impl FnOnce(&Path) -> io::Result<()>>,
+) -> Result<ConvertedOutput, ConversionExecutionError> {
     let metadata =
         fs::metadata(path).map_err(|source| ConversionExecutionError::OutputUnreadable {
             path: path.to_path_buf(),
             source,
         })?;
+    let before = OutputMetadataSnapshot::from_metadata(&metadata).map_err(|source| {
+        ConversionExecutionError::OutputUnreadable {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
     if !metadata.is_file() || metadata.len() == 0 {
         return Err(ConversionExecutionError::OutputEmpty {
             path: path.to_path_buf(),
@@ -168,11 +195,41 @@ fn inspect_output(path: &Path) -> Result<ConvertedOutput, ConversionExecutionErr
         }
         hasher.update(&buffer[..read]);
     }
+    if let Some(post_hash) = post_hash {
+        post_hash(path).map_err(|source| ConversionExecutionError::OutputUnreadable {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    let after_metadata =
+        fs::metadata(path).map_err(|source| ConversionExecutionError::OutputUnreadable {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let after = OutputMetadataSnapshot::from_metadata(&after_metadata).map_err(|source| {
+        ConversionExecutionError::OutputUnreadable {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    if before != after {
+        return Err(ConversionExecutionError::OutputChanged {
+            path: path.to_path_buf(),
+        });
+    }
 
     Ok(ConvertedOutput {
         size_bytes: metadata.len(),
         sha256: format!("{:x}", hasher.finalize()),
     })
+}
+
+#[cfg(test)]
+fn inspect_output_with_post_hash_hook(
+    path: &Path,
+    post_hash: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<ConvertedOutput, ConversionExecutionError> {
+    inspect_output_with_optional_post_hash(path, Some(post_hash))
 }
 
 fn positive_millis(duration: Duration) -> u64 {
@@ -190,6 +247,35 @@ fn current_unix_seconds() -> u64 {
 struct ConvertedOutput {
     size_bytes: u64,
     sha256: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct OutputMetadataSnapshot {
+    size_bytes: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl OutputMetadataSnapshot {
+    fn from_metadata(metadata: &fs::Metadata) -> io::Result<Self> {
+        Ok(Self {
+            size_bytes: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            device: {
+                use std::os::unix::fs::MetadataExt;
+                metadata.dev()
+            },
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt;
+                metadata.ino()
+            },
+        })
+    }
 }
 
 struct CommandOutcome {
@@ -313,6 +399,30 @@ pub enum ConversionExecutionError {
     },
     #[error("converted output is missing or unreadable at {path}: {source}")]
     OutputUnreadable { path: PathBuf, source: io::Error },
+    #[error(
+        "converted output already exists at {path}; refusing to overwrite without an explicit overwrite policy"
+    )]
+    OutputAlreadyExists { path: PathBuf },
     #[error("converted output is empty at {path}")]
     OutputEmpty { path: PathBuf },
+    #[error("converted output changed while inspecting {path}; refusing to record a stale proof")]
+    OutputChanged { path: PathBuf },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inspect_output_rejects_file_changed_after_hashing() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        fs::write(&output_path, b"original-heic").expect("output should be written");
+
+        let result = inspect_output_with_post_hash_hook(&output_path, |path| {
+            fs::write(path, b"mutated-heic")
+        });
+
+        assert!(result.is_err(), "mutated output must fail closed");
+    }
 }

@@ -850,6 +850,51 @@ fn workflow_convert_runs_tools_and_records_conversion_and_performance_atomically
 
 #[cfg(unix)]
 #[test]
+fn workflow_convert_refuses_preexisting_output_without_mutating_manifest_or_file() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
+    write_fake_conversion_tools(tool_dir.path());
+    let manifest_path = tempdir.path().join("manifest.json");
+    let nas_root = tempdir.path().join("nas");
+    let raw_path = write_old_raw(&nas_root, "camera/IMG_0001.dng", b"raw-bytes");
+    manifest_with_real_nas_verified(
+        &manifest_path,
+        fs::canonicalize(&raw_path).expect("raw should canonicalize"),
+        fs::canonicalize(&nas_root).expect("nas root should canonicalize"),
+    );
+    let output_path = tempdir.path().join("IMG_0001.heic");
+    fs::write(&output_path, b"existing-heic").expect("preexisting output should be written");
+    let before_manifest = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+    let before_output = fs::read(&output_path).expect("output should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "convert",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--asset-id",
+            "asset-1",
+            "--output-path",
+            output_path.to_str().expect("output path should be utf8"),
+            "--heic-quality",
+            "91",
+        ])
+        .env("PATH", tool_dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"));
+
+    let after_manifest = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+    let after_output = fs::read(&output_path).expect("output should remain readable");
+    assert_eq!(after_manifest, before_manifest);
+    assert_eq!(after_output, before_output);
+}
+
+#[cfg(unix)]
+#[test]
 fn workflow_convert_failure_does_not_mutate_manifest() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");

@@ -131,8 +131,9 @@ A safe side-by-side shape is:
 # 2. Verify the downloaded RAW under that storage root.
 icloudpd-optimizer workflow nas-verified --manifest manifest.json --asset-id IMG_0001 --raw-path /photos/raw/IMG_0001.dng --nas-root /photos --min-age-days 30
 
-# 3. Record conversion, performance, HEIC validation, upload proof, age proof, and approval.
-# 4. Emit a delete plan for manual review.
+# 3. Run workflow convert to create the HEIC and record measured conversion proofs.
+# 4. Record HEIC validation, upload proof, age proof, and approval.
+# 5. Emit a delete plan for manual review.
 icloudpd-optimizer workflow delete-plan --manifest manifest.json --asset-id IMG_0001
 ```
 
@@ -161,24 +162,37 @@ Run `icloudpd-optimizer doctor --json` in the host/sidecar environment before au
 
 ## Conversion Performance
 
-After `workflow conversion-recorded` and before `workflow heic-verified`, record the
-performance of the actual conversion. This is operator-provided telemetry for the
-production conversion that just ran:
+Prefer `workflow convert` for new runs. It executes the planned `sips` conversion and
+metadata steps, measures elapsed time in Rust with `std::time::Instant`, hashes and
+stats the actual HEIC output, and records `conversion` plus `conversion_performance`
+in one manifest save after proof validation:
+
+```sh
+icloudpd-optimizer workflow convert \
+  --manifest manifest.json \
+  --asset-id IMG_0001 \
+  --output-path /staging/IMG_0001.heic \
+  --heic-quality 90 \
+  --conversion-tool-version sips-macos
+```
+
+For manual/import workflows only, if the production conversion was run outside
+`workflow convert`, keep using `workflow conversion-performance` after
+`workflow conversion-recorded` and before `workflow heic-verified`:
 
 ```sh
 icloudpd-optimizer workflow conversion-performance \
   --manifest manifest.json \
   --asset-id IMG_0001 \
-  --conversion-tool magick \
-  --conversion-tool-version 7.1.1 \
+  --conversion-tool manual-external-encoder \
+  --conversion-tool-version external-run-2026-06-23 \
   --heic-quality 90 \
   --convert-wall-time-millis 1250 \
   --total-wall-time-millis 1500
 ```
 
-Use elapsed wall-clock durations from the production conversion, measured by the caller
-with a monotonic clock. Benchmarking tools such as `hyperfine` or ImageMagick `-bench`
-are useful for offline tool comparisons, but those repeated lab runs are not the
+For manual imports, use elapsed wall-clock durations from the production conversion,
+measured by the caller with a monotonic clock. Repeated lab comparison runs are not the
 manifest proof used for HEIC verification, upload readiness, or delete-plan gating.
 
 ## Uploading HEIC Files
