@@ -12,6 +12,7 @@ Install Rust and the external media tools used by the CLI:
 cargo --version
 sips -h
 heif-info --version
+magick --version
 exiftool -ver
 ```
 

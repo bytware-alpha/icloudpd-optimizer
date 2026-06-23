@@ -1,15 +1,25 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread::sleep;
+use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
+use uuid::Uuid;
 
 use crate::workflow::{HeicVerificationProof, UploadProof};
 
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_UPLOAD_RESPONSE_BYTES: u64 = 1024 * 1024;
+const PRIMARY_SYNC_ZONE: &str = "PrimarySync";
+const DEFAULT_LOCAL_TIME_ZONE_ID: &str = "UTC";
+const DEFAULT_UPLOAD_STATUS_POLLS: usize = 120;
+const DEFAULT_UPLOAD_STATUS_POLL_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcloudUploadRequest {
@@ -40,8 +50,10 @@ pub struct UploadCookie {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UploadSession {
     pub dsid: String,
-    pub upload_url: Url,
+    pub photosupload_url: Url,
     pub cookies: Vec<UploadCookie>,
+    pub local_time_zone_id: String,
+    pub time_zone_offset_minutes: i32,
 }
 
 impl UploadSession {
@@ -68,9 +80,580 @@ pub fn load_upload_session(path: &Path) -> Result<UploadSession, UploadError> {
 pub fn run_icloud_upload(
     request: &IcloudUploadRequest,
 ) -> Result<IcloudUploadOutcome, UploadError> {
-    let _session = load_upload_session(&request.session_path)?;
+    let session = load_upload_session(&request.session_path)?;
     validate_candidate_heic(&request.heic_path)?;
-    Err(UploadError::UnsupportedIcloudUploadProtocol)
+    let transport = ReqwestPhotosUploadTransport::new()?;
+    PhotosUploadClient::new(transport).upload_heic(&session, &request.heic_path)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhotosUploadEndpoint {
+    CreateUploadUrl,
+    PutAsset,
+    UploadStatus,
+}
+
+impl PhotosUploadEndpoint {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CreateUploadUrl => "createUploadUrl",
+            Self::PutAsset => "putAsset",
+            Self::UploadStatus => "uploadStatus",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleFileUploadRequest {
+    pub file_checksum: String,
+    #[serde(rename = "size")]
+    pub size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrapping_key: Option<String>,
+    pub reference_checksum: String,
+    pub receipt: String,
+}
+
+pub trait PhotosUploadTransport {
+    fn post_service_json(
+        &mut self,
+        session: &UploadSession,
+        endpoint: PhotosUploadEndpoint,
+        payload: Value,
+    ) -> Result<Value, UploadError>;
+
+    fn post_signed_upload(
+        &mut self,
+        session: &UploadSession,
+        upload_url: &Url,
+        heic_path: &Path,
+    ) -> Result<(SingleFileUploadRequest, String, u64), UploadError>;
+}
+
+impl<T: PhotosUploadTransport + ?Sized> PhotosUploadTransport for &mut T {
+    fn post_service_json(
+        &mut self,
+        session: &UploadSession,
+        endpoint: PhotosUploadEndpoint,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        (**self).post_service_json(session, endpoint, payload)
+    }
+
+    fn post_signed_upload(
+        &mut self,
+        session: &UploadSession,
+        upload_url: &Url,
+        heic_path: &Path,
+    ) -> Result<(SingleFileUploadRequest, String, u64), UploadError> {
+        (**self).post_signed_upload(session, upload_url, heic_path)
+    }
+}
+
+pub struct PhotosUploadClient<T> {
+    transport: T,
+    status_poll_delay: Duration,
+    max_status_polls: usize,
+}
+
+impl<T: PhotosUploadTransport> PhotosUploadClient<T> {
+    pub fn new(transport: T) -> Self {
+        Self {
+            transport,
+            status_poll_delay: DEFAULT_UPLOAD_STATUS_POLL_DELAY,
+            max_status_polls: DEFAULT_UPLOAD_STATUS_POLLS,
+        }
+    }
+
+    pub fn with_status_poll_delay(mut self, delay: Duration) -> Self {
+        self.status_poll_delay = delay;
+        self
+    }
+
+    pub fn with_max_status_polls(mut self, max_status_polls: usize) -> Self {
+        self.max_status_polls = max_status_polls;
+        self
+    }
+
+    pub fn upload_heic(
+        &mut self,
+        session: &UploadSession,
+        heic_path: &Path,
+    ) -> Result<IcloudUploadOutcome, UploadError> {
+        validate_candidate_heic(heic_path)?;
+        let filename = heic_filename(heic_path)?;
+        let metadata = std::fs::metadata(heic_path).map_err(|source| UploadError::ReadHeic {
+            path: heic_path.to_path_buf(),
+            source,
+        })?;
+        let heic_size = metadata.len();
+        let last_modified_millis = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+
+        let create_response = self.transport.post_service_json(
+            session,
+            PhotosUploadEndpoint::CreateUploadUrl,
+            create_upload_url_payload(heic_size),
+        )?;
+        let upload_url = parse_create_upload_url_response(create_response)?;
+        let (single_file, streamed_heic_sha256, streamed_size_bytes) = self
+            .transport
+            .post_signed_upload(session, &upload_url, heic_path)?;
+        validate_single_file_upload_request(&single_file)?;
+        if single_file.size_bytes != heic_size {
+            return Err(UploadError::SignedUploadSizeMismatch {
+                expected: heic_size,
+                actual: single_file.size_bytes,
+            });
+        }
+        if streamed_size_bytes != heic_size {
+            return Err(UploadError::StreamedHeicSizeMismatch {
+                expected: heic_size,
+                actual: streamed_size_bytes,
+            });
+        }
+
+        let put_response = self.transport.post_service_json(
+            session,
+            PhotosUploadEndpoint::PutAsset,
+            put_asset_payload(
+                &filename,
+                last_modified_millis,
+                session.time_zone_offset_minutes,
+                &session.local_time_zone_id,
+                &single_file,
+            ),
+        )?;
+        let put_asset = parse_put_asset_response(put_response)?;
+        self.poll_until_upload_complete(session, &put_asset.upload_job_id)?;
+
+        Ok(IcloudUploadOutcome {
+            response: IcloudUploadResponse {
+                asset_id: put_asset.cpl_asset,
+                filename: Some(filename),
+                master_id: Some(put_asset.cpl_master),
+            },
+            streamed_heic_sha256,
+            streamed_size_bytes,
+        })
+    }
+
+    fn poll_until_upload_complete(
+        &mut self,
+        session: &UploadSession,
+        upload_job_id: &str,
+    ) -> Result<(), UploadError> {
+        if self.max_status_polls == 0 {
+            return Err(UploadError::PhotosUploadStatusTimedOut);
+        }
+
+        for attempt in 0..self.max_status_polls {
+            let response = self.transport.post_service_json(
+                session,
+                PhotosUploadEndpoint::UploadStatus,
+                json!({ "uploadJobIds": [upload_job_id] }),
+            )?;
+            match parse_upload_status_response(response, upload_job_id)? {
+                UploadStatusState::Complete => return Ok(()),
+                UploadStatusState::InProgress => {
+                    if attempt + 1 < self.max_status_polls && !self.status_poll_delay.is_zero() {
+                        sleep(self.status_poll_delay);
+                    }
+                }
+            }
+        }
+
+        Err(UploadError::PhotosUploadStatusTimedOut)
+    }
+}
+
+pub struct ReqwestPhotosUploadTransport {
+    client: reqwest::blocking::Client,
+}
+
+impl ReqwestPhotosUploadTransport {
+    pub fn new() -> Result<Self, UploadError> {
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|source| UploadError::HttpClient { source })?;
+        Ok(Self { client })
+    }
+}
+
+impl PhotosUploadTransport for ReqwestPhotosUploadTransport {
+    fn post_service_json(
+        &mut self,
+        session: &UploadSession,
+        endpoint: PhotosUploadEndpoint,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        let url = photosupload_service_url(session, endpoint)?;
+        let response = self
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "text/plain;charset=UTF-8")
+            .header(reqwest::header::COOKIE, cookie_header(session)?)
+            .body(payload.to_string())
+            .send()
+            .map_err(|source| UploadError::Network {
+                operation: endpoint.as_str(),
+                source,
+            })?;
+        read_json_response(response, endpoint.as_str())
+    }
+
+    fn post_signed_upload(
+        &mut self,
+        session: &UploadSession,
+        upload_url: &Url,
+        heic_path: &Path,
+    ) -> Result<(SingleFileUploadRequest, String, u64), UploadError> {
+        validate_signed_upload_url(upload_url)?;
+        let file = File::open(heic_path).map_err(|source| UploadError::ReadHeic {
+            path: heic_path.to_path_buf(),
+            source,
+        })?;
+        let size = file
+            .metadata()
+            .map_err(|source| UploadError::ReadHeic {
+                path: heic_path.to_path_buf(),
+                source,
+            })?
+            .len();
+        let progress = Arc::new(Mutex::new(HashProgress::default()));
+        let reader = HashingFile {
+            file,
+            progress: Arc::clone(&progress),
+        };
+        let response = self
+            .client
+            .post(upload_url.clone())
+            .header(reqwest::header::CONTENT_TYPE, "text/plain")
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .header(reqwest::header::COOKIE, cookie_header(session)?)
+            .body(reqwest::blocking::Body::sized(reader, size))
+            .send()
+            .map_err(|source| UploadError::Network {
+                operation: "signed_upload",
+                source,
+            })?;
+        let value = read_json_response(response, "signed_upload")?;
+        let response: SignedUploadResponse =
+            serde_json::from_value(value).map_err(|source| UploadError::DecodeUploadResponse {
+                operation: "signed_upload",
+                source,
+            })?;
+        let (streamed_heic_sha256, streamed_size_bytes) = finalize_hash_progress(progress)?;
+        Ok((
+            response.single_file,
+            streamed_heic_sha256,
+            streamed_size_bytes,
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateUploadUrlResponse {
+    upload_urls: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignedUploadResponse {
+    single_file: SingleFileUploadRequest,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PutAssetSuccess {
+    upload_job_id: String,
+    cpl_master: String,
+    cpl_asset: String,
+}
+
+enum UploadStatusState {
+    InProgress,
+    Complete,
+}
+
+#[derive(Default)]
+struct HashProgress {
+    hasher: Sha256,
+    bytes: u64,
+}
+
+struct HashingFile {
+    file: File,
+    progress: Arc<Mutex<HashProgress>>,
+}
+
+impl Read for HashingFile {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let bytes_read = self.file.read(buffer)?;
+        if bytes_read > 0 {
+            let mut progress = self
+                .progress
+                .lock()
+                .map_err(|_| std::io::Error::other("hash progress lock poisoned"))?;
+            progress.hasher.update(&buffer[..bytes_read]);
+            progress.bytes += bytes_read as u64;
+        }
+        Ok(bytes_read)
+    }
+}
+
+fn create_upload_url_payload(size_bytes: u64) -> Value {
+    let mut assets = Map::new();
+    assets.insert(Uuid::new_v4().to_string(), json!(size_bytes));
+    json!({
+        "zoneName": PRIMARY_SYNC_ZONE,
+        "assets": assets,
+    })
+}
+
+fn put_asset_payload(
+    filename: &str,
+    last_modified_millis: u64,
+    time_zone_offset_minutes: i32,
+    local_time_zone_id: &str,
+    single_file: &SingleFileUploadRequest,
+) -> Value {
+    json!({
+        "zoneName": PRIMARY_SYNC_ZONE,
+        "localTimeZoneId": local_time_zone_id,
+        "files": [{
+            "fileName": filename,
+            "lastModDate": last_modified_millis,
+            "timeZoneOffset": time_zone_offset_minutes,
+            "singleFileUploadRequest": single_file,
+        }],
+    })
+}
+
+fn parse_create_upload_url_response(value: Value) -> Result<Url, UploadError> {
+    let response: CreateUploadUrlResponse =
+        serde_json::from_value(value).map_err(|source| UploadError::DecodeUploadResponse {
+            operation: PhotosUploadEndpoint::CreateUploadUrl.as_str(),
+            source,
+        })?;
+    if response.upload_urls.len() != 1 {
+        return Err(UploadError::InvalidPhotosUploadResponse(
+            "createUploadUrl must return exactly one upload URL",
+        ));
+    }
+    let (_, raw_url) =
+        response
+            .upload_urls
+            .into_iter()
+            .next()
+            .ok_or(UploadError::InvalidPhotosUploadResponse(
+                "createUploadUrl returned no upload URL",
+            ))?;
+    let url = Url::parse(&raw_url).map_err(|_| {
+        UploadError::InvalidPhotosUploadResponse("createUploadUrl returned an invalid URL")
+    })?;
+    validate_signed_upload_url(&url)?;
+    Ok(url)
+}
+
+fn parse_put_asset_response(value: Value) -> Result<PutAssetSuccess, UploadError> {
+    let items = value
+        .as_array()
+        .ok_or(UploadError::InvalidPhotosUploadResponse(
+            "putAsset response must be an array",
+        ))?;
+    if items.len() != 1 {
+        return Err(UploadError::InvalidPhotosUploadResponse(
+            "putAsset must return exactly one item",
+        ));
+    }
+    let item = &items[0];
+    let response_status = item
+        .get("response")
+        .and_then(|response| response.get("status"))
+        .and_then(Value::as_u64);
+    if let Some(status) = response_status.filter(|status| *status != 200) {
+        return Err(UploadError::PhotosPutAssetRejected {
+            status: status as u16,
+        });
+    }
+    if item.get("uploadJobId").is_some()
+        && item.get("cplMaster").is_some()
+        && item.get("cplAsset").is_some()
+    {
+        let success: PutAssetSuccess = serde_json::from_value(item.clone()).map_err(|source| {
+            UploadError::DecodeUploadResponse {
+                operation: PhotosUploadEndpoint::PutAsset.as_str(),
+                source,
+            }
+        })?;
+        if success.upload_job_id.trim().is_empty() {
+            return Err(UploadError::InvalidPhotosUploadResponse(
+                "putAsset did not return uploadJobId",
+            ));
+        }
+        if success.cpl_master.trim().is_empty() {
+            return Err(UploadError::InvalidPhotosUploadResponse(
+                "putAsset did not return cplMaster",
+            ));
+        }
+        if success.cpl_asset.trim().is_empty() {
+            return Err(UploadError::MissingUploadedAssetId);
+        }
+        return Ok(success);
+    }
+    Err(UploadError::InvalidPhotosUploadResponse(
+        "putAsset response was neither success nor error",
+    ))
+}
+
+fn parse_upload_status_response(
+    value: Value,
+    upload_job_id: &str,
+) -> Result<UploadStatusState, UploadError> {
+    let status = value
+        .get(upload_job_id)
+        .ok_or(UploadError::InvalidPhotosUploadResponse(
+            "uploadStatus did not include the upload job",
+        ))?;
+    if let Some(error_code) = status.get("errorCode").and_then(Value::as_u64) {
+        return Err(UploadError::PhotosUploadStatusFailed { error_code });
+    }
+    if let Some(status_text) = status.get("status").and_then(Value::as_str) {
+        return match status_text {
+            "COMPLETED" => Ok(UploadStatusState::Complete),
+            "ERROR" | "FAILED" => Err(UploadError::PhotosUploadStatusFailed { error_code: 0 }),
+            _ => Err(UploadError::InvalidPhotosUploadResponse(
+                "uploadStatus returned an unknown status",
+            )),
+        };
+    }
+    if status
+        .get("progress")
+        .and_then(Value::as_f64)
+        .is_some_and(|progress| progress >= 100.0)
+    {
+        return Ok(UploadStatusState::Complete);
+    }
+    Ok(UploadStatusState::InProgress)
+}
+
+fn validate_single_file_upload_request(
+    single_file: &SingleFileUploadRequest,
+) -> Result<(), UploadError> {
+    if single_file.file_checksum.trim().is_empty() {
+        return Err(UploadError::InvalidPhotosUploadResponse(
+            "signed upload response missing fileChecksum",
+        ));
+    }
+    if single_file.reference_checksum.trim().is_empty() {
+        return Err(UploadError::InvalidPhotosUploadResponse(
+            "signed upload response missing referenceChecksum",
+        ));
+    }
+    if single_file.receipt.trim().is_empty() {
+        return Err(UploadError::InvalidPhotosUploadResponse(
+            "signed upload response missing receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn photosupload_service_url(
+    session: &UploadSession,
+    endpoint: PhotosUploadEndpoint,
+) -> Result<Url, UploadError> {
+    let mut base = session.photosupload_url.clone();
+    {
+        let mut path = base.path().trim_end_matches('/').to_string();
+        path.push_str("/photosupload/");
+        path.push_str(endpoint.as_str());
+        base.set_path(&path);
+    }
+    base.set_query(Some(&format!("dsid={}", session.dsid)));
+    Ok(base)
+}
+
+fn validate_signed_upload_url(url: &Url) -> Result<(), UploadError> {
+    if url.scheme() != "https" {
+        return Err(UploadError::InvalidPhotosUploadResponse(
+            "signed upload URL must use https",
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(UploadError::InvalidPhotosUploadResponse(
+            "signed upload URL must not include credentials",
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(UploadError::InvalidPhotosUploadResponse(
+            "signed upload URL must not include a fragment",
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or(UploadError::InvalidPhotosUploadResponse(
+            "signed upload URL host is required",
+        ))?;
+    if !is_allowed_icloud_host(host) {
+        return Err(UploadError::InvalidPhotosUploadResponse(
+            "signed upload URL host is not an Apple iCloud host",
+        ));
+    }
+    Ok(())
+}
+
+fn cookie_header(session: &UploadSession) -> Result<String, UploadError> {
+    let value = session
+        .cookies
+        .iter()
+        .map(|cookie| format!("{}={}", cookie.name, cookie.value))
+        .collect::<Vec<_>>()
+        .join("; ");
+    reqwest::header::HeaderValue::from_str(&value)
+        .map_err(|_| UploadError::InvalidSession("cookies cannot form a header".to_string()))?;
+    Ok(value)
+}
+
+fn read_json_response(
+    mut response: reqwest::blocking::Response,
+    operation: &'static str,
+) -> Result<Value, UploadError> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(UploadError::UploadHttpStatus {
+            operation,
+            status: status.as_u16(),
+        });
+    }
+    let mut limited = response.by_ref().take(MAX_UPLOAD_RESPONSE_BYTES + 1);
+    let mut body = Vec::new();
+    limited
+        .read_to_end(&mut body)
+        .map_err(|source| UploadError::ReadUploadResponse { operation, source })?;
+    if body.len() as u64 > MAX_UPLOAD_RESPONSE_BYTES {
+        return Err(UploadError::UploadResponseTooLarge { operation });
+    }
+    serde_json::from_slice(&body)
+        .map_err(|source| UploadError::DecodeUploadResponse { operation, source })
+}
+
+fn finalize_hash_progress(
+    progress: Arc<Mutex<HashProgress>>,
+) -> Result<(String, u64), UploadError> {
+    let mut progress = progress
+        .lock()
+        .map_err(|_| UploadError::InvalidPhotosUploadResponse("hash progress lock poisoned"))?;
+    let hasher = std::mem::take(&mut progress.hasher);
+    Ok((format!("{:x}", hasher.finalize()), progress.bytes))
 }
 
 pub fn verify_local_heic(proof: &HeicVerificationProof) -> Result<(), UploadError> {
@@ -129,9 +712,11 @@ pub fn build_upload_proof(
 #[derive(Debug, Deserialize)]
 struct RawUploadSession {
     dsid: Option<String>,
-    upload_url: Option<String>,
+    photosupload_url: Option<String>,
     webservices: Option<RawWebServices>,
     cookies: Option<Vec<RawCookie>>,
+    local_time_zone_id: Option<String>,
+    time_zone_offset_minutes: Option<i32>,
     #[serde(default)]
     _cookiejar_path: Option<PathBuf>,
 }
@@ -145,15 +730,33 @@ impl RawUploadSession {
                 "dsid must contain only ASCII digits".to_string(),
             ));
         }
-        let upload_url = self
-            .upload_url
+        let photosupload_url = self
+            .photosupload_url
             .or_else(|| {
                 self.webservices
-                    .and_then(|webservices| webservices.uploadimagews)
-                    .and_then(|uploadimagews| uploadimagews.url)
+                    .and_then(|webservices| webservices.photosupload)
+                    .and_then(|photosupload| photosupload.url)
             })
-            .ok_or_else(|| UploadError::InvalidSession("upload_url is required".to_string()))?;
-        let upload_url = validate_upload_url(&upload_url)?;
+            .ok_or_else(|| {
+                UploadError::InvalidSession(
+                    "photosupload_url or webservices.photosupload.url is required".to_string(),
+                )
+            })?;
+        let photosupload_url = validate_photosupload_url(&photosupload_url)?;
+        let local_time_zone_id = match self.local_time_zone_id {
+            Some(value) => {
+                let value = required_nonempty(Some(value), "local_time_zone_id")?;
+                reject_control_chars(&value, "local_time_zone_id")?;
+                value
+            }
+            None => DEFAULT_LOCAL_TIME_ZONE_ID.to_string(),
+        };
+        let time_zone_offset_minutes = self.time_zone_offset_minutes.unwrap_or(0);
+        if !(-1440..=1440).contains(&time_zone_offset_minutes) {
+            return Err(UploadError::InvalidSession(
+                "time_zone_offset_minutes is outside the valid range".to_string(),
+            ));
+        }
         let cookies = self
             .cookies
             .ok_or_else(|| UploadError::InvalidSession("cookies are required".to_string()))?;
@@ -176,19 +779,21 @@ impl RawUploadSession {
         }
         Ok(UploadSession {
             dsid,
-            upload_url,
+            photosupload_url,
             cookies,
+            local_time_zone_id,
+            time_zone_offset_minutes,
         })
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct RawWebServices {
-    uploadimagews: Option<RawUploadImageWs>,
+    photosupload: Option<RawServiceUrl>,
 }
 
 #[derive(Debug, Deserialize)]
-struct RawUploadImageWs {
+struct RawServiceUrl {
     url: Option<String>,
 }
 
@@ -218,43 +823,37 @@ impl RawCookie {
     }
 }
 
-fn validate_upload_url(raw_url: &str) -> Result<Url, UploadError> {
+fn validate_photosupload_url(raw_url: &str) -> Result<Url, UploadError> {
     let url = Url::parse(raw_url).map_err(|_| {
-        UploadError::InvalidSession("upload_url must be an absolute HTTPS URL".to_string())
+        UploadError::InvalidSession("photosupload_url must be an absolute HTTPS URL".to_string())
     })?;
     if url.scheme() != "https" {
         return Err(UploadError::InvalidSession(
-            "upload_url must use https".to_string(),
+            "photosupload_url must use https".to_string(),
         ));
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(UploadError::InvalidSession(
-            "upload_url must not include credentials".to_string(),
+            "photosupload_url must not include credentials".to_string(),
         ));
     }
     if url.query().is_some() || url.fragment().is_some() {
         return Err(UploadError::InvalidSession(
-            "upload_url must not include query or fragment".to_string(),
+            "photosupload_url must not include query or fragment".to_string(),
         ));
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| UploadError::InvalidSession("upload_url host is required".to_string()))?;
-    if !is_allowed_icloud_host(host) {
+    let host = url.host_str().ok_or_else(|| {
+        UploadError::InvalidSession("photosupload_url host is required".to_string())
+    })?;
+    if !is_photosupload_service_host(host) {
         return Err(UploadError::InvalidSession(
-            "upload_url host is not an Apple iCloud host".to_string(),
+            "photosupload_url host is not an Apple Photos upload host".to_string(),
         ));
     }
     let path = url.path().trim_end_matches('/');
-    if path.is_empty() {
-        if !is_uploadimagews_service_host(host) {
-            return Err(UploadError::InvalidSession(
-                "root upload_url must use an uploadimagews iCloud host".to_string(),
-            ));
-        }
-    } else if path != "/uploadimagews" {
+    if !path.is_empty() {
         return Err(UploadError::InvalidSession(
-            "upload_url path must be empty, /, or /uploadimagews".to_string(),
+            "photosupload_url path must be empty or /".to_string(),
         ));
     }
     Ok(url)
@@ -266,14 +865,18 @@ fn is_allowed_icloud_host(host: &str) -> bool {
         || host.ends_with(".icloud.com")
         || host == "icloud.com.cn"
         || host.ends_with(".icloud.com.cn")
+        || host == "icloud-content.com"
+        || host.ends_with(".icloud-content.com")
+        || host == "icloud-content.com.cn"
+        || host.ends_with(".icloud-content.com.cn")
 }
 
-fn is_uploadimagews_service_host(host: &str) -> bool {
+fn is_photosupload_service_host(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
-    host == "uploadimagews.icloud.com"
-        || host.ends_with("-uploadimagews.icloud.com")
-        || host == "uploadimagews.icloud.com.cn"
-        || host.ends_with("-uploadimagews.icloud.com.cn")
+    host == "photosupload.icloud.com"
+        || host.ends_with("-photosupload.icloud.com")
+        || host == "photosupload.icloud.com.cn"
+        || host.ends_with("-photosupload.icloud.com.cn")
 }
 
 fn required_nonempty(value: Option<String>, field: &str) -> Result<String, UploadError> {
@@ -398,6 +1001,46 @@ pub enum UploadError {
         "iCloud Photos upload is not enabled: direct uploadimagews POST is not the iCloud Photos upload protocol; CloudKit /assets/upload and /records/modify support must be implemented first"
     )]
     UnsupportedIcloudUploadProtocol,
+    #[error("failed to build iCloud upload HTTP client")]
+    HttpClient {
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("iCloud upload network request failed during {operation}")]
+    Network {
+        operation: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("iCloud upload returned HTTP {status} during {operation}")]
+    UploadHttpStatus {
+        operation: &'static str,
+        status: u16,
+    },
+    #[error("failed to read iCloud upload response during {operation}: {source}")]
+    ReadUploadResponse {
+        operation: &'static str,
+        source: std::io::Error,
+    },
+    #[error("iCloud upload response during {operation} exceeded the size limit")]
+    UploadResponseTooLarge { operation: &'static str },
+    #[error("failed to decode iCloud upload response during {operation}: {source}")]
+    DecodeUploadResponse {
+        operation: &'static str,
+        source: serde_json::Error,
+    },
+    #[error("invalid iCloud Photos upload response: {0}")]
+    InvalidPhotosUploadResponse(&'static str),
+    #[error(
+        "signed upload size mismatch: expected {expected} bytes, service reported {actual} bytes"
+    )]
+    SignedUploadSizeMismatch { expected: u64, actual: u64 },
+    #[error("iCloud Photos putAsset rejected the upload with status {status}")]
+    PhotosPutAssetRejected { status: u16 },
+    #[error("iCloud Photos upload status failed with error code {error_code}")]
+    PhotosUploadStatusFailed { error_code: u64 },
+    #[error("iCloud Photos upload status did not complete before the poll limit")]
+    PhotosUploadStatusTimedOut,
     #[error("iCloud upload did not return a CPLAsset recordName")]
     MissingUploadedAssetId,
     #[error("failed to read verified HEIC at {path}: {source}")]

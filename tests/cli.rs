@@ -804,7 +804,7 @@ fn workflow_upload_heic_session_failure_does_not_mutate_manifest() {
         &session_path,
         serde_json::json!({
             "dsid": "123456789",
-            "upload_url": "https://evil.example/uploadimagews",
+            "photosupload_url": "https://evil.example",
             "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "token"}]
         })
         .to_string(),
@@ -845,7 +845,7 @@ fn workflow_upload_heic_session_error_does_not_echo_cookie_value() {
         &session_path,
         serde_json::json!({
             "dsid": "123456789",
-            "upload_url": "https://upload.icloud.com/uploadimagews",
+            "photosupload_url": "https://p140-photosupload.icloud.com:443",
             "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "secret-cookie-token\n"}]
         })
         .to_string(),
@@ -873,7 +873,7 @@ fn workflow_upload_heic_session_error_does_not_echo_cookie_value() {
 }
 
 #[test]
-fn workflow_upload_heic_valid_session_fails_closed_without_mutating_manifest() {
+fn workflow_upload_heic_rejects_legacy_uploadimagews_without_mutating_manifest() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let manifest_path = tempdir.path().join("manifest.json");
     let session_path = tempdir.path().join("session.json");
@@ -883,7 +883,9 @@ fn workflow_upload_heic_valid_session_fails_closed_without_mutating_manifest() {
         &session_path,
         serde_json::json!({
             "dsid": "123456789",
-            "upload_url": "https://p140-uploadimagews.icloud.com:443",
+            "webservices": {
+                "uploadimagews": {"url": "https://p140-uploadimagews.icloud.com:443"}
+            },
             "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "token"}]
         })
         .to_string(),
@@ -907,9 +909,8 @@ fn workflow_upload_heic_valid_session_fails_closed_without_mutating_manifest() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "iCloud Photos upload is not enabled",
-        ));
+        .stderr(predicate::str::contains("invalid upload session"))
+        .stderr(predicate::str::contains("photosupload"));
 
     let after = fs::read_to_string(&manifest_path).expect("manifest should be readable");
     assert_eq!(after, before);

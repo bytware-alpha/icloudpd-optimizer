@@ -37,8 +37,8 @@ The current CLI can:
 
 - verify RAW files under a storage root;
 - plan RAW-to-HEIC conversion commands;
-- record conversion, upload, and verification proofs;
-- validate upload-session inputs and fail closed until safe iCloud Photos upload support is implemented;
+- require visual validation before upload;
+- upload verified HEIC files through the iCloud Photos upload service;
 - reject incomplete or inconsistent workflow states;
 - print a JSON delete plan for manual review.
 
@@ -58,6 +58,7 @@ You will also need these tools available on `PATH`:
 
 - `sips`
 - `heif-info`
+- `magick`
 - `exiftool`
 
 Check your environment:
@@ -101,24 +102,22 @@ icloudpd-optimizer workflow delete-plan \
 
 The delete plan is JSON output. It does not remove files.
 
-## Upload Status
+## Uploading HEIC Files
 
-`workflow upload-heic` is intentionally disabled today. iCloud Photos web uploads use
-CloudKit asset-upload tokens plus record mutations, and a direct `uploadimagews` POST is
-not a safe upload protocol for this workflow. Until that CloudKit path is implemented,
-the command validates the session file and local HEIC, then fails without changing the
-manifest.
+`workflow upload-heic` uploads the verified HEIC file and records the returned iCloud
+asset id in the manifest. The command only runs after the HEIC proof includes structure,
+metadata, visual-content, and visual-match checks.
 
 The command requires an explicit pre-authenticated upload session JSON file. It does not
 accept an Apple ID, Apple account password, or MFA input.
 
-The session file must contain a DSID, an iCloud Photos upload service URL, and cookies
+The session file must contain a DSID, a Photos upload service URL, and cookies
 including `X-APPLE-WEBAUTH-TOKEN`:
 
 ```json
 {
   "dsid": "123456789",
-  "upload_url": "https://upload.icloud.com/uploadimagews",
+  "photosupload_url": "https://photosupload.icloud.com",
   "cookies": [
     { "name": "X-APPLE-WEBAUTH-TOKEN", "value": "..." },
     { "name": "session", "value": "..." }
@@ -126,10 +125,10 @@ including `X-APPLE-WEBAUTH-TOKEN`:
 }
 ```
 
-The upload URL may also be supplied as `webservices.uploadimagews.url`. Upload URLs must
-be HTTPS iCloud hosts and must not include credentials, query strings, or fragments.
-The DSID must be numeric. Cookie names and values are validated before any request is
-sent; values must be printable ASCII without whitespace or semicolons.
+The upload URL may also be supplied as `webservices.photosupload.url`. URLs must be
+HTTPS iCloud Photos upload hosts and must not include credentials, query strings, or
+fragments. The DSID must be numeric. Cookie names and values are validated before any
+request is sent; values must be printable ASCII without whitespace or semicolons.
 
 ```sh
 icloudpd-optimizer workflow upload-heic \
@@ -138,11 +137,11 @@ icloudpd-optimizer workflow upload-heic \
   --session /path/to/upload-session.json
 ```
 
-Before the disabled upload boundary, the tool rechecks the local HEIC size and SHA-256
-against the verified manifest proof. If the session is invalid, upload support is not
-available, or the local file changes, the manifest is not updated. Upload proofs can
-still be recorded with `workflow upload-verified` after an operator has independently
-verified the iCloud asset id and uploaded HEIC identity.
+Before upload, the tool rechecks the local HEIC size and SHA-256 against the verified
+manifest proof. If the session is invalid, the iCloud service rejects the upload, or the
+local file changes, the manifest is not updated. Upload proofs can still be recorded
+with `workflow upload-verified` after an operator has independently verified the iCloud
+asset id and uploaded HEIC identity.
 
 ## Safety Model
 
