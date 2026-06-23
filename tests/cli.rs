@@ -614,6 +614,43 @@ fn setup_and_install_docs_scope_sips_to_macos_conversion() {
 }
 
 #[test]
+fn container_builder_uses_declared_supported_rust_version() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cargo_toml =
+        fs::read_to_string(repo_root.join("Cargo.toml")).expect("Cargo.toml should be readable");
+    let containerfile = fs::read_to_string(repo_root.join("container/Containerfile"))
+        .expect("Containerfile should be readable");
+    let rust_version = cargo_toml
+        .lines()
+        .find_map(|line| line.strip_prefix("rust-version = \""))
+        .and_then(|version| version.strip_suffix('"'))
+        .expect("Cargo.toml should declare rust-version");
+
+    assert!(
+        rust_version_at_least(rust_version, 1, 86),
+        "locked dependency graph requires rustc 1.86 or newer"
+    );
+    assert!(
+        containerfile.contains(&format!(
+            "FROM docker.io/rust:{rust_version}-bookworm AS builder"
+        )),
+        "Containerfile builder image must match Cargo.toml rust-version"
+    );
+}
+
+fn rust_version_at_least(version: &str, minimum_major: u64, minimum_minor: u64) -> bool {
+    let mut parts = version.split('.');
+    let major = parts.next().and_then(|part| part.parse::<u64>().ok());
+    let minor = parts.next().and_then(|part| part.parse::<u64>().ok());
+
+    matches!(
+        (major, minor),
+        (Some(major), Some(minor))
+            if major > minimum_major || (major == minimum_major && minor >= minimum_minor)
+    )
+}
+
+#[test]
 fn doctor_json_reports_required_tools_missing_under_empty_path() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
 
