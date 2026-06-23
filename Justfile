@@ -31,6 +31,7 @@ setup:
     require_tool cargo-clippy 'rustup component add clippy'
     require_tool sips 'macOS: bundled with the OS'
     require_tool heif-info 'macOS: brew install libheif'
+    require_tool magick 'macOS: brew install imagemagick; Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y imagemagick'
     require_tool exiftool 'macOS: brew install exiftool; Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y libimage-exiftool-perl'
 
     if command -v cargo >/dev/null 2>&1; then

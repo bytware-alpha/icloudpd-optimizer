@@ -31,19 +31,31 @@ an original from iCloud, you want proof that:
 ## Project Status
 
 This project is early and intentionally conservative. Today it provides the safety and
-manifest layer for a RAW-to-HEIC optimization workflow. It is meant to be called by a
-higher-level sync job or automation.
+manifest layer for a RAW-to-HEIC optimization workflow after another tool has downloaded
+the originals.
+
+It is not a drop-in replacement for `icloudpd` or `docker-icloudpd`. It does not create
+Apple sessions, handle Apple ID authentication or MFA, enumerate iCloud libraries,
+traverse albums, run incremental sync, or delete originals from iCloud.
+
+| Capability | Owner |
+|-|-|
+| Apple ID auth, MFA, sessions, library listing, albums, Copy/Sync/Move downloads | `icloudpd` |
+| Container scheduling, `/config/icloudpd.conf`, keyring, notifications, Telegram reauth | `docker-icloudpd` |
+| RAW-on-storage proof, RAW-to-HEIC proof chain, verified upload proof, delete-plan JSON | `icloudpd-optimizer` |
 
 The current CLI can:
 
 - verify RAW files under a storage root;
 - plan RAW-to-HEIC conversion commands;
 - require visual validation before upload;
-- upload verified HEIC files through the iCloud Photos upload service;
+- upload verified HEIC files through an external iCloud Photos upload session;
 - reject incomplete or inconsistent workflow states;
 - print a JSON delete plan for manual review.
 
-It does not delete iCloud originals for you.
+The conversion planner currently emits macOS `sips` commands and uses ImageMagick for
+visual checks. Run it on a host or sidecar where those tools are available; do not assume
+it can run inside the Alpine `docker-icloudpd` auth container.
 
 ## Install
 
@@ -103,10 +115,55 @@ icloudpd-optimizer workflow delete-plan \
 
 The delete plan is JSON output. It does not remove files.
 
+## Working With iCloudPD
+
+Use `icloudpd` or `docker-icloudpd` in a non-destructive download mode first. For
+`icloudpd`, that means Copy mode rather than Move mode: do not use
+`--keep-icloud-recent-days` before this optimizer has produced and you have reviewed a
+delete plan. For `docker-icloudpd`, keep iCloud-deleting settings such as
+`delete_after_download` and `keep_icloud_recent_only` disabled for the library this tool
+is auditing.
+
+A safe side-by-side shape is:
+
+```sh
+# 1. Let icloudpd/docker-icloudpd download originals to storage.
+# 2. Verify the downloaded RAW under that storage root.
+icloudpd-optimizer workflow nas-verified --manifest manifest.json --asset-id IMG_0001 --raw-path /photos/raw/IMG_0001.dng --nas-root /photos --min-age-days 30
+
+# 3. Record conversion, performance, HEIC validation, upload proof, age proof, and approval.
+# 4. Emit a delete plan for manual review.
+icloudpd-optimizer workflow delete-plan --manifest manifest.json --asset-id IMG_0001
+```
+
+For `docker-icloudpd`, prefer running this tool on the host or as a separate sidecar:
+
+```yaml
+services:
+  icloudpd:
+    image: boredazfcuk/icloudpd
+    volumes:
+      - icloudpd-config:/config
+      - photos-download:/data
+
+  optimizer:
+    image: icloudpd-optimizer
+    volumes:
+      - photos-download:/photos:ro
+      - optimizer-state:/state
+      - optimizer-staging:/staging
+```
+
+Do not mount the `docker-icloudpd` `/config` volume into the optimizer. That directory
+contains auth cookies, keyring data, and `icloudpd.conf`; the optimizer should consume
+downloaded media from a read-only media mount and write only its manifest/staging data.
+Run `icloudpd-optimizer doctor --json` in the host/sidecar environment before automation.
+
 ## Conversion Performance
 
 After `workflow conversion-recorded` and before `workflow heic-verified`, record the
-performance of the actual conversion:
+performance of the actual conversion. This is operator-provided telemetry for the
+production conversion that just ran:
 
 ```sh
 icloudpd-optimizer workflow conversion-performance \
@@ -119,19 +176,23 @@ icloudpd-optimizer workflow conversion-performance \
   --total-wall-time-millis 1500
 ```
 
-Use elapsed wall-clock durations from the production conversion, measured with a
-monotonic clock. Benchmarking tools such as `hyperfine` or ImageMagick `-bench` are
-useful for offline tool comparisons, but those repeated lab runs are not the manifest
-proof used for HEIC verification, upload readiness, or delete-plan gating.
+Use elapsed wall-clock durations from the production conversion, measured by the caller
+with a monotonic clock. Benchmarking tools such as `hyperfine` or ImageMagick `-bench`
+are useful for offline tool comparisons, but those repeated lab runs are not the
+manifest proof used for HEIC verification, upload readiness, or delete-plan gating.
 
 ## Uploading HEIC Files
 
-`workflow upload-heic` uploads the verified HEIC file and records the returned iCloud
-asset id in the manifest. The command only runs after the HEIC proof includes structure,
-metadata, visual-content, and visual-match checks.
+`workflow upload-heic` is an experimental/manual upload helper. It uploads the verified
+HEIC file and records the returned iCloud asset id in the manifest. The command only
+runs after the HEIC proof includes structure, metadata, visual-content, and visual-match
+checks.
 
 The command requires an explicit pre-authenticated upload session JSON file. It does not
-accept an Apple ID, Apple account password, or MFA input.
+accept an Apple ID, Apple account password, or MFA input. `icloudpd` and
+`docker-icloudpd` do not produce this file for the optimizer; their keyring and cookie
+directories are not a supported upload-session source. External sessions can expire or
+stop matching Apple's private upload API.
 
 The session file must contain a DSID, a Photos upload service URL, and cookies
 including `X-APPLE-WEBAUTH-TOKEN`:
@@ -161,9 +222,9 @@ icloudpd-optimizer workflow upload-heic \
 
 Before upload, the tool rechecks the local HEIC size and SHA-256 against the verified
 manifest proof. If the session is invalid, the iCloud service rejects the upload, or the
-local file changes, the manifest is not updated. Upload proofs can still be recorded
-with `workflow upload-verified` after an operator has independently verified the iCloud
-asset id and uploaded HEIC identity.
+local file changes, the manifest is not updated. Until a supported session handoff
+exists, prefer recording upload proof with `workflow upload-verified` after an operator
+has independently verified the iCloud asset id and uploaded HEIC identity.
 
 ## Safety Model
 
@@ -189,8 +250,8 @@ just setup
 ```
 
 `just setup` checks Rust tooling, builds the CLI, runs `icloudpd-optimizer doctor
---json`, and prints install commands for missing runtime tools such as
-`heif-info` and `exiftool`.
+--json`, and prints install commands for missing runtime tools such as `heif-info`,
+ImageMagick, and `exiftool`.
 
 Run the normal project gate before opening a pull request:
 

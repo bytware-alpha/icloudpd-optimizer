@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          components: clippy, rustfmt
+      - name: Install runtime tools
+        run: brew install just libheif imagemagick exiftool
+      - name: Check
+        run: just check
+      - name: Package dry run
+        run: cargo package --locked

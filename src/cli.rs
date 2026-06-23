@@ -78,6 +78,7 @@ enum WorkflowCommand {
     #[command(name = "conversion-performance")]
     ConversionPerformance(WorkflowConversionPerformanceArgs),
     HeicVerified(WorkflowHeicVerifiedArgs),
+    #[command(about = "Upload with an external Photos upload session not produced by icloudpd")]
     UploadHeic(WorkflowUploadHeicArgs),
     UploadVerified(WorkflowUploadVerifiedArgs),
     MarkDeleteEligible(WorkflowAssetArgs),
@@ -170,7 +171,11 @@ struct WorkflowUploadHeicArgs {
     manifest: PathBuf,
     #[arg(long)]
     asset_id: String,
-    #[arg(long, value_name = "PATH")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "External Photos upload session JSON; not produced by icloudpd"
+    )]
     session: PathBuf,
 }
 

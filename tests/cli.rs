@@ -921,6 +921,8 @@ fn workflow_upload_heic_help_shows_session_not_python_credentials() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--session"))
+        .stdout(predicate::str::contains("external"))
+        .stdout(predicate::str::contains("not produced by icloudpd"))
         .stdout(predicate::str::contains("--python").not())
         .stdout(predicate::str::contains("--apple-id").not())
         .stdout(predicate::str::contains("--cookie-directory").not())

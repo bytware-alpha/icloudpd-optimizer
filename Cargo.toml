@@ -2,9 +2,13 @@
 name = "icloudpd-optimizer"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Fail-closed iCloudPD RAW optimization helper"
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/bytware-alpha/icloudpd-optimizer"
+keywords = ["icloud", "icloudpd", "photos", "raw", "heic"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
