@@ -6,10 +6,11 @@ use filetime::{FileTime, set_file_mtime};
 use icloudpd_optimizer::manifest::{AssetRecord, Manifest, State};
 use icloudpd_optimizer::proof::{NasRawProof, ProofError, prove_nas_raw};
 use icloudpd_optimizer::workflow::{
-    ConversionResultProof, HeicVerificationProof, SourceAgeProof, UploadProof, WorkflowError,
-    approve_delete, build_delete_plan, discover_raw_asset, mark_delete_eligible,
-    prove_and_record_nas, record_conversion_result, record_heic_verification, record_nas_proof,
-    record_source_age_proof, record_stage_failure, record_upload_proof, upload_ready_heic_proof,
+    ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, SourceAgeProof,
+    UploadProof, WorkflowError, approve_delete, build_delete_plan, discover_raw_asset,
+    mark_delete_eligible, prove_and_record_nas, record_conversion_performance,
+    record_conversion_result, record_heic_verification, record_nas_proof, record_source_age_proof,
+    record_stage_failure, record_upload_proof, upload_ready_heic_proof,
 };
 use serde_json::json;
 
@@ -32,6 +33,20 @@ fn conversion_proof() -> ConversionResultProof {
         heic_path: PathBuf::from("/staging/IMG_0001.heic"),
         heic_sha256: "heic-sha256".to_string(),
         size_bytes: 24,
+    }
+}
+
+fn conversion_performance_input() -> ConversionPerformanceInput {
+    ConversionPerformanceInput {
+        measured_at_unix_seconds: 1_800_000_100,
+        conversion_tool: "magick".to_string(),
+        conversion_tool_version: Some("7.1.1-41".to_string()),
+        heic_quality: 90,
+        convert_wall_time_millis: 1_250,
+        total_wall_time_millis: 1_500,
+        user_cpu_time_millis: Some(1_100),
+        system_cpu_time_millis: Some(90),
+        peak_rss_kib: Some(256_000),
     }
 }
 
@@ -100,7 +115,7 @@ fn set_raw_mtime(path: &Path, unix_seconds: u64) {
 }
 
 fn conversion_verified_manifest() -> Manifest {
-    let mut manifest = converted_manifest();
+    let mut manifest = conversion_performance_manifest();
     record_heic_verification(&mut manifest, "asset-1", heic_proof())
         .expect("heic verification should record");
     manifest
@@ -135,6 +150,8 @@ fn real_delete_approved_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {
     record_nas_proof(&mut manifest, "asset-1", proof).expect("nas proof should record");
     record_conversion_result(&mut manifest, "asset-1", conversion_proof())
         .expect("conversion should record");
+    record_conversion_performance(&mut manifest, "asset-1", conversion_performance_input())
+        .expect("conversion performance should record");
     record_heic_verification(&mut manifest, "asset-1", heic_proof())
         .expect("heic verification should record");
     record_source_age_proof(&mut manifest, "asset-1", old_source_age_proof())
@@ -171,6 +188,13 @@ fn converted_manifest() -> Manifest {
     record_nas_proof(&mut manifest, "asset-1", nas_proof()).expect("nas proof should record");
     record_conversion_result(&mut manifest, "asset-1", conversion_proof())
         .expect("conversion should record");
+    manifest
+}
+
+fn conversion_performance_manifest() -> Manifest {
+    let mut manifest = converted_manifest();
+    record_conversion_performance(&mut manifest, "asset-1", conversion_performance_input())
+        .expect("conversion performance should record");
     manifest
 }
 
@@ -218,6 +242,7 @@ fn valid_ordered_workflow_reaches_delete_plan_without_deleting() {
         vec![
             "nas",
             "conversion",
+            "conversion_performance",
             "heic",
             "source_age",
             "upload",
@@ -317,6 +342,32 @@ fn delete_plan_revalidates_upload_hash_and_path_against_heic() {
             error,
             WorkflowError::ProofMismatch {
                 proof_key: "heic",
+                field: actual,
+                ..
+            } if actual == field
+        ));
+    }
+}
+
+#[test]
+fn delete_plan_revalidates_conversion_performance_sizes() {
+    let cases = [
+        ("raw_size_bytes", json!(41)),
+        ("heic_size_bytes", json!(25)),
+    ];
+
+    for (field, value) in cases {
+        let (_tempdir, manifest) = forged_delete_approved_manifest(|record| {
+            proof_mut(record, "conversion_performance")[field] = value;
+        });
+
+        let error = build_delete_plan(&manifest, "asset-1")
+            .expect_err("forged conversion performance sizes must block delete plan");
+
+        assert!(matches!(
+            error,
+            WorkflowError::ProofMismatch {
+                proof_key: "conversion_performance",
                 field: actual,
                 ..
             } if actual == field
@@ -630,7 +681,7 @@ fn heic_verification_must_match_conversion_path_hash_and_size_without_mutation()
     ];
 
     for (field, proof) in cases {
-        let mut manifest = converted_manifest();
+        let mut manifest = conversion_performance_manifest();
         let before = manifest.get("asset-1").expect("asset should exist").clone();
 
         let error = record_heic_verification(&mut manifest, "asset-1", proof)
@@ -648,6 +699,119 @@ fn heic_verification_must_match_conversion_path_hash_and_size_without_mutation()
             manifest.get("asset-1").expect("asset should exist"),
             &before
         );
+    }
+}
+
+#[test]
+fn heic_verification_requires_conversion_performance_without_mutation() {
+    let mut manifest = converted_manifest();
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = record_heic_verification(&mut manifest, "asset-1", heic_proof())
+        .expect_err("conversion performance proof is required before HEIC verification");
+
+    assert!(matches!(
+        error,
+        WorkflowError::MissingProof {
+            proof_key,
+            ..
+        } if proof_key == "conversion_performance"
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+    assert!(!before.proofs.contains_key("heic"));
+}
+
+#[test]
+fn conversion_performance_records_derived_sizes_and_metrics() {
+    let mut manifest = converted_manifest();
+
+    let record =
+        record_conversion_performance(&mut manifest, "asset-1", conversion_performance_input())
+            .expect("conversion performance should record");
+
+    assert_eq!(record.state, State::Converted);
+    let proof = &record.proofs["conversion_performance"];
+    assert_eq!(proof["schema_version"], 1);
+    assert_eq!(proof["measured_at_unix_seconds"], 1_800_000_100);
+    assert_eq!(proof["measurement_method"], "monotonic_wall_clock");
+    assert_eq!(proof["conversion_tool"], "magick");
+    assert_eq!(proof["conversion_tool_version"], "7.1.1-41");
+    assert_eq!(proof["heic_quality"], 90);
+    assert_eq!(proof["raw_size_bytes"], 42);
+    assert_eq!(proof["heic_size_bytes"], 24);
+    assert_eq!(proof["convert_wall_time_millis"], 1_250);
+    assert_eq!(proof["total_wall_time_millis"], 1_500);
+    assert_eq!(proof["user_cpu_time_millis"], 1_100);
+    assert_eq!(proof["system_cpu_time_millis"], 90);
+    assert_eq!(proof["peak_rss_kib"], 256_000);
+}
+
+#[test]
+fn invalid_conversion_performance_metrics_fail_without_mutation() {
+    let cases = [
+        (
+            "convert_wall_time_millis",
+            ConversionPerformanceInput {
+                convert_wall_time_millis: 0,
+                ..conversion_performance_input()
+            },
+        ),
+        (
+            "total_wall_time_millis",
+            ConversionPerformanceInput {
+                convert_wall_time_millis: 1_250,
+                total_wall_time_millis: 1_000,
+                ..conversion_performance_input()
+            },
+        ),
+        (
+            "conversion_tool",
+            ConversionPerformanceInput {
+                conversion_tool: "  ".to_string(),
+                ..conversion_performance_input()
+            },
+        ),
+        (
+            "heic_quality",
+            ConversionPerformanceInput {
+                heic_quality: 0,
+                ..conversion_performance_input()
+            },
+        ),
+    ];
+
+    for (field, input) in cases {
+        let mut manifest = converted_manifest();
+        let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+        let error = record_conversion_performance(&mut manifest, "asset-1", input)
+            .expect_err("invalid conversion performance metrics must fail closed");
+
+        if field == "conversion_tool" {
+            assert!(matches!(
+                error,
+                WorkflowError::EmptyProofField {
+                    field: "conversion_tool"
+                }
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                WorkflowError::InvalidProofField {
+                    proof_key: "conversion_performance",
+                    field: actual,
+                    ..
+                } if actual == field
+            ));
+        }
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist"),
+            &before
+        );
+        assert!(!before.proofs.contains_key("conversion_performance"));
     }
 }
 
@@ -671,7 +835,7 @@ fn heic_verification_requires_visual_proofs_without_mutation() {
     ];
 
     for (field, proof) in cases {
-        let mut manifest = converted_manifest();
+        let mut manifest = conversion_performance_manifest();
         let before = manifest.get("asset-1").expect("asset should exist").clone();
 
         let error = record_heic_verification(&mut manifest, "asset-1", proof)

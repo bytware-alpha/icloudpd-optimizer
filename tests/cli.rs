@@ -7,8 +7,9 @@ use filetime::{FileTime, set_file_mtime};
 use icloudpd_optimizer::manifest::{AssetRecord, Manifest, State};
 use icloudpd_optimizer::proof::NasRawProof;
 use icloudpd_optimizer::workflow::{
-    ConversionResultProof, HeicVerificationProof, SourceAgeProof, discover_raw_asset,
-    record_conversion_result, record_heic_verification, record_nas_proof, record_source_age_proof,
+    ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, SourceAgeProof,
+    discover_raw_asset, record_conversion_performance, record_conversion_result,
+    record_heic_verification, record_nas_proof, record_source_age_proof,
 };
 use predicates::prelude::*;
 use serde_json::{Value, json};
@@ -100,6 +101,20 @@ fn conversion_proof() -> ConversionResultProof {
     }
 }
 
+fn conversion_performance_input() -> ConversionPerformanceInput {
+    ConversionPerformanceInput {
+        measured_at_unix_seconds: 1_800_000_100,
+        conversion_tool: "magick".to_string(),
+        conversion_tool_version: Some("7.1.1-41".to_string()),
+        heic_quality: 90,
+        convert_wall_time_millis: 1_250,
+        total_wall_time_millis: 1_500,
+        user_cpu_time_millis: Some(1_100),
+        system_cpu_time_millis: Some(90),
+        peak_rss_kib: Some(256_000),
+    }
+}
+
 fn heic_proof() -> HeicVerificationProof {
     HeicVerificationProof {
         heic_path: PathBuf::from("/staging/IMG_0001.heic"),
@@ -132,6 +147,36 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn record_conversion_performance_cli(manifest_arg: &str) {
+    binary()
+        .args([
+            "workflow",
+            "conversion-performance",
+            "--manifest",
+            manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--conversion-tool",
+            "magick",
+            "--conversion-tool-version",
+            "7.1.1-41",
+            "--heic-quality",
+            "90",
+            "--convert-wall-time-millis",
+            "1250",
+            "--total-wall-time-millis",
+            "1500",
+            "--user-cpu-time-millis",
+            "1100",
+            "--system-cpu-time-millis",
+            "90",
+            "--peak-rss-kib",
+            "256000",
+        ])
+        .assert()
+        .success();
+}
+
 fn manifest_with_nas_verified(path: &std::path::Path) {
     let mut manifest = Manifest::new();
     discover_raw_asset(
@@ -162,6 +207,8 @@ fn manifest_with_conversion_verified(path: &std::path::Path) {
     record_nas_proof(&mut manifest, "asset-1", nas_proof()).expect("nas proof should record");
     record_conversion_result(&mut manifest, "asset-1", conversion_proof())
         .expect("conversion should record");
+    record_conversion_performance(&mut manifest, "asset-1", conversion_performance_input())
+        .expect("conversion performance should record");
     record_heic_verification(&mut manifest, "asset-1", heic_proof())
         .expect("heic verification should record");
     record_source_age_proof(&mut manifest, "asset-1", old_source_age_proof())
@@ -188,6 +235,8 @@ fn manifest_with_real_conversion_verified(path: &std::path::Path, heic_path: Pat
         },
     )
     .expect("conversion should record");
+    record_conversion_performance(&mut manifest, "asset-1", conversion_performance_input())
+        .expect("conversion performance should record");
     record_heic_verification(
         &mut manifest,
         "asset-1",
@@ -254,6 +303,7 @@ fn manifest_with_real_delete_approval(tempdir: &std::path::Path) -> (PathBuf, Pa
         ])
         .assert()
         .success();
+    record_conversion_performance_cli(manifest_arg);
     binary()
         .args([
             "workflow",
@@ -577,7 +627,7 @@ fn workflow_nas_verified_rejects_min_age_below_floor_without_mutating_manifest()
 }
 
 #[test]
-fn workflow_conversion_result_and_heic_verified_commands_complete_conversion_gate() {
+fn workflow_conversion_result_performance_and_heic_verified_commands_complete_conversion_gate() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let manifest_path = tempdir.path().join("manifest.json");
     manifest_with_nas_verified(&manifest_path);
@@ -589,7 +639,7 @@ fn workflow_conversion_result_and_heic_verified_commands_complete_conversion_gat
     binary()
         .args([
             "workflow",
-            "conversion-recorded",
+            "conversion-result",
             "--manifest",
             manifest_arg,
             "--asset-id",
@@ -603,6 +653,7 @@ fn workflow_conversion_result_and_heic_verified_commands_complete_conversion_gat
         ])
         .assert()
         .success();
+    record_conversion_performance_cli(manifest_arg);
     binary()
         .args([
             "workflow",
@@ -629,6 +680,33 @@ fn workflow_conversion_result_and_heic_verified_commands_complete_conversion_gat
     let record = manifest.get("asset-1").expect("asset should exist");
     assert_eq!(record.state, State::ConversionVerified);
     assert_eq!(record.proofs["conversion"]["heic_sha256"], "heic-sha256");
+    assert_eq!(
+        record.proofs["conversion_performance"]["conversion_tool"],
+        "magick"
+    );
+    assert_eq!(
+        record.proofs["conversion_performance"]["conversion_tool_version"],
+        "7.1.1-41"
+    );
+    assert_eq!(record.proofs["conversion_performance"]["heic_quality"], 90);
+    assert_eq!(
+        record.proofs["conversion_performance"]["raw_size_bytes"],
+        42
+    );
+    assert_eq!(
+        record.proofs["conversion_performance"]["heic_size_bytes"],
+        24
+    );
+    assert_eq!(
+        record.proofs["conversion_performance"]["measurement_method"],
+        "monotonic_wall_clock"
+    );
+    assert!(
+        record.proofs["conversion_performance"]["measured_at_unix_seconds"]
+            .as_u64()
+            .expect("measured_at should be filled")
+            > 0
+    );
     assert_eq!(record.proofs["heic"]["heic_path"], "/staging/IMG_0001.heic");
 }
 
@@ -658,6 +736,7 @@ fn workflow_heic_verified_mismatch_fails_without_mutating_manifest() {
         ])
         .assert()
         .success();
+    record_conversion_performance_cli(manifest_arg);
     let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
 
     binary()
@@ -688,6 +767,61 @@ fn workflow_heic_verified_mismatch_fails_without_mutating_manifest() {
 }
 
 #[test]
+fn workflow_heic_verified_requires_conversion_performance_without_mutating_manifest() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    manifest_with_nas_verified(&manifest_path);
+    manifest_with_source_age_verified(&manifest_path);
+    let manifest_arg = manifest_path
+        .to_str()
+        .expect("manifest path should be utf8");
+    binary()
+        .args([
+            "workflow",
+            "conversion-result",
+            "--manifest",
+            manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--heic-path",
+            "/staging/IMG_0001.heic",
+            "--heic-sha256",
+            "heic-sha256",
+            "--size-bytes",
+            "24",
+        ])
+        .assert()
+        .success();
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "heic-verified",
+            "--manifest",
+            manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--heic-path",
+            "/staging/IMG_0001.heic",
+            "--heic-sha256",
+            "heic-sha256",
+            "--size-bytes",
+            "24",
+            "--heif-info-ok",
+            "--metadata-copied",
+            "--visual-content-ok",
+            "--visual-match-ok",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("conversion_performance"));
+
+    let after = fs::read_to_string(&manifest_path).expect("manifest should remain readable");
+    assert_eq!(after, before);
+}
+
+#[test]
 fn workflow_heic_verified_requires_explicit_boolean_proofs_without_mutating_manifest() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let manifest_path = tempdir.path().join("manifest.json");
@@ -712,6 +846,7 @@ fn workflow_heic_verified_requires_explicit_boolean_proofs_without_mutating_mani
         ])
         .assert()
         .success();
+    record_conversion_performance_cli(manifest_arg);
     let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
 
     binary()
@@ -1030,6 +1165,7 @@ fn workflow_mark_delete_eligible_requires_source_age_without_mutating_manifest()
         ])
         .assert()
         .success();
+    record_conversion_performance_cli(manifest_arg);
     binary()
         .args([
             "workflow",
@@ -1135,6 +1271,7 @@ fn workflow_mark_delete_eligible_rejects_too_new_source_age_without_mutating_man
         ])
         .assert()
         .success();
+    record_conversion_performance_cli(manifest_arg);
     binary()
         .args([
             "workflow",
