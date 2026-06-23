@@ -638,6 +638,26 @@ fn container_builder_uses_declared_supported_rust_version() {
     );
 }
 
+#[test]
+fn container_image_provides_magick_command_on_bookworm() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let containerfile = fs::read_to_string(repo_root.join("container/Containerfile"))
+        .expect("Containerfile should be readable");
+
+    assert!(
+        containerfile.contains("/usr/local/bin/magick"),
+        "doctor requires magick, so the Linux image must provide that command"
+    );
+    assert!(
+        containerfile.contains("exec /usr/bin/compare"),
+        "magick compare should dispatch to ImageMagick 6 compare on bookworm"
+    );
+    assert!(
+        containerfile.contains("exec /usr/bin/convert"),
+        "non-compare magick invocations should dispatch to ImageMagick 6 convert on bookworm"
+    );
+}
+
 fn rust_version_at_least(version: &str, minimum_major: u64, minimum_minor: u64) -> bool {
     let mut parts = version.split('.');
     let major = parts.next().and_then(|part| part.parse::<u64>().ok());

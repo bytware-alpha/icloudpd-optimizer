@@ -11,7 +11,17 @@ RUN apt-get update \
     imagemagick \
     libheif-examples \
     libimage-exiftool-perl \
-  && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/* \
+  && printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'if [ "${1:-}" = "compare" ]; then' \
+    '  shift' \
+    '  exec /usr/bin/compare "$@"' \
+    'fi' \
+    'exec /usr/bin/convert "$@"' \
+    > /usr/local/bin/magick \
+  && chmod +x /usr/local/bin/magick
 COPY --from=builder /src/target/release/icloudpd-optimizer /usr/local/bin/icloudpd-optimizer
 ENTRYPOINT ["icloudpd-optimizer"]
 CMD ["--help"]

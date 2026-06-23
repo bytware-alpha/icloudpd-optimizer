@@ -41,7 +41,7 @@ setup:
     esac
 
     require_tool heif-info 'macOS: brew install libheif; Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y libheif-examples'
-    require_tool magick 'macOS: brew install imagemagick; Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y imagemagick'
+    require_tool magick 'macOS: brew install imagemagick; Debian/Ubuntu source installs need an ImageMagick magick command or a compatible convert/compare wrapper'
     require_tool exiftool 'macOS: brew install exiftool; Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y libimage-exiftool-perl'
 
     if command -v cargo >/dev/null 2>&1; then
