@@ -35,7 +35,10 @@ cargo test
   tokens, usernames, phone numbers, or production asset identifiers.
 - Do not add generated build artifacts, local manifests, media files, or machine-specific
   configuration.
-- Update README examples when CLI names, arguments, or workflow sequencing change.
+- Update README examples when CLI names, arguments, or workflow sequencing change,
+  especially required proof steps between conversion and HEIC verification.
+- Test conversion performance proof behavior for workflow state changes, including
+  fail-closed paths when the proof is missing, stale, malformed, or no longer mutable.
 
 ## Pull Requests
 

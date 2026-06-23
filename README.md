@@ -20,6 +20,7 @@ an original from iCloud, you want proof that:
 
 - the RAW exists on durable storage;
 - the HEIC was created from that RAW;
+- the conversion performance for the actual run was recorded;
 - the HEIC was verified and metadata was copied;
 - the uploaded HEIC matches what was verified;
 - the original is old enough to be eligible;
@@ -101,6 +102,27 @@ icloudpd-optimizer workflow delete-plan \
 ```
 
 The delete plan is JSON output. It does not remove files.
+
+## Conversion Performance
+
+After `workflow conversion-recorded` and before `workflow heic-verified`, record the
+performance of the actual conversion:
+
+```sh
+icloudpd-optimizer workflow conversion-performance \
+  --manifest manifest.json \
+  --asset-id IMG_0001 \
+  --conversion-tool magick \
+  --conversion-tool-version 7.1.1 \
+  --heic-quality 90 \
+  --convert-wall-time-millis 1250 \
+  --total-wall-time-millis 1500
+```
+
+Use elapsed wall-clock durations from the production conversion, measured with a
+monotonic clock. Benchmarking tools such as `hyperfine` or ImageMagick `-bench` are
+useful for offline tool comparisons, but those repeated lab runs are not the manifest
+proof used for HEIC verification, upload readiness, or delete-plan gating.
 
 ## Uploading HEIC Files
 
