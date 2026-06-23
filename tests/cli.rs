@@ -551,6 +551,50 @@ fn manifest_show_bad_manifest_fails_without_mutating_it() {
 }
 
 #[test]
+fn apple_container_packaging_surface_is_documented() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let containerfile_path = repo_root.join("container/Containerfile");
+
+    assert!(
+        containerfile_path.exists(),
+        "container/Containerfile should be committed"
+    );
+
+    let containerfile =
+        fs::read_to_string(&containerfile_path).expect("Containerfile should be readable");
+    for disallowed in [
+        "/Users/",
+        "/home/",
+        "/config",
+        "localhost",
+        "127.0.0.1",
+        "APPLE_ID",
+        "PASSWORD",
+        "SECRET",
+        "TOKEN",
+    ] {
+        assert!(
+            !containerfile.contains(disallowed),
+            "Containerfile should not contain private marker {disallowed:?}"
+        );
+    }
+
+    let justfile = fs::read_to_string(repo_root.join("Justfile")).expect("Justfile should exist");
+    assert!(justfile.contains("apple-image-build"));
+    assert!(justfile.contains("apple-image-doctor"));
+    assert!(justfile.contains("oci-image-smoke"));
+    assert!(justfile.contains("container build"));
+    assert!(justfile.contains("--file container/Containerfile"));
+
+    let readme = fs::read_to_string(repo_root.join("README.md")).expect("README should exist");
+    assert!(readme.contains(
+        "container build --tag icloudpd-optimizer:local --file container/Containerfile ."
+    ));
+    assert!(readme.contains("OCI"));
+    assert!(readme.contains("Linux OCI runtimes"));
+}
+
+#[test]
 fn doctor_json_reports_required_tools_missing_under_empty_path() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
 

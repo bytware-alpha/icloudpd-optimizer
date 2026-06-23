@@ -80,6 +80,36 @@ Check your environment:
 icloudpd-optimizer doctor --json
 ```
 
+## OCI Image
+
+Apple `container` is the primary local image build/run path. It runs Linux
+containers on Apple silicon macOS and builds an OCI-compatible image that can also
+be used by Linux OCI runtimes.
+
+Build the standard OCI Linux image:
+
+```sh
+container build --tag icloudpd-optimizer:local --file container/Containerfile .
+```
+
+Run the image doctor check with Apple `container`:
+
+```sh
+container run --rm icloudpd-optimizer:local doctor --json
+```
+
+The same OCI image can be tagged and pushed to GHCR, then run on Linux OCI runtimes:
+
+```sh
+podman run --rm icloudpd-optimizer:local doctor --json
+```
+
+The Linux image supports manifest, proof, upload, and delete-plan operations. It does
+not make `workflow convert` portable today: that command remains macOS host-native
+because the supported conversion backend is `sips`. Inside the Linux image,
+`doctor --json` reports conversion as unsupported and `workflow convert` fails closed
+instead of using a hidden fallback.
+
 ## Quick Start
 
 Show the CLI help:

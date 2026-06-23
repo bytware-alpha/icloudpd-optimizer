@@ -52,6 +52,18 @@ check:
     cargo clippy --locked --all-targets -- -D warnings
     cargo test --locked
 
+# Build the standard OCI Linux image with Apple container.
+apple-image-build tag='icloudpd-optimizer:local':
+    container build --tag {{tag}} --file container/Containerfile .
+
+# Run doctor inside the Apple container-built OCI image.
+apple-image-doctor tag='icloudpd-optimizer:local':
+    container run --rm {{tag}} doctor --json
+
+# Smoke-test the same OCI image with another Linux OCI runtime.
+oci-image-smoke tag='icloudpd-optimizer:local' runtime='podman':
+    {{runtime}} run --rm {{tag}} doctor --json
+
 # Run the test suite.
 test:
     cargo test --locked

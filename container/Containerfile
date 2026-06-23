@@ -1,0 +1,17 @@
+FROM docker.io/rust:1.85-bookworm AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked
+
+FROM docker.io/debian:bookworm-slim
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    imagemagick \
+    libheif-examples \
+    libimage-exiftool-perl \
+  && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/icloudpd-optimizer /usr/local/bin/icloudpd-optimizer
+ENTRYPOINT ["icloudpd-optimizer"]
+CMD ["--help"]
