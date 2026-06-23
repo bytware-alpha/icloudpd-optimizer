@@ -595,6 +595,25 @@ fn apple_container_packaging_surface_is_documented() {
 }
 
 #[test]
+fn setup_and_install_docs_scope_sips_to_macos_conversion() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let justfile = fs::read_to_string(repo_root.join("Justfile")).expect("Justfile should exist");
+    let readme = fs::read_to_string(repo_root.join("README.md")).expect("README should exist");
+
+    assert!(justfile.contains("Darwin"));
+    assert!(justfile.contains("require_tool sips"));
+    assert!(justfile.contains("workflow convert is macOS host-native"));
+    assert!(justfile.contains("sips is not required"));
+
+    assert!(
+        readme.contains("`doctor --json` is authoritative for platform-specific required tools")
+    );
+    assert!(readme.contains("macOS host-native `workflow convert` requirements"));
+    assert!(readme.contains("Linux source and OCI installs do not require `sips`"));
+    assert!(!readme.contains("You will also need these tools available on `PATH`:\n\n- `sips`"));
+}
+
+#[test]
 fn doctor_json_reports_required_tools_missing_under_empty_path() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
 

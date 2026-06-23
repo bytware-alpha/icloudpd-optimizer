@@ -6,7 +6,7 @@ default:
 list:
     @just --list
 
-# Check local Rust tooling and runtime conversion dependencies.
+# Check local Rust tooling and platform-specific runtime dependencies.
 setup:
     #!/usr/bin/env sh
     set -eu
@@ -29,8 +29,18 @@ setup:
     require_tool cargo 'install Rust from https://rustup.rs'
     require_tool rustfmt 'rustup component add rustfmt'
     require_tool cargo-clippy 'rustup component add clippy'
-    require_tool sips 'macOS: bundled with the OS'
-    require_tool heif-info 'macOS: brew install libheif'
+
+    case "$(uname -s)" in
+      Darwin)
+        require_tool sips 'macOS: bundled with the OS'
+        ;;
+      *)
+        printf 'skip: sips\n'
+        printf '  note: workflow convert is macOS host-native; sips is not required for proof/upload/delete-plan workflows on this platform.\n'
+        ;;
+    esac
+
+    require_tool heif-info 'macOS: brew install libheif; Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y libheif-examples'
     require_tool magick 'macOS: brew install imagemagick; Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y imagemagick'
     require_tool exiftool 'macOS: brew install exiftool; Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y libimage-exiftool-perl'
 

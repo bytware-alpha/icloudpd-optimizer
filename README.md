@@ -53,9 +53,10 @@ The current CLI can:
 - reject incomplete or inconsistent workflow states;
 - print a JSON delete plan for manual review.
 
-The conversion planner currently emits macOS `sips` commands and uses ImageMagick for
-visual checks. Run it on a host or sidecar where those tools are available; do not assume
-it can run inside the Alpine `docker-icloudpd` auth container.
+Host-native `workflow convert` currently uses macOS `sips` commands and ImageMagick
+visual checks. Run conversion on a macOS host or sidecar where those tools are
+available; do not assume it can run inside the Alpine `docker-icloudpd` auth
+container.
 
 ## Install
 
@@ -67,18 +68,33 @@ cd icloudpd-optimizer
 cargo install --path . --locked
 ```
 
-You will also need these tools available on `PATH`:
+Check the active platform contract:
+
+```sh
+icloudpd-optimizer doctor --json
+```
+
+`doctor --json` is authoritative for platform-specific required tools. It reports
+the host platform, active conversion backend, whether `workflow convert` is
+supported, and the tools required for that platform.
+
+For source installs on supported platforms, keep these cross-platform runtime tools
+available on `PATH`:
+
+- `heif-info`
+- `magick`
+- `exiftool`
+
+macOS host-native `workflow convert` requirements:
 
 - `sips`
 - `heif-info`
 - `magick`
 - `exiftool`
 
-Check your environment:
-
-```sh
-icloudpd-optimizer doctor --json
-```
+Linux source and OCI installs do not require `sips`. They support manifest, proof,
+upload, and delete-plan workflows, while host-native `workflow convert` is reported
+unsupported and fails closed.
 
 ## OCI Image
 
@@ -312,7 +328,9 @@ just setup
 
 `just setup` checks Rust tooling, builds the CLI, runs `icloudpd-optimizer doctor
 --json`, and prints install commands for missing runtime tools such as `heif-info`,
-ImageMagick, and `exiftool`.
+ImageMagick, and `exiftool`. On Darwin/macOS it also requires `sips` for
+host-native `workflow convert`; on non-Darwin platforms it prints a skip note
+because `sips` is not required for proof, upload, or delete-plan workflows.
 
 Run the normal project gate before opening a pull request:
 
