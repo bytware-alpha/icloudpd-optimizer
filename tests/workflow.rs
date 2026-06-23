@@ -807,6 +807,13 @@ fn invalid_conversion_performance_metrics_fail_without_mutation() {
             },
         ),
         (
+            "conversion_tool_version",
+            ConversionPerformanceInput {
+                conversion_tool_version: Some("  ".to_string()),
+                ..conversion_performance_input()
+            },
+        ),
+        (
             "heic_quality",
             ConversionPerformanceInput {
                 heic_quality: 0,
@@ -829,12 +836,10 @@ fn invalid_conversion_performance_metrics_fail_without_mutation() {
         let error = record_conversion_performance(&mut manifest, "asset-1", input)
             .expect_err("invalid conversion performance metrics must fail closed");
 
-        if field == "conversion_tool" {
+        if matches!(field, "conversion_tool" | "conversion_tool_version") {
             assert!(matches!(
                 error,
-                WorkflowError::EmptyProofField {
-                    field: "conversion_tool"
-                }
+                WorkflowError::EmptyProofField { field: actual } if actual == field
             ));
         } else {
             assert!(matches!(
@@ -931,6 +936,31 @@ fn upload_ready_requires_conversion_performance_proof() {
 }
 
 #[test]
+fn upload_proof_requires_conversion_performance_without_mutation() {
+    let mut manifest = conversion_verified_manifest();
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    record.proofs.remove("conversion_performance");
+    manifest.upsert(record);
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = record_upload_proof(&mut manifest, "asset-1", upload_proof())
+        .expect_err("upload proof must require conversion performance proof");
+
+    assert!(matches!(
+        error,
+        WorkflowError::MissingProof {
+            proof_key,
+            ..
+        } if proof_key == "conversion_performance"
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+    assert!(!before.proofs.contains_key("upload"));
+}
+
+#[test]
 fn upload_proof_must_match_heic_hash_and_path_without_mutation() {
     let cases = [
         (
@@ -996,6 +1026,57 @@ fn upload_proof_requires_uploaded_path_without_mutation() {
         manifest.get("asset-1").expect("asset should exist"),
         &before
     );
+}
+
+#[test]
+fn delete_eligibility_requires_conversion_performance_without_mutation() {
+    let mut manifest = upload_verified_manifest();
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    record.proofs.remove("conversion_performance");
+    manifest.upsert(record);
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = mark_delete_eligible(&mut manifest, "asset-1")
+        .expect_err("delete eligibility must require conversion performance proof");
+
+    assert!(matches!(
+        error,
+        WorkflowError::MissingProof {
+            proof_key,
+            ..
+        } if proof_key == "conversion_performance"
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+    assert!(!before.proofs.contains_key("delete_eligibility"));
+}
+
+#[test]
+fn delete_eligibility_revalidates_conversion_performance_without_mutation() {
+    let mut manifest = upload_verified_manifest();
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    proof_mut(&mut record, "conversion_performance")["raw_size_bytes"] = json!(41);
+    manifest.upsert(record);
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = mark_delete_eligible(&mut manifest, "asset-1")
+        .expect_err("delete eligibility must revalidate conversion performance proof");
+
+    assert!(matches!(
+        error,
+        WorkflowError::ProofMismatch {
+            proof_key: "conversion_performance",
+            field: "raw_size_bytes",
+            ..
+        }
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+    assert!(!before.proofs.contains_key("delete_eligibility"));
 }
 
 #[test]

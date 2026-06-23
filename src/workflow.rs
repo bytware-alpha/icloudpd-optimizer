@@ -211,8 +211,7 @@ pub fn record_conversion_performance<'a>(
         }));
     }
 
-    let nas = stored_proof::<NasRawProof>(manifest, asset_id, NAS_PROOF)?;
-    let conversion = stored_proof::<ConversionResultProof>(manifest, asset_id, CONVERSION_PROOF)?;
+    let (nas, conversion) = load_conversion_context(manifest, asset_id)?;
     let proof = ConversionPerformanceProof {
         schema_version: CONVERSION_PERFORMANCE_SCHEMA_VERSION,
         measured_at_unix_seconds: input.measured_at_unix_seconds,
@@ -239,14 +238,7 @@ pub fn record_heic_verification<'a>(
 ) -> Result<&'a AssetRecord, WorkflowError> {
     require_non_empty_path("heic_path", &proof.heic_path)?;
     require_non_empty("heic_sha256", &proof.heic_sha256)?;
-    let nas = stored_proof::<NasRawProof>(manifest, asset_id, NAS_PROOF)?;
-    let conversion = stored_proof::<ConversionResultProof>(manifest, asset_id, CONVERSION_PROOF)?;
-    let conversion_performance = stored_proof::<ConversionPerformanceProof>(
-        manifest,
-        asset_id,
-        CONVERSION_PERFORMANCE_PROOF,
-    )?;
-    validate_conversion_performance_proof(&conversion_performance, &nas, &conversion)?;
+    let (_, conversion) = require_valid_conversion_performance(manifest, asset_id)?;
     require_matching_path(
         CONVERSION_PROOF,
         "heic_path",
@@ -290,6 +282,7 @@ pub fn record_upload_proof<'a>(
                 field: "uploaded_heic_path",
             })?;
     require_non_empty_path("uploaded_heic_path", uploaded_heic_path)?;
+    require_valid_conversion_performance(manifest, asset_id)?;
     let heic = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
     validate_heic_verification_flags(&heic)?;
     require_matching_str(
@@ -324,14 +317,7 @@ pub fn upload_ready_heic_proof(
             state: record.state,
         });
     }
-    let nas = stored_proof::<NasRawProof>(manifest, asset_id, NAS_PROOF)?;
-    let conversion = stored_proof::<ConversionResultProof>(manifest, asset_id, CONVERSION_PROOF)?;
-    let conversion_performance = stored_proof::<ConversionPerformanceProof>(
-        manifest,
-        asset_id,
-        CONVERSION_PERFORMANCE_PROOF,
-    )?;
-    validate_conversion_performance_proof(&conversion_performance, &nas, &conversion)?;
+    require_valid_conversion_performance(manifest, asset_id)?;
     let proof = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
     validate_heic_verification_flags(&proof)?;
     Ok(proof)
@@ -365,6 +351,7 @@ pub fn mark_delete_eligible<'a>(
             state: record.state,
         });
     }
+    require_valid_conversion_performance(manifest, asset_id)?;
     let upload = stored_proof::<UploadProof>(manifest, asset_id, UPLOAD_PROOF)?;
     let heic = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
     validate_heic_verification_flags(&heic)?;
@@ -459,8 +446,7 @@ pub fn record_stage_failure<'a>(
 
 fn revalidate_delete_plan_proofs(manifest: &Manifest, asset_id: &str) -> Result<(), WorkflowError> {
     let record = manifest.get(asset_id)?;
-    let nas = stored_proof::<NasRawProof>(manifest, asset_id, NAS_PROOF)?;
-    let conversion = stored_proof::<ConversionResultProof>(manifest, asset_id, CONVERSION_PROOF)?;
+    let (nas, conversion) = load_conversion_context(manifest, asset_id)?;
 
     let heic = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
     require_matching_path(
@@ -512,12 +498,7 @@ fn revalidate_delete_plan_proofs(manifest: &Manifest, asset_id: &str) -> Result<
     validate_nas_proof(record, &nas, source_age.min_age_seconds)?;
     reprove_nas_proof(record, &nas, source_age.min_age_seconds)?;
 
-    let conversion_performance = stored_proof::<ConversionPerformanceProof>(
-        manifest,
-        asset_id,
-        CONVERSION_PERFORMANCE_PROOF,
-    )?;
-    validate_conversion_performance_proof(&conversion_performance, &nas, &conversion)?;
+    validate_stored_conversion_performance(manifest, asset_id, &nas, &conversion)?;
 
     let eligibility =
         stored_proof::<DeleteEligibilityProof>(manifest, asset_id, DELETE_ELIGIBILITY_PROOF)?;
@@ -770,6 +751,9 @@ fn validate_conversion_performance_proof(
         &proof.measurement_method,
     )?;
     require_non_empty("conversion_tool", &proof.conversion_tool)?;
+    if let Some(version) = &proof.conversion_tool_version {
+        require_non_empty("conversion_tool_version", version)?;
+    }
     if !(1..=100).contains(&proof.heic_quality) {
         return Err(WorkflowError::InvalidProofField {
             proof_key: CONVERSION_PERFORMANCE_PROOF,
@@ -820,6 +804,38 @@ fn validate_conversion_performance_proof(
     )?;
 
     Ok(())
+}
+
+fn load_conversion_context(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<(NasRawProof, ConversionResultProof), WorkflowError> {
+    let nas = stored_proof::<NasRawProof>(manifest, asset_id, NAS_PROOF)?;
+    let conversion = stored_proof::<ConversionResultProof>(manifest, asset_id, CONVERSION_PROOF)?;
+    Ok((nas, conversion))
+}
+
+fn require_valid_conversion_performance(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<(NasRawProof, ConversionResultProof), WorkflowError> {
+    let (nas, conversion) = load_conversion_context(manifest, asset_id)?;
+    validate_stored_conversion_performance(manifest, asset_id, &nas, &conversion)?;
+    Ok((nas, conversion))
+}
+
+fn validate_stored_conversion_performance(
+    manifest: &Manifest,
+    asset_id: &str,
+    nas: &NasRawProof,
+    conversion: &ConversionResultProof,
+) -> Result<(), WorkflowError> {
+    let conversion_performance = stored_proof::<ConversionPerformanceProof>(
+        manifest,
+        asset_id,
+        CONVERSION_PERFORMANCE_PROOF,
+    )?;
+    validate_conversion_performance_proof(&conversion_performance, nas, conversion)
 }
 
 fn transition_with_proof<'a>(
