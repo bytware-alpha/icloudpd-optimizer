@@ -781,6 +781,13 @@ fn invalid_conversion_performance_metrics_fail_without_mutation() {
                 ..conversion_performance_input()
             },
         ),
+        (
+            "heic_quality",
+            ConversionPerformanceInput {
+                heic_quality: 101,
+                ..conversion_performance_input()
+            },
+        ),
     ];
 
     for (field, input) in cases {

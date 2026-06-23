@@ -14,14 +14,18 @@ use crate::proof::{
 
 const NAS_PROOF: &str = "nas";
 const CONVERSION_PROOF: &str = "conversion";
+const CONVERSION_PERFORMANCE_PROOF: &str = "conversion_performance";
 const HEIC_PROOF: &str = "heic";
 const SOURCE_AGE_PROOF: &str = "source_age";
 const UPLOAD_PROOF: &str = "upload";
 const DELETE_ELIGIBILITY_PROOF: &str = "delete_eligibility";
 const DELETE_APPROVAL_PROOF: &str = "delete_approval";
-const DELETE_PLAN_PROOFS: [&str; 7] = [
+const CONVERSION_PERFORMANCE_SCHEMA_VERSION: u8 = 1;
+const CONVERSION_PERFORMANCE_MEASUREMENT_METHOD: &str = "monotonic_wall_clock";
+const DELETE_PLAN_PROOFS: [&str; 8] = [
     NAS_PROOF,
     CONVERSION_PROOF,
+    CONVERSION_PERFORMANCE_PROOF,
     HEIC_PROOF,
     SOURCE_AGE_PROOF,
     UPLOAD_PROOF,
@@ -34,6 +38,40 @@ pub struct ConversionResultProof {
     pub heic_path: PathBuf,
     pub heic_sha256: String,
     pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConversionPerformanceInput {
+    pub measured_at_unix_seconds: u64,
+    pub conversion_tool: String,
+    pub conversion_tool_version: Option<String>,
+    pub heic_quality: u8,
+    pub convert_wall_time_millis: u64,
+    pub total_wall_time_millis: u64,
+    pub user_cpu_time_millis: Option<u64>,
+    pub system_cpu_time_millis: Option<u64>,
+    pub peak_rss_kib: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ConversionPerformanceProof {
+    pub schema_version: u8,
+    pub measured_at_unix_seconds: u64,
+    pub measurement_method: String,
+    pub conversion_tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversion_tool_version: Option<String>,
+    pub heic_quality: u8,
+    pub raw_size_bytes: u64,
+    pub heic_size_bytes: u64,
+    pub convert_wall_time_millis: u64,
+    pub total_wall_time_millis: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_cpu_time_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_cpu_time_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_rss_kib: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -159,6 +197,32 @@ pub fn record_conversion_result<'a>(
     )
 }
 
+pub fn record_conversion_performance<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    input: ConversionPerformanceInput,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    let nas = stored_proof::<NasRawProof>(manifest, asset_id, NAS_PROOF)?;
+    let conversion = stored_proof::<ConversionResultProof>(manifest, asset_id, CONVERSION_PROOF)?;
+    let proof = ConversionPerformanceProof {
+        schema_version: CONVERSION_PERFORMANCE_SCHEMA_VERSION,
+        measured_at_unix_seconds: input.measured_at_unix_seconds,
+        measurement_method: CONVERSION_PERFORMANCE_MEASUREMENT_METHOD.to_string(),
+        conversion_tool: input.conversion_tool,
+        conversion_tool_version: input.conversion_tool_version,
+        heic_quality: input.heic_quality,
+        raw_size_bytes: nas.size_bytes,
+        heic_size_bytes: conversion.size_bytes,
+        convert_wall_time_millis: input.convert_wall_time_millis,
+        total_wall_time_millis: input.total_wall_time_millis,
+        user_cpu_time_millis: input.user_cpu_time_millis,
+        system_cpu_time_millis: input.system_cpu_time_millis,
+        peak_rss_kib: input.peak_rss_kib,
+    };
+    validate_conversion_performance_proof(&proof, &nas, &conversion)?;
+    insert_workflow_proof(manifest, asset_id, CONVERSION_PERFORMANCE_PROOF, &proof)
+}
+
 pub fn record_heic_verification<'a>(
     manifest: &'a mut Manifest,
     asset_id: &str,
@@ -166,7 +230,14 @@ pub fn record_heic_verification<'a>(
 ) -> Result<&'a AssetRecord, WorkflowError> {
     require_non_empty_path("heic_path", &proof.heic_path)?;
     require_non_empty("heic_sha256", &proof.heic_sha256)?;
+    let nas = stored_proof::<NasRawProof>(manifest, asset_id, NAS_PROOF)?;
     let conversion = stored_proof::<ConversionResultProof>(manifest, asset_id, CONVERSION_PROOF)?;
+    let conversion_performance = stored_proof::<ConversionPerformanceProof>(
+        manifest,
+        asset_id,
+        CONVERSION_PERFORMANCE_PROOF,
+    )?;
+    validate_conversion_performance_proof(&conversion_performance, &nas, &conversion)?;
     require_matching_path(
         CONVERSION_PROOF,
         "heic_path",
@@ -371,7 +442,9 @@ pub fn record_stage_failure<'a>(
 
 fn revalidate_delete_plan_proofs(manifest: &Manifest, asset_id: &str) -> Result<(), WorkflowError> {
     let record = manifest.get(asset_id)?;
+    let nas = stored_proof::<NasRawProof>(manifest, asset_id, NAS_PROOF)?;
     let conversion = stored_proof::<ConversionResultProof>(manifest, asset_id, CONVERSION_PROOF)?;
+
     let heic = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
     require_matching_path(
         CONVERSION_PROOF,
@@ -419,9 +492,15 @@ fn revalidate_delete_plan_proofs(manifest: &Manifest, asset_id: &str) -> Result<
 
     let source_age = stored_proof::<SourceAgeProof>(manifest, asset_id, SOURCE_AGE_PROOF)?;
     let source_age_seconds = source_age_seconds(asset_id, &source_age)?;
-    let nas = stored_proof::<NasRawProof>(manifest, asset_id, NAS_PROOF)?;
     validate_nas_proof(record, &nas, source_age.min_age_seconds)?;
     reprove_nas_proof(record, &nas, source_age.min_age_seconds)?;
+
+    let conversion_performance = stored_proof::<ConversionPerformanceProof>(
+        manifest,
+        asset_id,
+        CONVERSION_PERFORMANCE_PROOF,
+    )?;
+    validate_conversion_performance_proof(&conversion_performance, &nas, &conversion)?;
 
     let eligibility =
         stored_proof::<DeleteEligibilityProof>(manifest, asset_id, DELETE_ELIGIBILITY_PROOF)?;
@@ -652,6 +731,76 @@ fn validate_heic_verification_flags(proof: &HeicVerificationProof) -> Result<(),
             return Err(WorkflowError::HeicVerificationFailed { field });
         }
     }
+
+    Ok(())
+}
+
+fn validate_conversion_performance_proof(
+    proof: &ConversionPerformanceProof,
+    nas: &NasRawProof,
+    conversion: &ConversionResultProof,
+) -> Result<(), WorkflowError> {
+    require_matching_u64(
+        CONVERSION_PERFORMANCE_PROOF,
+        "schema_version",
+        u64::from(CONVERSION_PERFORMANCE_SCHEMA_VERSION),
+        u64::from(proof.schema_version),
+    )?;
+    require_matching_str(
+        CONVERSION_PERFORMANCE_PROOF,
+        "measurement_method",
+        CONVERSION_PERFORMANCE_MEASUREMENT_METHOD,
+        &proof.measurement_method,
+    )?;
+    require_non_empty("conversion_tool", &proof.conversion_tool)?;
+    if !(1..=100).contains(&proof.heic_quality) {
+        return Err(WorkflowError::InvalidProofField {
+            proof_key: CONVERSION_PERFORMANCE_PROOF,
+            field: "heic_quality",
+            reason: "must be between 1 and 100",
+        });
+    }
+    require_positive_u64(
+        CONVERSION_PERFORMANCE_PROOF,
+        "measured_at_unix_seconds",
+        proof.measured_at_unix_seconds,
+    )?;
+    require_positive_u64(
+        CONVERSION_PERFORMANCE_PROOF,
+        "convert_wall_time_millis",
+        proof.convert_wall_time_millis,
+    )?;
+    require_positive_u64(
+        CONVERSION_PERFORMANCE_PROOF,
+        "total_wall_time_millis",
+        proof.total_wall_time_millis,
+    )?;
+    if proof.total_wall_time_millis < proof.convert_wall_time_millis {
+        return Err(WorkflowError::InvalidProofField {
+            proof_key: CONVERSION_PERFORMANCE_PROOF,
+            field: "total_wall_time_millis",
+            reason: "must be greater than or equal to convert_wall_time_millis",
+        });
+    }
+    if matches!(proof.peak_rss_kib, Some(0)) {
+        return Err(WorkflowError::InvalidProofField {
+            proof_key: CONVERSION_PERFORMANCE_PROOF,
+            field: "peak_rss_kib",
+            reason: "must be greater than zero",
+        });
+    }
+    require_matching_u64(
+        CONVERSION_PERFORMANCE_PROOF,
+        "raw_size_bytes",
+        nas.size_bytes,
+        proof.raw_size_bytes,
+    )?;
+    require_matching_u64(
+        CONVERSION_PERFORMANCE_PROOF,
+        "heic_size_bytes",
+        conversion.size_bytes,
+        proof.heic_size_bytes,
+    )?;
 
     Ok(())
 }

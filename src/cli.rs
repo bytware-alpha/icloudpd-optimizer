@@ -13,10 +13,11 @@ use crate::upload::{
     IcloudUploadRequest, UploadError, build_upload_proof, run_icloud_upload, verify_local_heic,
 };
 use crate::workflow::{
-    ConversionResultProof, HeicVerificationProof, SourceAgeProof, UploadProof, WorkflowError,
-    approve_delete, build_delete_plan, mark_delete_eligible, prove_and_record_nas,
-    record_conversion_result, record_heic_verification, record_source_age_proof,
-    record_stage_failure, record_upload_proof, upload_ready_heic_proof,
+    ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, SourceAgeProof,
+    UploadProof, WorkflowError, approve_delete, build_delete_plan, mark_delete_eligible,
+    prove_and_record_nas, record_conversion_performance, record_conversion_result,
+    record_heic_verification, record_source_age_proof, record_stage_failure, record_upload_proof,
+    upload_ready_heic_proof,
 };
 
 const REQUIRED_TOOLS: [&str; 4] = ["sips", "heif-info", "magick", "exiftool"];
@@ -74,6 +75,8 @@ enum WorkflowCommand {
     NasVerified(WorkflowNasVerifiedArgs),
     #[command(name = "conversion-recorded", alias = "conversion-result")]
     ConversionResult(WorkflowConversionResultArgs),
+    #[command(name = "conversion-performance")]
+    ConversionPerformance(WorkflowConversionPerformanceArgs),
     HeicVerified(WorkflowHeicVerifiedArgs),
     UploadHeic(WorkflowUploadHeicArgs),
     UploadVerified(WorkflowUploadVerifiedArgs),
@@ -111,6 +114,32 @@ struct WorkflowConversionResultArgs {
     heic_sha256: String,
     #[arg(long)]
     size_bytes: u64,
+}
+
+#[derive(Debug, Args)]
+struct WorkflowConversionPerformanceArgs {
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+    #[arg(long)]
+    asset_id: String,
+    #[arg(long)]
+    measured_at_unix_seconds: Option<u64>,
+    #[arg(long)]
+    conversion_tool: String,
+    #[arg(long)]
+    conversion_tool_version: Option<String>,
+    #[arg(long)]
+    heic_quality: u8,
+    #[arg(long)]
+    convert_wall_time_millis: u64,
+    #[arg(long)]
+    total_wall_time_millis: u64,
+    #[arg(long)]
+    user_cpu_time_millis: Option<u64>,
+    #[arg(long)]
+    system_cpu_time_millis: Option<u64>,
+    #[arg(long)]
+    peak_rss_kib: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -263,6 +292,7 @@ fn run_workflow<W: Write>(args: WorkflowArgs, writer: &mut W) -> Result<(), CliE
     match args.command {
         WorkflowCommand::NasVerified(args) => workflow_nas_verified(args),
         WorkflowCommand::ConversionResult(args) => workflow_conversion_result(args),
+        WorkflowCommand::ConversionPerformance(args) => workflow_conversion_performance(args),
         WorkflowCommand::HeicVerified(args) => workflow_heic_verified(args),
         WorkflowCommand::UploadHeic(args) => workflow_upload_heic(args),
         WorkflowCommand::UploadVerified(args) => workflow_upload_verified(args),
@@ -307,6 +337,30 @@ fn workflow_conversion_result(args: WorkflowConversionResultArgs) -> Result<(), 
             heic_path: args.heic_path,
             heic_sha256: args.heic_sha256,
             size_bytes: args.size_bytes,
+        },
+    )?;
+    save_manifest(&manifest, &args.manifest)
+}
+
+fn workflow_conversion_performance(
+    args: WorkflowConversionPerformanceArgs,
+) -> Result<(), CliError> {
+    let mut manifest = load_manifest_for_write(&args.manifest)?;
+    record_conversion_performance(
+        &mut manifest,
+        &args.asset_id,
+        ConversionPerformanceInput {
+            measured_at_unix_seconds: args
+                .measured_at_unix_seconds
+                .unwrap_or_else(|| system_time_unix_seconds(SystemTime::now())),
+            conversion_tool: args.conversion_tool,
+            conversion_tool_version: args.conversion_tool_version,
+            heic_quality: args.heic_quality,
+            convert_wall_time_millis: args.convert_wall_time_millis,
+            total_wall_time_millis: args.total_wall_time_millis,
+            user_cpu_time_millis: args.user_cpu_time_millis,
+            system_cpu_time_millis: args.system_cpu_time_millis,
+            peak_rss_kib: args.peak_rss_kib,
         },
     )?;
     save_manifest(&manifest, &args.manifest)
