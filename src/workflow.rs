@@ -202,6 +202,15 @@ pub fn record_conversion_performance<'a>(
     asset_id: &str,
     input: ConversionPerformanceInput,
 ) -> Result<&'a AssetRecord, WorkflowError> {
+    let state = manifest.get(asset_id)?.state;
+    if state != State::Converted {
+        return Err(WorkflowError::Manifest(ManifestError::InvalidTransition {
+            asset_id: asset_id.to_string(),
+            from: state,
+            to: State::Converted,
+        }));
+    }
+
     let nas = stored_proof::<NasRawProof>(manifest, asset_id, NAS_PROOF)?;
     let conversion = stored_proof::<ConversionResultProof>(manifest, asset_id, CONVERSION_PROOF)?;
     let proof = ConversionPerformanceProof {

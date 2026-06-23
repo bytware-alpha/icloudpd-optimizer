@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use filetime::{FileTime, set_file_mtime};
-use icloudpd_optimizer::manifest::{AssetRecord, Manifest, State};
+use icloudpd_optimizer::manifest::{AssetRecord, Manifest, ManifestError, State};
 use icloudpd_optimizer::proof::{NasRawProof, ProofError, prove_nas_raw};
 use icloudpd_optimizer::workflow::{
     ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, SourceAgeProof,
@@ -747,6 +747,38 @@ fn conversion_performance_records_derived_sizes_and_metrics() {
     assert_eq!(proof["user_cpu_time_millis"], 1_100);
     assert_eq!(proof["system_cpu_time_millis"], 90);
     assert_eq!(proof["peak_rss_kib"], 256_000);
+}
+
+#[test]
+fn conversion_performance_is_frozen_after_conversion_verified_without_mutation() {
+    let mut manifest = conversion_verified_manifest();
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = record_conversion_performance(
+        &mut manifest,
+        "asset-1",
+        ConversionPerformanceInput {
+            measured_at_unix_seconds: 1_900_000_000,
+            conversion_tool: "other-tool".to_string(),
+            convert_wall_time_millis: 2_500,
+            total_wall_time_millis: 3_000,
+            ..conversion_performance_input()
+        },
+    )
+    .expect_err("conversion performance proof must freeze after HEIC verification");
+
+    assert!(matches!(
+        error,
+        WorkflowError::Manifest(ManifestError::InvalidTransition {
+            from: State::ConversionVerified,
+            to: State::Converted,
+            ..
+        })
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
 }
 
 #[test]
