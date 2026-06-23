@@ -912,6 +912,25 @@ fn upload_ready_revalidates_visual_proofs() {
 }
 
 #[test]
+fn upload_ready_requires_conversion_performance_proof() {
+    let mut manifest = conversion_verified_manifest();
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    record.proofs.remove("conversion_performance");
+    manifest.upsert(record);
+
+    let error = upload_ready_heic_proof(&manifest, "asset-1")
+        .expect_err("legacy conversion verification without performance must not be upload-ready");
+
+    assert!(matches!(
+        error,
+        WorkflowError::MissingProof {
+            proof_key,
+            ..
+        } if proof_key == "conversion_performance"
+    ));
+}
+
+#[test]
 fn upload_proof_must_match_heic_hash_and_path_without_mutation() {
     let cases = [
         (

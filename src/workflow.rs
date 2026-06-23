@@ -324,6 +324,14 @@ pub fn upload_ready_heic_proof(
             state: record.state,
         });
     }
+    let nas = stored_proof::<NasRawProof>(manifest, asset_id, NAS_PROOF)?;
+    let conversion = stored_proof::<ConversionResultProof>(manifest, asset_id, CONVERSION_PROOF)?;
+    let conversion_performance = stored_proof::<ConversionPerformanceProof>(
+        manifest,
+        asset_id,
+        CONVERSION_PERFORMANCE_PROOF,
+    )?;
+    validate_conversion_performance_proof(&conversion_performance, &nas, &conversion)?;
     let proof = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
     validate_heic_verification_flags(&proof)?;
     Ok(proof)
