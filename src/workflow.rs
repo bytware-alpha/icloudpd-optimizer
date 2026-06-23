@@ -104,6 +104,7 @@ pub struct SourceAgeProof {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 struct DeleteEligibilityProof {
     upload_proof_key: String,
+    conversion_performance_proof_key: String,
     heic_proof_key: String,
     source_age_proof_key: String,
     uploaded_heic_asset_id: String,
@@ -359,6 +360,7 @@ pub fn mark_delete_eligible<'a>(
     let source_age_seconds = source_age_seconds(asset_id, &source_age)?;
     let proof = json!({
         "upload_proof_key": UPLOAD_PROOF,
+        "conversion_performance_proof_key": CONVERSION_PERFORMANCE_PROOF,
         "heic_proof_key": HEIC_PROOF,
         "source_age_proof_key": SOURCE_AGE_PROOF,
         "uploaded_heic_asset_id": upload.uploaded_heic_asset_id,
@@ -386,6 +388,8 @@ pub fn approve_delete<'a>(
     asset_id: &str,
     operator: &str,
 ) -> Result<&'a AssetRecord, WorkflowError> {
+    require_valid_conversion_performance(manifest, asset_id)?;
+
     let operator = operator.trim();
     if operator.is_empty() {
         return Err(WorkflowError::EmptyOperator);
@@ -651,6 +655,12 @@ fn validate_delete_eligibility_proof(
         "upload_proof_key",
         UPLOAD_PROOF,
         &eligibility.upload_proof_key,
+    )?;
+    require_matching_str(
+        DELETE_ELIGIBILITY_PROOF,
+        "conversion_performance_proof_key",
+        CONVERSION_PERFORMANCE_PROOF,
+        &eligibility.conversion_performance_proof_key,
     )?;
     require_matching_str(
         DELETE_ELIGIBILITY_PROOF,

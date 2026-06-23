@@ -258,6 +258,10 @@ fn valid_ordered_workflow_reaches_delete_plan_without_deleting() {
         plan.proofs["source_age"]["source_captured_unix_seconds"],
         SOURCE_AGE_VERIFIED_AT - 40 * DAY
     );
+    assert_eq!(
+        plan.proofs["delete_eligibility"]["conversion_performance_proof_key"],
+        "conversion_performance"
+    );
 }
 
 #[test]
@@ -1077,6 +1081,59 @@ fn delete_eligibility_revalidates_conversion_performance_without_mutation() {
         &before
     );
     assert!(!before.proofs.contains_key("delete_eligibility"));
+}
+
+#[test]
+fn delete_approval_requires_conversion_performance_without_mutation() {
+    let mut manifest = upload_verified_manifest();
+    mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    record.proofs.remove("conversion_performance");
+    manifest.upsert(record);
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = approve_delete(&mut manifest, "asset-1", "operator")
+        .expect_err("delete approval must require conversion performance proof");
+
+    assert!(matches!(
+        error,
+        WorkflowError::MissingProof {
+            proof_key,
+            ..
+        } if proof_key == "conversion_performance"
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+    assert!(!before.proofs.contains_key("delete_approval"));
+}
+
+#[test]
+fn delete_approval_revalidates_conversion_performance_without_mutation() {
+    let mut manifest = upload_verified_manifest();
+    mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    proof_mut(&mut record, "conversion_performance")["heic_size_bytes"] = json!(25);
+    manifest.upsert(record);
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = approve_delete(&mut manifest, "asset-1", "operator")
+        .expect_err("delete approval must revalidate conversion performance proof");
+
+    assert!(matches!(
+        error,
+        WorkflowError::ProofMismatch {
+            proof_key: "conversion_performance",
+            field: "heic_size_bytes",
+            ..
+        }
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+    assert!(!before.proofs.contains_key("delete_approval"));
 }
 
 #[test]
