@@ -36,7 +36,9 @@ setup:
         ;;
       *)
         printf 'skip: sips\n'
-        printf '  note: workflow convert is macOS host-native; sips is not required for proof/upload/delete-plan workflows on this platform.\n'
+        printf '  note: Linux workflow convert uses dcraw_emu, ImageMagick, and heif-enc instead of sips.\n'
+        require_tool dcraw_emu 'Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y libraw-bin'
+        require_tool heif-enc 'Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y libheif-examples'
         ;;
     esac
 

@@ -53,10 +53,10 @@ The current CLI can:
 - reject incomplete or inconsistent workflow states;
 - print a JSON delete plan for manual review.
 
-Host-native `workflow convert` currently uses macOS `sips` commands and ImageMagick
-visual checks. Run conversion on a macOS host or sidecar where those tools are
-available; do not assume it can run inside the Alpine `docker-icloudpd` auth
-container.
+`workflow convert` is platform-native and fail-closed. On macOS it uses `sips`.
+On Linux it uses LibRaw's `dcraw_emu`, ImageMagick, and `heif-enc`. Do not run it
+inside the Alpine `docker-icloudpd` auth container; use the host install or the
+separate optimizer OCI image.
 
 ## Install
 
@@ -78,8 +78,8 @@ icloudpd-optimizer doctor --json
 the host platform, active conversion backend, whether `workflow convert` is
 supported, and the tools required for that platform.
 
-For source installs on supported platforms, keep these cross-platform runtime tools
-available on `PATH`:
+For source installs on supported platforms, keep these runtime tools available on
+`PATH`:
 
 - `heif-info`
 - `magick`
@@ -93,8 +93,15 @@ macOS host-native `workflow convert` requirements:
 - `exiftool`
 
 Linux source and OCI installs do not require `sips`. They support manifest, proof,
-upload, and delete-plan workflows, while host-native `workflow convert` is reported
-unsupported and fails closed.
+upload, delete-plan, and Linux-native `workflow convert` workflows.
+
+Linux-native `workflow convert` requirements:
+
+- `dcraw_emu`
+- `heif-enc`
+- `heif-info`
+- `magick`
+- `exiftool`
 
 ## OCI Image
 
@@ -120,11 +127,10 @@ The same OCI image can be tagged and pushed to GHCR, then run on Linux OCI runti
 podman run --rm icloudpd-optimizer:local doctor --json
 ```
 
-The Linux image supports manifest, proof, upload, and delete-plan operations. It does
-not make `workflow convert` portable today: that command remains macOS host-native
-because the supported conversion backend is `sips`. Inside the Linux image,
-`doctor --json` reports conversion as unsupported and `workflow convert` fails closed
-instead of using a hidden fallback.
+The Linux image supports manifest, proof, upload, delete-plan, and Linux-native
+`workflow convert` operations. The conversion backend renders RAW with `dcraw_emu`,
+normalizes the rendered TIFF with ImageMagick, encodes HEIC with `heif-enc`, and
+records measured conversion performance before any upload/delete workflow can proceed.
 
 ## Quick Start
 
@@ -225,10 +231,10 @@ Run `icloudpd-optimizer doctor --json` in the host/sidecar environment before au
 
 ## Conversion Performance
 
-Prefer `workflow convert` for new runs. It executes the planned `sips` conversion and
-metadata steps, measures elapsed time in Rust with `std::time::Instant`, hashes and
-stats the actual HEIC output, and records `conversion` plus `conversion_performance`
-in one manifest save after proof validation:
+Prefer `workflow convert` for new runs. It executes the platform-native conversion
+chain and metadata steps, measures elapsed time in Rust with `std::time::Instant`,
+hashes and stats the actual HEIC output, and records `conversion` plus
+`conversion_performance` in one manifest save after proof validation:
 
 ```sh
 icloudpd-optimizer workflow convert \
@@ -236,7 +242,7 @@ icloudpd-optimizer workflow convert \
   --asset-id IMG_0001 \
   --output-path /staging/IMG_0001.heic \
   --heic-quality 90 \
-  --conversion-tool-version sips-macos
+  --conversion-tool-version linux-container-2026-06-23
 ```
 
 For manual/import workflows only, if the production conversion was run outside
@@ -329,8 +335,8 @@ just setup
 `just setup` checks Rust tooling, builds the CLI, runs `icloudpd-optimizer doctor
 --json`, and prints install commands for missing runtime tools such as `heif-info`,
 ImageMagick, and `exiftool`. On Darwin/macOS it also requires `sips` for
-host-native `workflow convert`; on non-Darwin platforms it prints a skip note
-because `sips` is not required for proof, upload, or delete-plan workflows.
+host-native `workflow convert`; on Linux it requires `dcraw_emu` and `heif-enc`
+for the container-native conversion backend.
 
 Run the normal project gate before opening a pull request:
 

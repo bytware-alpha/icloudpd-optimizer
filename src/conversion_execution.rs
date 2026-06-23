@@ -565,7 +565,7 @@ mod tests {
         );
         assert_eq!(
             record.proofs["conversion_performance"]["conversion_tool"],
-            "darktable-cli+heif-enc"
+            "dcraw_emu+magick+heif-enc"
         );
         assert_eq!(
             record.proofs["conversion_performance"]["conversion_tool_version"],
@@ -581,7 +581,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
-            "darktable-cli\nheif-enc\nexiftool\n"
+            "dcraw_emu\nmagick\nheif-enc\nexiftool\n"
         );
     }
 
@@ -630,7 +630,7 @@ exit 44
         assert!(!record.proofs.contains_key("conversion_performance"));
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
-            "darktable-cli\nheif-enc\n"
+            "dcraw_emu\nmagick\nheif-enc\n"
         );
     }
 
@@ -659,10 +659,33 @@ printf 'heic-bytes-from-linux-chain' > "$out"
     fn fake_linux_conversion_tools_with_heif_enc(heif_enc_body: &str) -> tempfile::TempDir {
         let tempdir = tempfile::tempdir().expect("tool tempdir should be created");
         write_executable_script(
-            &tempdir.path().join("darktable-cli"),
+            &tempdir.path().join("dcraw_emu"),
             r#"#!/bin/sh
-printf 'darktable-cli\n' >> "$EXECUTION_LOG"
-printf 'rendered-pixels' > "$2"
+printf 'dcraw_emu\n' >> "$EXECUTION_LOG"
+out=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-Z" ]; then
+    out="$arg"
+  fi
+  previous="$arg"
+done
+if [ -z "$out" ]; then
+  exit 42
+fi
+printf 'rendered-tiff' > "$out"
+"#,
+        );
+        write_executable_script(
+            &tempdir.path().join("magick"),
+            r#"#!/bin/sh
+printf 'magick\n' >> "$EXECUTION_LOG"
+input="$1"
+output="$2"
+if [ -z "$input" ] || [ -z "$output" ]; then
+  exit 45
+fi
+printf 'rendered-png' > "$output"
 "#,
         );
         write_executable_script(&tempdir.path().join("heif-enc"), heif_enc_body);

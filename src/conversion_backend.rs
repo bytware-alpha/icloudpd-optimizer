@@ -1,11 +1,6 @@
 const MACOS_REQUIRED_TOOLS: [&str; 4] = ["sips", "heif-info", "magick", "exiftool"];
-const LINUX_REQUIRED_TOOLS: [&str; 5] = [
-    "darktable-cli",
-    "heif-enc",
-    "heif-info",
-    "magick",
-    "exiftool",
-];
+const LINUX_REQUIRED_TOOLS: [&str; 5] =
+    ["dcraw_emu", "heif-enc", "heif-info", "magick", "exiftool"];
 const UNSUPPORTED_REQUIRED_TOOLS: [&str; 3] = ["heif-info", "magick", "exiftool"];
 
 /// Compile-target platform used to decide whether host-native conversion is supported.
@@ -65,7 +60,7 @@ pub fn backend_report_for_target(target: TargetPlatform) -> ConversionBackendRep
         "linux" => ConversionBackendReport {
             name: "linux-native",
             workflow_convert_supported: true,
-            reason: "workflow convert is supported by the Linux native darktable-cli/heif-enc backend",
+            reason: "workflow convert is supported by the Linux native LibRaw/ImageMagick/heif-enc backend",
         },
         _ => ConversionBackendReport {
             name: "unsupported-host",

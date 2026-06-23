@@ -211,16 +211,35 @@ fn linux_conversion_plan(
     output_path: &Path,
     heic_quality: u8,
 ) -> Result<ConversionPlan, ConversionError> {
-    let rendered_arg = intermediate_render_path(output_path)
+    let rendered_tiff_arg = intermediate_render_path(output_path, "rendered.tiff")
         .as_os_str()
         .to_os_string();
-    let render = CommandPlan::new("darktable-cli", vec![raw_arg.clone(), rendered_arg.clone()]);
+    let rendered_png_arg = intermediate_render_path(output_path, "rendered.png")
+        .as_os_str()
+        .to_os_string();
+    let render = CommandPlan::new(
+        "dcraw_emu",
+        vec![
+            OsString::from("-T"),
+            OsString::from("-6"),
+            OsString::from("-W"),
+            OsString::from("-q"),
+            OsString::from("3"),
+            OsString::from("-Z"),
+            rendered_tiff_arg.clone(),
+            raw_arg.clone(),
+        ],
+    );
+    let normalize = CommandPlan::new(
+        "magick",
+        vec![rendered_tiff_arg.clone(), rendered_png_arg.clone()],
+    );
     let encode = CommandPlan::new(
         "heif-enc",
         vec![
             OsString::from("-q"),
             OsString::from(heic_quality.to_string()),
-            rendered_arg,
+            rendered_png_arg.clone(),
             OsString::from("-o"),
             output_arg.clone(),
         ],
@@ -228,7 +247,7 @@ fn linux_conversion_plan(
 
     Ok(ConversionPlan {
         convert: render.clone(),
-        conversion_commands: vec![render, encode],
+        conversion_commands: vec![render, normalize, encode],
         metadata: CommandPlan::new(
             "exiftool",
             vec![
@@ -241,8 +260,13 @@ fn linux_conversion_plan(
         ),
         verify_image: CommandPlan::new("heif-info", vec![output_arg.clone()]),
         render_raw_preview: CommandPlan::new(
-            "darktable-cli",
-            vec![raw_arg, raw_preview_arg.clone()],
+            "magick",
+            vec![
+                rendered_png_arg,
+                OsString::from("-resize"),
+                OsString::from("512x512"),
+                raw_preview_arg.clone(),
+            ],
         ),
         render_heic_preview: CommandPlan::new(
             "magick",
@@ -288,9 +312,9 @@ fn linux_conversion_plan(
     })
 }
 
-fn intermediate_render_path(output_path: &Path) -> PathBuf {
+fn intermediate_render_path(output_path: &Path, label: &str) -> PathBuf {
     let mut rendered_path = output_path.to_path_buf();
-    rendered_path.set_extension("rendered.png");
+    rendered_path.set_extension(label);
     rendered_path
 }
 

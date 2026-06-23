@@ -595,21 +595,25 @@ fn apple_container_packaging_surface_is_documented() {
 }
 
 #[test]
-fn setup_and_install_docs_scope_sips_to_macos_conversion() {
+fn setup_and_install_docs_scope_platform_conversion_tools() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let justfile = fs::read_to_string(repo_root.join("Justfile")).expect("Justfile should exist");
     let readme = fs::read_to_string(repo_root.join("README.md")).expect("README should exist");
 
     assert!(justfile.contains("Darwin"));
     assert!(justfile.contains("require_tool sips"));
-    assert!(justfile.contains("workflow convert is macOS host-native"));
-    assert!(justfile.contains("sips is not required"));
+    assert!(justfile.contains("require_tool dcraw_emu"));
+    assert!(justfile.contains("require_tool heif-enc"));
+    assert!(justfile.contains("Linux workflow convert uses dcraw_emu"));
 
     assert!(
         readme.contains("`doctor --json` is authoritative for platform-specific required tools")
     );
     assert!(readme.contains("macOS host-native `workflow convert` requirements"));
     assert!(readme.contains("Linux source and OCI installs do not require `sips`"));
+    assert!(readme.contains("Linux-native `workflow convert` requirements"));
+    assert!(readme.contains("dcraw_emu"));
+    assert!(readme.contains("heif-enc"));
     assert!(!readme.contains("You will also need these tools available on `PATH`:\n\n- `sips`"));
 }
 
@@ -723,13 +727,7 @@ fn backend_report_marks_linux_workflow_convert_supported_without_sips() {
     assert!(!required_tools_for_target(target).contains(&"sips"));
     assert_eq!(
         required_tools_for_target(target),
-        [
-            "darktable-cli",
-            "heif-enc",
-            "heif-info",
-            "magick",
-            "exiftool"
-        ]
+        ["dcraw_emu", "heif-enc", "heif-info", "magick", "exiftool"]
     );
 }
 
