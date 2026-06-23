@@ -8,6 +8,9 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::conversion_execution::{
+    ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversion,
+};
 use crate::manifest::{AssetRecord, Manifest, ManifestError};
 use crate::upload::{
     IcloudUploadRequest, UploadError, build_upload_proof, run_icloud_upload, verify_local_heic,
@@ -73,6 +76,8 @@ struct WorkflowArgs {
 #[derive(Debug, Subcommand)]
 enum WorkflowCommand {
     NasVerified(WorkflowNasVerifiedArgs),
+    #[command(about = "Run the actual conversion and record measured performance proofs")]
+    Convert(WorkflowConvertArgs),
     #[command(name = "conversion-recorded", alias = "conversion-result")]
     ConversionResult(WorkflowConversionResultArgs),
     #[command(name = "conversion-performance")]
@@ -115,6 +120,24 @@ struct WorkflowConversionResultArgs {
     heic_sha256: String,
     #[arg(long)]
     size_bytes: u64,
+}
+
+#[derive(Debug, Args)]
+struct WorkflowConvertArgs {
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+    #[arg(long)]
+    asset_id: String,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "HEIC output path for the actual conversion"
+    )]
+    output_path: PathBuf,
+    #[arg(long, help = "HEIC quality used by the measured performance run")]
+    heic_quality: u8,
+    #[arg(long)]
+    conversion_tool_version: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -237,6 +260,8 @@ pub enum CliError {
     },
     #[error("workflow failed: {0}")]
     Workflow(#[from] WorkflowError),
+    #[error("conversion failed: {0}")]
+    Conversion(#[from] ConversionExecutionError),
     #[error("upload failed: {0}")]
     Upload(#[from] UploadError),
     #[error("failed to write JSON: {0}")]
@@ -296,6 +321,7 @@ fn run_doctor<W: Write>(args: DoctorArgs, writer: &mut W) -> Result<(), CliError
 fn run_workflow<W: Write>(args: WorkflowArgs, writer: &mut W) -> Result<(), CliError> {
     match args.command {
         WorkflowCommand::NasVerified(args) => workflow_nas_verified(args),
+        WorkflowCommand::Convert(args) => workflow_convert(args),
         WorkflowCommand::ConversionResult(args) => workflow_conversion_result(args),
         WorkflowCommand::ConversionPerformance(args) => workflow_conversion_performance(args),
         WorkflowCommand::HeicVerified(args) => workflow_heic_verified(args),
@@ -331,6 +357,20 @@ fn workflow_nas_verified(args: WorkflowNasVerifiedArgs) -> Result<(), CliError> 
         )?;
     }
     save_manifest(&manifest, &args.manifest)
+}
+
+fn workflow_convert(args: WorkflowConvertArgs) -> Result<(), CliError> {
+    let manifest = load_manifest_for_write(&args.manifest)?;
+    let updated = execute_measured_conversion(
+        &manifest,
+        ConversionExecutionRequest {
+            asset_id: args.asset_id,
+            output_path: args.output_path,
+            heic_quality: args.heic_quality,
+            conversion_tool_version: args.conversion_tool_version,
+        },
+    )?;
+    save_manifest(&updated, &args.manifest)
 }
 
 fn workflow_conversion_result(args: WorkflowConversionResultArgs) -> Result<(), CliError> {

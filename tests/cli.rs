@@ -57,6 +57,45 @@ fn write_fake_required_tools(directory: &std::path::Path) {
     write_executable(&directory.join("exiftool"));
 }
 
+#[cfg(unix)]
+fn write_fake_conversion_tools(directory: &std::path::Path) {
+    write_executable_with_body(
+        &directory.join("sips"),
+        r#"#!/bin/sh
+if [ "${FAIL_SIPS:-}" = "1" ]; then
+  exit 42
+fi
+out=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--out" ]; then
+    out="$arg"
+  fi
+  previous="$arg"
+done
+if [ -z "$out" ]; then
+  exit 43
+fi
+if [ "${MISSING_SIPS_OUTPUT:-}" = "1" ]; then
+  exit 0
+elif [ "${EMPTY_SIPS_OUTPUT:-}" = "1" ]; then
+  : > "$out"
+else
+  printf 'heic-bytes-from-fake-sips' > "$out"
+fi
+"#,
+    );
+    write_executable_with_body(
+        &directory.join("exiftool"),
+        r#"#!/bin/sh
+if [ "${FAIL_EXIFTOOL:-}" = "1" ]; then
+  exit 44
+fi
+exit 0
+"#,
+    );
+}
+
 fn doctor_json_with_path(path: impl AsRef<std::ffi::OsStr>, cwd: &std::path::Path) -> Value {
     let output = binary()
         .args(["doctor", "--json"])
@@ -186,6 +225,30 @@ fn manifest_with_nas_verified(path: &std::path::Path) {
     )
     .expect("asset should be discovered");
     record_nas_proof(&mut manifest, "asset-1", nas_proof()).expect("nas proof should record");
+    manifest.save_atomic(path).expect("manifest should save");
+}
+
+fn manifest_with_real_nas_verified(path: &std::path::Path, raw_path: PathBuf, nas_root: PathBuf) {
+    let mut manifest = Manifest::new();
+    discover_raw_asset(&mut manifest, "asset-1", raw_path.clone())
+        .expect("asset should be discovered");
+    let raw = fs::read(&raw_path).expect("raw should be readable");
+    record_nas_proof(
+        &mut manifest,
+        "asset-1",
+        NasRawProof {
+            canonical_path: raw_path.clone(),
+            relative_path: raw_path
+                .strip_prefix(&nas_root)
+                .expect("raw should be under nas root")
+                .to_path_buf(),
+            size_bytes: raw.len() as u64,
+            modified_unix_seconds: 1_700_000_000,
+            age_seconds: 40 * DAY,
+            sha256: sha256_hex(&raw),
+        },
+    )
+    .expect("nas proof should record");
     manifest.save_atomic(path).expect("manifest should save");
 }
 
@@ -708,6 +771,271 @@ fn workflow_conversion_result_performance_and_heic_verified_commands_complete_co
             > 0
     );
     assert_eq!(record.proofs["heic"]["heic_path"], "/staging/IMG_0001.heic");
+}
+
+#[cfg(unix)]
+#[test]
+fn workflow_convert_runs_tools_and_records_conversion_and_performance_atomically() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
+    write_fake_conversion_tools(tool_dir.path());
+    let manifest_path = tempdir.path().join("manifest.json");
+    let nas_root = tempdir.path().join("nas");
+    let raw_path = write_old_raw(&nas_root, "camera/IMG_0001.dng", b"raw-bytes");
+    manifest_with_real_nas_verified(
+        &manifest_path,
+        fs::canonicalize(&raw_path).expect("raw should canonicalize"),
+        fs::canonicalize(&nas_root).expect("nas root should canonicalize"),
+    );
+    let output_path = tempdir.path().join("IMG_0001.heic");
+
+    binary()
+        .args([
+            "workflow",
+            "convert",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--asset-id",
+            "asset-1",
+            "--output-path",
+            output_path.to_str().expect("output path should be utf8"),
+            "--heic-quality",
+            "91",
+            "--conversion-tool-version",
+            "sips-123",
+        ])
+        .env("PATH", tool_dir.path())
+        .assert()
+        .success();
+
+    let heic = fs::read(&output_path).expect("heic output should be readable");
+    let manifest = Manifest::load(&manifest_path).expect("manifest should load");
+    let record = manifest.get("asset-1").expect("asset should exist");
+    assert_eq!(record.state, State::Converted);
+    assert_eq!(
+        record.proofs["conversion"]["heic_path"],
+        output_path.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        record.proofs["conversion"]["heic_sha256"],
+        sha256_hex(&heic)
+    );
+    assert_eq!(record.proofs["conversion"]["size_bytes"], heic.len() as u64);
+    assert_eq!(
+        record.proofs["conversion_performance"]["conversion_tool"],
+        "sips"
+    );
+    assert_eq!(
+        record.proofs["conversion_performance"]["conversion_tool_version"],
+        "sips-123"
+    );
+    assert_eq!(record.proofs["conversion_performance"]["heic_quality"], 91);
+    assert!(
+        record.proofs["conversion_performance"]["convert_wall_time_millis"]
+            .as_u64()
+            .expect("convert wall time should be present")
+            > 0
+    );
+    assert!(
+        record.proofs["conversion_performance"]["total_wall_time_millis"]
+            .as_u64()
+            .expect("total wall time should be present")
+            >= record.proofs["conversion_performance"]["convert_wall_time_millis"]
+                .as_u64()
+                .expect("convert wall time should be present")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workflow_convert_failure_does_not_mutate_manifest() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
+    write_fake_conversion_tools(tool_dir.path());
+    let manifest_path = tempdir.path().join("manifest.json");
+    let nas_root = tempdir.path().join("nas");
+    let raw_path = write_old_raw(&nas_root, "camera/IMG_0001.dng", b"raw-bytes");
+    manifest_with_real_nas_verified(
+        &manifest_path,
+        fs::canonicalize(&raw_path).expect("raw should canonicalize"),
+        fs::canonicalize(&nas_root).expect("nas root should canonicalize"),
+    );
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "convert",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--asset-id",
+            "asset-1",
+            "--output-path",
+            tempdir
+                .path()
+                .join("IMG_0001.heic")
+                .to_str()
+                .expect("output path should be utf8"),
+            "--heic-quality",
+            "91",
+        ])
+        .env("PATH", tool_dir.path())
+        .env("FAIL_SIPS", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("conversion command failed"));
+
+    let after = fs::read_to_string(&manifest_path).expect("manifest should remain readable");
+    assert_eq!(after, before);
+}
+
+#[cfg(unix)]
+#[test]
+fn workflow_convert_metadata_failure_does_not_mutate_manifest() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
+    write_fake_conversion_tools(tool_dir.path());
+    let manifest_path = tempdir.path().join("manifest.json");
+    let nas_root = tempdir.path().join("nas");
+    let raw_path = write_old_raw(&nas_root, "camera/IMG_0001.dng", b"raw-bytes");
+    manifest_with_real_nas_verified(
+        &manifest_path,
+        fs::canonicalize(&raw_path).expect("raw should canonicalize"),
+        fs::canonicalize(&nas_root).expect("nas root should canonicalize"),
+    );
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "convert",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--asset-id",
+            "asset-1",
+            "--output-path",
+            tempdir
+                .path()
+                .join("IMG_0001.heic")
+                .to_str()
+                .expect("output path should be utf8"),
+            "--heic-quality",
+            "91",
+        ])
+        .env("PATH", tool_dir.path())
+        .env("FAIL_EXIFTOOL", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("metadata command failed"));
+
+    let after = fs::read_to_string(&manifest_path).expect("manifest should remain readable");
+    assert_eq!(after, before);
+}
+
+#[cfg(unix)]
+#[test]
+fn workflow_convert_empty_output_does_not_mutate_manifest() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
+    write_fake_conversion_tools(tool_dir.path());
+    let manifest_path = tempdir.path().join("manifest.json");
+    let nas_root = tempdir.path().join("nas");
+    let raw_path = write_old_raw(&nas_root, "camera/IMG_0001.dng", b"raw-bytes");
+    manifest_with_real_nas_verified(
+        &manifest_path,
+        fs::canonicalize(&raw_path).expect("raw should canonicalize"),
+        fs::canonicalize(&nas_root).expect("nas root should canonicalize"),
+    );
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "convert",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--asset-id",
+            "asset-1",
+            "--output-path",
+            tempdir
+                .path()
+                .join("IMG_0001.heic")
+                .to_str()
+                .expect("output path should be utf8"),
+            "--heic-quality",
+            "91",
+        ])
+        .env("PATH", tool_dir.path())
+        .env("EMPTY_SIPS_OUTPUT", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("empty"));
+
+    let after = fs::read_to_string(&manifest_path).expect("manifest should remain readable");
+    assert_eq!(after, before);
+}
+
+#[cfg(unix)]
+#[test]
+fn workflow_convert_missing_output_does_not_mutate_manifest() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
+    write_fake_conversion_tools(tool_dir.path());
+    let manifest_path = tempdir.path().join("manifest.json");
+    let nas_root = tempdir.path().join("nas");
+    let raw_path = write_old_raw(&nas_root, "camera/IMG_0001.dng", b"raw-bytes");
+    manifest_with_real_nas_verified(
+        &manifest_path,
+        fs::canonicalize(&raw_path).expect("raw should canonicalize"),
+        fs::canonicalize(&nas_root).expect("nas root should canonicalize"),
+    );
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "convert",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--asset-id",
+            "asset-1",
+            "--output-path",
+            tempdir
+                .path()
+                .join("IMG_0001.heic")
+                .to_str()
+                .expect("output path should be utf8"),
+            "--heic-quality",
+            "91",
+        ])
+        .env("PATH", tool_dir.path())
+        .env("MISSING_SIPS_OUTPUT", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("missing or unreadable"));
+
+    let after = fs::read_to_string(&manifest_path).expect("manifest should remain readable");
+    assert_eq!(after, before);
+}
+
+#[test]
+fn workflow_convert_help_describes_measured_actual_conversion() {
+    binary()
+        .args(["workflow", "convert", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("actual conversion"))
+        .stdout(predicate::str::contains("measured performance"));
 }
 
 #[test]

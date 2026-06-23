@@ -504,6 +504,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "filetime",
+ "libc",
  "predicates",
  "reqwest",
  "serde",
