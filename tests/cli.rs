@@ -23,8 +23,8 @@ fn binary() -> Command {
 fn missing_tools_json() -> Value {
     json!({
         "tools": [
-            {"name": "vips", "present": false},
-            {"name": "vipsheader", "present": false},
+            {"name": "sips", "present": false},
+            {"name": "heif-info", "present": false},
             {"name": "exiftool", "present": false}
         ]
     })
@@ -49,8 +49,8 @@ fn write_executable_with_body(path: &std::path::Path, body: &str) {
 
 #[cfg(unix)]
 fn write_fake_required_tools(directory: &std::path::Path) {
-    write_executable(&directory.join("vips"));
-    write_executable(&directory.join("vipsheader"));
+    write_executable(&directory.join("sips"));
+    write_executable(&directory.join("heif-info"));
     write_executable(&directory.join("exiftool"));
 }
 
@@ -103,7 +103,7 @@ fn heic_proof() -> HeicVerificationProof {
         heic_path: PathBuf::from("/staging/IMG_0001.heic"),
         heic_sha256: "heic-sha256".to_string(),
         size_bytes: 24,
-        vipsheader_ok: true,
+        heif_info_ok: true,
         metadata_copied: true,
     }
 }
@@ -191,7 +191,7 @@ fn manifest_with_real_conversion_verified(path: &std::path::Path, heic_path: Pat
             heic_path,
             heic_sha256: sha256_hex(body),
             size_bytes: body.len() as u64,
-            vipsheader_ok: true,
+            heif_info_ok: true,
             metadata_copied: true,
         },
     )
@@ -262,7 +262,7 @@ fn manifest_with_real_delete_approval(tempdir: &std::path::Path) -> (PathBuf, Pa
             "heic-sha256",
             "--size-bytes",
             "24",
-            "--vipsheader-ok",
+            "--heif-info-ok",
             "--metadata-copied",
         ])
         .assert()
@@ -417,10 +417,10 @@ fn doctor_json_reports_required_tools_missing_under_empty_path() {
 
 #[cfg(unix)]
 #[test]
-fn doctor_json_reports_vipsheader_as_required() {
+fn doctor_json_reports_heif_info_as_required() {
     let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
     let cwd = tempfile::tempdir().expect("cwd tempdir should be created");
-    write_executable(&tool_dir.path().join("vips"));
+    write_executable(&tool_dir.path().join("sips"));
     write_executable(&tool_dir.path().join("exiftool"));
 
     let shown = doctor_json_with_path(tool_dir.path(), cwd.path());
@@ -429,8 +429,8 @@ fn doctor_json_reports_vipsheader_as_required() {
         shown,
         json!({
             "tools": [
-                {"name": "vips", "present": true},
-                {"name": "vipsheader", "present": false},
+                {"name": "sips", "present": true},
+                {"name": "heif-info", "present": false},
                 {"name": "exiftool", "present": true}
             ]
         })
@@ -608,7 +608,7 @@ fn workflow_conversion_result_and_heic_verified_commands_complete_conversion_gat
             "heic-sha256",
             "--size-bytes",
             "24",
-            "--vipsheader-ok",
+            "--heif-info-ok",
             "--metadata-copied",
         ])
         .assert()
@@ -663,7 +663,7 @@ fn workflow_heic_verified_mismatch_fails_without_mutating_manifest() {
             "other-heic-sha256",
             "--size-bytes",
             "24",
-            "--vipsheader-ok",
+            "--heif-info-ok",
             "--metadata-copied",
         ])
         .assert()
@@ -715,7 +715,7 @@ fn workflow_heic_verified_requires_explicit_boolean_proofs_without_mutating_mani
             "heic-sha256",
             "--size-bytes",
             "24",
-            "--vipsheader-ok",
+            "--heif-info-ok",
         ])
         .assert()
         .failure()
@@ -858,6 +858,49 @@ fn workflow_upload_heic_session_error_does_not_echo_cookie_value() {
 }
 
 #[test]
+fn workflow_upload_heic_valid_session_fails_closed_without_mutating_manifest() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let session_path = tempdir.path().join("session.json");
+    let heic_path = tempdir.path().join("IMG_0001.heic");
+    fs::write(&heic_path, b"heic-bytes").expect("heic should be written");
+    fs::write(
+        &session_path,
+        serde_json::json!({
+            "dsid": "123456789",
+            "upload_url": "https://p140-uploadimagews.icloud.com:443",
+            "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "token"}]
+        })
+        .to_string(),
+    )
+    .expect("session should be written");
+    manifest_with_real_conversion_verified(&manifest_path, heic_path, b"heic-bytes");
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "upload-heic",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--asset-id",
+            "asset-1",
+            "--session",
+            session_path.to_str().expect("session path should be utf8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "iCloud Photos upload is not enabled",
+        ));
+
+    let after = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+    assert_eq!(after, before);
+}
+
+#[test]
 fn workflow_upload_heic_rechecks_heic_before_loading_session() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let manifest_path = tempdir.path().join("manifest.json");
@@ -985,7 +1028,7 @@ fn workflow_mark_delete_eligible_requires_source_age_without_mutating_manifest()
             "heic-sha256",
             "--size-bytes",
             "24",
-            "--vipsheader-ok",
+            "--heif-info-ok",
             "--metadata-copied",
         ])
         .assert()
@@ -1088,7 +1131,7 @@ fn workflow_mark_delete_eligible_rejects_too_new_source_age_without_mutating_man
             "heic-sha256",
             "--size-bytes",
             "24",
-            "--vipsheader-ok",
+            "--heif-info-ok",
             "--metadata-copied",
         ])
         .assert()

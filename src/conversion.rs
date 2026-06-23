@@ -31,7 +31,7 @@ pub struct ConversionPlan {
 /// ```
 /// # use icloudpd_optimizer::conversion::plan_conversion;
 /// let plan = plan_conversion("/nas/photo.dng", "/tmp/photo.heic", 90)?;
-/// assert_eq!(plan.convert.program, "vips");
+/// assert_eq!(plan.convert.program, "sips");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn plan_conversion(
@@ -61,13 +61,20 @@ pub fn plan_conversion(
 
     let raw_arg = raw_path.as_os_str().to_os_string();
     let output_arg = output_path.as_os_str().to_os_string();
-    let mut output_with_options = output_arg.clone();
-    output_with_options.push(format!("[Q={heic_quality}]"));
-
     Ok(ConversionPlan {
         convert: CommandPlan::new(
-            "vips",
-            vec![OsString::from("copy"), raw_arg.clone(), output_with_options],
+            "sips",
+            vec![
+                OsString::from("-s"),
+                OsString::from("format"),
+                OsString::from("heic"),
+                OsString::from("-s"),
+                OsString::from("formatOptions"),
+                OsString::from(heic_quality.to_string()),
+                raw_arg.clone(),
+                OsString::from("--out"),
+                output_arg.clone(),
+            ],
         ),
         metadata: CommandPlan::new(
             "exiftool",
@@ -79,7 +86,7 @@ pub fn plan_conversion(
                 output_arg.clone(),
             ],
         ),
-        verify_image: CommandPlan::new("vipsheader", vec![output_arg.clone()]),
+        verify_image: CommandPlan::new("heif-info", vec![output_arg.clone()]),
         verify_metadata: CommandPlan::new(
             "exiftool",
             vec![

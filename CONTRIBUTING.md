@@ -10,8 +10,8 @@ Install Rust and the external media tools used by the CLI:
 
 ```sh
 cargo --version
-vips --version
-vipsheader --version
+sips -h
+heif-info --version
 exiftool -ver
 ```
 

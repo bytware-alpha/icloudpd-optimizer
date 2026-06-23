@@ -41,7 +41,8 @@ pub struct HeicVerificationProof {
     pub heic_path: PathBuf,
     pub heic_sha256: String,
     pub size_bytes: u64,
-    pub vipsheader_ok: bool,
+    #[serde(alias = "vipsheader_ok")]
+    pub heif_info_ok: bool,
     pub metadata_copied: bool,
 }
 
@@ -182,9 +183,9 @@ pub fn record_heic_verification<'a>(
         conversion.size_bytes,
         proof.size_bytes,
     )?;
-    if !proof.vipsheader_ok {
+    if !proof.heif_info_ok {
         return Err(WorkflowError::HeicVerificationFailed {
-            field: "vipsheader_ok",
+            field: "heif_info_ok",
         });
     }
     if !proof.metadata_copied {
@@ -393,9 +394,9 @@ fn revalidate_delete_plan_proofs(manifest: &Manifest, asset_id: &str) -> Result<
         conversion.size_bytes,
         heic.size_bytes,
     )?;
-    if !heic.vipsheader_ok {
+    if !heic.heif_info_ok {
         return Err(WorkflowError::HeicVerificationFailed {
-            field: "vipsheader_ok",
+            field: "heif_info_ok",
         });
     }
     if !heic.metadata_copied {

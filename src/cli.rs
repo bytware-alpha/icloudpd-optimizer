@@ -19,7 +19,7 @@ use crate::workflow::{
     record_stage_failure, record_upload_proof, upload_ready_heic_proof,
 };
 
-const REQUIRED_TOOLS: [&str; 3] = ["vips", "vipsheader", "exiftool"];
+const REQUIRED_TOOLS: [&str; 3] = ["sips", "heif-info", "exiftool"];
 const DAY_SECONDS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Parser)]
@@ -126,7 +126,7 @@ struct WorkflowHeicVerifiedArgs {
     #[arg(long)]
     size_bytes: u64,
     #[arg(long, action = clap::ArgAction::SetTrue)]
-    vipsheader_ok: bool,
+    heif_info_ok: bool,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     metadata_copied: bool,
 }
@@ -317,7 +317,7 @@ fn workflow_heic_verified(args: WorkflowHeicVerifiedArgs) -> Result<(), CliError
             heic_path: args.heic_path,
             heic_sha256: args.heic_sha256,
             size_bytes: args.size_bytes,
-            vipsheader_ok: args.vipsheader_ok,
+            heif_info_ok: args.heif_info_ok,
             metadata_copied: args.metadata_copied,
         },
     )?;

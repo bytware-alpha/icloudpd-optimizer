@@ -24,19 +24,25 @@ fn contains_forbidden_action(plan: &CommandPlan) -> bool {
 }
 
 #[test]
-fn plans_exact_vips_exiftool_and_verification_commands() {
+fn plans_exact_sips_exiftool_and_verification_commands() {
     let raw = PathBuf::from("/nas/raw/IMG_0001.dng");
     let output = PathBuf::from("/staging/IMG_0001.heic");
 
     let plan = plan_conversion(&raw, &output, 90).expect("conversion should plan");
 
-    assert_eq!(plan.convert.program, "vips");
+    assert_eq!(plan.convert.program, "sips");
     assert_eq!(
         args(&plan.convert),
         vec![
-            "copy",
+            "-s",
+            "format",
+            "heic",
+            "-s",
+            "formatOptions",
+            "90",
             "/nas/raw/IMG_0001.dng",
-            "/staging/IMG_0001.heic[Q=90]"
+            "--out",
+            "/staging/IMG_0001.heic"
         ]
     );
     assert_eq!(plan.metadata.program, "exiftool");
@@ -50,7 +56,7 @@ fn plans_exact_vips_exiftool_and_verification_commands() {
             "/staging/IMG_0001.heic"
         ]
     );
-    assert_eq!(plan.verify_image.program, "vipsheader");
+    assert_eq!(plan.verify_image.program, "heif-info");
     assert_eq!(args(&plan.verify_image), vec!["/staging/IMG_0001.heic"]);
     assert_eq!(plan.verify_metadata.program, "exiftool");
     assert_eq!(
@@ -60,7 +66,7 @@ fn plans_exact_vips_exiftool_and_verification_commands() {
 }
 
 #[test]
-fn includes_requested_heic_quality_in_vips_output_suffix() {
+fn includes_requested_heic_quality_in_sips_format_options() {
     let plan = plan_conversion(
         PathBuf::from("/nas/raw/IMG_0002.cr2"),
         PathBuf::from("/staging/IMG_0002.heic"),
@@ -71,9 +77,15 @@ fn includes_requested_heic_quality_in_vips_output_suffix() {
     assert_eq!(
         args(&plan.convert),
         vec![
-            "copy",
+            "-s",
+            "format",
+            "heic",
+            "-s",
+            "formatOptions",
+            "82",
             "/nas/raw/IMG_0002.cr2",
-            "/staging/IMG_0002.heic[Q=82]"
+            "--out",
+            "/staging/IMG_0002.heic"
         ]
     );
 }

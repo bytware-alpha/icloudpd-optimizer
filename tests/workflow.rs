@@ -40,9 +40,23 @@ fn heic_proof() -> HeicVerificationProof {
         heic_path: PathBuf::from("/staging/IMG_0001.heic"),
         heic_sha256: "heic-sha256".to_string(),
         size_bytes: 24,
-        vipsheader_ok: true,
+        heif_info_ok: true,
         metadata_copied: true,
     }
+}
+
+#[test]
+fn heic_verification_proof_accepts_legacy_vipsheader_field() {
+    let proof: HeicVerificationProof = serde_json::from_value(json!({
+        "heic_path": "/staging/IMG_0001.heic",
+        "heic_sha256": "heic-sha256",
+        "size_bytes": 24,
+        "vipsheader_ok": true,
+        "metadata_copied": true
+    }))
+    .expect("legacy proof field should deserialize");
+
+    assert!(proof.heif_info_ok);
 }
 
 fn upload_proof() -> UploadProof {
@@ -220,16 +234,16 @@ fn valid_ordered_workflow_reaches_delete_plan_without_deleting() {
 #[test]
 fn delete_plan_revalidates_persisted_heic_verification_flags() {
     let (_tempdir, manifest) = forged_delete_approved_manifest(|record| {
-        proof_mut(record, "heic")["vipsheader_ok"] = json!(false);
+        proof_mut(record, "heic")["heif_info_ok"] = json!(false);
     });
 
     let error = build_delete_plan(&manifest, "asset-1")
-        .expect_err("forged vipsheader failure must block delete plan");
+        .expect_err("forged heif-info failure must block delete plan");
 
     assert!(matches!(
         error,
         WorkflowError::HeicVerificationFailed {
-            field: "vipsheader_ok"
+            field: "heif_info_ok"
         }
     ));
 }

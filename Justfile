@@ -29,8 +29,8 @@ setup:
     require_tool cargo 'install Rust from https://rustup.rs'
     require_tool rustfmt 'rustup component add rustfmt'
     require_tool cargo-clippy 'rustup component add clippy'
-    require_tool vips 'macOS: brew install vips; Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y libvips-tools'
-    require_tool vipsheader 'macOS: brew install vips; Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y libvips-tools'
+    require_tool sips 'macOS: bundled with the OS'
+    require_tool heif-info 'macOS: brew install libheif'
     require_tool exiftool 'macOS: brew install exiftool; Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y libimage-exiftool-perl'
 
     if command -v cargo >/dev/null 2>&1; then

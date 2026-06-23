@@ -38,7 +38,7 @@ The current CLI can:
 - verify RAW files under a storage root;
 - plan RAW-to-HEIC conversion commands;
 - record conversion, upload, and verification proofs;
-- upload a verified HEIC through the Rust upload client and record the resulting iCloud asset id;
+- validate upload-session inputs and fail closed until safe iCloud Photos upload support is implemented;
 - reject incomplete or inconsistent workflow states;
 - print a JSON delete plan for manual review.
 
@@ -56,8 +56,8 @@ cargo install --path . --locked
 
 You will also need these tools available on `PATH`:
 
-- `vips`
-- `vipsheader`
+- `sips`
+- `heif-info`
 - `exiftool`
 
 Check your environment:
@@ -101,12 +101,16 @@ icloudpd-optimizer workflow delete-plan \
 
 The delete plan is JSON output. It does not remove files.
 
-## Uploading HEICs
+## Upload Status
 
-`workflow upload-heic` uploads the verified HEIC using the Rust upload client and records
-the uploaded iCloud asset id in the manifest. The command requires an explicit
-pre-authenticated upload session JSON file. It does not accept an Apple ID, Apple account
-password, or MFA input.
+`workflow upload-heic` is intentionally disabled today. iCloud Photos web uploads use
+CloudKit asset-upload tokens plus record mutations, and a direct `uploadimagews` POST is
+not a safe upload protocol for this workflow. Until that CloudKit path is implemented,
+the command validates the session file and local HEIC, then fails without changing the
+manifest.
+
+The command requires an explicit pre-authenticated upload session JSON file. It does not
+accept an Apple ID, Apple account password, or MFA input.
 
 The session file must contain a DSID, an iCloud Photos upload service URL, and cookies
 including `X-APPLE-WEBAUTH-TOKEN`:
@@ -134,10 +138,11 @@ icloudpd-optimizer workflow upload-heic \
   --session /path/to/upload-session.json
 ```
 
-Before upload, the tool rechecks the local HEIC size and SHA-256 against the verified
-manifest proof. It also verifies the HEIC again before recording upload proof. If the
-session is invalid, the HTTP request fails, the response is malformed, or the local file
-changes, the manifest is not updated.
+Before the disabled upload boundary, the tool rechecks the local HEIC size and SHA-256
+against the verified manifest proof. If the session is invalid, upload support is not
+available, or the local file changes, the manifest is not updated. Upload proofs can
+still be recorded with `workflow upload-verified` after an operator has independently
+verified the iCloud asset id and uploaded HEIC identity.
 
 ## Safety Model
 
@@ -163,8 +168,8 @@ just setup
 ```
 
 `just setup` checks Rust tooling, builds the CLI, runs `icloudpd-optimizer doctor
---json`, and prints install commands for missing runtime tools such as `vips`,
-`vipsheader`, and `exiftool`.
+--json`, and prints install commands for missing runtime tools such as
+`heif-info` and `exiftool`.
 
 Run the normal project gate before opening a pull request:
 

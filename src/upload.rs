@@ -1,21 +1,15 @@
 use std::fs::File;
-use std::io::{Read, Take};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use reqwest::Url;
-use reqwest::blocking::{Body, Client};
-use reqwest::header::{CONTENT_TYPE, COOKIE, HeaderValue};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use url::Url;
 
 use crate::workflow::{HeicVerificationProof, UploadProof};
 
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_UPLOAD_RESPONSE_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcloudUploadRequest {
@@ -58,28 +52,6 @@ impl UploadSession {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UploadHttpRequest {
-    pub url: String,
-    pub cookie_header: String,
-    pub body_path: PathBuf,
-    pub content_len: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UploadHttpResponse {
-    pub status: u16,
-    pub body: String,
-}
-
-pub trait UploadTransport {
-    fn post(
-        &self,
-        request: UploadHttpRequest,
-        body: Box<dyn Read + Send>,
-    ) -> Result<UploadHttpResponse, UploadError>;
-}
-
 pub fn load_upload_session(path: &Path) -> Result<UploadSession, UploadError> {
     let json = std::fs::read_to_string(path).map_err(|source| UploadError::ReadSession {
         path: path.to_path_buf(),
@@ -96,55 +68,9 @@ pub fn load_upload_session(path: &Path) -> Result<UploadSession, UploadError> {
 pub fn run_icloud_upload(
     request: &IcloudUploadRequest,
 ) -> Result<IcloudUploadOutcome, UploadError> {
-    let session = load_upload_session(&request.session_path)?;
-    let transport = ReqwestUploadTransport::new()?;
-    upload_with_transport(&session, &request.heic_path, &transport)
-}
-
-pub fn upload_with_transport(
-    session: &UploadSession,
-    heic_path: &Path,
-    transport: &dyn UploadTransport,
-) -> Result<IcloudUploadOutcome, UploadError> {
-    let filename = heic_filename(heic_path)?;
-    let metadata = std::fs::metadata(heic_path).map_err(|source| UploadError::ReadHeic {
-        path: heic_path.to_path_buf(),
-        source,
-    })?;
-    if metadata.len() == 0 {
-        return Err(UploadError::EmptyHeic {
-            path: heic_path.to_path_buf(),
-        });
-    }
-    let file = File::open(heic_path).map_err(|source| UploadError::ReadHeic {
-        path: heic_path.to_path_buf(),
-        source,
-    })?;
-    let stream_state = UploadStreamState::new();
-    let body = Box::new(HashingReader::new(file, stream_state.clone()));
-    let request = UploadHttpRequest {
-        url: upload_endpoint(session, &filename)?,
-        cookie_header: cookie_header(session),
-        body_path: heic_path.to_path_buf(),
-        content_len: metadata.len(),
-    };
-    let response = transport.post(request, body)?;
-    if !(200..300).contains(&response.status) {
-        return Err(UploadError::HttpStatus(response.status));
-    }
-    ensure_response_size(&response.body)?;
-    let streamed = stream_state.finish()?;
-    if streamed.size_bytes != metadata.len() {
-        return Err(UploadError::StreamedHeicSizeMismatch {
-            expected: metadata.len(),
-            actual: streamed.size_bytes,
-        });
-    }
-    Ok(IcloudUploadOutcome {
-        response: parse_upload_response(&response.body, filename)?,
-        streamed_heic_sha256: streamed.sha256,
-        streamed_size_bytes: streamed.size_bytes,
-    })
+    let _session = load_upload_session(&request.session_path)?;
+    validate_candidate_heic(&request.heic_path)?;
+    Err(UploadError::UnsupportedIcloudUploadProtocol)
 }
 
 pub fn verify_local_heic(proof: &HeicVerificationProof) -> Result<(), UploadError> {
@@ -198,125 +124,6 @@ pub fn build_upload_proof(
         uploaded_heic_sha256: heic.heic_sha256.clone(),
         uploaded_heic_path: Some(heic.heic_path.clone()),
     })
-}
-
-struct ReqwestUploadTransport {
-    client: Client,
-}
-
-impl ReqwestUploadTransport {
-    fn new() -> Result<Self, UploadError> {
-        let client = Client::builder()
-            .timeout(UPLOAD_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .https_only(true)
-            .use_rustls_tls()
-            .build()
-            .map_err(UploadError::BuildHttpClient)?;
-        Ok(Self { client })
-    }
-}
-
-impl UploadTransport for ReqwestUploadTransport {
-    fn post(
-        &self,
-        request: UploadHttpRequest,
-        body: Box<dyn Read + Send>,
-    ) -> Result<UploadHttpResponse, UploadError> {
-        let mut cookie = HeaderValue::from_str(&request.cookie_header)
-            .map_err(|_| UploadError::InvalidSession("cookie header is invalid".to_string()))?;
-        cookie.set_sensitive(true);
-        let response = self
-            .client
-            .post(&request.url)
-            .header(COOKIE, cookie)
-            .header(CONTENT_TYPE, "application/octet-stream")
-            .body(Body::sized(body, request.content_len))
-            .send()
-            .map_err(|source| UploadError::Http { source })?;
-        let status = response.status().as_u16();
-        let body = read_limited_response(response)?;
-        Ok(UploadHttpResponse { status, body })
-    }
-}
-
-#[derive(Clone)]
-struct UploadStreamState {
-    inner: Arc<Mutex<UploadStreamHash>>,
-}
-
-impl UploadStreamState {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(UploadStreamHash {
-                hasher: Some(Sha256::new()),
-                size_bytes: 0,
-            })),
-        }
-    }
-
-    fn update(&self, bytes: &[u8]) -> Result<(), UploadError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| UploadError::UploadStreamStatePoisoned)?;
-        let hasher = inner
-            .hasher
-            .as_mut()
-            .ok_or(UploadError::UploadStreamAlreadyFinalized)?;
-        hasher.update(bytes);
-        inner.size_bytes = inner.size_bytes.saturating_add(bytes.len() as u64);
-        Ok(())
-    }
-
-    fn finish(&self) -> Result<StreamedHeic, UploadError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| UploadError::UploadStreamStatePoisoned)?;
-        let hasher = inner
-            .hasher
-            .take()
-            .ok_or(UploadError::UploadStreamAlreadyFinalized)?;
-        Ok(StreamedHeic {
-            sha256: format!("{:x}", hasher.finalize()),
-            size_bytes: inner.size_bytes,
-        })
-    }
-}
-
-struct UploadStreamHash {
-    hasher: Option<Sha256>,
-    size_bytes: u64,
-}
-
-struct StreamedHeic {
-    sha256: String,
-    size_bytes: u64,
-}
-
-struct HashingReader<R> {
-    reader: R,
-    state: UploadStreamState,
-}
-
-impl<R> HashingReader<R> {
-    fn new(reader: R, state: UploadStreamState) -> Self {
-        Self { reader, state }
-    }
-}
-
-impl<R: Read> Read for HashingReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let bytes_read = self.reader.read(buffer)?;
-        if bytes_read > 0 {
-            self.state
-                .update(&buffer[..bytes_read])
-                .map_err(std::io::Error::other)?;
-        }
-        Ok(bytes_read)
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,22 +218,6 @@ impl RawCookie {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct UploadApiResponse {
-    #[serde(default)]
-    records: Vec<UploadRecord>,
-    #[serde(default)]
-    errors: Vec<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UploadRecord {
-    #[serde(default, rename = "recordType", alias = "record_type", alias = "type")]
-    record_type: String,
-    #[serde(default, rename = "recordName", alias = "record_name")]
-    record_name: String,
-}
-
 fn validate_upload_url(raw_url: &str) -> Result<Url, UploadError> {
     let url = Url::parse(raw_url).map_err(|_| {
         UploadError::InvalidSession("upload_url must be an absolute HTTPS URL".to_string())
@@ -454,9 +245,16 @@ fn validate_upload_url(raw_url: &str) -> Result<Url, UploadError> {
             "upload_url host is not an Apple iCloud host".to_string(),
         ));
     }
-    if url.path().trim_end_matches('/') != "/uploadimagews" {
+    let path = url.path().trim_end_matches('/');
+    if path.is_empty() {
+        if !is_uploadimagews_service_host(host) {
+            return Err(UploadError::InvalidSession(
+                "root upload_url must use an uploadimagews iCloud host".to_string(),
+            ));
+        }
+    } else if path != "/uploadimagews" {
         return Err(UploadError::InvalidSession(
-            "upload_url path must be /uploadimagews".to_string(),
+            "upload_url path must be empty, /, or /uploadimagews".to_string(),
         ));
     }
     Ok(url)
@@ -468,6 +266,14 @@ fn is_allowed_icloud_host(host: &str) -> bool {
         || host.ends_with(".icloud.com")
         || host == "icloud.com.cn"
         || host.ends_with(".icloud.com.cn")
+}
+
+fn is_uploadimagews_service_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host == "uploadimagews.icloud.com"
+        || host.ends_with("-uploadimagews.icloud.com")
+        || host == "uploadimagews.icloud.com.cn"
+        || host.ends_with("-uploadimagews.icloud.com.cn")
 }
 
 fn required_nonempty(value: Option<String>, field: &str) -> Result<String, UploadError> {
@@ -532,81 +338,22 @@ fn heic_filename(path: &Path) -> Result<String, UploadError> {
     Ok(file_name.to_string())
 }
 
-fn upload_endpoint(session: &UploadSession, filename: &str) -> Result<String, UploadError> {
-    let mut url = session.upload_url.clone();
-    let mut path = url.path().trim_end_matches('/').to_string();
-    path.push_str("/upload");
-    url.set_path(&path);
-    url.query_pairs_mut()
-        .append_pair("dsid", &session.dsid)
-        .append_pair("filename", filename);
-    Ok(url.to_string())
-}
-
-fn cookie_header(session: &UploadSession) -> String {
-    session
-        .cookies
-        .iter()
-        .map(|cookie| format!("{}={}", cookie.name, cookie.value))
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-fn parse_upload_response(
-    body: &str,
-    fallback_filename: String,
-) -> Result<IcloudUploadResponse, UploadError> {
-    ensure_response_size(body)?;
-    let response: UploadApiResponse =
-        serde_json::from_str(body).map_err(|source| UploadError::DecodeUploadJson { source })?;
-    if !response.errors.is_empty() {
-        return Err(UploadError::UploadResponseErrors(response.errors.len()));
-    }
-
-    let mut asset_id = None;
-    let mut master_id = None;
-    for record in response.records {
-        if record.record_name.trim().is_empty() {
-            continue;
-        }
-        match record.record_type.as_str() {
-            "CPLAsset" => asset_id = Some(record.record_name),
-            "CPLMaster" => master_id = Some(record.record_name),
-            _ => {}
-        }
-    }
-
-    let asset_id = asset_id.ok_or(UploadError::MissingUploadedAssetId)?;
-    if asset_id.trim().is_empty() {
-        return Err(UploadError::MissingUploadedAssetId);
-    }
-    Ok(IcloudUploadResponse {
-        asset_id,
-        filename: Some(fallback_filename),
-        master_id,
-    })
-}
-
-fn ensure_response_size(body: &str) -> Result<(), UploadError> {
-    let actual = body.len() as u64;
-    if actual > MAX_UPLOAD_RESPONSE_BYTES {
-        return Err(UploadError::UploadResponseTooLarge {
-            limit: MAX_UPLOAD_RESPONSE_BYTES,
-            actual,
+fn validate_candidate_heic(path: &Path) -> Result<(), UploadError> {
+    heic_filename(path)?;
+    let metadata = std::fs::metadata(path).map_err(|source| UploadError::ReadHeic {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.len() == 0 {
+        return Err(UploadError::EmptyHeic {
+            path: path.to_path_buf(),
         });
     }
+    File::open(path).map_err(|source| UploadError::ReadHeic {
+        path: path.to_path_buf(),
+        source,
+    })?;
     Ok(())
-}
-
-fn read_limited_response(response: reqwest::blocking::Response) -> Result<String, UploadError> {
-    let mut limited: Take<reqwest::blocking::Response> =
-        response.take(MAX_UPLOAD_RESPONSE_BYTES + 1);
-    let mut body = String::new();
-    limited
-        .read_to_string(&mut body)
-        .map_err(|source| UploadError::ReadUploadResponse { source })?;
-    ensure_response_size(&body)?;
-    Ok(body)
 }
 
 fn hash_file_sha256(path: &Path) -> Result<String, UploadError> {
@@ -647,23 +394,10 @@ pub enum UploadError {
     },
     #[error("invalid upload session: {0}")]
     InvalidSession(String),
-    #[error("failed to build iCloud upload HTTP client: {0}")]
-    BuildHttpClient(reqwest::Error),
-    #[error("iCloud upload HTTP request failed")]
-    Http {
-        #[source]
-        source: reqwest::Error,
-    },
-    #[error("iCloud upload returned HTTP status {0}")]
-    HttpStatus(u16),
-    #[error("failed to read iCloud upload response")]
-    ReadUploadResponse { source: std::io::Error },
-    #[error("iCloud upload response exceeded {limit} bytes")]
-    UploadResponseTooLarge { limit: u64, actual: u64 },
-    #[error("failed to decode iCloud upload response JSON: {source}")]
-    DecodeUploadJson { source: serde_json::Error },
-    #[error("iCloud upload response contained {0} error record(s)")]
-    UploadResponseErrors(usize),
+    #[error(
+        "iCloud Photos upload is not enabled: direct uploadimagews POST is not the iCloud Photos upload protocol; CloudKit /assets/upload and /records/modify support must be implemented first"
+    )]
+    UnsupportedIcloudUploadProtocol,
     #[error("iCloud upload did not return a CPLAsset recordName")]
     MissingUploadedAssetId,
     #[error("failed to read verified HEIC at {path}: {source}")]
@@ -691,8 +425,4 @@ pub enum UploadError {
     StreamedHeicSizeMismatch { expected: u64, actual: u64 },
     #[error("streamed HEIC SHA-256 mismatch")]
     StreamedHeicHashMismatch { expected: String, actual: String },
-    #[error("upload stream hash state was poisoned")]
-    UploadStreamStatePoisoned,
-    #[error("upload stream hash state was already finalized")]
-    UploadStreamAlreadyFinalized,
 }
