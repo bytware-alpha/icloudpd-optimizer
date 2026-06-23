@@ -1,3 +1,4 @@
+use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -95,7 +96,8 @@ fn run_planned_command(
     stage: &'static str,
     plan: &CommandPlan,
 ) -> Result<ChildResourceUsage, ConversionExecutionError> {
-    let mut command = Command::new(&plan.program);
+    let resolved_program = resolve_sanitized_path_tool(&plan.program)?;
+    let mut command = Command::new(resolved_program);
     command
         .args(&plan.args)
         .stdin(Stdio::null())
@@ -109,6 +111,45 @@ fn run_planned_command(
         });
     }
     Ok(outcome.resource_usage)
+}
+
+fn resolve_sanitized_path_tool(program: &str) -> Result<PathBuf, ConversionExecutionError> {
+    let Some(paths) = env::var_os("PATH") else {
+        return Err(ConversionExecutionError::ToolNotFound {
+            program: program.to_string(),
+        });
+    };
+
+    env::split_paths(&paths)
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .filter_map(|directory| {
+            let candidate = directory.join(program);
+            if is_executable_file(&candidate) {
+                fs::canonicalize(candidate).ok()
+            } else {
+                None
+            }
+        })
+        .next()
+        .ok_or_else(|| ConversionExecutionError::ToolNotFound {
+            program: program.to_string(),
+        })
+}
+
+#[cfg(unix)]
+pub(crate) fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.is_file()
+        && path
+            .metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 #[cfg(unix)]
@@ -391,6 +432,8 @@ pub enum ConversionExecutionError {
     Manifest(#[from] ManifestError),
     #[error("failed to run conversion tool: {0}")]
     Io(#[from] io::Error),
+    #[error("conversion tool not found on sanitized PATH: {program}")]
+    ToolNotFound { program: String },
     #[error("{stage} command failed: {program} exited with {status}")]
     CommandFailed {
         stage: &'static str,

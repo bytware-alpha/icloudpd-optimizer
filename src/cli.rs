@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::conversion_execution::{
     ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversion,
+    is_executable_file,
 };
 use crate::manifest::{AssetRecord, Manifest, ManifestError};
 use crate::upload::{
@@ -518,22 +519,6 @@ fn tool_present(tool_name: &str) -> bool {
     env::split_paths(&paths)
         .filter(|directory| !directory.as_os_str().is_empty())
         .any(|directory| is_executable_file(&directory.join(tool_name)))
-}
-
-#[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    path.is_file()
-        && path
-            .metadata()
-            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
 }
 
 #[derive(Serialize)]

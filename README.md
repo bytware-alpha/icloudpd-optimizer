@@ -119,10 +119,10 @@ The delete plan is JSON output. It does not remove files.
 
 Use `icloudpd` or `docker-icloudpd` in a non-destructive download mode first. For
 `icloudpd`, that means Copy mode rather than Move mode: do not use
-`--keep-icloud-recent-days` before this optimizer has produced and you have reviewed a
-delete plan. For `docker-icloudpd`, keep iCloud-deleting settings such as
-`delete_after_download` and `keep_icloud_recent_only` disabled for the library this tool
-is auditing.
+`--keep-icloud-recent-days` or legacy `--delete-after-download` before this optimizer
+has produced and you have reviewed a delete plan. For `docker-icloudpd`, keep
+iCloud-deleting settings such as `delete_after_download` and
+`keep_icloud_recent_only` disabled for the library this tool is auditing.
 
 A safe side-by-side shape is:
 
@@ -143,14 +143,29 @@ For `docker-icloudpd`, prefer running this tool on the host or as a separate sid
 services:
   icloudpd:
     image: boredazfcuk/icloudpd
+    environment:
+      - download_path=/data
     volumes:
       - icloudpd-config:/config
       - photos-download:/data
 
   optimizer:
     image: icloudpd-optimizer
+    command:
+      - workflow
+      - nas-verified
+      - --manifest
+      - /state/manifest.json
+      - --asset-id
+      - IMG_0001
+      - --raw-path
+      - /data/raw/IMG_0001.dng
+      - --nas-root
+      - /data
+      - --min-age-days
+      - "30"
     volumes:
-      - photos-download:/photos:ro
+      - photos-download:/data:ro
       - optimizer-state:/state
       - optimizer-staging:/staging
 ```
@@ -158,6 +173,8 @@ services:
 Do not mount the `docker-icloudpd` `/config` volume into the optimizer. That directory
 contains auth cookies, keyring data, and `icloudpd.conf`; the optimizer should consume
 downloaded media from a read-only media mount and write only its manifest/staging data.
+The optimizer media mount must match the `docker-icloudpd` `download_path`; in the
+example above, both services use `/data`.
 Run `icloudpd-optimizer doctor --json` in the host/sidecar environment before automation.
 
 ## Conversion Performance
