@@ -58,6 +58,58 @@ fn plans_exact_sips_exiftool_and_verification_commands() {
     );
     assert_eq!(plan.verify_image.program, "heif-info");
     assert_eq!(args(&plan.verify_image), vec!["/staging/IMG_0001.heic"]);
+    assert_eq!(plan.render_raw_preview.program, "sips");
+    assert_eq!(
+        args(&plan.render_raw_preview),
+        vec![
+            "-Z",
+            "512",
+            "-s",
+            "format",
+            "png",
+            "/nas/raw/IMG_0001.dng",
+            "--out",
+            "/staging/IMG_0001.raw-preview.png"
+        ]
+    );
+    assert_eq!(plan.render_heic_preview.program, "sips");
+    assert_eq!(
+        args(&plan.render_heic_preview),
+        vec![
+            "-Z",
+            "512",
+            "-s",
+            "format",
+            "png",
+            "/staging/IMG_0001.heic",
+            "--out",
+            "/staging/IMG_0001.heic-preview.png"
+        ]
+    );
+    assert_eq!(plan.verify_visual_content.program, "magick");
+    assert_eq!(
+        args(&plan.verify_visual_content),
+        vec![
+            "/staging/IMG_0001.heic-preview.png",
+            "-colorspace",
+            "RGB",
+            "-format",
+            "%[fx:standard_deviation]",
+            "info:"
+        ]
+    );
+    assert_eq!(plan.verify_visual_match.program, "magick");
+    assert_eq!(
+        args(&plan.verify_visual_match),
+        vec![
+            "compare",
+            "-metric",
+            "RMSE",
+            "/staging/IMG_0001.raw-preview.png",
+            "/staging/IMG_0001.heic-preview.png",
+            "null:"
+        ]
+    );
     assert_eq!(plan.verify_metadata.program, "exiftool");
     assert_eq!(
         args(&plan.verify_metadata),
@@ -174,6 +226,10 @@ fn plans_do_not_include_delete_or_upload_commands() {
         &plan.convert,
         &plan.metadata,
         &plan.verify_image,
+        &plan.render_raw_preview,
+        &plan.render_heic_preview,
+        &plan.verify_visual_content,
+        &plan.verify_visual_match,
         &plan.verify_metadata,
     ];
 

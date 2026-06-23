@@ -9,7 +9,7 @@ use icloudpd_optimizer::workflow::{
     ConversionResultProof, HeicVerificationProof, SourceAgeProof, UploadProof, WorkflowError,
     approve_delete, build_delete_plan, discover_raw_asset, mark_delete_eligible,
     prove_and_record_nas, record_conversion_result, record_heic_verification, record_nas_proof,
-    record_source_age_proof, record_stage_failure, record_upload_proof,
+    record_source_age_proof, record_stage_failure, record_upload_proof, upload_ready_heic_proof,
 };
 use serde_json::json;
 
@@ -42,6 +42,8 @@ fn heic_proof() -> HeicVerificationProof {
         size_bytes: 24,
         heif_info_ok: true,
         metadata_copied: true,
+        visual_content_ok: true,
+        visual_match_ok: true,
     }
 }
 
@@ -52,7 +54,9 @@ fn heic_verification_proof_accepts_legacy_vipsheader_field() {
         "heic_sha256": "heic-sha256",
         "size_bytes": 24,
         "vipsheader_ok": true,
-        "metadata_copied": true
+        "metadata_copied": true,
+        "visual_content_ok": true,
+        "visual_match_ok": true
     }))
     .expect("legacy proof field should deserialize");
 
@@ -233,17 +237,63 @@ fn valid_ordered_workflow_reaches_delete_plan_without_deleting() {
 
 #[test]
 fn delete_plan_revalidates_persisted_heic_verification_flags() {
+    let cases = [
+        (
+            "heif_info_ok",
+            "forged heif-info failure must block delete plan",
+        ),
+        (
+            "metadata_copied",
+            "forged metadata proof must block delete plan",
+        ),
+        (
+            "visual_content_ok",
+            "forged visual-content proof must block delete plan",
+        ),
+        (
+            "visual_match_ok",
+            "forged visual-match proof must block delete plan",
+        ),
+    ];
+
+    for (field, message) in cases {
+        let (_tempdir, manifest) = forged_delete_approved_manifest(|record| {
+            proof_mut(record, "heic")[field] = json!(false);
+        });
+
+        let error = build_delete_plan(&manifest, "asset-1").expect_err(message);
+
+        assert!(matches!(
+            error,
+            WorkflowError::HeicVerificationFailed {
+                field: actual
+            } if actual == field
+        ));
+    }
+}
+
+#[test]
+fn delete_plan_rejects_legacy_heic_proof_without_visual_validation() {
     let (_tempdir, manifest) = forged_delete_approved_manifest(|record| {
-        proof_mut(record, "heic")["heif_info_ok"] = json!(false);
+        let proof = proof_mut(record, "heic");
+        proof
+            .as_object_mut()
+            .expect("proof should be an object")
+            .remove("visual_content_ok");
+        proof
+            .as_object_mut()
+            .expect("proof should be an object")
+            .remove("visual_match_ok");
     });
 
     let error = build_delete_plan(&manifest, "asset-1")
-        .expect_err("forged heif-info failure must block delete plan");
+        .expect_err("legacy visual proof must block delete plan");
 
     assert!(matches!(
         error,
-        WorkflowError::HeicVerificationFailed {
-            field: "heif_info_ok"
+        WorkflowError::ProofDecode {
+            proof_key: "heic",
+            ..
         }
     ));
 }
@@ -599,6 +649,63 @@ fn heic_verification_must_match_conversion_path_hash_and_size_without_mutation()
             &before
         );
     }
+}
+
+#[test]
+fn heic_verification_requires_visual_proofs_without_mutation() {
+    let cases = [
+        (
+            "visual_content_ok",
+            HeicVerificationProof {
+                visual_content_ok: false,
+                ..heic_proof()
+            },
+        ),
+        (
+            "visual_match_ok",
+            HeicVerificationProof {
+                visual_match_ok: false,
+                ..heic_proof()
+            },
+        ),
+    ];
+
+    for (field, proof) in cases {
+        let mut manifest = converted_manifest();
+        let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+        let error = record_heic_verification(&mut manifest, "asset-1", proof)
+            .expect_err("visual validation is required before conversion verification");
+
+        assert!(matches!(
+            error,
+            WorkflowError::HeicVerificationFailed {
+                field: actual
+            } if actual == field
+        ));
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist"),
+            &before
+        );
+    }
+}
+
+#[test]
+fn upload_ready_revalidates_visual_proofs() {
+    let mut manifest = conversion_verified_manifest();
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    proof_mut(&mut record, "heic")["visual_match_ok"] = json!(false);
+    manifest.upsert(record);
+
+    let error = upload_ready_heic_proof(&manifest, "asset-1")
+        .expect_err("forged visual proof must not be upload-ready");
+
+    assert!(matches!(
+        error,
+        WorkflowError::HeicVerificationFailed {
+            field: "visual_match_ok"
+        }
+    ));
 }
 
 #[test]

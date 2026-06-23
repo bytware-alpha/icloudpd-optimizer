@@ -19,6 +19,8 @@ fn heic_proof(path: PathBuf, bytes: &[u8]) -> HeicVerificationProof {
         size_bytes: bytes.len() as u64,
         heif_info_ok: true,
         metadata_copied: true,
+        visual_content_ok: true,
+        visual_match_ok: true,
     }
 }
 

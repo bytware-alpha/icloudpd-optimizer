@@ -44,6 +44,8 @@ pub struct HeicVerificationProof {
     #[serde(alias = "vipsheader_ok")]
     pub heif_info_ok: bool,
     pub metadata_copied: bool,
+    pub visual_content_ok: bool,
+    pub visual_match_ok: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -183,16 +185,7 @@ pub fn record_heic_verification<'a>(
         conversion.size_bytes,
         proof.size_bytes,
     )?;
-    if !proof.heif_info_ok {
-        return Err(WorkflowError::HeicVerificationFailed {
-            field: "heif_info_ok",
-        });
-    }
-    if !proof.metadata_copied {
-        return Err(WorkflowError::HeicVerificationFailed {
-            field: "metadata_copied",
-        });
-    }
+    validate_heic_verification_flags(&proof)?;
     transition_with_proof(
         manifest,
         asset_id,
@@ -218,6 +211,7 @@ pub fn record_upload_proof<'a>(
             })?;
     require_non_empty_path("uploaded_heic_path", uploaded_heic_path)?;
     let heic = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
+    validate_heic_verification_flags(&heic)?;
     require_matching_str(
         HEIC_PROOF,
         "uploaded_heic_sha256",
@@ -250,7 +244,9 @@ pub fn upload_ready_heic_proof(
             state: record.state,
         });
     }
-    stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)
+    let proof = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
+    validate_heic_verification_flags(&proof)?;
+    Ok(proof)
 }
 
 pub fn record_source_age_proof<'a>(
@@ -283,6 +279,7 @@ pub fn mark_delete_eligible<'a>(
     }
     let upload = stored_proof::<UploadProof>(manifest, asset_id, UPLOAD_PROOF)?;
     let heic = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
+    validate_heic_verification_flags(&heic)?;
     let source_age = stored_proof::<SourceAgeProof>(manifest, asset_id, SOURCE_AGE_PROOF)?;
     let source_age_seconds = source_age_seconds(asset_id, &source_age)?;
     let proof = json!({
@@ -394,16 +391,7 @@ fn revalidate_delete_plan_proofs(manifest: &Manifest, asset_id: &str) -> Result<
         conversion.size_bytes,
         heic.size_bytes,
     )?;
-    if !heic.heif_info_ok {
-        return Err(WorkflowError::HeicVerificationFailed {
-            field: "heif_info_ok",
-        });
-    }
-    if !heic.metadata_copied {
-        return Err(WorkflowError::HeicVerificationFailed {
-            field: "metadata_copied",
-        });
-    }
+    validate_heic_verification_flags(&heic)?;
 
     let upload = stored_proof::<UploadProof>(manifest, asset_id, UPLOAD_PROOF)?;
     require_non_empty("uploaded_heic_asset_id", &upload.uploaded_heic_asset_id)?;
@@ -647,6 +635,23 @@ fn validate_delete_eligibility_proof(
         source_age.min_age_seconds,
         eligibility.min_source_age_seconds,
     )?;
+
+    Ok(())
+}
+
+fn validate_heic_verification_flags(proof: &HeicVerificationProof) -> Result<(), WorkflowError> {
+    let required = [
+        ("heif_info_ok", proof.heif_info_ok),
+        ("metadata_copied", proof.metadata_copied),
+        ("visual_content_ok", proof.visual_content_ok),
+        ("visual_match_ok", proof.visual_match_ok),
+    ];
+
+    for (field, value) in required {
+        if !value {
+            return Err(WorkflowError::HeicVerificationFailed { field });
+        }
+    }
 
     Ok(())
 }

@@ -25,6 +25,7 @@ fn missing_tools_json() -> Value {
         "tools": [
             {"name": "sips", "present": false},
             {"name": "heif-info", "present": false},
+            {"name": "magick", "present": false},
             {"name": "exiftool", "present": false}
         ]
     })
@@ -51,6 +52,7 @@ fn write_executable_with_body(path: &std::path::Path, body: &str) {
 fn write_fake_required_tools(directory: &std::path::Path) {
     write_executable(&directory.join("sips"));
     write_executable(&directory.join("heif-info"));
+    write_executable(&directory.join("magick"));
     write_executable(&directory.join("exiftool"));
 }
 
@@ -105,6 +107,8 @@ fn heic_proof() -> HeicVerificationProof {
         size_bytes: 24,
         heif_info_ok: true,
         metadata_copied: true,
+        visual_content_ok: true,
+        visual_match_ok: true,
     }
 }
 
@@ -193,6 +197,8 @@ fn manifest_with_real_conversion_verified(path: &std::path::Path, heic_path: Pat
             size_bytes: body.len() as u64,
             heif_info_ok: true,
             metadata_copied: true,
+            visual_content_ok: true,
+            visual_match_ok: true,
         },
     )
     .expect("heic verification should record");
@@ -264,6 +270,8 @@ fn manifest_with_real_delete_approval(tempdir: &std::path::Path) -> (PathBuf, Pa
             "24",
             "--heif-info-ok",
             "--metadata-copied",
+            "--visual-content-ok",
+            "--visual-match-ok",
         ])
         .assert()
         .success();
@@ -417,7 +425,7 @@ fn doctor_json_reports_required_tools_missing_under_empty_path() {
 
 #[cfg(unix)]
 #[test]
-fn doctor_json_reports_heif_info_as_required() {
+fn doctor_json_reports_heif_info_and_magick_as_required() {
     let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
     let cwd = tempfile::tempdir().expect("cwd tempdir should be created");
     write_executable(&tool_dir.path().join("sips"));
@@ -431,6 +439,7 @@ fn doctor_json_reports_heif_info_as_required() {
             "tools": [
                 {"name": "sips", "present": true},
                 {"name": "heif-info", "present": false},
+                {"name": "magick", "present": false},
                 {"name": "exiftool", "present": true}
             ]
         })
@@ -610,6 +619,8 @@ fn workflow_conversion_result_and_heic_verified_commands_complete_conversion_gat
             "24",
             "--heif-info-ok",
             "--metadata-copied",
+            "--visual-content-ok",
+            "--visual-match-ok",
         ])
         .assert()
         .success();
@@ -665,6 +676,8 @@ fn workflow_heic_verified_mismatch_fails_without_mutating_manifest() {
             "24",
             "--heif-info-ok",
             "--metadata-copied",
+            "--visual-content-ok",
+            "--visual-match-ok",
         ])
         .assert()
         .failure()
@@ -716,10 +729,12 @@ fn workflow_heic_verified_requires_explicit_boolean_proofs_without_mutating_mani
             "--size-bytes",
             "24",
             "--heif-info-ok",
+            "--metadata-copied",
+            "--visual-match-ok",
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("metadata_copied"));
+        .stderr(predicate::str::contains("visual_content_ok"));
 
     let after = fs::read_to_string(&manifest_path).expect("manifest should remain readable");
     assert_eq!(after, before);
@@ -1030,6 +1045,8 @@ fn workflow_mark_delete_eligible_requires_source_age_without_mutating_manifest()
             "24",
             "--heif-info-ok",
             "--metadata-copied",
+            "--visual-content-ok",
+            "--visual-match-ok",
         ])
         .assert()
         .success();
@@ -1133,6 +1150,8 @@ fn workflow_mark_delete_eligible_rejects_too_new_source_age_without_mutating_man
             "24",
             "--heif-info-ok",
             "--metadata-copied",
+            "--visual-content-ok",
+            "--visual-match-ok",
         ])
         .assert()
         .success();

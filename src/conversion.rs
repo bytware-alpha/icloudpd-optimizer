@@ -23,6 +23,10 @@ pub struct ConversionPlan {
     pub convert: CommandPlan,
     pub metadata: CommandPlan,
     pub verify_image: CommandPlan,
+    pub render_raw_preview: CommandPlan,
+    pub render_heic_preview: CommandPlan,
+    pub verify_visual_content: CommandPlan,
+    pub verify_visual_match: CommandPlan,
     pub verify_metadata: CommandPlan,
 }
 
@@ -61,6 +65,12 @@ pub fn plan_conversion(
 
     let raw_arg = raw_path.as_os_str().to_os_string();
     let output_arg = output_path.as_os_str().to_os_string();
+    let raw_preview_arg = visual_preview_path(output_path, "raw")
+        .as_os_str()
+        .to_os_string();
+    let heic_preview_arg = visual_preview_path(output_path, "heic")
+        .as_os_str()
+        .to_os_string();
     Ok(ConversionPlan {
         convert: CommandPlan::new(
             "sips",
@@ -80,13 +90,61 @@ pub fn plan_conversion(
             "exiftool",
             vec![
                 OsString::from("-TagsFromFile"),
-                raw_arg,
+                raw_arg.clone(),
                 OsString::from("-all:all"),
                 OsString::from("-overwrite_original"),
                 output_arg.clone(),
             ],
         ),
         verify_image: CommandPlan::new("heif-info", vec![output_arg.clone()]),
+        render_raw_preview: CommandPlan::new(
+            "sips",
+            vec![
+                OsString::from("-Z"),
+                OsString::from("512"),
+                OsString::from("-s"),
+                OsString::from("format"),
+                OsString::from("png"),
+                raw_arg,
+                OsString::from("--out"),
+                raw_preview_arg.clone(),
+            ],
+        ),
+        render_heic_preview: CommandPlan::new(
+            "sips",
+            vec![
+                OsString::from("-Z"),
+                OsString::from("512"),
+                OsString::from("-s"),
+                OsString::from("format"),
+                OsString::from("png"),
+                output_arg.clone(),
+                OsString::from("--out"),
+                heic_preview_arg.clone(),
+            ],
+        ),
+        verify_visual_content: CommandPlan::new(
+            "magick",
+            vec![
+                heic_preview_arg.clone(),
+                OsString::from("-colorspace"),
+                OsString::from("RGB"),
+                OsString::from("-format"),
+                OsString::from("%[fx:standard_deviation]"),
+                OsString::from("info:"),
+            ],
+        ),
+        verify_visual_match: CommandPlan::new(
+            "magick",
+            vec![
+                OsString::from("compare"),
+                OsString::from("-metric"),
+                OsString::from("RMSE"),
+                raw_preview_arg,
+                heic_preview_arg,
+                OsString::from("null:"),
+            ],
+        ),
         verify_metadata: CommandPlan::new(
             "exiftool",
             vec![
@@ -98,6 +156,12 @@ pub fn plan_conversion(
             ],
         ),
     })
+}
+
+fn visual_preview_path(output_path: &Path, label: &str) -> PathBuf {
+    let mut preview_path = output_path.to_path_buf();
+    preview_path.set_extension(format!("{label}-preview.png"));
+    preview_path
 }
 
 fn has_heic_extension(path: &Path) -> bool {
