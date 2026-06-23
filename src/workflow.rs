@@ -122,6 +122,14 @@ struct DeleteApprovalProof {
     operator: String,
 }
 
+struct PreDeleteFacts {
+    upload: UploadProof,
+    uploaded_heic_path: PathBuf,
+    heic: HeicVerificationProof,
+    source_age: SourceAgeProof,
+    source_age_seconds: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeletePlan {
     pub asset_id: String,
@@ -353,24 +361,20 @@ pub fn mark_delete_eligible<'a>(
         });
     }
     require_valid_conversion_performance(manifest, asset_id)?;
-    let upload = stored_proof::<UploadProof>(manifest, asset_id, UPLOAD_PROOF)?;
-    let heic = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
-    validate_heic_verification_flags(&heic)?;
-    let source_age = stored_proof::<SourceAgeProof>(manifest, asset_id, SOURCE_AGE_PROOF)?;
-    let source_age_seconds = source_age_seconds(asset_id, &source_age)?;
+    let facts = validate_pre_delete_facts(manifest, asset_id)?;
     let proof = json!({
         "upload_proof_key": UPLOAD_PROOF,
         "conversion_performance_proof_key": CONVERSION_PERFORMANCE_PROOF,
         "heic_proof_key": HEIC_PROOF,
         "source_age_proof_key": SOURCE_AGE_PROOF,
-        "uploaded_heic_asset_id": upload.uploaded_heic_asset_id,
-        "uploaded_heic_sha256": upload.uploaded_heic_sha256,
-        "uploaded_heic_path": upload.uploaded_heic_path,
-        "verified_heic_sha256": heic.heic_sha256,
-        "verified_heic_path": heic.heic_path,
-        "source_captured_unix_seconds": source_age.source_captured_unix_seconds,
-        "source_age_seconds": source_age_seconds,
-        "min_source_age_seconds": source_age.min_age_seconds,
+        "uploaded_heic_asset_id": &facts.upload.uploaded_heic_asset_id,
+        "uploaded_heic_sha256": &facts.upload.uploaded_heic_sha256,
+        "uploaded_heic_path": &facts.uploaded_heic_path,
+        "verified_heic_sha256": &facts.heic.heic_sha256,
+        "verified_heic_path": &facts.heic.heic_path,
+        "source_captured_unix_seconds": facts.source_age.source_captured_unix_seconds,
+        "source_age_seconds": facts.source_age_seconds,
+        "min_source_age_seconds": facts.source_age.min_age_seconds,
     });
 
     manifest
@@ -394,6 +398,18 @@ pub fn approve_delete<'a>(
     if operator.is_empty() {
         return Err(WorkflowError::EmptyOperator);
     }
+
+    let record = manifest.get(asset_id)?;
+    if record.state != State::DeleteEligible {
+        return Err(WorkflowError::Manifest(ManifestError::InvalidTransition {
+            asset_id: asset_id.to_string(),
+            from: record.state,
+            to: State::DeleteApproved,
+        }));
+    }
+
+    let facts = validate_pre_delete_facts(manifest, asset_id)?;
+    validate_delete_eligibility_chain(manifest, asset_id, &facts)?;
 
     let proof = json!({ "operator": operator });
     manifest
@@ -449,6 +465,15 @@ pub fn record_stage_failure<'a>(
 }
 
 fn revalidate_delete_plan_proofs(manifest: &Manifest, asset_id: &str) -> Result<(), WorkflowError> {
+    let facts = validate_pre_delete_facts(manifest, asset_id)?;
+    validate_delete_eligibility_chain(manifest, asset_id, &facts)?;
+    validate_delete_approval_proof(manifest, asset_id)
+}
+
+fn validate_pre_delete_facts(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<PreDeleteFacts, WorkflowError> {
     let record = manifest.get(asset_id)?;
     let (nas, conversion) = load_conversion_context(manifest, asset_id)?;
 
@@ -496,6 +521,7 @@ fn revalidate_delete_plan_proofs(manifest: &Manifest, asset_id: &str) -> Result<
         &heic.heic_path,
         uploaded_heic_path,
     )?;
+    let uploaded_heic_path = uploaded_heic_path.clone();
 
     let source_age = stored_proof::<SourceAgeProof>(manifest, asset_id, SOURCE_AGE_PROOF)?;
     let source_age_seconds = source_age_seconds(asset_id, &source_age)?;
@@ -504,17 +530,38 @@ fn revalidate_delete_plan_proofs(manifest: &Manifest, asset_id: &str) -> Result<
 
     validate_stored_conversion_performance(manifest, asset_id, &nas, &conversion)?;
 
+    Ok(PreDeleteFacts {
+        upload,
+        uploaded_heic_path,
+        heic,
+        source_age,
+        source_age_seconds,
+    })
+}
+
+fn validate_delete_eligibility_chain(
+    manifest: &Manifest,
+    asset_id: &str,
+    facts: &PreDeleteFacts,
+) -> Result<(), WorkflowError> {
     let eligibility =
         stored_proof::<DeleteEligibilityProof>(manifest, asset_id, DELETE_ELIGIBILITY_PROOF)?;
     validate_delete_eligibility_proof(
         &eligibility,
-        &upload,
-        uploaded_heic_path,
-        &heic,
-        &source_age,
-        source_age_seconds,
+        &facts.upload,
+        &facts.uploaded_heic_path,
+        &facts.heic,
+        &facts.source_age,
+        facts.source_age_seconds,
     )?;
 
+    Ok(())
+}
+
+fn validate_delete_approval_proof(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<(), WorkflowError> {
     let approval = stored_proof::<DeleteApprovalProof>(manifest, asset_id, DELETE_APPROVAL_PROOF)?;
     if approval.operator.trim().is_empty() {
         return Err(WorkflowError::EmptyOperator);

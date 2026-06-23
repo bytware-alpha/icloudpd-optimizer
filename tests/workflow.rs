@@ -135,7 +135,7 @@ fn upload_verified_manifest() -> Manifest {
     manifest
 }
 
-fn real_delete_approved_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {
+fn real_upload_verified_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let nas_root = tempdir.path().join("nas");
     fs::create_dir_all(&nas_root).expect("nas root should be created");
@@ -158,6 +158,12 @@ fn real_delete_approved_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {
         .expect("source age proof should record");
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
+
+    (tempdir, manifest, canonical_raw_path)
+}
+
+fn real_delete_approved_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {
+    let (tempdir, mut manifest, canonical_raw_path) = real_upload_verified_manifest();
     mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
     approve_delete(&mut manifest, "asset-1", "operator").expect("approval should record");
 
@@ -1084,8 +1090,178 @@ fn delete_eligibility_revalidates_conversion_performance_without_mutation() {
 }
 
 #[test]
+fn delete_eligibility_revalidates_heic_identity_without_mutation() {
+    let cases = [
+        ("heic_path", json!("/other/IMG_0001.heic")),
+        ("heic_sha256", json!("other-heic-sha256")),
+        ("size_bytes", json!(25)),
+    ];
+
+    for (field, value) in cases {
+        let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+        let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+        proof_mut(&mut record, "heic")[field] = value;
+        manifest.upsert(record);
+        let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+        let error = mark_delete_eligible(&mut manifest, "asset-1")
+            .expect_err("forged HEIC proof must block delete eligibility");
+
+        assert!(matches!(
+            error,
+            WorkflowError::ProofMismatch {
+                proof_key: "conversion",
+                field: actual,
+                ..
+            } if actual == field
+        ));
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist"),
+            &before
+        );
+        assert!(!before.proofs.contains_key("delete_eligibility"));
+    }
+}
+
+#[test]
+fn delete_eligibility_revalidates_upload_binding_without_mutation() {
+    let cases = [
+        ("uploaded_heic_sha256", json!("other-heic-sha256")),
+        ("uploaded_heic_path", json!("/other/IMG_0001.heic")),
+    ];
+
+    for (field, value) in cases {
+        let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+        let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+        proof_mut(&mut record, "upload")[field] = value;
+        manifest.upsert(record);
+        let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+        let error = mark_delete_eligible(&mut manifest, "asset-1")
+            .expect_err("forged upload proof must block delete eligibility");
+
+        assert!(matches!(
+            error,
+            WorkflowError::ProofMismatch {
+                proof_key: "heic",
+                field: actual,
+                ..
+            } if actual == field
+        ));
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist"),
+            &before
+        );
+        assert!(!before.proofs.contains_key("delete_eligibility"));
+    }
+}
+
+#[test]
+fn delete_eligibility_revalidates_nas_size_without_mutation() {
+    let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    proof_mut(&mut record, "nas")["size_bytes"] = json!(43);
+    proof_mut(&mut record, "conversion_performance")["raw_size_bytes"] = json!(43);
+    manifest.upsert(record);
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = mark_delete_eligible(&mut manifest, "asset-1")
+        .expect_err("forged NAS size must block delete eligibility");
+
+    assert!(matches!(
+        error,
+        WorkflowError::ProofMismatch {
+            proof_key: "nas",
+            field: "size_bytes",
+            ..
+        }
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+    assert!(!before.proofs.contains_key("delete_eligibility"));
+}
+
+#[test]
+fn delete_eligibility_reproves_live_nas_bytes_without_mutation() {
+    let (_tempdir, mut manifest, raw_path) = real_upload_verified_manifest();
+    let stored_modified =
+        manifest.get("asset-1").expect("asset should exist").proofs["nas"]["modified_unix_seconds"]
+            .as_u64()
+            .expect("stored mtime should be a u64");
+    fs::write(&raw_path, b"new-bytes").expect("raw bytes should mutate");
+    set_raw_mtime(&raw_path, stored_modified);
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = mark_delete_eligible(&mut manifest, "asset-1")
+        .expect_err("changed NAS bytes must block delete eligibility");
+
+    assert!(matches!(
+        error,
+        WorkflowError::ProofMismatch {
+            proof_key: "nas",
+            field: "sha256",
+            ..
+        }
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+    assert!(!before.proofs.contains_key("delete_eligibility"));
+}
+
+#[test]
+fn delete_eligibility_revalidates_source_age_without_mutation() {
+    let cases = [
+        (
+            "source_captured_unix_seconds",
+            json!(SOURCE_AGE_VERIFIED_AT - 10 * DAY),
+        ),
+        ("min_age_seconds", json!(0)),
+    ];
+
+    for (field, value) in cases {
+        let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+        let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+        proof_mut(&mut record, "source_age")[field] = value;
+        manifest.upsert(record);
+        let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+        let error = mark_delete_eligible(&mut manifest, "asset-1")
+            .expect_err("forged source age proof must block delete eligibility");
+
+        if field == "source_captured_unix_seconds" {
+            assert!(matches!(
+                error,
+                WorkflowError::SourceAgeTooNew {
+                    age_seconds,
+                    min_age_seconds,
+                    ..
+                } if age_seconds == 10 * DAY && min_age_seconds == 30 * DAY
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                WorkflowError::MinAgeBelowSafetyFloor {
+                    requested_seconds: 0,
+                    minimum_seconds,
+                    ..
+                } if minimum_seconds == 30 * DAY
+            ));
+        }
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist"),
+            &before
+        );
+        assert!(!before.proofs.contains_key("delete_eligibility"));
+    }
+}
+
+#[test]
 fn delete_approval_requires_conversion_performance_without_mutation() {
-    let mut manifest = upload_verified_manifest();
+    let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
     mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     record.proofs.remove("conversion_performance");
@@ -1111,7 +1287,7 @@ fn delete_approval_requires_conversion_performance_without_mutation() {
 
 #[test]
 fn delete_approval_revalidates_conversion_performance_without_mutation() {
-    let mut manifest = upload_verified_manifest();
+    let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
     mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     proof_mut(&mut record, "conversion_performance")["heic_size_bytes"] = json!(25);
@@ -1126,6 +1302,189 @@ fn delete_approval_revalidates_conversion_performance_without_mutation() {
         WorkflowError::ProofMismatch {
             proof_key: "conversion_performance",
             field: "heic_size_bytes",
+            ..
+        }
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+    assert!(!before.proofs.contains_key("delete_approval"));
+}
+
+#[test]
+fn delete_approval_revalidates_heic_identity_without_mutation() {
+    let cases = [
+        ("visual_content_ok", json!(false)),
+        ("heic_sha256", json!("other-heic-sha256")),
+    ];
+
+    for (field, value) in cases {
+        let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+        mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
+        let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+        proof_mut(&mut record, "heic")[field] = value;
+        manifest.upsert(record);
+        let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+        let error = approve_delete(&mut manifest, "asset-1", "operator")
+            .expect_err("forged HEIC proof must block delete approval");
+
+        if field == "visual_content_ok" {
+            assert!(matches!(
+                error,
+                WorkflowError::HeicVerificationFailed {
+                    field: "visual_content_ok"
+                }
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                WorkflowError::ProofMismatch {
+                    proof_key: "conversion",
+                    field: "heic_sha256",
+                    ..
+                }
+            ));
+        }
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist"),
+            &before
+        );
+        assert!(!before.proofs.contains_key("delete_approval"));
+    }
+}
+
+#[test]
+fn delete_approval_revalidates_upload_binding_without_mutation() {
+    let cases = [
+        ("uploaded_heic_sha256", json!("other-heic-sha256")),
+        ("uploaded_heic_path", json!("/other/IMG_0001.heic")),
+    ];
+
+    for (field, value) in cases {
+        let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+        mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
+        let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+        proof_mut(&mut record, "upload")[field] = value;
+        manifest.upsert(record);
+        let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+        let error = approve_delete(&mut manifest, "asset-1", "operator")
+            .expect_err("forged upload proof must block delete approval");
+
+        assert!(matches!(
+            error,
+            WorkflowError::ProofMismatch {
+                proof_key: "heic",
+                field: actual,
+                ..
+            } if actual == field
+        ));
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist"),
+            &before
+        );
+        assert!(!before.proofs.contains_key("delete_approval"));
+    }
+}
+
+#[test]
+fn delete_approval_reproves_live_nas_bytes_without_mutation() {
+    let (_tempdir, mut manifest, raw_path) = real_upload_verified_manifest();
+    mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
+    let stored_modified =
+        manifest.get("asset-1").expect("asset should exist").proofs["nas"]["modified_unix_seconds"]
+            .as_u64()
+            .expect("stored mtime should be a u64");
+    fs::write(&raw_path, b"new-bytes").expect("raw bytes should mutate");
+    set_raw_mtime(&raw_path, stored_modified);
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = approve_delete(&mut manifest, "asset-1", "operator")
+        .expect_err("changed NAS bytes must block delete approval");
+
+    assert!(matches!(
+        error,
+        WorkflowError::ProofMismatch {
+            proof_key: "nas",
+            field: "sha256",
+            ..
+        }
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+    assert!(!before.proofs.contains_key("delete_approval"));
+}
+
+#[test]
+fn delete_approval_revalidates_source_age_without_mutation() {
+    let cases = [
+        (
+            "source_captured_unix_seconds",
+            json!(SOURCE_AGE_VERIFIED_AT - 10 * DAY),
+        ),
+        ("min_age_seconds", json!(0)),
+    ];
+
+    for (field, value) in cases {
+        let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+        mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
+        let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+        proof_mut(&mut record, "source_age")[field] = value;
+        manifest.upsert(record);
+        let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+        let error = approve_delete(&mut manifest, "asset-1", "operator")
+            .expect_err("forged source age proof must block delete approval");
+
+        if field == "source_captured_unix_seconds" {
+            assert!(matches!(
+                error,
+                WorkflowError::SourceAgeTooNew {
+                    age_seconds,
+                    min_age_seconds,
+                    ..
+                } if age_seconds == 10 * DAY && min_age_seconds == 30 * DAY
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                WorkflowError::MinAgeBelowSafetyFloor {
+                    requested_seconds: 0,
+                    minimum_seconds,
+                    ..
+                } if minimum_seconds == 30 * DAY
+            ));
+        }
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist"),
+            &before
+        );
+        assert!(!before.proofs.contains_key("delete_approval"));
+    }
+}
+
+#[test]
+fn delete_approval_revalidates_delete_eligibility_without_mutation() {
+    let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+    mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    proof_mut(&mut record, "delete_eligibility")["uploaded_heic_sha256"] =
+        json!("stale-heic-sha256");
+    manifest.upsert(record);
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = approve_delete(&mut manifest, "asset-1", "operator")
+        .expect_err("stale delete eligibility proof must block delete approval");
+
+    assert!(matches!(
+        error,
+        WorkflowError::ProofMismatch {
+            proof_key: "delete_eligibility",
+            field: "uploaded_heic_sha256",
             ..
         }
     ));
@@ -1219,9 +1578,10 @@ fn source_age_proof_rejects_minimum_below_floor_without_mutation() {
 
 #[test]
 fn source_age_proof_can_be_recorded_after_upload_before_delete_eligibility() {
-    let mut manifest = conversion_verified_manifest();
-    record_upload_proof(&mut manifest, "asset-1", upload_proof())
-        .expect("upload proof should record before source age");
+    let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    record.proofs.remove("source_age");
+    manifest.upsert(record);
 
     record_source_age_proof(&mut manifest, "asset-1", old_source_age_proof())
         .expect("source age proof should remain valid before delete eligibility");
@@ -1237,7 +1597,7 @@ fn source_age_proof_can_be_recorded_after_upload_before_delete_eligibility() {
 
 #[test]
 fn source_age_proof_cannot_be_weakened_after_delete_eligibility() {
-    let mut manifest = upload_verified_manifest();
+    let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
     mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
@@ -1285,7 +1645,7 @@ fn source_age_proof_cannot_be_weakened_after_delete_approval() {
 
 #[test]
 fn delete_plan_is_unavailable_before_explicit_approval() {
-    let mut manifest = upload_verified_manifest();
+    let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
     mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
@@ -1307,7 +1667,7 @@ fn delete_plan_is_unavailable_before_explicit_approval() {
 
 #[test]
 fn delete_approval_requires_non_empty_operator() {
-    let mut manifest = upload_verified_manifest();
+    let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
     mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
