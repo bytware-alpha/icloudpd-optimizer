@@ -1,7 +1,10 @@
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
-use icloudpd_optimizer::conversion::{CommandPlan, ConversionError, plan_conversion};
+use icloudpd_optimizer::conversion::{
+    CommandPlan, ConversionError, plan_conversion, plan_conversion_for_target,
+};
+use icloudpd_optimizer::conversion_backend::TargetPlatform;
 
 fn args(plan: &CommandPlan) -> Vec<String> {
     plan.args
@@ -28,7 +31,9 @@ fn plans_exact_sips_exiftool_and_verification_commands() {
     let raw = PathBuf::from("/nas/raw/IMG_0001.dng");
     let output = PathBuf::from("/staging/IMG_0001.heic");
 
-    let plan = plan_conversion(&raw, &output, 90).expect("conversion should plan");
+    let plan =
+        plan_conversion_for_target(TargetPlatform::new("macos", "aarch64"), &raw, &output, 90)
+            .expect("conversion should plan");
 
     assert_eq!(plan.convert.program, "sips");
     assert_eq!(
@@ -119,7 +124,8 @@ fn plans_exact_sips_exiftool_and_verification_commands() {
 
 #[test]
 fn includes_requested_heic_quality_in_sips_format_options() {
-    let plan = plan_conversion(
+    let plan = plan_conversion_for_target(
+        TargetPlatform::new("macos", "aarch64"),
         PathBuf::from("/nas/raw/IMG_0002.cr2"),
         PathBuf::from("/staging/IMG_0002.heic"),
         82,
@@ -139,6 +145,51 @@ fn includes_requested_heic_quality_in_sips_format_options() {
             "--out",
             "/staging/IMG_0002.heic"
         ]
+    );
+}
+
+#[test]
+fn plans_linux_native_conversion_without_sips() {
+    let plan = plan_conversion_for_target(
+        TargetPlatform::new("linux", "x86_64"),
+        PathBuf::from("/nas/raw/IMG_0006.dng"),
+        PathBuf::from("/staging/IMG_0006.heic"),
+        88,
+    )
+    .expect("linux conversion should plan");
+
+    let conversion_programs: Vec<_> = plan
+        .conversion_commands
+        .iter()
+        .map(|command| command.program.as_str())
+        .collect();
+    assert_eq!(conversion_programs, vec!["darktable-cli", "heif-enc"]);
+    assert_eq!(plan.convert.program, "darktable-cli");
+    assert_eq!(plan.metadata.program, "exiftool");
+    assert_eq!(plan.verify_image.program, "heif-info");
+    assert_eq!(plan.render_raw_preview.program, "darktable-cli");
+    assert_eq!(plan.render_heic_preview.program, "magick");
+    assert_eq!(plan.verify_visual_content.program, "magick");
+    assert_eq!(plan.verify_visual_match.program, "magick");
+    assert_eq!(plan.verify_metadata.program, "exiftool");
+
+    let all_plans = [
+        plan.conversion_commands.as_slice(),
+        &[
+            plan.metadata,
+            plan.verify_image,
+            plan.render_raw_preview,
+            plan.render_heic_preview,
+            plan.verify_visual_content,
+            plan.verify_visual_match,
+            plan.verify_metadata,
+        ],
+    ]
+    .concat();
+
+    assert!(
+        all_plans.iter().all(|command| command.program != "sips"),
+        "linux conversion plans must not require sips"
     );
 }
 

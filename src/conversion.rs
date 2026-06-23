@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
+use crate::conversion_backend::TargetPlatform;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,6 +22,7 @@ impl CommandPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversionPlan {
     pub convert: CommandPlan,
+    pub conversion_commands: Vec<CommandPlan>,
     pub metadata: CommandPlan,
     pub verify_image: CommandPlan,
     pub render_raw_preview: CommandPlan,
@@ -35,10 +37,24 @@ pub struct ConversionPlan {
 /// ```
 /// # use icloudpd_optimizer::conversion::plan_conversion;
 /// let plan = plan_conversion("/nas/photo.dng", "/tmp/photo.heic", 90)?;
-/// assert_eq!(plan.convert.program, "sips");
+/// assert!(!plan.convert.program.is_empty());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn plan_conversion(
+    raw_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    heic_quality: u8,
+) -> Result<ConversionPlan, ConversionError> {
+    plan_conversion_for_target(
+        TargetPlatform::current(),
+        raw_path.as_ref(),
+        output_path.as_ref(),
+        heic_quality,
+    )
+}
+
+pub fn plan_conversion_for_target(
+    target: TargetPlatform,
     raw_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     heic_quality: u8,
@@ -71,21 +87,50 @@ pub fn plan_conversion(
     let heic_preview_arg = visual_preview_path(output_path, "heic")
         .as_os_str()
         .to_os_string();
-    Ok(ConversionPlan {
-        convert: CommandPlan::new(
-            "sips",
-            vec![
-                OsString::from("-s"),
-                OsString::from("format"),
-                OsString::from("heic"),
-                OsString::from("-s"),
-                OsString::from("formatOptions"),
-                OsString::from(heic_quality.to_string()),
-                raw_arg.clone(),
-                OsString::from("--out"),
-                output_arg.clone(),
-            ],
+    match target.os {
+        "linux" => linux_conversion_plan(
+            raw_arg,
+            output_arg,
+            raw_preview_arg,
+            heic_preview_arg,
+            output_path,
+            heic_quality,
         ),
+        _ => macos_conversion_plan(
+            raw_arg,
+            output_arg,
+            raw_preview_arg,
+            heic_preview_arg,
+            heic_quality,
+        ),
+    }
+}
+
+fn macos_conversion_plan(
+    raw_arg: OsString,
+    output_arg: OsString,
+    raw_preview_arg: OsString,
+    heic_preview_arg: OsString,
+    heic_quality: u8,
+) -> Result<ConversionPlan, ConversionError> {
+    let convert = CommandPlan::new(
+        "sips",
+        vec![
+            OsString::from("-s"),
+            OsString::from("format"),
+            OsString::from("heic"),
+            OsString::from("-s"),
+            OsString::from("formatOptions"),
+            OsString::from(heic_quality.to_string()),
+            raw_arg.clone(),
+            OsString::from("--out"),
+            output_arg.clone(),
+        ],
+    );
+
+    Ok(ConversionPlan {
+        convert: convert.clone(),
+        conversion_commands: vec![convert],
         metadata: CommandPlan::new(
             "exiftool",
             vec![
@@ -156,6 +201,97 @@ pub fn plan_conversion(
             ],
         ),
     })
+}
+
+fn linux_conversion_plan(
+    raw_arg: OsString,
+    output_arg: OsString,
+    raw_preview_arg: OsString,
+    heic_preview_arg: OsString,
+    output_path: &Path,
+    heic_quality: u8,
+) -> Result<ConversionPlan, ConversionError> {
+    let rendered_arg = intermediate_render_path(output_path)
+        .as_os_str()
+        .to_os_string();
+    let render = CommandPlan::new("darktable-cli", vec![raw_arg.clone(), rendered_arg.clone()]);
+    let encode = CommandPlan::new(
+        "heif-enc",
+        vec![
+            OsString::from("-q"),
+            OsString::from(heic_quality.to_string()),
+            rendered_arg,
+            OsString::from("-o"),
+            output_arg.clone(),
+        ],
+    );
+
+    Ok(ConversionPlan {
+        convert: render.clone(),
+        conversion_commands: vec![render, encode],
+        metadata: CommandPlan::new(
+            "exiftool",
+            vec![
+                OsString::from("-TagsFromFile"),
+                raw_arg.clone(),
+                OsString::from("-all:all"),
+                OsString::from("-overwrite_original"),
+                output_arg.clone(),
+            ],
+        ),
+        verify_image: CommandPlan::new("heif-info", vec![output_arg.clone()]),
+        render_raw_preview: CommandPlan::new(
+            "darktable-cli",
+            vec![raw_arg, raw_preview_arg.clone()],
+        ),
+        render_heic_preview: CommandPlan::new(
+            "magick",
+            vec![
+                output_arg.clone(),
+                OsString::from("-resize"),
+                OsString::from("512x512"),
+                heic_preview_arg.clone(),
+            ],
+        ),
+        verify_visual_content: CommandPlan::new(
+            "magick",
+            vec![
+                heic_preview_arg.clone(),
+                OsString::from("-colorspace"),
+                OsString::from("RGB"),
+                OsString::from("-format"),
+                OsString::from("%[fx:standard_deviation]"),
+                OsString::from("info:"),
+            ],
+        ),
+        verify_visual_match: CommandPlan::new(
+            "magick",
+            vec![
+                OsString::from("compare"),
+                OsString::from("-metric"),
+                OsString::from("RMSE"),
+                raw_preview_arg,
+                heic_preview_arg,
+                OsString::from("null:"),
+            ],
+        ),
+        verify_metadata: CommandPlan::new(
+            "exiftool",
+            vec![
+                OsString::from("-json"),
+                OsString::from("-a"),
+                OsString::from("-G1"),
+                OsString::from("-s"),
+                output_arg,
+            ],
+        ),
+    })
+}
+
+fn intermediate_render_path(output_path: &Path) -> PathBuf {
+    let mut rendered_path = output_path.to_path_buf();
+    rendered_path.set_extension("rendered.png");
+    rendered_path
 }
 
 fn visual_preview_path(output_path: &Path, label: &str) -> PathBuf {

@@ -1,5 +1,12 @@
 const MACOS_REQUIRED_TOOLS: [&str; 4] = ["sips", "heif-info", "magick", "exiftool"];
-const NON_MACOS_REQUIRED_TOOLS: [&str; 3] = ["heif-info", "magick", "exiftool"];
+const LINUX_REQUIRED_TOOLS: [&str; 5] = [
+    "darktable-cli",
+    "heif-enc",
+    "heif-info",
+    "magick",
+    "exiftool",
+];
+const UNSUPPORTED_REQUIRED_TOOLS: [&str; 3] = ["heif-info", "magick", "exiftool"];
 
 /// Compile-target platform used to decide whether host-native conversion is supported.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,8 +52,8 @@ pub struct ConversionBackendReport {
 /// use icloudpd_optimizer::conversion_backend::{TargetPlatform, backend_report_for_target};
 ///
 /// let report = backend_report_for_target(TargetPlatform::new("linux", "x86_64"));
-/// assert_eq!(report.name, "manual-proof-linux");
-/// assert!(!report.workflow_convert_supported);
+/// assert_eq!(report.name, "linux-native");
+/// assert!(report.workflow_convert_supported);
 /// ```
 pub fn backend_report_for_target(target: TargetPlatform) -> ConversionBackendReport {
     match target.os {
@@ -56,9 +63,9 @@ pub fn backend_report_for_target(target: TargetPlatform) -> ConversionBackendRep
             reason: "workflow convert is supported by the macOS host-native sips backend",
         },
         "linux" => ConversionBackendReport {
-            name: "manual-proof-linux",
-            workflow_convert_supported: false,
-            reason: "workflow convert requires macOS sips; this Linux target supports proof and manifest workflows only",
+            name: "linux-native",
+            workflow_convert_supported: true,
+            reason: "workflow convert is supported by the Linux native darktable-cli/heif-enc backend",
         },
         _ => ConversionBackendReport {
             name: "unsupported-host",
@@ -85,6 +92,7 @@ pub fn current_backend_report() -> ConversionBackendReport {
 pub fn required_tools_for_target(target: TargetPlatform) -> &'static [&'static str] {
     match target.os {
         "macos" => &MACOS_REQUIRED_TOOLS,
-        _ => &NON_MACOS_REQUIRED_TOOLS,
+        "linux" => &LINUX_REQUIRED_TOOLS,
+        _ => &UNSUPPORTED_REQUIRED_TOOLS,
     }
 }

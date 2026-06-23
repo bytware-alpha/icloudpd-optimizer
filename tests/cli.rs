@@ -714,13 +714,23 @@ fn doctor_json_reports_platform_backend_support_and_required_tools() {
 }
 
 #[test]
-fn backend_report_marks_linux_workflow_convert_unsupported_without_sips() {
+fn backend_report_marks_linux_workflow_convert_supported_without_sips() {
     let target = TargetPlatform::new("linux", "x86_64");
     let report = backend_report_for_target(target);
 
-    assert_eq!(report.name, "manual-proof-linux");
-    assert!(!report.workflow_convert_supported);
+    assert_eq!(report.name, "linux-native");
+    assert!(report.workflow_convert_supported);
     assert!(!required_tools_for_target(target).contains(&"sips"));
+    assert_eq!(
+        required_tools_for_target(target),
+        [
+            "darktable-cli",
+            "heif-enc",
+            "heif-info",
+            "magick",
+            "exiftool"
+        ]
+    );
 }
 
 #[test]
