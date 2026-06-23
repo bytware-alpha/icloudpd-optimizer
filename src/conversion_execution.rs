@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::conversion::{CommandPlan, ConversionError, plan_conversion};
+use crate::conversion_backend::current_backend_report;
 use crate::manifest::{Manifest, ManifestError, State};
 use crate::workflow::{
     ConversionPerformanceInput, ConversionResultProof, WorkflowError,
@@ -39,6 +40,14 @@ pub fn execute_measured_conversion(
     }
 
     let raw_path = record.raw_path.clone();
+    let backend = current_backend_report();
+    if !backend.workflow_convert_supported {
+        return Err(ConversionExecutionError::UnsupportedBackend {
+            backend: backend.name,
+            reason: backend.reason,
+        });
+    }
+
     let plan = plan_conversion(&raw_path, &request.output_path, request.heic_quality)?;
     refuse_preexisting_output(&request.output_path)?;
     let total_started = Instant::now();
@@ -432,6 +441,11 @@ pub enum ConversionExecutionError {
     Manifest(#[from] ManifestError),
     #[error("failed to run conversion tool: {0}")]
     Io(#[from] io::Error),
+    #[error("unsupported conversion backend {backend}: {reason}")]
+    UnsupportedBackend {
+        backend: &'static str,
+        reason: &'static str,
+    },
     #[error("conversion tool not found on sanitized PATH: {program}")]
     ToolNotFound { program: String },
     #[error("{stage} command failed: {program} exited with {status}")]

@@ -4,6 +4,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use assert_cmd::Command;
 use filetime::{FileTime, set_file_mtime};
+use icloudpd_optimizer::conversion_backend::{
+    TargetPlatform, backend_report_for_target, required_tools_for_target,
+};
 use icloudpd_optimizer::manifest::{AssetRecord, Manifest, State};
 use icloudpd_optimizer::proof::NasRawProof;
 use icloudpd_optimizer::workflow::{
@@ -21,15 +24,35 @@ fn binary() -> Command {
     Command::cargo_bin("icloudpd-optimizer").expect("binary should build")
 }
 
-fn missing_tools_json() -> Value {
+fn current_target_platform() -> TargetPlatform {
+    TargetPlatform::new(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn doctor_json_with_tool_presence(present: impl Fn(&str) -> bool) -> Value {
+    let target = current_target_platform();
+    let backend = backend_report_for_target(target);
+    let required_tools: Vec<Value> = required_tools_for_target(target)
+        .iter()
+        .copied()
+        .map(|name| json!({"name": name, "present": present(name)}))
+        .collect();
+
     json!({
-        "tools": [
-            {"name": "sips", "present": false},
-            {"name": "heif-info", "present": false},
-            {"name": "magick", "present": false},
-            {"name": "exiftool", "present": false}
-        ]
+        "platform": {
+            "os": target.os,
+            "arch": target.arch
+        },
+        "conversion_backend": {
+            "name": backend.name,
+            "workflow_convert_supported": backend.workflow_convert_supported,
+            "reason": backend.reason
+        },
+        "required_tools": required_tools
     })
+}
+
+fn missing_required_tools_json() -> Value {
+    doctor_json_with_tool_presence(|_| false)
 }
 
 #[cfg(unix)]
@@ -533,7 +556,61 @@ fn doctor_json_reports_required_tools_missing_under_empty_path() {
 
     let shown = doctor_json_with_path(tempdir.path(), tempdir.path());
 
-    assert_eq!(shown, missing_tools_json());
+    assert_eq!(shown, missing_required_tools_json());
+}
+
+#[test]
+fn doctor_json_reports_platform_backend_support_and_required_tools() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let target = current_target_platform();
+    let backend = backend_report_for_target(target);
+
+    let shown = doctor_json_with_path(tempdir.path(), tempdir.path());
+
+    assert_eq!(shown["platform"]["os"], std::env::consts::OS);
+    assert_eq!(shown["platform"]["arch"], std::env::consts::ARCH);
+    assert_eq!(shown["conversion_backend"]["name"], backend.name);
+    assert_eq!(
+        shown["conversion_backend"]["workflow_convert_supported"],
+        cfg!(target_os = "macos")
+    );
+    assert_eq!(shown["conversion_backend"]["reason"], backend.reason);
+    assert_eq!(
+        shown["required_tools"]
+            .as_array()
+            .expect("required tools should be array")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name should be string"))
+            .collect::<Vec<_>>(),
+        required_tools_for_target(target)
+    );
+    assert!(
+        shown["required_tools"]
+            .as_array()
+            .expect("required tools should be array")
+            .iter()
+            .all(|tool| tool["present"] == false)
+    );
+}
+
+#[test]
+fn backend_report_marks_linux_workflow_convert_unsupported_without_sips() {
+    let target = TargetPlatform::new("linux", "x86_64");
+    let report = backend_report_for_target(target);
+
+    assert_eq!(report.name, "manual-proof-linux");
+    assert!(!report.workflow_convert_supported);
+    assert!(!required_tools_for_target(target).contains(&"sips"));
+}
+
+#[test]
+fn backend_report_marks_macos_workflow_convert_supported_with_sips() {
+    let target = TargetPlatform::new("macos", "aarch64");
+    let report = backend_report_for_target(target);
+
+    assert_eq!(report.name, "macos-sips");
+    assert!(report.workflow_convert_supported);
+    assert!(required_tools_for_target(target).contains(&"sips"));
 }
 
 #[cfg(unix)]
@@ -548,14 +625,7 @@ fn doctor_json_reports_heif_info_and_magick_as_required() {
 
     assert_eq!(
         shown,
-        json!({
-            "tools": [
-                {"name": "sips", "present": true},
-                {"name": "heif-info", "present": false},
-                {"name": "magick", "present": false},
-                {"name": "exiftool", "present": true}
-            ]
-        })
+        doctor_json_with_tool_presence(|name| name == "sips" || name == "exiftool")
     );
 }
 
@@ -567,7 +637,7 @@ fn doctor_json_ignores_empty_path_when_cwd_contains_matching_executables() {
 
     let shown = doctor_json_with_path("", cwd.path());
 
-    assert_eq!(shown, missing_tools_json());
+    assert_eq!(shown, missing_required_tools_json());
 }
 
 #[cfg(unix)]
@@ -590,7 +660,7 @@ fn doctor_json_ignores_leading_trailing_and_doubled_empty_path_components() {
 
     for path in cases {
         let shown = doctor_json_with_path(path, cwd.path());
-        assert_eq!(shown, missing_tools_json());
+        assert_eq!(shown, missing_required_tools_json());
     }
 }
 
@@ -773,7 +843,7 @@ fn workflow_conversion_result_performance_and_heic_verified_commands_complete_co
     assert_eq!(record.proofs["heic"]["heic_path"], "/staging/IMG_0001.heic");
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, target_os = "macos"))]
 #[test]
 fn workflow_convert_runs_tools_and_records_conversion_and_performance_atomically() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
@@ -848,7 +918,7 @@ fn workflow_convert_runs_tools_and_records_conversion_and_performance_atomically
     );
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, target_os = "macos"))]
 #[test]
 fn workflow_convert_ignores_empty_path_segments_without_mutating_manifest_or_output() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
@@ -894,7 +964,50 @@ fn workflow_convert_ignores_empty_path_segments_without_mutating_manifest_or_out
     assert!(!output_path.exists());
 }
 
-#[cfg(unix)]
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn workflow_convert_fails_closed_on_unsupported_backend_without_mutating_manifest_or_output() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let nas_root = tempdir.path().join("nas");
+    let raw_path = write_old_raw(&nas_root, "camera/IMG_0001.dng", b"raw-bytes");
+    manifest_with_real_nas_verified(
+        &manifest_path,
+        fs::canonicalize(&raw_path).expect("raw should canonicalize"),
+        fs::canonicalize(&nas_root).expect("nas root should canonicalize"),
+    );
+    let output_path = tempdir.path().join("IMG_0001.heic");
+    let before_manifest = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "convert",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--asset-id",
+            "asset-1",
+            "--output-path",
+            output_path.to_str().expect("output path should be utf8"),
+            "--heic-quality",
+            "91",
+        ])
+        .env("PATH", tempdir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unsupported conversion backend"))
+        .stderr(predicate::str::contains(
+            backend_report_for_target(current_target_platform()).name,
+        ));
+
+    let after_manifest = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+    assert_eq!(after_manifest, before_manifest);
+    assert!(!output_path.exists());
+}
+
+#[cfg(all(unix, target_os = "macos"))]
 #[test]
 fn workflow_convert_refuses_preexisting_output_without_mutating_manifest_or_file() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
@@ -939,7 +1052,7 @@ fn workflow_convert_refuses_preexisting_output_without_mutating_manifest_or_file
     assert_eq!(after_output, before_output);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, target_os = "macos"))]
 #[test]
 fn workflow_convert_failure_does_not_mutate_manifest() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
@@ -984,7 +1097,7 @@ fn workflow_convert_failure_does_not_mutate_manifest() {
     assert_eq!(after, before);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, target_os = "macos"))]
 #[test]
 fn workflow_convert_metadata_failure_does_not_mutate_manifest() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
@@ -1029,7 +1142,7 @@ fn workflow_convert_metadata_failure_does_not_mutate_manifest() {
     assert_eq!(after, before);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, target_os = "macos"))]
 #[test]
 fn workflow_convert_empty_output_does_not_mutate_manifest() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
@@ -1074,7 +1187,7 @@ fn workflow_convert_empty_output_does_not_mutate_manifest() {
     assert_eq!(after, before);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, target_os = "macos"))]
 #[test]
 fn workflow_convert_missing_output_does_not_mutate_manifest() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");

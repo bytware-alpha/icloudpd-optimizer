@@ -8,6 +8,9 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::conversion_backend::{
+    TargetPlatform, current_backend_report, required_tools_for_target,
+};
 use crate::conversion_execution::{
     ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversion,
     is_executable_file,
@@ -24,7 +27,6 @@ use crate::workflow::{
     upload_ready_heic_proof,
 };
 
-const REQUIRED_TOOLS: [&str; 4] = ["sips", "heif-info", "magick", "exiftool"];
 const DAY_SECONDS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Parser)]
@@ -304,9 +306,21 @@ fn show_manifest<W: Write>(args: ManifestShowArgs, writer: &mut W) -> Result<(),
 
 fn run_doctor<W: Write>(args: DoctorArgs, writer: &mut W) -> Result<(), CliError> {
     if args.json {
+        let target = TargetPlatform::current();
+        let backend = current_backend_report();
         let report = DoctorReport {
-            tools: REQUIRED_TOOLS
-                .into_iter()
+            platform: PlatformReport {
+                os: target.os,
+                arch: target.arch,
+            },
+            conversion_backend: DoctorConversionBackendReport {
+                name: backend.name,
+                workflow_convert_supported: backend.workflow_convert_supported,
+                reason: backend.reason,
+            },
+            required_tools: required_tools_for_target(target)
+                .iter()
+                .copied()
                 .map(|name| ToolReport {
                     name,
                     present: tool_present(name),
@@ -528,7 +542,22 @@ struct ManifestOutput<'a> {
 
 #[derive(Serialize)]
 struct DoctorReport {
-    tools: Vec<ToolReport>,
+    platform: PlatformReport,
+    conversion_backend: DoctorConversionBackendReport,
+    required_tools: Vec<ToolReport>,
+}
+
+#[derive(Serialize)]
+struct PlatformReport {
+    os: &'static str,
+    arch: &'static str,
+}
+
+#[derive(Serialize)]
+struct DoctorConversionBackendReport {
+    name: &'static str,
+    workflow_convert_supported: bool,
+    reason: &'static str,
 }
 
 #[derive(Serialize)]

@@ -22,3 +22,5 @@ output/
 outputs/
 
 target/
+
+.superpowers/
