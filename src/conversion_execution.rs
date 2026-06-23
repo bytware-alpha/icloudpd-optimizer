@@ -8,8 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::conversion::{CommandPlan, ConversionError, plan_conversion};
-use crate::conversion_backend::current_backend_report;
+use crate::conversion::{CommandPlan, ConversionError, plan_conversion_for_target};
+use crate::conversion_backend::{TargetPlatform, backend_report_for_target};
 use crate::manifest::{Manifest, ManifestError, State};
 use crate::workflow::{
     ConversionPerformanceInput, ConversionResultProof, WorkflowError,
@@ -28,6 +28,14 @@ pub fn execute_measured_conversion(
     manifest: &Manifest,
     request: ConversionExecutionRequest,
 ) -> Result<Manifest, ConversionExecutionError> {
+    execute_measured_conversion_for_target(manifest, request, TargetPlatform::current())
+}
+
+fn execute_measured_conversion_for_target(
+    manifest: &Manifest,
+    request: ConversionExecutionRequest,
+    target: TargetPlatform,
+) -> Result<Manifest, ConversionExecutionError> {
     let record = manifest.get(&request.asset_id)?;
     if record.state != State::NasVerified {
         return Err(ConversionExecutionError::Workflow(WorkflowError::Manifest(
@@ -40,7 +48,7 @@ pub fn execute_measured_conversion(
     }
 
     let raw_path = record.raw_path.clone();
-    let backend = current_backend_report();
+    let backend = backend_report_for_target(target);
     if !backend.workflow_convert_supported {
         return Err(ConversionExecutionError::UnsupportedBackend {
             backend: backend.name,
@@ -48,11 +56,16 @@ pub fn execute_measured_conversion(
         });
     }
 
-    let plan = plan_conversion(&raw_path, &request.output_path, request.heic_quality)?;
+    let plan = plan_conversion_for_target(
+        target,
+        &raw_path,
+        &request.output_path,
+        request.heic_quality,
+    )?;
     refuse_preexisting_output(&request.output_path)?;
     let total_started = Instant::now();
     let convert_started = Instant::now();
-    let convert_usage = run_planned_command("conversion", &plan.convert)?;
+    let convert_usage = run_planned_commands("conversion", &plan.conversion_commands)?;
     let convert_wall_time_millis = positive_millis(convert_started.elapsed());
     let metadata_usage = run_planned_command("metadata", &plan.metadata)?;
     let output = inspect_output(&request.output_path)?;
@@ -74,7 +87,7 @@ pub fn execute_measured_conversion(
         &request.asset_id,
         ConversionPerformanceInput {
             measured_at_unix_seconds: current_unix_seconds(),
-            conversion_tool: plan.convert.program,
+            conversion_tool: conversion_tool_name(&plan),
             conversion_tool_version: request.conversion_tool_version,
             heic_quality: request.heic_quality,
             convert_wall_time_millis,
@@ -86,6 +99,18 @@ pub fn execute_measured_conversion(
     )?;
 
     Ok(updated)
+}
+
+fn conversion_tool_name(plan: &crate::conversion::ConversionPlan) -> String {
+    match plan.conversion_commands.as_slice() {
+        [] => plan.convert.program.clone(),
+        [command] => command.program.clone(),
+        commands => commands
+            .iter()
+            .map(|command| command.program.as_str())
+            .collect::<Vec<_>>()
+            .join("+"),
+    }
 }
 
 fn refuse_preexisting_output(path: &Path) -> Result<(), ConversionExecutionError> {
@@ -120,6 +145,17 @@ fn run_planned_command(
         });
     }
     Ok(outcome.resource_usage)
+}
+
+fn run_planned_commands(
+    stage: &'static str,
+    plans: &[CommandPlan],
+) -> Result<ChildResourceUsage, ConversionExecutionError> {
+    let mut resource_usage = ChildResourceUsage::default();
+    for plan in plans {
+        resource_usage = resource_usage.combine(run_planned_command(stage, plan)?);
+    }
+    Ok(resource_usage)
 }
 
 fn resolve_sanitized_path_tool(program: &str) -> Result<PathBuf, ConversionExecutionError> {
@@ -469,6 +505,14 @@ pub enum ConversionExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    use crate::proof::NasRawProof;
+    use crate::workflow::{discover_raw_asset, record_nas_proof};
+
+    #[cfg(unix)]
+    static PATH_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn inspect_output_rejects_file_changed_after_hashing() {
@@ -481,5 +525,248 @@ mod tests {
         });
 
         assert!(result.is_err(), "mutated output must fail closed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_conversion_runs_full_chain_and_records_chain_tool_name() {
+        let tool_dir = fake_linux_conversion_tools();
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest = nas_verified_manifest(&raw_path);
+
+        let updated = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: Some("linux-tools-1".to_string()),
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect("linux conversion chain should complete");
+
+        let heic = fs::read(&output_path).expect("heic output should be readable");
+        let record = updated.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::Converted);
+        assert_eq!(
+            record.proofs["conversion"]["heic_path"],
+            output_path.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            record.proofs["conversion"]["heic_sha256"],
+            format!("{:x}", Sha256::digest(&heic))
+        );
+        assert_eq!(
+            record.proofs["conversion_performance"]["conversion_tool"],
+            "darktable-cli+heif-enc"
+        );
+        assert_eq!(
+            record.proofs["conversion_performance"]["conversion_tool_version"],
+            "linux-tools-1"
+        );
+        assert!(
+            record.proofs["conversion_performance"]["total_wall_time_millis"]
+                .as_u64()
+                .expect("total wall time should be present")
+                >= record.proofs["conversion_performance"]["convert_wall_time_millis"]
+                    .as_u64()
+                    .expect("convert wall time should be present")
+        );
+        assert_eq!(
+            fs::read_to_string(log_path).expect("command log should be readable"),
+            "darktable-cli\nheif-enc\nexiftool\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_conversion_chain_failure_does_not_record_output() {
+        let tool_dir = fake_linux_conversion_tools_with_heif_enc(
+            r#"#!/bin/sh
+printf 'heif-enc\n' >> "$EXECUTION_LOG"
+exit 44
+"#,
+        );
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest = nas_verified_manifest(&raw_path);
+
+        let error = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("failing heif-enc should fail conversion");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::CommandFailed {
+                stage: "conversion",
+                program,
+                ..
+            } if program == "heif-enc"
+        ));
+        assert!(!output_path.exists());
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::NasVerified);
+        assert!(!record.proofs.contains_key("conversion"));
+        assert!(!record.proofs.contains_key("conversion_performance"));
+        assert_eq!(
+            fs::read_to_string(log_path).expect("command log should be readable"),
+            "darktable-cli\nheif-enc\n"
+        );
+    }
+
+    #[cfg(unix)]
+    fn fake_linux_conversion_tools() -> tempfile::TempDir {
+        fake_linux_conversion_tools_with_heif_enc(
+            r#"#!/bin/sh
+printf 'heif-enc\n' >> "$EXECUTION_LOG"
+out=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-o" ]; then
+    out="$arg"
+  fi
+  previous="$arg"
+done
+if [ -z "$out" ]; then
+  exit 43
+fi
+printf 'heic-bytes-from-linux-chain' > "$out"
+"#,
+        )
+    }
+
+    #[cfg(unix)]
+    fn fake_linux_conversion_tools_with_heif_enc(heif_enc_body: &str) -> tempfile::TempDir {
+        let tempdir = tempfile::tempdir().expect("tool tempdir should be created");
+        write_executable_script(
+            &tempdir.path().join("darktable-cli"),
+            r#"#!/bin/sh
+printf 'darktable-cli\n' >> "$EXECUTION_LOG"
+printf 'rendered-pixels' > "$2"
+"#,
+        );
+        write_executable_script(&tempdir.path().join("heif-enc"), heif_enc_body);
+        write_executable_script(
+            &tempdir.path().join("exiftool"),
+            r#"#!/bin/sh
+printf 'exiftool\n' >> "$EXECUTION_LOG"
+exit 0
+"#,
+        );
+        tempdir
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, body).expect("fake tool should be written");
+        let mut permissions = fs::metadata(path)
+            .expect("fake tool metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("fake tool should be executable");
+    }
+
+    fn nas_verified_manifest(raw_path: &Path) -> Manifest {
+        let mut manifest = Manifest::new();
+        discover_raw_asset(&mut manifest, "asset-1", raw_path.to_path_buf())
+            .expect("asset should be discovered");
+        record_nas_proof(
+            &mut manifest,
+            "asset-1",
+            NasRawProof {
+                canonical_path: raw_path.to_path_buf(),
+                relative_path: PathBuf::from("IMG_0001.dng"),
+                size_bytes: 9,
+                modified_unix_seconds: 1_700_000_000,
+                age_seconds: 40 * 24 * 60 * 60,
+                sha256: "raw-sha256".to_string(),
+            },
+        )
+        .expect("nas proof should be recorded");
+        manifest
+    }
+
+    #[cfg(unix)]
+    struct PathGuard {
+        previous: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl PathGuard {
+        fn install(path: &Path) -> Self {
+            let lock = PATH_LOCK.lock().expect("PATH lock should be available");
+            let previous = env::var_os("PATH");
+            unsafe {
+                env::set_var("PATH", path);
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(previous) => env::set_var("PATH", previous),
+                    None => env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvVarGuard {
+        fn install(name: &'static str, value: &Path) -> Self {
+            let previous = env::var_os(name);
+            unsafe {
+                env::set_var(name, value);
+            }
+            Self { name, previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(previous) => env::set_var(self.name, previous),
+                    None => env::remove_var(self.name),
+                }
+            }
+        }
     }
 }
