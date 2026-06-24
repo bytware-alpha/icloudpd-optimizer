@@ -290,6 +290,11 @@ icloudpd-optimizer monitor launchd-plist \
   --output ~/Library/LaunchAgents/com.icloudpd-optimizer.monitor.plist
 ```
 
+On macOS, a LaunchAgent that scans a NAS or SMB-backed iCloudPD folder must be
+allowed to access network volumes. If macOS denies that access, the monitor logs a
+scan preflight error instead of hanging; grant the installed app or binary Network
+Volumes/Full Disk Access before enabling the agent.
+
 ## Conversion Performance
 
 Prefer `workflow convert` for new runs. It executes the platform-native conversion
