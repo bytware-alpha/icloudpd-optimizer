@@ -63,6 +63,13 @@ check:
     cargo clippy --locked --all-targets -- -D warnings
     cargo test --locked
 
+# Build and install the CLI into a local prefix.
+install prefix='$HOME/.local':
+    cargo build --release --locked
+    mkdir -p "{{prefix}}/bin"
+    cp target/release/icloudpd-optimizer "{{prefix}}/bin/icloudpd-optimizer"
+    "{{prefix}}/bin/icloudpd-optimizer" doctor --json
+
 # Build the standard OCI Linux image with Apple container.
 apple-image-build tag='icloudpd-optimizer:local':
     container build --tag {{tag}} --file container/Containerfile .

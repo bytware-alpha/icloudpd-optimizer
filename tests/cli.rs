@@ -121,6 +121,26 @@ fi
 exit 0
 "#,
     );
+    write_executable_with_body(
+        &directory.join("heif-enc"),
+        r#"#!/bin/sh
+if [ "${FAIL_HEIF_ENC:-}" = "1" ]; then
+  exit 45
+fi
+out=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-o" ]; then
+    out="$arg"
+  fi
+  previous="$arg"
+done
+if [ -z "$out" ]; then
+  exit 46
+fi
+printf 'heic-bytes-from-fake-heif-enc' > "$out"
+"#,
+    );
 }
 
 fn doctor_json_with_path(path: impl AsRef<std::ffi::OsStr>, cwd: &std::path::Path) -> Value {
@@ -769,6 +789,387 @@ fn manifest_show_bad_manifest_fails_without_mutating_it() {
 
     let after = fs::read_to_string(&manifest_path).expect("bad manifest should remain readable");
     assert_eq!(after, before);
+}
+
+#[cfg(unix)]
+#[test]
+fn monitor_init_writes_simple_config_without_overwriting() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let config_path = tempdir.path().join("monitor.json");
+    let download_root = tempdir.path().join("download");
+    let heic_dir = tempdir.path().join("heic");
+    let manifest_path = tempdir.path().join("manifest.json");
+
+    binary()
+        .args([
+            "monitor",
+            "init",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--download-root",
+            download_root
+                .to_str()
+                .expect("download root should be utf8"),
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--heic-output-dir",
+            heic_dir.to_str().expect("heic dir should be utf8"),
+            "--scan-interval-seconds",
+            "60",
+            "--jobs",
+            "4",
+        ])
+        .assert()
+        .success();
+
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).expect("config should be readable"))
+            .expect("config should be json");
+    assert_eq!(config["schema_version"], 1);
+    assert_eq!(
+        config["download_root"],
+        download_root.to_string_lossy().as_ref()
+    );
+    assert_eq!(config["nas_root"], download_root.to_string_lossy().as_ref());
+    assert_eq!(
+        config["manifest_path"],
+        manifest_path.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        config["heic_output_dir"],
+        heic_dir.to_string_lossy().as_ref()
+    );
+    assert_eq!(config["scan_interval_seconds"], 60);
+    assert_eq!(config["jobs"], 4);
+
+    binary()
+        .args([
+            "monitor",
+            "init",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--download-root",
+            download_root
+                .to_str()
+                .expect("download root should be utf8"),
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--heic-output-dir",
+            heic_dir.to_str().expect("heic dir should be utf8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"));
+}
+
+#[cfg(unix)]
+#[test]
+fn monitor_run_once_converts_matching_old_raw_and_writes_stats() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
+    write_fake_conversion_tools(tool_dir.path());
+    let config_path = tempdir.path().join("monitor.json");
+    let download_root = tempdir.path().join("download");
+    let heic_dir = tempdir.path().join("heic");
+    let manifest_path = tempdir.path().join("manifest.json");
+    fs::create_dir_all(&download_root).expect("download root should be created");
+    let raw_path = write_old_raw(&download_root, "PrimarySync/IMG_0001.DNG", b"raw-bytes");
+
+    binary()
+        .args([
+            "monitor",
+            "init",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--download-root",
+            download_root
+                .to_str()
+                .expect("download root should be utf8"),
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--heic-output-dir",
+            heic_dir.to_str().expect("heic dir should be utf8"),
+            "--jobs",
+            "2",
+            "--conversion-tool-version",
+            "monitor-test",
+        ])
+        .assert()
+        .success();
+
+    binary()
+        .args([
+            "monitor",
+            "run",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--once",
+        ])
+        .env("PATH", tool_dir.path())
+        .assert()
+        .success();
+
+    let manifest = Manifest::load(&manifest_path).expect("manifest should load");
+    let record = manifest
+        .records()
+        .values()
+        .next()
+        .expect("monitor should discover one record");
+    assert_eq!(record.state, State::Converted);
+    assert_eq!(
+        record.proofs["nas"]["canonical_path"],
+        fs::canonicalize(raw_path)
+            .expect("raw should canonicalize")
+            .to_string_lossy()
+            .as_ref()
+    );
+    let heic_path = record.proofs["conversion"]["heic_path"]
+        .as_str()
+        .expect("conversion should record heic path");
+    assert!(PathBuf::from(heic_path).exists());
+    assert_eq!(
+        record.proofs["conversion_performance"]["conversion_tool_version"],
+        "monitor-test"
+    );
+
+    let stats_path = config_path.with_file_name("manifest.monitor-stats.json");
+    let stats: Value =
+        serde_json::from_str(&fs::read_to_string(&stats_path).expect("stats should be readable"))
+            .expect("stats should be json");
+    assert_eq!(stats["scans_started"], 1);
+    assert_eq!(stats["scans_completed"], 1);
+    assert_eq!(stats["raw_files_seen"], 1);
+    assert_eq!(stats["candidates_verified"], 1);
+    assert_eq!(stats["conversions_attempted"], 1);
+    assert_eq!(stats["conversions_completed"], 1);
+    assert_eq!(stats["state_counts"]["converted"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn monitor_run_once_honors_max_conversions_per_scan() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
+    write_fake_conversion_tools(tool_dir.path());
+    let config_path = tempdir.path().join("monitor.json");
+    let download_root = tempdir.path().join("download");
+    let heic_dir = tempdir.path().join("heic");
+    let manifest_path = tempdir.path().join("manifest.json");
+    fs::create_dir_all(&download_root).expect("download root should be created");
+    write_old_raw(&download_root, "PrimarySync/IMG_0001.DNG", b"raw-one");
+    write_old_raw(&download_root, "PrimarySync/IMG_0002.DNG", b"raw-two");
+
+    binary()
+        .args([
+            "monitor",
+            "init",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--download-root",
+            download_root
+                .to_str()
+                .expect("download root should be utf8"),
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--heic-output-dir",
+            heic_dir.to_str().expect("heic dir should be utf8"),
+            "--max-conversions-per-scan",
+            "1",
+        ])
+        .assert()
+        .success();
+
+    binary()
+        .args([
+            "monitor",
+            "run",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--once",
+        ])
+        .env("PATH", tool_dir.path())
+        .assert()
+        .success();
+
+    let manifest = Manifest::load(&manifest_path).expect("manifest should load");
+    assert_eq!(manifest.records().len(), 1);
+    assert_eq!(
+        manifest
+            .records()
+            .values()
+            .next()
+            .expect("one record should exist")
+            .state,
+        State::Converted
+    );
+    assert_eq!(
+        fs::read_dir(&heic_dir)
+            .expect("heic dir should be readable")
+            .filter(|entry| entry
+                .as_ref()
+                .expect("entry should be readable")
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("heic"))
+            .count(),
+        1
+    );
+
+    let stats: Value = serde_json::from_str(
+        &fs::read_to_string(config_path.with_file_name("manifest.monitor-stats.json"))
+            .expect("stats should be readable"),
+    )
+    .expect("stats should be json");
+    assert_eq!(stats["conversions_attempted"], 1);
+    assert_eq!(stats["conversions_completed"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn monitor_run_once_skips_young_raw_without_manifest_record() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let config_path = tempdir.path().join("monitor.json");
+    let download_root = tempdir.path().join("download");
+    let heic_dir = tempdir.path().join("heic");
+    let manifest_path = tempdir.path().join("manifest.json");
+    fs::create_dir_all(download_root.join("PrimarySync")).expect("download root should be created");
+    fs::write(download_root.join("PrimarySync/IMG_0001.DNG"), b"young-raw")
+        .expect("young raw should be written");
+
+    binary()
+        .args([
+            "monitor",
+            "init",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--download-root",
+            download_root
+                .to_str()
+                .expect("download root should be utf8"),
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--heic-output-dir",
+            heic_dir.to_str().expect("heic dir should be utf8"),
+        ])
+        .assert()
+        .success();
+
+    binary()
+        .args([
+            "monitor",
+            "run",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--once",
+        ])
+        .assert()
+        .success();
+
+    let manifest = Manifest::load(&manifest_path).expect("manifest should load");
+    assert!(manifest.records().is_empty());
+    let stats: Value = serde_json::from_str(
+        &fs::read_to_string(config_path.with_file_name("manifest.monitor-stats.json"))
+            .expect("stats should be readable"),
+    )
+    .expect("stats should be json");
+    assert_eq!(stats["raw_files_seen"], 1);
+    assert_eq!(stats["skipped_not_ready"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn monitor_stats_tui_and_launchd_plist_are_simple_and_non_secret() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let config_path = tempdir.path().join("monitor.json");
+    let download_root = tempdir.path().join("download");
+    let heic_dir = tempdir.path().join("heic");
+    let manifest_path = tempdir.path().join("manifest.json");
+
+    binary()
+        .args([
+            "monitor",
+            "init",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--download-root",
+            download_root
+                .to_str()
+                .expect("download root should be utf8"),
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--heic-output-dir",
+            heic_dir.to_str().expect("heic dir should be utf8"),
+        ])
+        .assert()
+        .success();
+
+    let stats_output = binary()
+        .args([
+            "monitor",
+            "stats",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stats_text = String::from_utf8(stats_output).expect("stats should be utf8");
+    assert!(stats_text.contains("icloudpd-optimizer monitor"));
+    assert!(!stats_text.to_ascii_lowercase().contains("password"));
+    assert!(!stats_text.to_ascii_lowercase().contains("token"));
+
+    let tui_output = binary()
+        .args([
+            "monitor",
+            "tui",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--once",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let tui_text = String::from_utf8(tui_output).expect("tui should be utf8");
+    assert!(tui_text.contains("icloudpd-optimizer monitor"));
+    assert!(tui_text.contains("Press Ctrl-C to stop"));
+
+    let plist_output = binary()
+        .args([
+            "monitor",
+            "launchd-plist",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--bin",
+            "/usr/local/bin/icloudpd-optimizer",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let plist = String::from_utf8(plist_output).expect("plist should be utf8");
+    assert!(plist.contains("<string>monitor</string>"));
+    assert!(plist.contains("<string>run</string>"));
+    assert!(!plist.contains("/config"));
+    assert!(!plist.to_ascii_lowercase().contains("password"));
+    assert!(!plist.to_ascii_lowercase().contains("token"));
 }
 
 #[test]

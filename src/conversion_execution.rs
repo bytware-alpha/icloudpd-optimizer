@@ -72,19 +72,33 @@ fn execute_measured_conversions_for_target(
         }
 
         let mut chunk_results = Vec::with_capacity(handles.len());
+        let mut first_error = None;
         for (asset_id, handle) in handles {
-            let result =
-                handle
-                    .join()
-                    .map_err(|_| ConversionExecutionError::BatchWorkerPanicked {
-                        asset_id: asset_id.clone(),
-                    })?;
-            let (asset_id, manifest) =
-                result.map_err(|source| ConversionExecutionError::BatchConversionFailed {
-                    asset_id: asset_id.clone(),
-                    source: Box::new(source),
-                })?;
-            chunk_results.push((asset_id, manifest));
+            match handle.join() {
+                Ok(Ok((asset_id, manifest))) => chunk_results.push((asset_id, manifest)),
+                Ok(Err(source)) => {
+                    first_error.get_or_insert_with(|| {
+                        ConversionExecutionError::BatchConversionFailed {
+                            asset_id: asset_id.clone(),
+                            source: Box::new(source),
+                        }
+                    });
+                }
+                Err(_) => {
+                    first_error.get_or_insert_with(|| {
+                        ConversionExecutionError::BatchWorkerPanicked {
+                            asset_id: asset_id.clone(),
+                        }
+                    });
+                }
+            }
+        }
+
+        if let Some(error) = first_error {
+            for (_, manifest) in chunk_results {
+                remove_conversion_outputs(&manifest);
+            }
+            return Err(error);
         }
 
         for (asset_id, manifest) in chunk_results {
@@ -94,6 +108,21 @@ fn execute_measured_conversions_for_target(
     }
 
     Ok(updated)
+}
+
+fn remove_conversion_outputs(manifest: &Manifest) {
+    for record in manifest.records().values() {
+        if record.state == State::Converted {
+            if let Some(path) = record
+                .proofs
+                .get("conversion")
+                .and_then(|proof| proof.get("heic_path"))
+                .and_then(|path| path.as_str())
+            {
+                remove_failed_output(Path::new(path));
+            }
+        }
+    }
 }
 
 fn reject_duplicate_batch_inputs(
@@ -863,7 +892,7 @@ mod tests {
             vec![
                 ConversionExecutionRequest {
                     asset_id: "asset-1".to_string(),
-                    output_path: output_1,
+                    output_path: output_1.clone(),
                     heic_quality: 91,
                     conversion_tool_version: None,
                 },
@@ -892,6 +921,14 @@ mod tests {
         assert_eq!(
             manifest.get("asset-2").expect("asset should exist").state,
             State::NasVerified
+        );
+        assert!(
+            !output_1.exists(),
+            "successful worker output from a failed batch chunk must be removed"
+        );
+        assert_eq!(
+            fs::read(&output_2).expect("preexisting output should remain readable"),
+            b"existing-output"
         );
     }
 

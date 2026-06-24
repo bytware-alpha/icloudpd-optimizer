@@ -49,6 +49,7 @@ The current CLI can:
 - verify RAW files under a storage root;
 - plan RAW-to-HEIC conversion commands;
 - require visual validation before upload;
+- monitor an iCloudPD download folder and convert matching old RAWs in the background;
 - upload verified HEIC files through an external iCloud Photos upload session;
 - reject incomplete or inconsistent workflow states;
 - print a JSON delete plan for manual review.
@@ -67,6 +68,13 @@ Install from source:
 git clone https://github.com/bytware-alpha/icloudpd-optimizer.git
 cd icloudpd-optimizer
 cargo install --path . --locked
+```
+
+For local development, `just install` builds the release binary and copies it to
+`$HOME/.local/bin`:
+
+```sh
+just install
 ```
 
 Check the active platform contract:
@@ -232,6 +240,55 @@ downloaded media from a read-only media mount and write only its manifest/stagin
 The optimizer media mount must match the `docker-icloudpd` `download_path`; in the
 example above, both services use `/data`.
 Run `icloudpd-optimizer doctor --json` in the host/sidecar environment before automation.
+
+## Background Monitor
+
+The monitor is a small foreground process that is meant to be launched by
+`launchd`, systemd, cron, or a terminal. It polls the iCloudPD download folder,
+proves matching RAW files are under the configured storage root and older than
+the safety floor, then runs the existing measured conversion path with bounded
+parallelism. It stops at the `converted` manifest state. It does not authenticate
+to Apple, upload, approve delete, execute delete, or mutate iCloud.
+
+Create a config:
+
+```sh
+icloudpd-optimizer monitor init \
+  --config ~/.config/icloudpd-optimizer/monitor.json \
+  --download-root /photos/PrimarySync \
+  --manifest ~/.local/state/icloudpd-optimizer/manifest.json \
+  --heic-output-dir ~/.local/state/icloudpd-optimizer/heic \
+  --jobs 4 \
+  --scan-interval-seconds 300
+```
+
+Run one scan manually:
+
+```sh
+icloudpd-optimizer monitor run --config ~/.config/icloudpd-optimizer/monitor.json --once
+```
+
+Run continuously:
+
+```sh
+icloudpd-optimizer monitor run --config ~/.config/icloudpd-optimizer/monitor.json
+```
+
+Show stats or the simple TUI:
+
+```sh
+icloudpd-optimizer monitor stats --config ~/.config/icloudpd-optimizer/monitor.json
+icloudpd-optimizer monitor tui --config ~/.config/icloudpd-optimizer/monitor.json
+```
+
+Generate a macOS LaunchAgent plist:
+
+```sh
+icloudpd-optimizer monitor launchd-plist \
+  --config ~/.config/icloudpd-optimizer/monitor.json \
+  --bin ~/.local/bin/icloudpd-optimizer \
+  --output ~/Library/LaunchAgents/com.icloudpd-optimizer.monitor.plist
+```
 
 ## Conversion Performance
 

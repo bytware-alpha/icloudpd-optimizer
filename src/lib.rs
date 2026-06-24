@@ -4,6 +4,7 @@ pub mod conversion_backend;
 pub mod conversion_execution;
 pub mod local_mirror;
 pub mod manifest;
+pub mod monitor;
 pub mod proof;
 pub mod upload;
 pub mod workflow;

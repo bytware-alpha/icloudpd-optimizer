@@ -2,7 +2,8 @@ use std::env;
 use std::io::ErrorKind;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
@@ -19,6 +20,10 @@ use crate::local_mirror::{
     IcloudpdLocalMirrorRequest, LocalMirrorError, ensure_icloudpd_local_mirror,
 };
 use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
+use crate::monitor::{
+    MonitorConfig, MonitorError, MonitorStats, launchd_plist, render_tui, run_monitor_once,
+    write_launchd_plist,
+};
 use crate::proof::NasRawProof;
 use crate::upload::{
     CloudKitDeleteClient, CloudKitOriginalAssetBatchResolveRequest,
@@ -54,6 +59,7 @@ enum Command {
     Manifest(ManifestArgs),
     Doctor(DoctorArgs),
     Workflow(WorkflowArgs),
+    Monitor(MonitorArgs),
 }
 
 #[derive(Debug, Args)]
@@ -83,6 +89,97 @@ struct DoctorArgs {
 struct WorkflowArgs {
     #[command(subcommand)]
     command: WorkflowCommand,
+}
+
+#[derive(Debug, Args)]
+struct MonitorArgs {
+    #[command(subcommand)]
+    command: MonitorCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum MonitorCommand {
+    #[command(about = "Write a simple monitor config JSON file")]
+    Init(MonitorInitArgs),
+    #[command(about = "Run the background monitor loop")]
+    Run(MonitorRunArgs),
+    #[command(about = "Print monitor stats")]
+    Stats(MonitorStatsArgs),
+    #[command(about = "Show a simple refreshing monitor TUI")]
+    Tui(MonitorTuiArgs),
+    #[command(
+        name = "launchd-plist",
+        about = "Print or write a macOS user LaunchAgent plist"
+    )]
+    LaunchdPlist(MonitorLaunchdPlistArgs),
+}
+
+#[derive(Debug, Args)]
+struct MonitorInitArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long, value_name = "DIR")]
+    download_root: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+    #[arg(long, value_name = "DIR")]
+    heic_output_dir: PathBuf,
+    #[arg(long, value_name = "DIR")]
+    nas_root: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    stats: Option<PathBuf>,
+    #[arg(long, default_value_t = 30)]
+    min_age_days: u64,
+    #[arg(long, default_value_t = 300)]
+    scan_interval_seconds: u64,
+    #[arg(long, default_value_t = 1)]
+    jobs: usize,
+    #[arg(long, default_value_t = 90)]
+    heic_quality: u8,
+    #[arg(long, default_value_t = 25)]
+    max_conversions_per_scan: usize,
+    #[arg(long)]
+    conversion_tool_version: Option<String>,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct MonitorRunArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    once: bool,
+}
+
+#[derive(Debug, Args)]
+struct MonitorStatsArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MonitorTuiArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long, default_value_t = 2)]
+    refresh_seconds: u64,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    once: bool,
+}
+
+#[derive(Debug, Args)]
+struct MonitorLaunchdPlistArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long, default_value = "com.icloudpd-optimizer.monitor")]
+    label: String,
+    #[arg(long, value_name = "PATH")]
+    bin: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -394,6 +491,10 @@ pub enum CliError {
     Upload(#[from] UploadError),
     #[error("local mirror failed: {0}")]
     LocalMirror(#[from] LocalMirrorError),
+    #[error("monitor failed: {0}")]
+    Monitor(#[from] MonitorError),
+    #[error("config already exists at {path}; pass --force to overwrite")]
+    ConfigAlreadyExists { path: PathBuf },
     #[error("unsafe batch asset id for output filename: {asset_id}")]
     UnsafeBatchAssetId { asset_id: String },
     #[error("failed to write JSON: {0}")]
@@ -411,6 +512,7 @@ fn run_with_writer<W: Write>(cli: Cli, writer: &mut W) -> Result<(), CliError> {
         Command::Manifest(args) => run_manifest(args, writer),
         Command::Doctor(args) => run_doctor(args, writer),
         Command::Workflow(args) => run_workflow(args, writer),
+        Command::Monitor(args) => run_monitor(args, writer),
     }
 }
 
@@ -484,6 +586,93 @@ fn run_workflow<W: Write>(args: WorkflowArgs, writer: &mut W) -> Result<(), CliE
         WorkflowCommand::DeletePlan(args) => workflow_delete_plan(args, writer),
         WorkflowCommand::DeleteExecute(args) => workflow_delete_execute(args),
     }
+}
+
+fn run_monitor<W: Write>(args: MonitorArgs, writer: &mut W) -> Result<(), CliError> {
+    match args.command {
+        MonitorCommand::Init(args) => monitor_init(args),
+        MonitorCommand::Run(args) => monitor_run(args),
+        MonitorCommand::Stats(args) => monitor_stats(args, writer),
+        MonitorCommand::Tui(args) => monitor_tui(args, writer),
+        MonitorCommand::LaunchdPlist(args) => monitor_launchd_plist(args, writer),
+    }
+}
+
+fn monitor_init(args: MonitorInitArgs) -> Result<(), CliError> {
+    if args.config.exists() && !args.force {
+        return Err(CliError::ConfigAlreadyExists { path: args.config });
+    }
+    let mut config = MonitorConfig::new(args.download_root, args.manifest, args.heic_output_dir);
+    if let Some(nas_root) = args.nas_root {
+        config.nas_root = nas_root;
+    }
+    if let Some(stats_path) = args.stats {
+        config.stats_path = stats_path;
+    }
+    config.min_age_days = args.min_age_days;
+    config.scan_interval_seconds = args.scan_interval_seconds;
+    config.jobs = args.jobs;
+    config.heic_quality = args.heic_quality;
+    config.max_conversions_per_scan = args.max_conversions_per_scan;
+    config.conversion_tool_version = args.conversion_tool_version;
+    config.validate()?;
+    config.save_atomic(args.config)?;
+    Ok(())
+}
+
+fn monitor_run(args: MonitorRunArgs) -> Result<(), CliError> {
+    let config = MonitorConfig::load(&args.config)?;
+    config.validate()?;
+    if args.once {
+        run_monitor_once(&config)?;
+        return Ok(());
+    }
+
+    loop {
+        run_monitor_once(&config)?;
+        thread::sleep(Duration::from_secs(config.scan_interval_seconds));
+    }
+}
+
+fn monitor_stats<W: Write>(args: MonitorStatsArgs, writer: &mut W) -> Result<(), CliError> {
+    let config = MonitorConfig::load(&args.config)?;
+    let stats = MonitorStats::load(&config.stats_path)?;
+    if args.json {
+        serde_json::to_writer_pretty(&mut *writer, &stats)?;
+        writeln!(writer)?;
+    } else {
+        write!(writer, "{}", render_tui(&config, &stats))?;
+    }
+    Ok(())
+}
+
+fn monitor_tui<W: Write>(args: MonitorTuiArgs, writer: &mut W) -> Result<(), CliError> {
+    let config = MonitorConfig::load(&args.config)?;
+    loop {
+        let stats = MonitorStats::load(&config.stats_path)?;
+        write!(writer, "\x1b[2J\x1b[H{}", render_tui(&config, &stats))?;
+        writer.flush()?;
+        if args.once {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_secs(args.refresh_seconds.max(1)));
+    }
+}
+
+fn monitor_launchd_plist<W: Write>(
+    args: MonitorLaunchdPlistArgs,
+    writer: &mut W,
+) -> Result<(), CliError> {
+    let binary = match args.bin {
+        Some(path) => path,
+        None => env::current_exe()?,
+    };
+    if let Some(output) = args.output {
+        write_launchd_plist(&args.label, &binary, &args.config, &output)?;
+    } else {
+        writer.write_all(launchd_plist(&args.label, &binary, &args.config)?.as_bytes())?;
+    }
+    Ok(())
 }
 
 fn workflow_nas_verified(args: WorkflowNasVerifiedArgs) -> Result<(), CliError> {
