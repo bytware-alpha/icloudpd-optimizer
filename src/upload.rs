@@ -503,6 +503,7 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
             .map(|target| (target.asset_id.clone(), Vec::new()))
             .collect();
         let target_index = OriginalAssetTargetIndex::new(&request.targets);
+        let mut download_cache: BTreeMap<(String, u64), CloudKitResourceDownload> = BTreeMap::new();
         let mut exhausted = false;
         let mut continuation_marker = None;
         for _ in 0..request.max_pages {
@@ -518,21 +519,29 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
                 &target_index,
             )?;
             for candidate in page_result.matches {
-                let download = self.transport.download_resource(
-                    session,
-                    &candidate.download_url,
+                let cache_key = (
+                    candidate.download_url.as_str().to_string(),
                     candidate.raw_size_bytes,
-                )?;
-                if download.size_bytes != candidate.raw_size_bytes {
-                    return Err(UploadError::CloudKitOriginalAssetDownloadSizeMismatch {
-                        expected: candidate.raw_size_bytes,
-                        actual: download.size_bytes,
-                    });
-                }
+                );
+                let download = if let Some(download) = download_cache.get(&cache_key) {
+                    download.clone()
+                } else {
+                    let download = self.transport.download_resource(
+                        session,
+                        &candidate.download_url,
+                        candidate.raw_size_bytes,
+                    )?;
+                    if download.size_bytes != candidate.raw_size_bytes {
+                        return Err(UploadError::CloudKitOriginalAssetDownloadSizeMismatch {
+                            expected: candidate.raw_size_bytes,
+                            actual: download.size_bytes,
+                        });
+                    }
+                    download_cache.insert(cache_key, download.clone());
+                    download
+                };
                 if download.sha256 != candidate.matched_raw_sha256 {
-                    return Err(UploadError::OriginalAssetResolveHashMismatch {
-                        asset_id: candidate.asset_id,
-                    });
+                    continue;
                 }
                 let target_matches = matches.get_mut(&candidate.asset_id).ok_or(
                     UploadError::InvalidCloudKitOriginalAssetResponse(

@@ -115,6 +115,25 @@ fn cloudkit_raw_pair_with(
     ])
 }
 
+fn cloudkit_raw_pair_with_url(
+    asset_name: &str,
+    master_name: &str,
+    change_tag: &str,
+    size_bytes: u64,
+    asset_date_millis: i64,
+    download_url: &str,
+) -> Value {
+    let mut records = cloudkit_raw_pair_with(
+        asset_name,
+        master_name,
+        change_tag,
+        size_bytes,
+        asset_date_millis,
+    );
+    records[1]["fields"]["resOriginalRes"]["value"]["downloadURL"] = json!(download_url);
+    records
+}
+
 fn original_asset_resolve_request() -> CloudKitOriginalAssetResolveRequest {
     let raw_bytes = b"raw-bytes";
     CloudKitOriginalAssetResolveRequest {
@@ -667,26 +686,28 @@ fn cloudkit_original_asset_batch_resolver_duplicate_candidate_for_one_target_fai
 }
 
 #[test]
-fn cloudkit_original_asset_batch_resolver_hash_mismatch_fails_closed_even_with_later_match() {
+fn cloudkit_original_asset_batch_resolver_skips_wrong_hash_and_resolves_later_exact_match() {
     let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
         .expect("session should load");
-    let mut records = cloudkit_raw_pair_with(
+    let mut records = cloudkit_raw_pair_with_url(
         "CPLAsset-original-123",
         "CPLMaster-raw-123",
         "tag-1",
         9,
         1_800_000_000_000,
+        "https://p140-icloud-content.icloud.com/wrong-original",
     );
     records
         .as_array_mut()
         .expect("records should be array")
         .extend(
-            cloudkit_raw_pair_with(
+            cloudkit_raw_pair_with_url(
                 "CPLAsset-original-456",
                 "CPLMaster-raw-456",
                 "tag-2",
                 9,
                 1_800_000_000_000,
+                "https://p140-icloud-content.icloud.com/exact-original",
             )
             .as_array()
             .expect("records should be array")
@@ -697,7 +718,7 @@ fn cloudkit_original_asset_batch_resolver_hash_mismatch_fails_closed_even_with_l
         vec![b"wrong-raw".to_vec(), b"raw-bytes".to_vec()],
     );
 
-    let error = CloudKitDeleteClient::new(&mut transport)
+    let proofs = CloudKitDeleteClient::new(&mut transport)
         .resolve_original_assets_batch(
             &session,
             &batch_resolve_request(vec![batch_resolve_target(
@@ -706,13 +727,101 @@ fn cloudkit_original_asset_batch_resolver_hash_mismatch_fails_closed_even_with_l
                 b"raw-bytes",
             )]),
         )
-        .expect_err("candidate hash mismatch must fail closed");
+        .expect("later exact candidate should resolve after a wrong plausible hash");
+
+    assert_eq!(proofs["asset-1"].record_name, "CPLAsset-original-456");
+    assert_eq!(transport.downloaded_urls.len(), 2);
+}
+
+#[test]
+fn cloudkit_original_asset_batch_resolver_same_size_time_targets_resolve_by_exact_hash() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut records = cloudkit_raw_pair_with_url(
+        "CPLAsset-original-123",
+        "CPLMaster-raw-123",
+        "tag-1",
+        9,
+        1_800_000_000_000,
+        "https://p140-icloud-content.icloud.com/raw-a",
+    );
+    records
+        .as_array_mut()
+        .expect("records should be array")
+        .extend(
+            cloudkit_raw_pair_with_url(
+                "CPLAsset-original-456",
+                "CPLMaster-raw-456",
+                "tag-2",
+                9,
+                1_800_000_000_000,
+                "https://p140-icloud-content.icloud.com/raw-b",
+            )
+            .as_array()
+            .expect("records should be array")
+            .clone(),
+        );
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": records})],
+        vec![b"raw-bytes".to_vec(), b"other-raw".to_vec()],
+    );
+
+    let proofs = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch(
+            &session,
+            &batch_resolve_request(vec![
+                batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes"),
+                batch_resolve_target("asset-2", "IMG_0002.dng", b"other-raw"),
+            ]),
+        )
+        .expect("same size/time targets should resolve by exact content hash");
+
+    assert_eq!(proofs["asset-1"].record_name, "CPLAsset-original-123");
+    assert_eq!(proofs["asset-2"].record_name, "CPLAsset-original-456");
+    assert_eq!(
+        transport.downloaded_urls,
+        vec![
+            "https://p140-icloud-content.icloud.com/raw-a".to_string(),
+            "https://p140-icloud-content.icloud.com/raw-b".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn cloudkit_original_asset_batch_resolver_reuses_duplicate_resource_downloads() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let records = cloudkit_raw_pair_with_url(
+        "CPLAsset-original-123",
+        "CPLMaster-raw-123",
+        "tag-1",
+        9,
+        1_800_000_000_000,
+        "https://p140-icloud-content.icloud.com/shared-raw",
+    );
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": records})],
+        vec![b"raw-bytes".to_vec()],
+    );
+
+    let error = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch(
+            &session,
+            &batch_resolve_request(vec![
+                batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes"),
+                batch_resolve_target("asset-2", "IMG_0002.dng", b"other-raw"),
+            ]),
+        )
+        .expect_err("the unmatched target still fails the all-or-none batch");
 
     assert!(matches!(
         error,
-        UploadError::OriginalAssetResolveHashMismatch { .. }
+        UploadError::OriginalAssetResolveNotUnique { matches: 0 }
     ));
-    assert_eq!(transport.downloaded_urls.len(), 1);
+    assert_eq!(
+        transport.downloaded_urls,
+        vec!["https://p140-icloud-content.icloud.com/shared-raw".to_string()]
+    );
 }
 
 #[test]
