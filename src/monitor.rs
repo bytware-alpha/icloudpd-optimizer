@@ -4,6 +4,12 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
+#[cfg(target_os = "macos")]
+use std::thread;
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -1011,7 +1017,77 @@ fn ensure_scan_root_access(path: &Path) -> Result<(), MonitorError> {
             });
         }
     }
+    #[cfg(target_os = "macos")]
+    ensure_macos_scan_root_enumerable(path)?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_scan_root_enumerable(path: &Path) -> Result<(), MonitorError> {
+    let mut child = Command::new("/usr/bin/perl")
+        .arg("-e")
+        .arg("opendir(my $dh, $ARGV[0]) or die \"$!\\n\"; readdir($dh);")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| MonitorError::CommandIo {
+            program: "perl",
+            source,
+        })?;
+    let timeout = Duration::from_secs(5);
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return Ok(());
+                }
+                let stderr = read_child_stderr(&mut child);
+                return Err(MonitorError::DownloadRootPreflight {
+                    path: path.to_path_buf(),
+                    message: format!("macOS directory preflight exited with {status}: {stderr}"),
+                });
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MonitorError::DownloadRootPreflight {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "macOS directory preflight timed out after {} seconds",
+                        timeout.as_secs()
+                    ),
+                });
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(source) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MonitorError::DownloadRootPreflight {
+                    path: path.to_path_buf(),
+                    message: format!("macOS directory preflight failed to poll child: {source}"),
+                });
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_child_stderr(child: &mut std::process::Child) -> String {
+    use std::io::Read;
+
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        "no stderr".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn log_monitor_event(event: &str, scan_started_unix_seconds: u64, fields: serde_json::Value) {
@@ -1450,6 +1526,10 @@ pub enum MonitorError {
         "monitor root {path} is not accessible for scanning: {source}; on macOS launchd jobs, grant the optimizer process access to network volumes or Full Disk Access"
     )]
     DownloadRootAccess { path: PathBuf, source: io::Error },
+    #[error(
+        "monitor root {path} failed the macOS scan preflight: {message}; grant the optimizer process access to network volumes or Full Disk Access"
+    )]
+    DownloadRootPreflight { path: PathBuf, message: String },
     #[error("failed to read directory {path}: {source}")]
     ReadDir { path: PathBuf, source: io::Error },
     #[error("failed to read directory entry under {path}: {source}")]
