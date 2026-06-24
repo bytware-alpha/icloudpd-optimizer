@@ -417,6 +417,51 @@ fn cloudkit_original_asset_resolver_zero_matches_fails_closed() {
 }
 
 #[test]
+fn cloudkit_original_asset_resolver_fails_when_max_pages_reached_without_exhaustion() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut request = original_asset_resolve_request();
+    request.page_size = 2;
+    request.max_pages = 1;
+    let mut transport = FakeCloudKitDeleteTransport::query_responses(vec![json!({
+        "records": cloudkit_raw_pair("CPLAsset-original-123", "CPLMaster-raw-123", "change-tag-1")
+    })]);
+
+    let error = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_asset(&session, &request)
+        .expect_err("a full final page does not prove global uniqueness");
+
+    assert!(matches!(
+        error,
+        UploadError::OriginalAssetResolveIncomplete { matches: 1 }
+    ));
+}
+
+#[test]
+fn cloudkit_original_asset_resolver_rejects_pagination_overflow_before_transport() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut request = original_asset_resolve_request();
+    request.start_rank = u64::MAX;
+    request.page_size = 2;
+    request.max_pages = 2;
+    let mut transport = FakeCloudKitDeleteTransport::query_responses(vec![
+        json!({"records": []}),
+        json!({"records": []}),
+    ]);
+
+    let error = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_asset(&session, &request)
+        .expect_err("pagination overflow must fail closed");
+
+    assert!(matches!(
+        error,
+        UploadError::InvalidCloudKitOriginalAssetRequest(_)
+    ));
+    assert!(transport.query_payloads.is_empty());
+}
+
+#[test]
 fn cloudkit_original_asset_resolver_multiple_matches_fails_closed() {
     let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
         .expect("session should load");

@@ -398,9 +398,11 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
         request: &CloudKitOriginalAssetResolveRequest,
     ) -> Result<OriginalAssetProof, UploadError> {
         validate_original_asset_resolve_request(request)?;
+        validate_original_asset_pagination_range(request)?;
         let mut matches = Vec::new();
+        let mut exhausted = false;
         for page in 0..request.max_pages {
-            let start_rank = request.start_rank + page.saturating_mul(request.page_size);
+            let start_rank = original_asset_query_start_rank(request, page)?;
             let payload = cloudkit_original_asset_query_payload(start_rank, request.page_size);
             let response = self.transport.post_records_query(session, payload)?;
             let page_result = parse_original_asset_query_response(response, request)?;
@@ -413,8 +415,14 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
                 });
             }
             if record_count < request.page_size as usize {
+                exhausted = true;
                 break;
             }
+        }
+        if !exhausted {
+            return Err(UploadError::OriginalAssetResolveIncomplete {
+                matches: matches.len(),
+            });
         }
         match matches.len() {
             1 => Ok(matches.remove(0)),
@@ -715,6 +723,21 @@ fn cloudkit_original_asset_query_payload(start_rank: u64, page_size: u64) -> Val
         ],
         "zoneID": {"zoneName": PRIMARY_SYNC_ZONE}
     })
+}
+
+fn original_asset_query_start_rank(
+    request: &CloudKitOriginalAssetResolveRequest,
+    page: u64,
+) -> Result<u64, UploadError> {
+    let offset = page.checked_mul(request.page_size).ok_or(
+        UploadError::InvalidCloudKitOriginalAssetRequest("pagination start rank overflow"),
+    )?;
+    request
+        .start_rank
+        .checked_add(offset)
+        .ok_or(UploadError::InvalidCloudKitOriginalAssetRequest(
+            "pagination start rank overflow",
+        ))
 }
 
 fn parse_create_upload_url_response(value: Value) -> Result<Url, UploadError> {
@@ -1734,6 +1757,13 @@ fn validate_original_asset_resolve_request(
     Ok(())
 }
 
+fn validate_original_asset_pagination_range(
+    request: &CloudKitOriginalAssetResolveRequest,
+) -> Result<(), UploadError> {
+    original_asset_query_start_rank(request, request.max_pages - 1)?;
+    Ok(())
+}
+
 fn reject_cloudkit_identity_chars(value: &str, field: &'static str) -> Result<(), UploadError> {
     if value.chars().any(char::is_control) {
         return Err(UploadError::InvalidCloudKitDeleteRequest(match field {
@@ -1971,6 +2001,10 @@ pub enum UploadError {
         "CloudKit original asset resolver found {matches} matching candidates; expected exactly one"
     )]
     OriginalAssetResolveNotUnique { matches: usize },
+    #[error(
+        "CloudKit original asset resolver reached the scan limit with {matches} matching candidates; exact uniqueness is unproven"
+    )]
+    OriginalAssetResolveIncomplete { matches: usize },
     #[error(
         "signed upload size mismatch: expected {expected} bytes, service reported {actual} bytes"
     )]
