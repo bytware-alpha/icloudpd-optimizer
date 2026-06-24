@@ -11,7 +11,7 @@ use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
 use crate::proof::{
     MIN_RAW_AGE_SECONDS, NasRawProof, ProofError, prove_nas_raw, prove_nas_raw_with_min_age_seconds,
 };
-use crate::upload::CloudKitDeleteOutcome;
+use crate::upload::{CloudKitDeleteOutcome, CloudKitDeleteRequest};
 
 const NAS_PROOF: &str = "nas";
 const ORIGINAL_ASSET_PROOF: &str = "original_asset";
@@ -526,6 +526,26 @@ pub fn record_delete_execution<'a>(
         DELETE_EXECUTION_PROOF,
         &proof,
     )
+}
+
+pub fn approved_original_delete_request(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<CloudKitDeleteRequest, WorkflowError> {
+    let record = manifest.get(asset_id)?;
+    if record.state != State::DeleteApproved {
+        return Err(WorkflowError::DeletePlanUnavailable {
+            asset_id: asset_id.to_string(),
+            state: record.state,
+        });
+    }
+
+    revalidate_delete_plan_proofs(manifest, asset_id)?;
+    let original = stored_proof::<OriginalAssetProof>(manifest, asset_id, ORIGINAL_ASSET_PROOF)?;
+    Ok(CloudKitDeleteRequest {
+        record_name: original.record_name,
+        record_change_tag: original.record_change_tag,
+    })
 }
 
 pub fn build_delete_plan(manifest: &Manifest, asset_id: &str) -> Result<DeletePlan, WorkflowError> {

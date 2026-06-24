@@ -10,10 +10,9 @@ use icloudpd_optimizer::conversion_backend::{
 use icloudpd_optimizer::manifest::{AssetRecord, Manifest, State};
 use icloudpd_optimizer::proof::NasRawProof;
 use icloudpd_optimizer::workflow::{
-    ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, OriginalAssetProof,
-    SourceAgeProof, discover_raw_asset, record_conversion_performance, record_conversion_result,
-    record_heic_verification, record_nas_proof, record_original_asset_proof,
-    record_source_age_proof,
+    ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, SourceAgeProof,
+    discover_raw_asset, record_conversion_performance, record_conversion_result,
+    record_heic_verification, record_nas_proof, record_source_age_proof,
 };
 use predicates::prelude::*;
 use serde_json::{Value, json};
@@ -284,6 +283,32 @@ fn manifest_with_source_age_verified(path: &std::path::Path) {
     manifest.save_atomic(path).expect("manifest should save");
 }
 
+fn record_original_asset_cli(manifest_arg: &str, size_bytes: &str, matched_raw_sha256: &str) {
+    binary()
+        .args([
+            "workflow",
+            "original-asset-verified",
+            "--manifest",
+            manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--record-name",
+            "original-record-1",
+            "--record-change-tag",
+            "old-change-tag",
+            "--record-type",
+            "CPLAsset",
+            "--filename",
+            "IMG_0001.dng",
+            "--size-bytes",
+            size_bytes,
+            "--matched-raw-sha256",
+            matched_raw_sha256,
+        ])
+        .assert()
+        .success();
+}
+
 fn manifest_with_conversion_verified(path: &std::path::Path) {
     let mut manifest = Manifest::new();
     discover_raw_asset(
@@ -430,27 +455,16 @@ fn manifest_with_real_delete_approval(tempdir: &std::path::Path) -> (PathBuf, Pa
         ])
         .assert()
         .success();
-    let mut manifest = Manifest::load(&manifest_path).expect("manifest should load");
+    let manifest = Manifest::load(&manifest_path).expect("manifest should load");
     let nas = manifest.get("asset-1").expect("asset should exist").proofs["nas"].clone();
-    record_original_asset_proof(
-        &mut manifest,
-        "asset-1",
-        OriginalAssetProof {
-            record_name: "original-record-1".to_string(),
-            record_change_tag: "old-change-tag".to_string(),
-            record_type: "CPLAsset".to_string(),
-            filename: "IMG_0001.dng".to_string(),
-            size_bytes: nas["size_bytes"].as_u64().expect("NAS size should be u64"),
-            matched_raw_sha256: nas["sha256"]
-                .as_str()
-                .expect("NAS sha should be a string")
-                .to_string(),
-        },
-    )
-    .expect("original asset proof should record");
-    manifest
-        .save_atomic(&manifest_path)
-        .expect("manifest should save");
+    record_original_asset_cli(
+        manifest_arg,
+        &nas["size_bytes"]
+            .as_u64()
+            .expect("NAS size should be u64")
+            .to_string(),
+        nas["sha256"].as_str().expect("NAS sha should be a string"),
+    );
     binary()
         .args([
             "workflow",
@@ -483,6 +497,129 @@ fn manifest_with_real_delete_approval(tempdir: &std::path::Path) -> (PathBuf, Pa
             .parse::<u64>()
             .expect("source captured should parse"),
     )
+}
+
+#[test]
+fn workflow_original_asset_verified_records_original_identity() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    manifest_with_nas_verified(&manifest_path);
+    let manifest_arg = manifest_path
+        .to_str()
+        .expect("manifest path should be utf8");
+
+    record_original_asset_cli(manifest_arg, "42", "raw-sha256");
+
+    let manifest = Manifest::load(&manifest_path).expect("manifest should load");
+    let record = manifest.get("asset-1").expect("asset should exist");
+    assert_eq!(
+        record.proofs["original_asset"]["record_name"],
+        "original-record-1"
+    );
+    assert_eq!(
+        record.proofs["original_asset"]["record_change_tag"],
+        "old-change-tag"
+    );
+    assert_eq!(record.proofs["original_asset"]["record_type"], "CPLAsset");
+    assert_eq!(record.proofs["original_asset"]["filename"], "IMG_0001.dng");
+    assert_eq!(record.proofs["original_asset"]["size_bytes"], 42);
+    assert_eq!(
+        record.proofs["original_asset"]["matched_raw_sha256"],
+        "raw-sha256"
+    );
+}
+
+#[test]
+fn workflow_original_asset_verified_rejects_mismatched_nas_facts_without_mutating_manifest() {
+    for (size_bytes, matched_raw_sha256, expected_field) in [
+        ("41", "raw-sha256", "size_bytes"),
+        ("42", "other-raw-sha256", "matched_raw_sha256"),
+    ] {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let manifest_path = tempdir.path().join("manifest.json");
+        manifest_with_nas_verified(&manifest_path);
+        let manifest_arg = manifest_path
+            .to_str()
+            .expect("manifest path should be utf8");
+        let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+        binary()
+            .args([
+                "workflow",
+                "original-asset-verified",
+                "--manifest",
+                manifest_arg,
+                "--asset-id",
+                "asset-1",
+                "--record-name",
+                "original-record-1",
+                "--record-change-tag",
+                "old-change-tag",
+                "--record-type",
+                "CPLAsset",
+                "--filename",
+                "IMG_0001.dng",
+                "--size-bytes",
+                size_bytes,
+                "--matched-raw-sha256",
+                matched_raw_sha256,
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(expected_field))
+            .stderr(predicate::str::contains("mismatch"));
+
+        let after = fs::read_to_string(&manifest_path).expect("manifest should remain readable");
+        assert_eq!(after, before);
+    }
+}
+
+#[test]
+fn workflow_original_asset_verified_requires_nas_proof_without_mutating_manifest() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let mut manifest = Manifest::new();
+    discover_raw_asset(
+        &mut manifest,
+        "asset-1",
+        PathBuf::from("/nas/photos/IMG_0001.dng"),
+    )
+    .expect("asset should be discovered");
+    manifest
+        .save_atomic(&manifest_path)
+        .expect("manifest should save");
+    let manifest_arg = manifest_path
+        .to_str()
+        .expect("manifest path should be utf8");
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "original-asset-verified",
+            "--manifest",
+            manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--record-name",
+            "original-record-1",
+            "--record-change-tag",
+            "old-change-tag",
+            "--record-type",
+            "CPLAsset",
+            "--filename",
+            "IMG_0001.dng",
+            "--size-bytes",
+            "42",
+            "--matched-raw-sha256",
+            "raw-sha256",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nas"));
+
+    let after = fs::read_to_string(&manifest_path).expect("manifest should remain readable");
+    assert_eq!(after, before);
 }
 
 #[test]
@@ -2108,6 +2245,87 @@ fn workflow_delete_plan_prints_json_and_does_not_mutate_manifest() {
         shown["proofs"]["source_age"]["source_captured_unix_seconds"],
         source_captured
     );
+    let after = fs::read_to_string(&manifest_path).expect("manifest should remain readable");
+    assert_eq!(after, before);
+}
+
+#[test]
+fn workflow_delete_execute_help_uses_session_without_manual_identity_overrides() {
+    let output = binary()
+        .args(["workflow", "delete-execute", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(output).expect("help should be utf8");
+
+    assert!(help.contains("--session"));
+    assert!(help.contains("CloudKit delete session"));
+    assert!(!help.contains("--record-name"));
+    assert!(!help.contains("--record-change-tag"));
+}
+
+#[test]
+fn workflow_delete_execute_rejects_missing_session_without_mutating_manifest() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let (manifest_path, _, _) = manifest_with_real_delete_approval(tempdir.path());
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "delete-execute",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--asset-id",
+            "asset-1",
+            "--session",
+            tempdir
+                .path()
+                .join("missing-delete-session.json")
+                .to_str()
+                .expect("session path should be utf8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("upload failed"))
+        .stderr(predicate::str::contains("missing-delete-session.json"));
+
+    let after = fs::read_to_string(&manifest_path).expect("manifest should remain readable");
+    assert_eq!(after, before);
+}
+
+#[test]
+fn workflow_delete_execute_requires_approved_state_without_mutating_manifest() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    manifest_with_nas_verified(&manifest_path);
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "delete-execute",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--asset-id",
+            "asset-1",
+            "--session",
+            tempdir
+                .path()
+                .join("missing-delete-session.json")
+                .to_str()
+                .expect("session path should be utf8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("delete approval required"));
+
     let after = fs::read_to_string(&manifest_path).expect("manifest should remain readable");
     assert_eq!(after, before);
 }

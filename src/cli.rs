@@ -17,14 +17,16 @@ use crate::conversion_execution::{
 };
 use crate::manifest::{AssetRecord, Manifest, ManifestError};
 use crate::upload::{
-    IcloudUploadRequest, UploadError, build_upload_proof, run_icloud_upload, verify_local_heic,
+    CloudKitDeleteClient, IcloudUploadRequest, ReqwestCloudKitDeleteTransport, UploadError,
+    build_upload_proof, load_cloudkit_delete_session, run_icloud_upload, verify_local_heic,
 };
 use crate::workflow::{
-    ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, SourceAgeProof,
-    UploadProof, WorkflowError, approve_delete, build_delete_plan, mark_delete_eligible,
-    prove_and_record_nas, record_conversion_performance, record_conversion_result,
-    record_heic_verification, record_source_age_proof, record_stage_failure, record_upload_proof,
-    upload_ready_heic_proof,
+    ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, OriginalAssetProof,
+    SourceAgeProof, UploadProof, WorkflowError, approve_delete, approved_original_delete_request,
+    build_delete_plan, mark_delete_eligible, prove_and_record_nas, record_conversion_performance,
+    record_conversion_result, record_delete_execution, record_heic_verification,
+    record_original_asset_proof, record_source_age_proof, record_stage_failure,
+    record_upload_proof, upload_ready_heic_proof,
 };
 
 const DAY_SECONDS: u64 = 24 * 60 * 60;
@@ -89,10 +91,13 @@ enum WorkflowCommand {
     #[command(about = "Upload with an external Photos upload session not produced by icloudpd")]
     UploadHeic(WorkflowUploadHeicArgs),
     UploadVerified(WorkflowUploadVerifiedArgs),
+    OriginalAssetVerified(WorkflowOriginalAssetVerifiedArgs),
     MarkDeleteEligible(WorkflowAssetArgs),
     ApproveDelete(WorkflowApproveDeleteArgs),
     Failed(WorkflowFailedArgs),
     DeletePlan(WorkflowAssetArgs),
+    #[command(about = "Execute the approved original asset delete with a CloudKit delete session")]
+    DeleteExecute(WorkflowDeleteExecuteArgs),
 }
 
 #[derive(Debug, Args)]
@@ -220,6 +225,26 @@ struct WorkflowUploadVerifiedArgs {
 }
 
 #[derive(Debug, Args)]
+struct WorkflowOriginalAssetVerifiedArgs {
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+    #[arg(long)]
+    asset_id: String,
+    #[arg(long)]
+    record_name: String,
+    #[arg(long)]
+    record_change_tag: String,
+    #[arg(long)]
+    record_type: String,
+    #[arg(long)]
+    filename: String,
+    #[arg(long)]
+    size_bytes: u64,
+    #[arg(long)]
+    matched_raw_sha256: String,
+}
+
+#[derive(Debug, Args)]
 struct WorkflowAssetArgs {
     #[arg(long, value_name = "PATH")]
     manifest: PathBuf,
@@ -247,6 +272,16 @@ struct WorkflowFailedArgs {
     stage: String,
     #[arg(long)]
     message: String,
+}
+
+#[derive(Debug, Args)]
+struct WorkflowDeleteExecuteArgs {
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+    #[arg(long)]
+    asset_id: String,
+    #[arg(long, value_name = "PATH", help = "CloudKit delete session JSON")]
+    session: PathBuf,
 }
 
 #[derive(Debug, Error)]
@@ -342,10 +377,12 @@ fn run_workflow<W: Write>(args: WorkflowArgs, writer: &mut W) -> Result<(), CliE
         WorkflowCommand::HeicVerified(args) => workflow_heic_verified(args),
         WorkflowCommand::UploadHeic(args) => workflow_upload_heic(args),
         WorkflowCommand::UploadVerified(args) => workflow_upload_verified(args),
+        WorkflowCommand::OriginalAssetVerified(args) => workflow_original_asset_verified(args),
         WorkflowCommand::MarkDeleteEligible(args) => workflow_mark_delete_eligible(args),
         WorkflowCommand::ApproveDelete(args) => workflow_approve_delete(args),
         WorkflowCommand::Failed(args) => workflow_failed(args),
         WorkflowCommand::DeletePlan(args) => workflow_delete_plan(args, writer),
+        WorkflowCommand::DeleteExecute(args) => workflow_delete_execute(args),
     }
 }
 
@@ -472,6 +509,25 @@ fn workflow_upload_verified(args: WorkflowUploadVerifiedArgs) -> Result<(), CliE
     save_manifest(&manifest, &args.manifest)
 }
 
+fn workflow_original_asset_verified(
+    args: WorkflowOriginalAssetVerifiedArgs,
+) -> Result<(), CliError> {
+    let mut manifest = load_manifest_for_write(&args.manifest)?;
+    record_original_asset_proof(
+        &mut manifest,
+        &args.asset_id,
+        OriginalAssetProof {
+            record_name: args.record_name,
+            record_change_tag: args.record_change_tag,
+            record_type: args.record_type,
+            filename: args.filename,
+            size_bytes: args.size_bytes,
+            matched_raw_sha256: args.matched_raw_sha256,
+        },
+    )?;
+    save_manifest(&manifest, &args.manifest)
+}
+
 fn workflow_mark_delete_eligible(args: WorkflowAssetArgs) -> Result<(), CliError> {
     let mut manifest = load_manifest_for_write(&args.manifest)?;
     mark_delete_eligible(&mut manifest, &args.asset_id)?;
@@ -499,6 +555,17 @@ fn workflow_delete_plan<W: Write>(args: WorkflowAssetArgs, writer: &mut W) -> Re
     serde_json::to_writer_pretty(&mut *writer, &plan)?;
     writeln!(writer)?;
     Ok(())
+}
+
+fn workflow_delete_execute(args: WorkflowDeleteExecuteArgs) -> Result<(), CliError> {
+    let mut manifest = load_manifest_for_write(&args.manifest)?;
+    let request = approved_original_delete_request(&manifest, &args.asset_id)?;
+    let session = load_cloudkit_delete_session(&args.session)?;
+    let transport = ReqwestCloudKitDeleteTransport::new()?;
+    let mut client = CloudKitDeleteClient::new(transport);
+    let outcome = client.delete_original(&session, &request)?;
+    record_delete_execution(&mut manifest, &args.asset_id, outcome)?;
+    save_manifest(&manifest, &args.manifest)
 }
 
 fn load_manifest_for_write(path: &Path) -> Result<Manifest, CliError> {
