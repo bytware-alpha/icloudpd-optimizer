@@ -382,6 +382,10 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
         ..MonitorScanSummary::default()
     };
 
+    if config.full_lifecycle {
+        run_lifecycle_stages(config, &mut manifest, &mut summary)?;
+    }
+
     let download_root = fs::canonicalize(&config.download_root).map_err(|source| {
         MonitorError::CanonicalizeRoot {
             path: config.download_root.clone(),
@@ -392,7 +396,8 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
     let mut pending_capacity = config
         .max_conversions_per_scan
         .saturating_sub(pending_conversion_count(&manifest));
-    if pending_capacity > 0 {
+    let lifecycle_pending = config.full_lifecycle && pending_lifecycle_count(&manifest) > 0;
+    if pending_capacity > 0 && !lifecycle_pending {
         visit_raw_paths(&download_root, config.scan_recursive, &mut |raw_path| {
             if pending_capacity == 0 {
                 return Ok(VisitDecision::Stop);
@@ -470,7 +475,7 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
         }
     }
 
-    if config.full_lifecycle {
+    if config.full_lifecycle && !lifecycle_pending {
         run_lifecycle_stages(config, &mut manifest, &mut summary)?;
     }
 
@@ -875,6 +880,23 @@ fn pending_conversion_count(manifest: &Manifest) -> usize {
         .records()
         .values()
         .filter(|record| record.state == State::NasVerified)
+        .count()
+}
+
+fn pending_lifecycle_count(manifest: &Manifest) -> usize {
+    manifest
+        .records()
+        .values()
+        .filter(|record| {
+            matches!(
+                record.state,
+                State::Converted
+                    | State::ConversionVerified
+                    | State::UploadVerified
+                    | State::DeleteEligible
+                    | State::DeleteApproved
+            )
+        })
         .count()
 }
 
@@ -1367,5 +1389,28 @@ mod tests {
             assert_eq!(record.failures[0].stage, "original_asset_resolve");
             assert!(record.failures[0].message.contains("0 matching candidates"));
         }
+    }
+
+    #[test]
+    fn pending_lifecycle_count_includes_remote_mutation_states_only() {
+        let mut manifest = Manifest::new();
+        for (asset_id, state) in [
+            ("discovered", State::Discovered),
+            ("nas", State::NasVerified),
+            ("converted", State::Converted),
+            ("verified", State::ConversionVerified),
+            ("uploaded", State::UploadVerified),
+            ("eligible", State::DeleteEligible),
+            ("approved", State::DeleteApproved),
+            ("deleted", State::Deleted),
+            ("failed", State::Failed),
+        ] {
+            let mut record =
+                AssetRecord::new(asset_id, PathBuf::from(format!("/raw/{asset_id}.DNG")));
+            record.state = state;
+            manifest.upsert(record);
+        }
+
+        assert_eq!(pending_lifecycle_count(&manifest), 5);
     }
 }
