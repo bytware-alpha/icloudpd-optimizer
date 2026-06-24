@@ -10,9 +10,10 @@ use icloudpd_optimizer::conversion_backend::{
 use icloudpd_optimizer::manifest::{AssetRecord, Manifest, State};
 use icloudpd_optimizer::proof::NasRawProof;
 use icloudpd_optimizer::workflow::{
-    ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, SourceAgeProof,
-    discover_raw_asset, record_conversion_performance, record_conversion_result,
-    record_heic_verification, record_nas_proof, record_source_age_proof,
+    ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, OriginalAssetProof,
+    SourceAgeProof, discover_raw_asset, record_conversion_performance, record_conversion_result,
+    record_heic_verification, record_nas_proof, record_original_asset_proof,
+    record_source_age_proof,
 };
 use predicates::prelude::*;
 use serde_json::{Value, json};
@@ -429,6 +430,27 @@ fn manifest_with_real_delete_approval(tempdir: &std::path::Path) -> (PathBuf, Pa
         ])
         .assert()
         .success();
+    let mut manifest = Manifest::load(&manifest_path).expect("manifest should load");
+    let nas = manifest.get("asset-1").expect("asset should exist").proofs["nas"].clone();
+    record_original_asset_proof(
+        &mut manifest,
+        "asset-1",
+        OriginalAssetProof {
+            record_name: "original-record-1".to_string(),
+            record_change_tag: "old-change-tag".to_string(),
+            record_type: "CPLAsset".to_string(),
+            filename: "IMG_0001.dng".to_string(),
+            size_bytes: nas["size_bytes"].as_u64().expect("NAS size should be u64"),
+            matched_raw_sha256: nas["sha256"]
+                .as_str()
+                .expect("NAS sha should be a string")
+                .to_string(),
+        },
+    )
+    .expect("original asset proof should record");
+    manifest
+        .save_atomic(&manifest_path)
+        .expect("manifest should save");
     binary()
         .args([
             "workflow",

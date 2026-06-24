@@ -5,12 +5,14 @@ use std::time::{Duration, SystemTime};
 use filetime::{FileTime, set_file_mtime};
 use icloudpd_optimizer::manifest::{AssetRecord, Manifest, ManifestError, State};
 use icloudpd_optimizer::proof::{NasRawProof, ProofError, prove_nas_raw};
+use icloudpd_optimizer::upload::CloudKitDeleteOutcome;
 use icloudpd_optimizer::workflow::{
     ConversionCommandTiming, ConversionPerformanceInput, ConversionPerformanceProof,
-    ConversionResultProof, HeicVerificationProof, SourceAgeProof, UploadProof, WorkflowError,
-    approve_delete, build_delete_plan, discover_raw_asset, mark_delete_eligible,
+    ConversionResultProof, HeicVerificationProof, OriginalAssetProof, SourceAgeProof, UploadProof,
+    WorkflowError, approve_delete, build_delete_plan, discover_raw_asset, mark_delete_eligible,
     prove_and_record_nas, record_conversion_performance, record_conversion_result,
-    record_heic_verification, record_nas_proof, record_source_age_proof, record_stage_failure,
+    record_delete_execution, record_heic_verification, record_nas_proof,
+    record_original_asset_proof, record_source_age_proof, record_stage_failure,
     record_upload_proof, upload_ready_heic_proof,
 };
 use serde_json::json;
@@ -88,6 +90,24 @@ fn upload_proof() -> UploadProof {
     }
 }
 
+fn original_asset_proof() -> OriginalAssetProof {
+    OriginalAssetProof {
+        record_name: "original-record-1".to_string(),
+        record_change_tag: "old-change-tag".to_string(),
+        record_type: "CPLAsset".to_string(),
+        filename: "IMG_0001.dng".to_string(),
+        size_bytes: 42,
+        matched_raw_sha256: "raw-sha256".to_string(),
+    }
+}
+
+fn delete_outcome() -> CloudKitDeleteOutcome {
+    CloudKitDeleteOutcome {
+        record_name: "original-record-1".to_string(),
+        record_change_tag: "deleted-change-tag".to_string(),
+    }
+}
+
 fn source_age_proof(age_days: u64) -> SourceAgeProof {
     SourceAgeProof {
         source_captured_unix_seconds: SOURCE_AGE_VERIFIED_AT - age_days * DAY,
@@ -134,6 +154,8 @@ fn upload_verified_manifest() -> Manifest {
     let mut manifest = source_age_verified_manifest();
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
+    record_original_asset_proof(&mut manifest, "asset-1", original_asset_proof())
+        .expect("original asset proof should record");
     manifest
 }
 
@@ -160,6 +182,20 @@ fn real_upload_verified_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {
         .expect("source age proof should record");
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
+    let nas = manifest.get("asset-1").expect("asset should exist").proofs["nas"].clone();
+    record_original_asset_proof(
+        &mut manifest,
+        "asset-1",
+        OriginalAssetProof {
+            size_bytes: nas["size_bytes"].as_u64().expect("NAS size should be u64"),
+            matched_raw_sha256: nas["sha256"]
+                .as_str()
+                .expect("NAS sha should be a string")
+                .to_string(),
+            ..original_asset_proof()
+        },
+    )
+    .expect("original asset proof should record");
 
     (tempdir, manifest, canonical_raw_path)
 }
@@ -207,6 +243,138 @@ fn conversion_performance_manifest() -> Manifest {
 }
 
 #[test]
+fn original_asset_proof_records_icloud_identity_bound_to_nas() {
+    let mut manifest = converted_manifest();
+
+    let record = record_original_asset_proof(&mut manifest, "asset-1", original_asset_proof())
+        .expect("original asset proof should record");
+
+    assert_eq!(record.state, State::Converted);
+    assert_eq!(
+        record.proofs["original_asset"]["record_name"],
+        "original-record-1"
+    );
+    assert_eq!(
+        record.proofs["original_asset"]["record_change_tag"],
+        "old-change-tag"
+    );
+    assert_eq!(record.proofs["original_asset"]["record_type"], "CPLAsset");
+    assert_eq!(record.proofs["original_asset"]["filename"], "IMG_0001.dng");
+    assert_eq!(record.proofs["original_asset"]["size_bytes"], 42);
+    assert_eq!(
+        record.proofs["original_asset"]["matched_raw_sha256"],
+        "raw-sha256"
+    );
+}
+
+#[test]
+fn original_asset_proof_fails_closed_without_nas_or_valid_identity() {
+    let cases = [
+        (
+            "record_name",
+            OriginalAssetProof {
+                record_name: " ".to_string(),
+                ..original_asset_proof()
+            },
+        ),
+        (
+            "record_change_tag",
+            OriginalAssetProof {
+                record_change_tag: " ".to_string(),
+                ..original_asset_proof()
+            },
+        ),
+        (
+            "filename",
+            OriginalAssetProof {
+                filename: " ".to_string(),
+                ..original_asset_proof()
+            },
+        ),
+        (
+            "record_type",
+            OriginalAssetProof {
+                record_type: "CPLMaster".to_string(),
+                ..original_asset_proof()
+            },
+        ),
+        (
+            "size_bytes",
+            OriginalAssetProof {
+                size_bytes: 41,
+                ..original_asset_proof()
+            },
+        ),
+        (
+            "matched_raw_sha256",
+            OriginalAssetProof {
+                matched_raw_sha256: "other-raw-sha256".to_string(),
+                ..original_asset_proof()
+            },
+        ),
+    ];
+
+    for (field, proof) in cases {
+        let mut manifest = converted_manifest();
+        let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+        let error = record_original_asset_proof(&mut manifest, "asset-1", proof)
+            .expect_err("invalid original asset proof must fail closed");
+
+        if matches!(field, "record_name" | "record_change_tag" | "filename") {
+            assert!(matches!(
+                error,
+                WorkflowError::EmptyProofField { field: actual } if actual == field
+            ));
+        } else if field == "record_type" {
+            assert!(matches!(
+                error,
+                WorkflowError::ProofMismatch {
+                    proof_key: "original_asset",
+                    field: "record_type",
+                    ..
+                }
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                WorkflowError::ProofMismatch {
+                    proof_key: "nas",
+                    field: actual,
+                    ..
+                } if actual == field
+            ));
+        }
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist"),
+            &before
+        );
+    }
+
+    let mut manifest = Manifest::new();
+    manifest.upsert(AssetRecord::new(
+        "asset-1",
+        PathBuf::from("/nas/photos/IMG_0001.dng"),
+    ));
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = record_original_asset_proof(&mut manifest, "asset-1", original_asset_proof())
+        .expect_err("NAS proof is required before original identity");
+
+    assert!(matches!(
+        error,
+        WorkflowError::MissingProof {
+            proof_key,
+            ..
+        } if proof_key == "nas"
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+}
+
+#[test]
 fn prove_and_record_nas_rejects_min_age_below_floor_without_mutation() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let nas_root = tempdir.path().join("nas");
@@ -249,6 +417,7 @@ fn valid_ordered_workflow_reaches_delete_plan_without_deleting() {
         plan.required_proof_keys,
         vec![
             "nas",
+            "original_asset",
             "conversion",
             "conversion_performance",
             "heic",
@@ -270,6 +439,246 @@ fn valid_ordered_workflow_reaches_delete_plan_without_deleting() {
         plan.proofs["delete_eligibility"]["conversion_performance_proof_key"],
         "conversion_performance"
     );
+    assert_eq!(
+        plan.proofs["delete_eligibility"]["original_asset_proof_key"],
+        "original_asset"
+    );
+    assert_eq!(
+        plan.proofs["original_asset"]["record_name"],
+        "original-record-1"
+    );
+}
+
+#[test]
+fn delete_eligibility_requires_original_asset_identity_without_mutation() {
+    let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    record.proofs.remove("original_asset");
+    manifest.upsert(record);
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = mark_delete_eligible(&mut manifest, "asset-1")
+        .expect_err("original asset identity is required before delete eligibility");
+
+    assert!(matches!(
+        error,
+        WorkflowError::MissingProof {
+            proof_key,
+            ..
+        } if proof_key == "original_asset"
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+    assert!(!before.proofs.contains_key("delete_eligibility"));
+}
+
+#[test]
+fn delete_approval_revalidates_original_asset_identity() {
+    let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+    mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    proof_mut(&mut record, "original_asset")["matched_raw_sha256"] = json!("forged-raw-sha256");
+    manifest.upsert(record);
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = approve_delete(&mut manifest, "asset-1", "operator")
+        .expect_err("approval must revalidate original asset identity");
+
+    assert!(matches!(
+        error,
+        WorkflowError::ProofMismatch {
+            proof_key: "nas",
+            field: "matched_raw_sha256",
+            ..
+        }
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+    assert!(!before.proofs.contains_key("delete_approval"));
+}
+
+#[test]
+fn delete_plan_revalidates_original_asset_identity() {
+    let (_tempdir, manifest) = forged_delete_approved_manifest(|record| {
+        proof_mut(record, "original_asset")["record_name"] = json!(" ");
+    });
+
+    let error = build_delete_plan(&manifest, "asset-1")
+        .expect_err("delete plan must revalidate original identity");
+
+    assert!(matches!(
+        error,
+        WorkflowError::EmptyProofField {
+            field: "record_name"
+        }
+    ));
+}
+
+#[test]
+fn delete_execution_records_confirmed_delete_and_transitions_to_deleted() {
+    let (_tempdir, mut manifest, _) = real_delete_approved_manifest();
+
+    let record = record_delete_execution(&mut manifest, "asset-1", delete_outcome())
+        .expect("confirmed delete should record");
+
+    assert_eq!(record.state, State::Deleted);
+    assert_eq!(
+        record.proofs["delete"]["deleted_record_name"],
+        "original-record-1"
+    );
+    assert_eq!(
+        record.proofs["delete"]["old_record_change_tag"],
+        "old-change-tag"
+    );
+    assert_eq!(
+        record.proofs["delete"]["confirmed_deleted_change_tag"],
+        "deleted-change-tag"
+    );
+    assert_eq!(
+        record.proofs["delete"]["uploaded_heic_asset_id"],
+        "icloud-heic-asset-1"
+    );
+}
+
+#[test]
+fn delete_execution_fails_closed_for_mismatched_outcome_or_unapproved_state() {
+    let (_tempdir, mut manifest, _) = real_delete_approved_manifest();
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = record_delete_execution(
+        &mut manifest,
+        "asset-1",
+        CloudKitDeleteOutcome {
+            record_name: "other-record".to_string(),
+            ..delete_outcome()
+        },
+    )
+    .expect_err("mismatched delete outcome must fail closed");
+
+    assert!(matches!(
+        error,
+        WorkflowError::ProofMismatch {
+            proof_key: "original_asset",
+            field: "record_name",
+            ..
+        }
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+
+    let mut unapproved = upload_verified_manifest();
+    let before = unapproved
+        .get("asset-1")
+        .expect("asset should exist")
+        .clone();
+    let error = record_delete_execution(&mut unapproved, "asset-1", delete_outcome())
+        .expect_err("delete execution requires approval");
+
+    assert!(matches!(
+        error,
+        WorkflowError::Manifest(ManifestError::InvalidTransition {
+            from: State::UploadVerified,
+            to: State::Deleted,
+            ..
+        })
+    ));
+    assert_eq!(
+        unapproved.get("asset-1").expect("asset should exist"),
+        &before
+    );
+}
+
+#[test]
+fn delete_execution_fails_closed_without_original_identity_or_with_forged_facts() {
+    let (_tempdir, mut manifest, _) = real_delete_approved_manifest();
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    record.proofs.remove("original_asset");
+    manifest.upsert(record);
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = record_delete_execution(&mut manifest, "asset-1", delete_outcome())
+        .expect_err("delete execution requires original identity proof");
+
+    assert!(matches!(
+        error,
+        WorkflowError::MissingProof {
+            proof_key,
+            ..
+        } if proof_key == "original_asset"
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+
+    let (_tempdir, mut manifest, _) = real_delete_approved_manifest();
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    proof_mut(&mut record, "delete_eligibility")["uploaded_heic_asset_id"] =
+        json!("forged-heic-asset");
+    manifest.upsert(record);
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = record_delete_execution(&mut manifest, "asset-1", delete_outcome())
+        .expect_err("delete execution revalidates delete facts");
+
+    assert!(matches!(
+        error,
+        WorkflowError::ProofMismatch {
+            proof_key: "delete_eligibility",
+            field: "uploaded_heic_asset_id",
+            ..
+        }
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+}
+
+#[test]
+fn delete_execution_requires_new_non_empty_change_tag_without_mutation() {
+    for record_change_tag in [" ", "old-change-tag"] {
+        let (_tempdir, mut manifest, _) = real_delete_approved_manifest();
+        let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+        let error = record_delete_execution(
+            &mut manifest,
+            "asset-1",
+            CloudKitDeleteOutcome {
+                record_change_tag: record_change_tag.to_string(),
+                ..delete_outcome()
+            },
+        )
+        .expect_err("delete execution requires a new confirmed change tag");
+
+        if record_change_tag.trim().is_empty() {
+            assert!(matches!(
+                error,
+                WorkflowError::EmptyProofField {
+                    field: "confirmed_deleted_change_tag"
+                }
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                WorkflowError::ProofMismatch {
+                    proof_key: "delete",
+                    field: "confirmed_deleted_change_tag",
+                    ..
+                }
+            ));
+        }
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist"),
+            &before
+        );
+    }
 }
 
 #[test]

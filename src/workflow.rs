@@ -11,8 +11,10 @@ use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
 use crate::proof::{
     MIN_RAW_AGE_SECONDS, NasRawProof, ProofError, prove_nas_raw, prove_nas_raw_with_min_age_seconds,
 };
+use crate::upload::CloudKitDeleteOutcome;
 
 const NAS_PROOF: &str = "nas";
+const ORIGINAL_ASSET_PROOF: &str = "original_asset";
 const CONVERSION_PROOF: &str = "conversion";
 const CONVERSION_PERFORMANCE_PROOF: &str = "conversion_performance";
 const HEIC_PROOF: &str = "heic";
@@ -20,10 +22,12 @@ const SOURCE_AGE_PROOF: &str = "source_age";
 const UPLOAD_PROOF: &str = "upload";
 const DELETE_ELIGIBILITY_PROOF: &str = "delete_eligibility";
 const DELETE_APPROVAL_PROOF: &str = "delete_approval";
+const DELETE_EXECUTION_PROOF: &str = "delete";
 const CONVERSION_PERFORMANCE_SCHEMA_VERSION: u8 = 1;
 const CONVERSION_PERFORMANCE_MEASUREMENT_METHOD: &str = "monotonic_wall_clock";
-const DELETE_PLAN_PROOFS: [&str; 8] = [
+const DELETE_PLAN_PROOFS: [&str; 9] = [
     NAS_PROOF,
+    ORIGINAL_ASSET_PROOF,
     CONVERSION_PROOF,
     CONVERSION_PERFORMANCE_PROOF,
     HEIC_PROOF,
@@ -104,6 +108,16 @@ pub struct UploadProof {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OriginalAssetProof {
+    pub record_name: String,
+    pub record_change_tag: String,
+    pub record_type: String,
+    pub filename: String,
+    pub size_bytes: u64,
+    pub matched_raw_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SourceAgeProof {
     pub source_captured_unix_seconds: u64,
     pub verified_at_unix_seconds: u64,
@@ -113,6 +127,7 @@ pub struct SourceAgeProof {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 struct DeleteEligibilityProof {
     upload_proof_key: String,
+    original_asset_proof_key: String,
     conversion_performance_proof_key: String,
     heic_proof_key: String,
     source_age_proof_key: String,
@@ -124,6 +139,12 @@ struct DeleteEligibilityProof {
     source_captured_unix_seconds: u64,
     source_age_seconds: u64,
     min_source_age_seconds: u64,
+    original_record_name: String,
+    original_record_change_tag: String,
+    original_record_type: String,
+    original_filename: String,
+    original_size_bytes: u64,
+    matched_raw_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -132,11 +153,20 @@ struct DeleteApprovalProof {
 }
 
 struct PreDeleteFacts {
+    original: OriginalAssetProof,
     upload: UploadProof,
     uploaded_heic_path: PathBuf,
     heic: HeicVerificationProof,
     source_age: SourceAgeProof,
     source_age_seconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeleteExecutionProof {
+    pub old_record_change_tag: String,
+    pub deleted_record_name: String,
+    pub confirmed_deleted_change_tag: String,
+    pub uploaded_heic_asset_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -325,6 +355,16 @@ pub fn record_upload_proof<'a>(
     )
 }
 
+pub fn record_original_asset_proof<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    proof: OriginalAssetProof,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    let nas = stored_proof::<NasRawProof>(manifest, asset_id, NAS_PROOF)?;
+    validate_original_asset_proof(&proof, &nas)?;
+    insert_workflow_proof(manifest, asset_id, ORIGINAL_ASSET_PROOF, &proof)
+}
+
 pub fn upload_ready_heic_proof(
     manifest: &Manifest,
     asset_id: &str,
@@ -374,6 +414,7 @@ pub fn mark_delete_eligible<'a>(
     let facts = validate_pre_delete_facts(manifest, asset_id)?;
     let proof = json!({
         "upload_proof_key": UPLOAD_PROOF,
+        "original_asset_proof_key": ORIGINAL_ASSET_PROOF,
         "conversion_performance_proof_key": CONVERSION_PERFORMANCE_PROOF,
         "heic_proof_key": HEIC_PROOF,
         "source_age_proof_key": SOURCE_AGE_PROOF,
@@ -385,6 +426,12 @@ pub fn mark_delete_eligible<'a>(
         "source_captured_unix_seconds": facts.source_age.source_captured_unix_seconds,
         "source_age_seconds": facts.source_age_seconds,
         "min_source_age_seconds": facts.source_age.min_age_seconds,
+        "original_record_name": &facts.original.record_name,
+        "original_record_change_tag": &facts.original.record_change_tag,
+        "original_record_type": &facts.original.record_type,
+        "original_filename": &facts.original.filename,
+        "original_size_bytes": facts.original.size_bytes,
+        "matched_raw_sha256": &facts.original.matched_raw_sha256,
     });
 
     manifest
@@ -430,6 +477,55 @@ pub fn approve_delete<'a>(
             proof,
         )
         .map_err(WorkflowError::Manifest)
+}
+
+pub fn record_delete_execution<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    outcome: CloudKitDeleteOutcome,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    let record = manifest.get(asset_id)?;
+    if record.state != State::DeleteApproved {
+        return Err(WorkflowError::Manifest(ManifestError::InvalidTransition {
+            asset_id: asset_id.to_string(),
+            from: record.state,
+            to: State::Deleted,
+        }));
+    }
+
+    revalidate_delete_plan_proofs(manifest, asset_id)?;
+    let original = stored_proof::<OriginalAssetProof>(manifest, asset_id, ORIGINAL_ASSET_PROOF)?;
+    let upload = stored_proof::<UploadProof>(manifest, asset_id, UPLOAD_PROOF)?;
+
+    require_matching_str(
+        ORIGINAL_ASSET_PROOF,
+        "record_name",
+        &original.record_name,
+        &outcome.record_name,
+    )?;
+    require_non_empty("confirmed_deleted_change_tag", &outcome.record_change_tag)?;
+    if outcome.record_change_tag == original.record_change_tag {
+        return Err(WorkflowError::ProofMismatch {
+            proof_key: DELETE_EXECUTION_PROOF,
+            field: "confirmed_deleted_change_tag",
+            expected: format!("new tag different from {}", original.record_change_tag),
+            actual: outcome.record_change_tag,
+        });
+    }
+
+    let proof = DeleteExecutionProof {
+        old_record_change_tag: original.record_change_tag,
+        deleted_record_name: outcome.record_name,
+        confirmed_deleted_change_tag: outcome.record_change_tag,
+        uploaded_heic_asset_id: upload.uploaded_heic_asset_id,
+    };
+    transition_with_proof(
+        manifest,
+        asset_id,
+        State::Deleted,
+        DELETE_EXECUTION_PROOF,
+        &proof,
+    )
 }
 
 pub fn build_delete_plan(manifest: &Manifest, asset_id: &str) -> Result<DeletePlan, WorkflowError> {
@@ -539,8 +635,11 @@ fn validate_pre_delete_facts(
     reprove_nas_proof(record, &nas, source_age.min_age_seconds)?;
 
     validate_stored_conversion_performance(manifest, asset_id, &nas, &conversion)?;
+    let original = stored_proof::<OriginalAssetProof>(manifest, asset_id, ORIGINAL_ASSET_PROOF)?;
+    validate_original_asset_proof(&original, &nas)?;
 
     Ok(PreDeleteFacts {
+        original,
         upload,
         uploaded_heic_path,
         heic,
@@ -558,6 +657,7 @@ fn validate_delete_eligibility_chain(
         stored_proof::<DeleteEligibilityProof>(manifest, asset_id, DELETE_ELIGIBILITY_PROOF)?;
     validate_delete_eligibility_proof(
         &eligibility,
+        &facts.original,
         &facts.upload,
         &facts.uploaded_heic_path,
         &facts.heic,
@@ -701,6 +801,7 @@ fn derive_nas_root_from_proof(proof: &NasRawProof) -> Result<PathBuf, WorkflowEr
 
 fn validate_delete_eligibility_proof(
     eligibility: &DeleteEligibilityProof,
+    original: &OriginalAssetProof,
     upload: &UploadProof,
     uploaded_heic_path: &Path,
     heic: &HeicVerificationProof,
@@ -712,6 +813,12 @@ fn validate_delete_eligibility_proof(
         "upload_proof_key",
         UPLOAD_PROOF,
         &eligibility.upload_proof_key,
+    )?;
+    require_matching_str(
+        DELETE_ELIGIBILITY_PROOF,
+        "original_asset_proof_key",
+        ORIGINAL_ASSET_PROOF,
+        &eligibility.original_asset_proof_key,
     )?;
     require_matching_str(
         DELETE_ELIGIBILITY_PROOF,
@@ -778,6 +885,66 @@ fn validate_delete_eligibility_proof(
         "min_source_age_seconds",
         source_age.min_age_seconds,
         eligibility.min_source_age_seconds,
+    )?;
+    require_matching_str(
+        DELETE_ELIGIBILITY_PROOF,
+        "original_record_name",
+        &original.record_name,
+        &eligibility.original_record_name,
+    )?;
+    require_matching_str(
+        DELETE_ELIGIBILITY_PROOF,
+        "original_record_change_tag",
+        &original.record_change_tag,
+        &eligibility.original_record_change_tag,
+    )?;
+    require_matching_str(
+        DELETE_ELIGIBILITY_PROOF,
+        "original_record_type",
+        &original.record_type,
+        &eligibility.original_record_type,
+    )?;
+    require_matching_str(
+        DELETE_ELIGIBILITY_PROOF,
+        "original_filename",
+        &original.filename,
+        &eligibility.original_filename,
+    )?;
+    require_matching_u64(
+        DELETE_ELIGIBILITY_PROOF,
+        "original_size_bytes",
+        original.size_bytes,
+        eligibility.original_size_bytes,
+    )?;
+    require_matching_str(
+        DELETE_ELIGIBILITY_PROOF,
+        "matched_raw_sha256",
+        &original.matched_raw_sha256,
+        &eligibility.matched_raw_sha256,
+    )?;
+
+    Ok(())
+}
+
+fn validate_original_asset_proof(
+    proof: &OriginalAssetProof,
+    nas: &NasRawProof,
+) -> Result<(), WorkflowError> {
+    require_non_empty("record_name", &proof.record_name)?;
+    require_non_empty("record_change_tag", &proof.record_change_tag)?;
+    require_non_empty("filename", &proof.filename)?;
+    require_matching_str(
+        ORIGINAL_ASSET_PROOF,
+        "record_type",
+        "CPLAsset",
+        &proof.record_type,
+    )?;
+    require_matching_u64(NAS_PROOF, "size_bytes", nas.size_bytes, proof.size_bytes)?;
+    require_matching_str(
+        NAS_PROOF,
+        "matched_raw_sha256",
+        &nas.sha256,
+        &proof.matched_raw_sha256,
     )?;
 
     Ok(())
