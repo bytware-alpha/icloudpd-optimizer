@@ -16,6 +16,7 @@ fn args(plan: &CommandPlan) -> Vec<String> {
 fn contains_forbidden_action(plan: &CommandPlan) -> bool {
     std::iter::once(OsStr::new(&plan.program))
         .chain(plan.args.iter().map(|arg| arg.as_os_str()))
+        .chain(plan.stdout_path.iter().map(|path| path.as_os_str()))
         .map(|part| part.to_string_lossy().to_ascii_lowercase())
         .any(|part| {
             part.contains("delete")
@@ -163,41 +164,39 @@ fn plans_linux_native_conversion_without_sips() {
         .iter()
         .map(|command| command.program.as_str())
         .collect();
-    assert_eq!(conversion_programs, vec!["dcraw_emu", "magick", "heif-enc"]);
-    assert_eq!(plan.convert.program, "dcraw_emu");
+    assert_eq!(conversion_programs, vec!["exiftool", "heif-enc"]);
+    assert_eq!(plan.convert.program, "exiftool");
     assert_eq!(
         args(&plan.conversion_commands[0]),
-        vec![
-            "-T",
-            "-6",
-            "-W",
-            "-q",
-            "3",
-            "-Z",
-            "/staging/IMG_0006.rendered.tiff",
-            "/nas/raw/IMG_0006.dng"
-        ]
+        vec!["-b", "-PreviewImage", "/nas/raw/IMG_0006.dng"]
+    );
+    assert_eq!(
+        plan.conversion_commands[0].stdout_path,
+        Some(PathBuf::from("/staging/IMG_0006.embedded-preview.jpg"))
     );
     assert_eq!(
         args(&plan.conversion_commands[1]),
         vec![
-            "/staging/IMG_0006.rendered.tiff",
-            "/staging/IMG_0006.rendered.png"
-        ]
-    );
-    assert_eq!(
-        args(&plan.conversion_commands[2]),
-        vec![
             "-q",
             "88",
-            "/staging/IMG_0006.rendered.png",
+            "/staging/IMG_0006.embedded-preview.jpg",
             "-o",
             "/staging/IMG_0006.heic"
         ]
     );
+    assert_eq!(plan.conversion_commands[1].stdout_path, None);
     assert_eq!(plan.metadata.program, "exiftool");
     assert_eq!(plan.verify_image.program, "heif-info");
     assert_eq!(plan.render_raw_preview.program, "magick");
+    assert_eq!(
+        args(&plan.render_raw_preview),
+        vec![
+            "/staging/IMG_0006.embedded-preview.jpg",
+            "-resize",
+            "512x512",
+            "/staging/IMG_0006.raw-preview.png"
+        ]
+    );
     assert_eq!(plan.render_heic_preview.program, "magick");
     assert_eq!(plan.verify_visual_content.program, "magick");
     assert_eq!(plan.verify_visual_match.program, "magick");

@@ -63,43 +63,51 @@ fn execute_measured_conversion_for_target(
         request.heic_quality,
     )?;
     refuse_preexisting_output(&request.output_path)?;
-    let total_started = Instant::now();
-    let convert_started = Instant::now();
-    let convert_outcome = run_planned_commands("conversion", &plan.conversion_commands)?;
-    let convert_wall_time_millis = positive_millis(convert_started.elapsed());
-    let metadata_usage = run_planned_command("metadata", &plan.metadata)?;
-    let output = inspect_output(&request.output_path)?;
-    let total_wall_time_millis = positive_millis(total_started.elapsed());
-    let resource_usage = convert_outcome.resource_usage.combine(metadata_usage);
+    let conversion_result = (|| {
+        let total_started = Instant::now();
+        let convert_started = Instant::now();
+        let convert_outcome = run_planned_commands("conversion", &plan.conversion_commands)?;
+        let convert_wall_time_millis = positive_millis(convert_started.elapsed());
+        let metadata_usage = run_planned_command("metadata", &plan.metadata)?;
+        let output = inspect_output(&request.output_path)?;
+        let total_wall_time_millis = positive_millis(total_started.elapsed());
+        let resource_usage = convert_outcome.resource_usage.combine(metadata_usage);
 
-    let mut updated = manifest.clone();
-    record_conversion_result(
-        &mut updated,
-        &request.asset_id,
-        ConversionResultProof {
-            heic_path: request.output_path,
-            heic_sha256: output.sha256,
-            size_bytes: output.size_bytes,
-        },
-    )?;
-    record_conversion_performance(
-        &mut updated,
-        &request.asset_id,
-        ConversionPerformanceInput {
-            measured_at_unix_seconds: current_unix_seconds(),
-            conversion_tool: conversion_tool_name(&plan),
-            conversion_tool_version: request.conversion_tool_version,
-            heic_quality: request.heic_quality,
-            convert_wall_time_millis,
-            total_wall_time_millis,
-            user_cpu_time_millis: resource_usage.user_cpu_time_millis,
-            system_cpu_time_millis: resource_usage.system_cpu_time_millis,
-            peak_rss_kib: resource_usage.peak_rss_kib,
-            conversion_command_timings: convert_outcome.command_timings,
-        },
-    )?;
+        let mut updated = manifest.clone();
+        record_conversion_result(
+            &mut updated,
+            &request.asset_id,
+            ConversionResultProof {
+                heic_path: request.output_path.clone(),
+                heic_sha256: output.sha256,
+                size_bytes: output.size_bytes,
+            },
+        )?;
+        record_conversion_performance(
+            &mut updated,
+            &request.asset_id,
+            ConversionPerformanceInput {
+                measured_at_unix_seconds: current_unix_seconds(),
+                conversion_tool: conversion_tool_name(&plan),
+                conversion_tool_version: request.conversion_tool_version,
+                heic_quality: request.heic_quality,
+                convert_wall_time_millis,
+                total_wall_time_millis,
+                user_cpu_time_millis: resource_usage.user_cpu_time_millis,
+                system_cpu_time_millis: resource_usage.system_cpu_time_millis,
+                peak_rss_kib: resource_usage.peak_rss_kib,
+                conversion_command_timings: convert_outcome.command_timings,
+            },
+        )?;
 
-    Ok(updated)
+        Ok(updated)
+    })();
+
+    if conversion_result.is_err() {
+        remove_failed_output(&request.output_path);
+    }
+
+    conversion_result
 }
 
 fn conversion_tool_name(plan: &crate::conversion::ConversionPlan) -> String {
@@ -133,10 +141,16 @@ fn run_planned_command(
 ) -> Result<ChildResourceUsage, ConversionExecutionError> {
     let resolved_program = resolve_sanitized_path_tool(&plan.program)?;
     let mut command = Command::new(resolved_program);
-    command
-        .args(&plan.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null());
+    let stdout = match &plan.stdout_path {
+        Some(path) => Stdio::from(File::create(path).map_err(|source| {
+            ConversionExecutionError::OutputUnreadable {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?),
+        None => Stdio::null(),
+    };
+    command.args(&plan.args).stdin(Stdio::null()).stdout(stdout);
     let outcome = wait_for_command_with_usage(command)?;
     if !outcome.status.success() {
         return Err(ConversionExecutionError::CommandFailed {
@@ -145,7 +159,19 @@ fn run_planned_command(
             status: outcome.status.to_string(),
         });
     }
+    if let Some(path) = &plan.stdout_path {
+        inspect_required_intermediate_output(path)?;
+    }
     Ok(outcome.resource_usage)
+}
+
+fn remove_failed_output(path: &Path) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+            let _ = fs::remove_file(path);
+        }
+        _ => {}
+    }
 }
 
 fn run_planned_commands(
@@ -251,6 +277,26 @@ fn wait_for_command_with_usage(
 
 fn inspect_output(path: &Path) -> Result<ConvertedOutput, ConversionExecutionError> {
     inspect_output_with_optional_post_hash(path, Option::<fn(&Path) -> io::Result<()>>::None)
+}
+
+fn inspect_required_intermediate_output(path: &Path) -> Result<(), ConversionExecutionError> {
+    let metadata =
+        fs::metadata(path).map_err(|source| ConversionExecutionError::OutputUnreadable {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !metadata.is_file() {
+        return Err(ConversionExecutionError::OutputUnreadable {
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "output is not a regular file"),
+        });
+    }
+    if metadata.len() == 0 {
+        return Err(ConversionExecutionError::OutputEmpty {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 fn inspect_output_with_optional_post_hash(
@@ -582,7 +628,7 @@ mod tests {
         );
         assert_eq!(
             record.proofs["conversion_performance"]["conversion_tool"],
-            "dcraw_emu+magick+heif-enc"
+            "exiftool+heif-enc"
         );
         assert_eq!(
             record.proofs["conversion_performance"]["conversion_tool_version"],
@@ -599,11 +645,8 @@ mod tests {
         let command_timings = record.proofs["conversion_performance"]["conversion_command_timings"]
             .as_array()
             .expect("command timings should be present");
-        assert_eq!(command_timings.len(), 3);
-        for (timing, program) in command_timings
-            .iter()
-            .zip(["dcraw_emu", "magick", "heif-enc"])
-        {
+        assert_eq!(command_timings.len(), 2);
+        for (timing, program) in command_timings.iter().zip(["exiftool", "heif-enc"]) {
             assert_eq!(timing["program"], program);
             assert!(
                 timing["wall_time_millis"]
@@ -614,16 +657,28 @@ mod tests {
         }
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
-            "dcraw_emu\nmagick\nheif-enc\nexiftool\n"
+            "exiftool-preview\nheif-enc\nexiftool-metadata\n"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn linux_conversion_chain_failure_does_not_record_output() {
-        let tool_dir = fake_linux_conversion_tools_with_heif_enc(
+    fn linux_conversion_chain_failure_removes_partial_output_and_does_not_record_proofs() {
+        let tool_dir = fake_linux_conversion_tools_with_preview_and_heif_enc(
+            DEFAULT_PREVIEW_EXTRACTION_SCRIPT,
             r#"#!/bin/sh
 printf 'heif-enc\n' >> "$EXECUTION_LOG"
+out=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-o" ]; then
+    out="$arg"
+  fi
+  previous="$arg"
+done
+if [ -n "$out" ]; then
+  printf 'partial-heic' > "$out"
+fi
 exit 44
 "#,
         );
@@ -663,72 +718,174 @@ exit 44
         assert!(!record.proofs.contains_key("conversion_performance"));
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
-            "dcraw_emu\nmagick\nheif-enc\n"
+            "exiftool-preview\nheif-enc\n"
         );
     }
 
     #[cfg(unix)]
+    #[test]
+    fn linux_preview_extraction_failure_does_not_encode_or_record_proofs() {
+        let tool_dir = fake_linux_conversion_tools_with_preview_and_heif_enc(
+            r#"printf 'exiftool-preview\n' >> "$EXECUTION_LOG"
+exit 41
+"#,
+            DEFAULT_HEIF_ENC_SCRIPT,
+        );
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest = nas_verified_manifest(&raw_path);
+
+        let error = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("failing preview extraction should fail conversion");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::CommandFailed {
+                stage: "conversion",
+                program,
+                ..
+            } if program == "exiftool"
+        ));
+        assert!(!output_path.exists());
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::NasVerified);
+        assert!(!record.proofs.contains_key("conversion"));
+        assert!(!record.proofs.contains_key("conversion_performance"));
+        assert_eq!(
+            fs::read_to_string(log_path).expect("command log should be readable"),
+            "exiftool-preview\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_empty_preview_extraction_does_not_encode_or_record_proofs() {
+        let tool_dir = fake_linux_conversion_tools_with_preview_and_heif_enc(
+            r#"printf 'exiftool-preview\n' >> "$EXECUTION_LOG"
+exit 0
+"#,
+            DEFAULT_HEIF_ENC_SCRIPT,
+        );
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest = nas_verified_manifest(&raw_path);
+
+        let error = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("empty preview extraction should fail conversion");
+
+        assert!(
+            matches!(error, ConversionExecutionError::OutputEmpty { path } if path.ends_with("IMG_0001.embedded-preview.jpg"))
+        );
+        assert!(!output_path.exists());
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::NasVerified);
+        assert!(!record.proofs.contains_key("conversion"));
+        assert!(!record.proofs.contains_key("conversion_performance"));
+        assert_eq!(
+            fs::read_to_string(log_path).expect("command log should be readable"),
+            "exiftool-preview\n"
+        );
+    }
+
+    #[test]
+    fn required_intermediate_output_rejects_missing_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let missing_path = tempdir.path().join("missing-preview.jpg");
+
+        let error = inspect_required_intermediate_output(&missing_path)
+            .expect_err("missing intermediate output should fail closed");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::OutputUnreadable { path, .. } if path == missing_path
+        ));
+    }
+
+    #[cfg(unix)]
     fn fake_linux_conversion_tools() -> tempfile::TempDir {
-        fake_linux_conversion_tools_with_heif_enc(
-            r#"#!/bin/sh
+        fake_linux_conversion_tools_with_preview_and_heif_enc(
+            DEFAULT_PREVIEW_EXTRACTION_SCRIPT,
+            DEFAULT_HEIF_ENC_SCRIPT,
+        )
+    }
+
+    #[cfg(unix)]
+    const DEFAULT_PREVIEW_EXTRACTION_SCRIPT: &str = r#"printf 'exiftool-preview\n' >> "$EXECUTION_LOG"
+printf 'embedded-preview-jpeg'
+exit 0
+"#;
+
+    #[cfg(unix)]
+    const DEFAULT_HEIF_ENC_SCRIPT: &str = r#"#!/bin/sh
 printf 'heif-enc\n' >> "$EXECUTION_LOG"
 out=""
+input=""
 previous=""
 for arg in "$@"; do
   if [ "$previous" = "-o" ]; then
     out="$arg"
   fi
-  previous="$arg"
-done
-if [ -z "$out" ]; then
-  exit 43
-fi
-printf 'heic-bytes-from-linux-chain' > "$out"
-"#,
-        )
-    }
-
-    #[cfg(unix)]
-    fn fake_linux_conversion_tools_with_heif_enc(heif_enc_body: &str) -> tempfile::TempDir {
-        let tempdir = tempfile::tempdir().expect("tool tempdir should be created");
-        write_executable_script(
-            &tempdir.path().join("dcraw_emu"),
-            r#"#!/bin/sh
-printf 'dcraw_emu\n' >> "$EXECUTION_LOG"
-out=""
-previous=""
-for arg in "$@"; do
-  if [ "$previous" = "-Z" ]; then
-    out="$arg"
+  if [ "$arg" != "-q" ] && [ "$arg" != "-o" ] && [ "$previous" != "-q" ] && [ "$previous" != "-o" ]; then
+    input="$arg"
   fi
   previous="$arg"
 done
-if [ -z "$out" ]; then
-  exit 42
+if [ -z "$out" ] || [ -z "$input" ]; then
+  exit 43
 fi
-printf 'rendered-tiff' > "$out"
-"#,
-        );
-        write_executable_script(
-            &tempdir.path().join("magick"),
-            r#"#!/bin/sh
-printf 'magick\n' >> "$EXECUTION_LOG"
-input="$1"
-output="$2"
-if [ -z "$input" ] || [ -z "$output" ]; then
-  exit 45
+preview_bytes=""
+read -r preview_bytes < "$input"
+if [ "$preview_bytes" != "embedded-preview-jpeg" ]; then
+  exit 46
 fi
-printf 'rendered-png' > "$output"
-"#,
-        );
+printf 'heic-bytes-from-preview' > "$out"
+"#;
+
+    #[cfg(unix)]
+    fn fake_linux_conversion_tools_with_preview_and_heif_enc(
+        preview_extraction_body: &str,
+        heif_enc_body: &str,
+    ) -> tempfile::TempDir {
+        let tempdir = tempfile::tempdir().expect("tool tempdir should be created");
         write_executable_script(&tempdir.path().join("heif-enc"), heif_enc_body);
-        write_executable_script(
-            &tempdir.path().join("exiftool"),
+        let exiftool_body = format!(
             r#"#!/bin/sh
-printf 'exiftool\n' >> "$EXECUTION_LOG"
+if [ "$1" = "-b" ] && [ "$2" = "-PreviewImage" ]; then
+{preview_extraction_body}
+fi
+printf 'exiftool-metadata\n' >> "$EXECUTION_LOG"
 exit 0
-"#,
+"#
         );
+        write_executable_script(&tempdir.path().join("exiftool"), &exiftool_body);
         tempdir
     }
 

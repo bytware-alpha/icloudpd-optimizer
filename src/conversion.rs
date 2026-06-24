@@ -8,6 +8,7 @@ use thiserror::Error;
 pub struct CommandPlan {
     pub program: String,
     pub args: Vec<OsString>,
+    pub stdout_path: Option<PathBuf>,
 }
 
 impl CommandPlan {
@@ -15,7 +16,13 @@ impl CommandPlan {
         Self {
             program: program.into(),
             args,
+            stdout_path: None,
         }
+    }
+
+    pub fn with_stdout_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.stdout_path = Some(path.into());
+        self
     }
 }
 
@@ -211,43 +218,31 @@ fn linux_conversion_plan(
     output_path: &Path,
     heic_quality: u8,
 ) -> Result<ConversionPlan, ConversionError> {
-    let rendered_tiff_arg = intermediate_render_path(output_path, "rendered.tiff")
-        .as_os_str()
-        .to_os_string();
-    let rendered_png_arg = intermediate_render_path(output_path, "rendered.png")
-        .as_os_str()
-        .to_os_string();
-    let render = CommandPlan::new(
-        "dcraw_emu",
+    let embedded_preview_path = intermediate_preview_path(output_path);
+    let embedded_preview_arg = embedded_preview_path.as_os_str().to_os_string();
+    let extract_preview = CommandPlan::new(
+        "exiftool",
         vec![
-            OsString::from("-T"),
-            OsString::from("-6"),
-            OsString::from("-W"),
-            OsString::from("-q"),
-            OsString::from("3"),
-            OsString::from("-Z"),
-            rendered_tiff_arg.clone(),
+            OsString::from("-b"),
+            OsString::from("-PreviewImage"),
             raw_arg.clone(),
         ],
-    );
-    let normalize = CommandPlan::new(
-        "magick",
-        vec![rendered_tiff_arg.clone(), rendered_png_arg.clone()],
-    );
+    )
+    .with_stdout_file(embedded_preview_path);
     let encode = CommandPlan::new(
         "heif-enc",
         vec![
             OsString::from("-q"),
             OsString::from(heic_quality.to_string()),
-            rendered_png_arg.clone(),
+            embedded_preview_arg.clone(),
             OsString::from("-o"),
             output_arg.clone(),
         ],
     );
 
     Ok(ConversionPlan {
-        convert: render.clone(),
-        conversion_commands: vec![render, normalize, encode],
+        convert: extract_preview.clone(),
+        conversion_commands: vec![extract_preview, encode],
         metadata: CommandPlan::new(
             "exiftool",
             vec![
@@ -262,7 +257,7 @@ fn linux_conversion_plan(
         render_raw_preview: CommandPlan::new(
             "magick",
             vec![
-                rendered_png_arg,
+                embedded_preview_arg,
                 OsString::from("-resize"),
                 OsString::from("512x512"),
                 raw_preview_arg.clone(),
@@ -312,10 +307,10 @@ fn linux_conversion_plan(
     })
 }
 
-fn intermediate_render_path(output_path: &Path, label: &str) -> PathBuf {
-    let mut rendered_path = output_path.to_path_buf();
-    rendered_path.set_extension(label);
-    rendered_path
+fn intermediate_preview_path(output_path: &Path) -> PathBuf {
+    let mut preview_path = output_path.to_path_buf();
+    preview_path.set_extension("embedded-preview.jpg");
+    preview_path
 }
 
 fn visual_preview_path(output_path: &Path, label: &str) -> PathBuf {
