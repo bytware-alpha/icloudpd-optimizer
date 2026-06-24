@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use icloudpd_optimizer::upload::{
     CloudKitDeleteClient, CloudKitDeleteRequest, CloudKitDeleteSession, CloudKitDeleteTransport,
     CloudKitOriginalAssetBatchResolveRequest, CloudKitOriginalAssetResolveRequest,
-    CloudKitOriginalAssetResolveTarget, IcloudUploadOutcome, IcloudUploadRequest,
-    IcloudUploadResponse, PhotosUploadClient, PhotosUploadEndpoint, PhotosUploadTransport,
-    SingleFileUploadRequest, UploadError, UploadSession, build_upload_proof, load_upload_session,
-    run_icloud_upload,
+    CloudKitOriginalAssetResolveTarget, CloudKitUploadedHeicResolveRequest, IcloudUploadOutcome,
+    IcloudUploadRequest, IcloudUploadResponse, PhotosUploadClient, PhotosUploadEndpoint,
+    PhotosUploadTransport, SingleFileUploadRequest, UploadError, UploadSession, build_upload_proof,
+    load_upload_session, run_icloud_upload,
 };
 use icloudpd_optimizer::workflow::HeicVerificationProof;
 use serde_json::{Value, json};
@@ -132,6 +132,39 @@ fn cloudkit_raw_pair_with_url(
     );
     records[1]["fields"]["resOriginalRes"]["value"]["downloadURL"] = json!(download_url);
     records
+}
+
+fn cloudkit_uploaded_heic_asset(asset_name: &str, master_name: &str, change_tag: &str) -> Value {
+    json!({
+        "records": [{
+            "recordName": asset_name,
+            "recordType": "CPLAsset",
+            "recordChangeTag": change_tag,
+            "fields": {
+                "masterRef": {"value": {"recordName": master_name}},
+                "isDeleted": {"value": 0}
+            }
+        }]
+    })
+}
+
+fn cloudkit_uploaded_heic_master(master_name: &str, size_bytes: u64, download_url: &str) -> Value {
+    json!({
+        "records": [{
+            "recordName": master_name,
+            "recordType": "CPLMaster",
+            "recordChangeTag": "master-change-tag",
+            "fields": {
+                "resOriginalRes": {
+                    "value": {
+                        "size": size_bytes,
+                        "downloadURL": download_url
+                    }
+                },
+                "resOriginalFileType": {"value": "public.heic"}
+            }
+        }]
+    })
 }
 
 fn original_asset_resolve_request() -> CloudKitOriginalAssetResolveRequest {
@@ -387,9 +420,11 @@ fn cloudkit_delete_client_rejects_missing_or_unsuccessful_delete_confirmation() 
         let mut transport = FakeCloudKitDeleteTransport {
             payloads: Vec::new(),
             query_payloads: Vec::new(),
+            lookup_payloads: Vec::new(),
             downloaded_urls: Vec::new(),
             response,
             query_responses: Vec::new(),
+            lookup_responses: Vec::new(),
             resource_bodies: Vec::new(),
         };
 
@@ -408,6 +443,167 @@ fn cloudkit_delete_client_rejects_missing_or_unsuccessful_delete_confirmation() 
             UploadError::InvalidCloudKitDeleteResponse(_)
         ));
     }
+}
+
+#[test]
+fn cloudkit_delete_client_resolves_uploaded_heic_asset_by_hash_before_delete() {
+    let session =
+        CloudKitDeleteSession::from_json(&valid_delete_session_json()).expect("session loads");
+    let heic_bytes = b"bad-uploaded-heic";
+    let mut transport = FakeCloudKitDeleteTransport::lookup_responses_with_downloads(
+        vec![
+            cloudkit_uploaded_heic_asset(
+                "CPLAsset-uploaded-heic-123",
+                "CPLMaster-heic-123",
+                "tag-1",
+            ),
+            cloudkit_uploaded_heic_master(
+                "CPLMaster-heic-123",
+                heic_bytes.len() as u64,
+                "https://p140-icloud-content.icloud.com/uploaded-heic",
+            ),
+        ],
+        vec![heic_bytes.to_vec()],
+    );
+
+    let resolved = CloudKitDeleteClient::new(&mut transport)
+        .resolve_uploaded_heic_asset(
+            &session,
+            &CloudKitUploadedHeicResolveRequest {
+                uploaded_asset_id: "CPLAsset-uploaded-heic-123".to_string(),
+                expected_heic_sha256: sha256_hex(heic_bytes),
+                expected_size_bytes: heic_bytes.len() as u64,
+            },
+        )
+        .expect("uploaded HEIC should resolve after byte proof");
+
+    assert_eq!(resolved.record_name, "CPLAsset-uploaded-heic-123");
+    assert_eq!(resolved.record_change_tag, "tag-1");
+    assert_eq!(resolved.master_record_name, "CPLMaster-heic-123");
+    assert_eq!(resolved.size_bytes, heic_bytes.len() as u64);
+    assert_eq!(transport.lookup_payloads.len(), 2);
+    assert_eq!(
+        transport.lookup_payloads[0]["records"][0]["recordName"],
+        "CPLAsset-uploaded-heic-123"
+    );
+    assert_eq!(
+        transport.lookup_payloads[1]["records"][0]["recordName"],
+        "CPLMaster-heic-123"
+    );
+    assert_eq!(
+        transport.downloaded_urls,
+        vec!["https://p140-icloud-content.icloud.com/uploaded-heic"]
+    );
+}
+
+#[test]
+fn cloudkit_delete_client_rejects_uploaded_heic_hash_mismatch_without_delete_payload() {
+    let session =
+        CloudKitDeleteSession::from_json(&valid_delete_session_json()).expect("session loads");
+    let mut transport = FakeCloudKitDeleteTransport::lookup_responses_with_downloads(
+        vec![
+            cloudkit_uploaded_heic_asset(
+                "CPLAsset-uploaded-heic-123",
+                "CPLMaster-heic-123",
+                "tag-1",
+            ),
+            cloudkit_uploaded_heic_master(
+                "CPLMaster-heic-123",
+                17,
+                "https://p140-icloud-content.icloud.com/uploaded-heic",
+            ),
+        ],
+        vec![b"bad-uploaded-heic".to_vec()],
+    );
+
+    let error = CloudKitDeleteClient::new(&mut transport)
+        .resolve_uploaded_heic_asset(
+            &session,
+            &CloudKitUploadedHeicResolveRequest {
+                uploaded_asset_id: "CPLAsset-uploaded-heic-123".to_string(),
+                expected_heic_sha256: sha256_hex(b"different-heic"),
+                expected_size_bytes: 17,
+            },
+        )
+        .expect_err("hash mismatch must fail closed");
+
+    assert!(matches!(
+        error,
+        UploadError::CloudKitUploadedHeicDownloadHashMismatch { .. }
+    ));
+    assert!(transport.payloads.is_empty());
+}
+
+#[test]
+fn cloudkit_delete_client_rejects_already_deleted_uploaded_heic() {
+    let session =
+        CloudKitDeleteSession::from_json(&valid_delete_session_json()).expect("session loads");
+    let mut deleted_asset =
+        cloudkit_uploaded_heic_asset("CPLAsset-uploaded-heic-123", "CPLMaster-heic-123", "tag-1");
+    deleted_asset["records"][0]["fields"]["isDeleted"]["value"] = json!(1);
+    let mut transport =
+        FakeCloudKitDeleteTransport::lookup_responses_with_downloads(vec![deleted_asset], vec![]);
+
+    let error = CloudKitDeleteClient::new(&mut transport)
+        .resolve_uploaded_heic_asset(
+            &session,
+            &CloudKitUploadedHeicResolveRequest {
+                uploaded_asset_id: "CPLAsset-uploaded-heic-123".to_string(),
+                expected_heic_sha256: sha256_hex(b"bad-uploaded-heic"),
+                expected_size_bytes: 17,
+            },
+        )
+        .expect_err("already deleted uploaded HEIC must fail closed");
+
+    assert!(matches!(
+        error,
+        UploadError::InvalidCloudKitUploadedHeicResponse(_)
+    ));
+    assert!(transport.payloads.is_empty());
+    assert!(transport.downloaded_urls.is_empty());
+}
+
+#[test]
+fn cloudkit_delete_client_deletes_resolved_uploaded_heic_record() {
+    let session =
+        CloudKitDeleteSession::from_json(&valid_delete_session_json()).expect("session loads");
+    let mut transport = FakeCloudKitDeleteTransport {
+        payloads: Vec::new(),
+        query_payloads: Vec::new(),
+        lookup_payloads: Vec::new(),
+        downloaded_urls: Vec::new(),
+        response: json!({
+            "records": [{
+                "recordName": "CPLAsset-uploaded-heic-123",
+                "recordChangeTag": "tag-2",
+                "fields": {"isDeleted": {"value": 1}}
+            }]
+        }),
+        query_responses: Vec::new(),
+        lookup_responses: Vec::new(),
+        resource_bodies: Vec::new(),
+    };
+
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .delete_cpl_asset(
+            &session,
+            &CloudKitDeleteRequest {
+                record_name: "CPLAsset-uploaded-heic-123".to_string(),
+                record_change_tag: "tag-1".to_string(),
+            },
+        )
+        .expect("delete should confirm uploaded HEIC record");
+
+    assert_eq!(outcome.record_name, "CPLAsset-uploaded-heic-123");
+    assert_eq!(outcome.record_change_tag, "tag-2");
+    assert_eq!(
+        transport.payloads[0]["operations"][0]["record"]["recordName"],
+        "CPLAsset-uploaded-heic-123"
+    );
+    assert_eq!(
+        transport.payloads[0]["operations"][0]["record"]["recordChangeTag"],
+        "tag-1"
+    );
 }
 
 #[test]
@@ -1757,9 +1953,11 @@ impl PhotosUploadTransport for FakePhotosTransport {
 struct FakeCloudKitDeleteTransport {
     payloads: Vec<Value>,
     query_payloads: Vec<Value>,
+    lookup_payloads: Vec<Value>,
     downloaded_urls: Vec<String>,
     response: Value,
     query_responses: Vec<Value>,
+    lookup_responses: Vec<Value>,
     resource_bodies: Vec<Vec<u8>>,
 }
 
@@ -1768,6 +1966,7 @@ impl FakeCloudKitDeleteTransport {
         Self {
             payloads: Vec::new(),
             query_payloads: Vec::new(),
+            lookup_payloads: Vec::new(),
             downloaded_urls: Vec::new(),
             response: json!({
                 "records": [{
@@ -1779,6 +1978,7 @@ impl FakeCloudKitDeleteTransport {
                 }]
             }),
             query_responses: Vec::new(),
+            lookup_responses: Vec::new(),
             resource_bodies: Vec::new(),
         }
     }
@@ -1787,9 +1987,11 @@ impl FakeCloudKitDeleteTransport {
         Self {
             payloads: Vec::new(),
             query_payloads: Vec::new(),
+            lookup_payloads: Vec::new(),
             downloaded_urls: Vec::new(),
             response: json!({"records": []}),
             query_responses,
+            lookup_responses: Vec::new(),
             resource_bodies: Vec::new(),
         }
     }
@@ -1801,9 +2003,27 @@ impl FakeCloudKitDeleteTransport {
         Self {
             payloads: Vec::new(),
             query_payloads: Vec::new(),
+            lookup_payloads: Vec::new(),
             downloaded_urls: Vec::new(),
             response: json!({"records": []}),
             query_responses,
+            lookup_responses: Vec::new(),
+            resource_bodies,
+        }
+    }
+
+    fn lookup_responses_with_downloads(
+        lookup_responses: Vec<Value>,
+        resource_bodies: Vec<Vec<u8>>,
+    ) -> Self {
+        Self {
+            payloads: Vec::new(),
+            query_payloads: Vec::new(),
+            lookup_payloads: Vec::new(),
+            downloaded_urls: Vec::new(),
+            response: json!({"records": []}),
+            query_responses: Vec::new(),
+            lookup_responses,
             resource_bodies,
         }
     }
@@ -1826,6 +2046,15 @@ impl CloudKitDeleteTransport for FakeCloudKitDeleteTransport {
     ) -> Result<Value, UploadError> {
         self.query_payloads.push(payload);
         Ok(self.query_responses.remove(0))
+    }
+
+    fn post_records_lookup(
+        &mut self,
+        _session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        self.lookup_payloads.push(payload);
+        Ok(self.lookup_responses.remove(0))
     }
 
     fn download_resource(

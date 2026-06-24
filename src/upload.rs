@@ -108,6 +108,22 @@ pub struct CloudKitDeleteOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudKitUploadedHeicResolveRequest {
+    pub uploaded_asset_id: String,
+    pub expected_heic_sha256: String,
+    pub expected_size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CloudKitUploadedHeicAsset {
+    pub record_name: String,
+    pub record_change_tag: String,
+    pub master_record_name: String,
+    pub matched_heic_sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CloudKitResourceDownload {
     pub sha256: String,
     pub size_bytes: u64,
@@ -236,6 +252,12 @@ pub trait CloudKitDeleteTransport {
         payload: Value,
     ) -> Result<Value, UploadError>;
 
+    fn post_records_lookup(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError>;
+
     fn download_resource(
         &mut self,
         session: &CloudKitDeleteSession,
@@ -259,6 +281,14 @@ impl<T: CloudKitDeleteTransport + ?Sized> CloudKitDeleteTransport for &mut T {
         payload: Value,
     ) -> Result<Value, UploadError> {
         (**self).post_records_query(session, payload)
+    }
+
+    fn post_records_lookup(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        (**self).post_records_lookup(session, payload)
     }
 
     fn download_resource(
@@ -426,11 +456,74 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
         session: &CloudKitDeleteSession,
         request: &CloudKitDeleteRequest,
     ) -> Result<CloudKitDeleteOutcome, UploadError> {
+        self.delete_cpl_asset(session, request)
+    }
+
+    pub fn delete_cpl_asset(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        request: &CloudKitDeleteRequest,
+    ) -> Result<CloudKitDeleteOutcome, UploadError> {
         validate_cloudkit_delete_request(request)?;
         let response = self
             .transport
             .post_records_modify(session, cloudkit_delete_payload(request))?;
         parse_cloudkit_delete_response(response, request)
+    }
+
+    pub fn resolve_uploaded_heic_asset(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        request: &CloudKitUploadedHeicResolveRequest,
+    ) -> Result<CloudKitUploadedHeicAsset, UploadError> {
+        validate_uploaded_heic_resolve_request(request)?;
+        let asset_response = self.transport.post_records_lookup(
+            session,
+            cloudkit_records_lookup_payload(
+                &[request.uploaded_asset_id.as_str()],
+                &["masterRef", "isDeleted"],
+            ),
+        )?;
+        let asset = parse_uploaded_heic_asset_lookup_response(asset_response, request)?;
+        let master_response = self.transport.post_records_lookup(
+            session,
+            cloudkit_records_lookup_payload(
+                &[asset.master_record_name.as_str()],
+                &[
+                    "resOriginalRes",
+                    "resOriginalFileType",
+                    "resOriginalAltRes",
+                    "resOriginalAltFileType",
+                    "resSidecarRes",
+                    "resSidecarFileType",
+                    "resOriginalVidComplRes",
+                    "resOriginalVidComplFileType",
+                ],
+            ),
+        )?;
+        let download_url = parse_uploaded_heic_master_lookup_response(
+            master_response,
+            &asset.master_record_name,
+            request.expected_size_bytes,
+        )?;
+        let download = self.transport.download_resource(
+            session,
+            &download_url,
+            request.expected_size_bytes,
+        )?;
+        if download.sha256 != request.expected_heic_sha256 {
+            return Err(UploadError::CloudKitUploadedHeicDownloadHashMismatch {
+                expected: request.expected_heic_sha256.clone(),
+                actual: download.sha256,
+            });
+        }
+        Ok(CloudKitUploadedHeicAsset {
+            record_name: asset.record_name,
+            record_change_tag: asset.record_change_tag,
+            master_record_name: asset.master_record_name,
+            matched_heic_sha256: request.expected_heic_sha256.clone(),
+            size_bytes: download.size_bytes,
+        })
     }
 
     pub fn resolve_original_asset(
@@ -735,6 +828,25 @@ impl CloudKitDeleteTransport for ReqwestCloudKitDeleteTransport {
         read_json_response(response, "records_query")
     }
 
+    fn post_records_lookup(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        let url = cloudkit_records_lookup_url(session)?;
+        let response = self
+            .client
+            .post(url)
+            .headers(cloudkit_records_request_headers(session)?)
+            .body(payload.to_string())
+            .send()
+            .map_err(|source| UploadError::Network {
+                operation: "records_lookup",
+                source,
+            })?;
+        read_json_response(response, "records_lookup")
+    }
+
     fn download_resource(
         &mut self,
         session: &CloudKitDeleteSession,
@@ -894,6 +1006,18 @@ fn cloudkit_delete_payload(request: &CloudKitDeleteRequest) -> Value {
                 }
             }
         }],
+        "zoneID": {"zoneName": PRIMARY_SYNC_ZONE}
+    })
+}
+
+fn cloudkit_records_lookup_payload(record_names: &[&str], desired_keys: &[&str]) -> Value {
+    let records: Vec<Value> = record_names
+        .iter()
+        .map(|record_name| json!({ "recordName": record_name }))
+        .collect();
+    json!({
+        "records": records,
+        "desiredKeys": desired_keys,
         "zoneID": {"zoneName": PRIMARY_SYNC_ZONE}
     })
 }
@@ -1358,6 +1482,116 @@ struct OriginalAssetBatchQueryPage {
     matches: Vec<OriginalAssetBatchCandidate>,
 }
 
+struct UploadedHeicAssetLookup {
+    record_name: String,
+    record_change_tag: String,
+    master_record_name: String,
+}
+
+fn parse_uploaded_heic_asset_lookup_response(
+    value: Value,
+    request: &CloudKitUploadedHeicResolveRequest,
+) -> Result<UploadedHeicAssetLookup, UploadError> {
+    let records = cloudkit_lookup_records(&value)?;
+    if records.len() != 1 {
+        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "records/lookup must return exactly one uploaded HEIC asset",
+        ));
+    }
+    let record = &records[0];
+    reject_cloudkit_record_error(record, "records/lookup")?;
+    require_record_type(record, "CPLAsset")?;
+    let record_name = required_record_string(record, "recordName")?;
+    if record_name != request.uploaded_asset_id {
+        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "records/lookup returned a different uploaded HEIC asset",
+        ));
+    }
+    let record_change_tag = required_record_string(record, "recordChangeTag")?;
+    if record_change_tag.trim().is_empty() {
+        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "uploaded HEIC recordChangeTag is empty",
+        ));
+    }
+    let fields = record_fields(record)?;
+    if field_value(fields, "isDeleted").is_some_and(cloudkit_truthy) {
+        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "uploaded HEIC asset is already deleted",
+        ));
+    }
+    let master_record_name = field_value(fields, "masterRef")
+        .and_then(master_ref_record_name)
+        .ok_or(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "uploaded HEIC asset missing masterRef",
+        ))?;
+    if master_record_name.trim().is_empty() {
+        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "uploaded HEIC masterRef is empty",
+        ));
+    }
+    Ok(UploadedHeicAssetLookup {
+        record_name: record_name.to_string(),
+        record_change_tag: record_change_tag.to_string(),
+        master_record_name: master_record_name.to_string(),
+    })
+}
+
+fn parse_uploaded_heic_master_lookup_response(
+    value: Value,
+    expected_master_record_name: &str,
+    expected_size_bytes: u64,
+) -> Result<Url, UploadError> {
+    let records = cloudkit_lookup_records(&value)?;
+    if records.len() != 1 {
+        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "records/lookup must return exactly one uploaded HEIC master",
+        ));
+    }
+    let record = &records[0];
+    reject_cloudkit_record_error(record, "records/lookup")?;
+    require_record_type(record, "CPLMaster")?;
+    let record_name = required_record_string(record, "recordName")?;
+    if record_name != expected_master_record_name {
+        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "records/lookup returned a different uploaded HEIC master",
+        ));
+    }
+    master_matching_heic_resource_url(record, expected_size_bytes)
+}
+
+fn cloudkit_lookup_records(value: &Value) -> Result<&Vec<Value>, UploadError> {
+    value.get("records").and_then(Value::as_array).ok_or(
+        UploadError::InvalidCloudKitUploadedHeicResponse(
+            "records/lookup response must include records",
+        ),
+    )
+}
+
+fn reject_cloudkit_record_error(
+    record: &Value,
+    operation: &'static str,
+) -> Result<(), UploadError> {
+    if record.get("serverErrorCode").is_some() {
+        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+            match operation {
+                "records/lookup" => "records/lookup returned a record error",
+                _ => "CloudKit returned a record error",
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn require_record_type(record: &Value, expected: &'static str) -> Result<(), UploadError> {
+    let record_type = required_record_string(record, "recordType")?;
+    if record_type != expected {
+        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "CloudKit record has an unexpected recordType",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_cloudkit_continuation_marker(value: &Value) -> Result<Option<String>, UploadError> {
     let Some(response) = value.as_object() else {
         return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
@@ -1505,6 +1739,63 @@ fn master_matching_raw_resource_urls(
     Ok(matches)
 }
 
+fn master_matching_heic_resource_url(
+    master: &Value,
+    expected_size_bytes: u64,
+) -> Result<Url, UploadError> {
+    let fields = record_fields(master)?;
+    let mut saw_resource = false;
+    let mut matches = Vec::new();
+    for prefix in [
+        "resOriginal",
+        "resOriginalAlt",
+        "resSidecar",
+        "resOriginalVidCompl",
+    ] {
+        let res_key = format!("{prefix}Res");
+        let Some(resource_field) = fields.get(&res_key) else {
+            continue;
+        };
+        saw_resource = true;
+        let Some(resource) = field_value_object(resource_field) else {
+            return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+                "CPLMaster HEIC resource field is malformed",
+            ));
+        };
+        let Some(size_bytes) = resource_size_bytes(resource) else {
+            return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+                "CPLMaster HEIC resource missing size",
+            ));
+        };
+        if size_bytes != expected_size_bytes {
+            continue;
+        }
+        let file_type_key = format!("{prefix}FileType");
+        let Some(file_type) = field_string(fields, &file_type_key) else {
+            return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+                "CPLMaster HEIC resource missing file type",
+            ));
+        };
+        if resource_type_is_heic(file_type) {
+            matches.push(resource_download_url(resource)?);
+        }
+    }
+    if !saw_resource {
+        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "CPLMaster missing HEIC resources",
+        ));
+    }
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "CPLMaster has no HEIC resource matching the expected size",
+        )),
+        _ => Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "CPLMaster has multiple HEIC resources matching the expected size",
+        )),
+    }
+}
+
 fn required_record_string<'a>(
     record: &'a Value,
     key: &'static str,
@@ -1541,6 +1832,10 @@ fn master_ref_record_name(value: &Value) -> Option<&str> {
         .get("recordName")
         .and_then(Value::as_str)
         .or_else(|| value.as_str())
+}
+
+fn cloudkit_truthy(value: &Value) -> bool {
+    matches!(value.as_i64(), Some(1)) || matches!(value.as_bool(), Some(true))
 }
 
 fn cloudkit_unix_seconds(value: &Value) -> Option<u64> {
@@ -1591,6 +1886,15 @@ fn resource_type_is_raw(value: &str) -> bool {
         || value.contains("raw")
         || value.contains("digital-negative")
         || value.contains("adobe.raw-image")
+}
+
+fn resource_type_is_heic(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value == "heic"
+        || value == "heif"
+        || value.contains("heic")
+        || value.contains("heif")
+        || value.contains("hevc")
 }
 
 fn validate_single_file_upload_request(
@@ -1645,6 +1949,19 @@ fn cloudkit_records_modify_url(session: &CloudKitDeleteSession) -> Result<Url, U
 fn cloudkit_records_query_url(session: &CloudKitDeleteSession) -> Result<Url, UploadError> {
     let mut base = session.ckdatabasews_url.clone();
     base.set_path("/database/1/com.apple.photos.cloud/production/private/records/query");
+    {
+        let mut query = base.query_pairs_mut();
+        query.clear();
+        for param in &session.cloudkit_query_params {
+            query.append_pair(&param.name, &param.value);
+        }
+    }
+    Ok(base)
+}
+
+fn cloudkit_records_lookup_url(session: &CloudKitDeleteSession) -> Result<Url, UploadError> {
+    let mut base = session.ckdatabasews_url.clone();
+    base.set_path("/database/1/com.apple.photos.cloud/production/private/records/lookup");
     {
         let mut query = base.query_pairs_mut();
         query.clear();
@@ -2250,6 +2567,28 @@ fn validate_cloudkit_delete_request(request: &CloudKitDeleteRequest) -> Result<(
     Ok(())
 }
 
+fn validate_uploaded_heic_resolve_request(
+    request: &CloudKitUploadedHeicResolveRequest,
+) -> Result<(), UploadError> {
+    if request.uploaded_asset_id.trim().is_empty() {
+        return Err(UploadError::InvalidCloudKitUploadedHeicRequest(
+            "uploaded HEIC asset id is required",
+        ));
+    }
+    if request.expected_heic_sha256.trim().is_empty() {
+        return Err(UploadError::InvalidCloudKitUploadedHeicRequest(
+            "expected HEIC SHA-256 is required",
+        ));
+    }
+    if request.expected_size_bytes == 0 {
+        return Err(UploadError::InvalidCloudKitUploadedHeicRequest(
+            "expected HEIC size must be positive",
+        ));
+    }
+    reject_cloudkit_identity_chars(&request.uploaded_asset_id, "uploaded HEIC asset id")?;
+    Ok(())
+}
+
 fn validate_original_asset_resolve_request(
     request: &CloudKitOriginalAssetResolveRequest,
 ) -> Result<(), UploadError> {
@@ -2617,6 +2956,10 @@ pub enum UploadError {
     InvalidCloudKitOriginalAssetRequest(&'static str),
     #[error("invalid CloudKit original asset response: {0}")]
     InvalidCloudKitOriginalAssetResponse(&'static str),
+    #[error("invalid CloudKit uploaded HEIC request: {0}")]
+    InvalidCloudKitUploadedHeicRequest(&'static str),
+    #[error("invalid CloudKit uploaded HEIC response: {0}")]
+    InvalidCloudKitUploadedHeicResponse(&'static str),
     #[error(
         "CloudKit original asset resolver found {matches} matching candidates; expected exactly one"
     )]
@@ -2629,6 +2972,10 @@ pub enum UploadError {
         "CloudKit original asset download size mismatch: expected {expected} bytes, downloaded {actual} bytes"
     )]
     CloudKitOriginalAssetDownloadSizeMismatch { expected: u64, actual: u64 },
+    #[error(
+        "CloudKit uploaded HEIC download hash mismatch: expected {expected}, downloaded {actual}"
+    )]
+    CloudKitUploadedHeicDownloadHashMismatch { expected: String, actual: String },
     #[error(
         "signed upload size mismatch: expected {expected} bytes, service reported {actual} bytes"
     )]

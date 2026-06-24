@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use filetime::{FileTime, set_file_mtime};
 use icloudpd_optimizer::manifest::{AssetRecord, Manifest, ManifestError, State};
 use icloudpd_optimizer::proof::{NasRawProof, ProofError, prove_nas_raw};
-use icloudpd_optimizer::upload::CloudKitDeleteOutcome;
+use icloudpd_optimizer::upload::{CloudKitDeleteOutcome, CloudKitUploadedHeicAsset};
 use icloudpd_optimizer::workflow::{
     ConversionCommandTiming, ConversionPerformanceInput, ConversionPerformanceProof,
     ConversionResultProof, HeicVerificationProof, IcloudpdLocalMirrorProof, OriginalAssetProof,
@@ -14,7 +14,8 @@ use icloudpd_optimizer::workflow::{
     record_conversion_result, record_delete_execution, record_heic_verification,
     record_icloudpd_local_mirror_proof, record_nas_proof, record_original_asset_batch_proofs,
     record_original_asset_proof, record_source_age_proof, record_stage_failure,
-    record_upload_proof, upload_ready_heic_proof,
+    record_upload_proof, record_uploaded_heic_delete, upload_ready_heic_proof,
+    uploaded_heic_delete_request,
 };
 use serde_json::json;
 
@@ -116,6 +117,23 @@ fn delete_outcome() -> CloudKitDeleteOutcome {
     CloudKitDeleteOutcome {
         record_name: "original-record-1".to_string(),
         record_change_tag: "deleted-change-tag".to_string(),
+    }
+}
+
+fn uploaded_heic_asset() -> CloudKitUploadedHeicAsset {
+    CloudKitUploadedHeicAsset {
+        record_name: "icloud-heic-asset-1".to_string(),
+        record_change_tag: "uploaded-old-change-tag".to_string(),
+        master_record_name: "icloud-heic-master-1".to_string(),
+        matched_heic_sha256: "heic-sha256".to_string(),
+        size_bytes: 24,
+    }
+}
+
+fn uploaded_heic_delete_outcome() -> CloudKitDeleteOutcome {
+    CloudKitDeleteOutcome {
+        record_name: "icloud-heic-asset-1".to_string(),
+        record_change_tag: "uploaded-deleted-change-tag".to_string(),
     }
 }
 
@@ -1377,6 +1395,101 @@ fn upload_proof_records_heic_identity_for_future_skip() {
     assert_eq!(
         record.proofs["upload"]["uploaded_heic_path"],
         "/staging/IMG_0001.heic"
+    );
+}
+
+#[test]
+fn uploaded_heic_delete_request_uses_uploaded_asset_and_heic_hash() {
+    let manifest = upload_verified_manifest();
+
+    let request = uploaded_heic_delete_request(&manifest, "asset-1")
+        .expect("uploaded HEIC delete request should build from upload proof");
+
+    assert_eq!(request.uploaded_asset_id, "icloud-heic-asset-1");
+    assert_eq!(request.expected_heic_sha256, "heic-sha256");
+    assert_eq!(request.expected_size_bytes, 24);
+}
+
+#[test]
+fn uploaded_heic_delete_request_rejects_original_asset_target() {
+    let mut manifest = upload_verified_manifest();
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    proof_mut(&mut record, "upload")["uploaded_heic_asset_id"] = json!("original-record-1");
+    manifest.upsert(record);
+
+    let error = uploaded_heic_delete_request(&manifest, "asset-1")
+        .expect_err("uploaded HEIC delete must not target original RAW asset");
+
+    assert!(matches!(
+        error,
+        WorkflowError::InvalidProofField {
+            proof_key: "upload",
+            field: "uploaded_heic_asset_id",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn uploaded_heic_delete_records_repair_proof_without_changing_deleted_state() {
+    let (_tempdir, mut manifest, _) = real_delete_approved_manifest();
+    record_delete_execution(&mut manifest, "asset-1", delete_outcome())
+        .expect("original delete should record");
+
+    let record = record_uploaded_heic_delete(
+        &mut manifest,
+        "asset-1",
+        uploaded_heic_asset(),
+        uploaded_heic_delete_outcome(),
+    )
+    .expect("uploaded HEIC repair delete proof should record");
+
+    assert_eq!(record.state, State::Deleted);
+    assert_eq!(
+        record.proofs["uploaded_heic_delete"]["uploaded_heic_asset_id"],
+        "icloud-heic-asset-1"
+    );
+    assert_eq!(
+        record.proofs["uploaded_heic_delete"]["deleted_record_name"],
+        "icloud-heic-asset-1"
+    );
+    assert_eq!(
+        record.proofs["uploaded_heic_delete"]["matched_heic_sha256"],
+        "heic-sha256"
+    );
+    assert_eq!(
+        record.proofs["uploaded_heic_delete"]["confirmed_deleted_change_tag"],
+        "uploaded-deleted-change-tag"
+    );
+}
+
+#[test]
+fn uploaded_heic_delete_rejects_mismatched_deleted_record_without_mutation() {
+    let mut manifest = upload_verified_manifest();
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = record_uploaded_heic_delete(
+        &mut manifest,
+        "asset-1",
+        uploaded_heic_asset(),
+        CloudKitDeleteOutcome {
+            record_name: "other-uploaded-heic".to_string(),
+            record_change_tag: "uploaded-deleted-change-tag".to_string(),
+        },
+    )
+    .expect_err("delete outcome must match uploaded HEIC asset");
+
+    assert!(matches!(
+        error,
+        WorkflowError::ProofMismatch {
+            proof_key: "uploaded_heic_delete",
+            field: "deleted_record_name",
+            ..
+        }
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
     );
 }
 

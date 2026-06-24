@@ -11,7 +11,10 @@ use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
 use crate::proof::{
     MIN_RAW_AGE_SECONDS, NasRawProof, ProofError, prove_nas_raw, prove_nas_raw_with_min_age_seconds,
 };
-use crate::upload::{CloudKitDeleteOutcome, CloudKitDeleteRequest};
+use crate::upload::{
+    CloudKitDeleteOutcome, CloudKitDeleteRequest, CloudKitUploadedHeicAsset,
+    CloudKitUploadedHeicResolveRequest,
+};
 
 const NAS_PROOF: &str = "nas";
 const ORIGINAL_ASSET_PROOF: &str = "original_asset";
@@ -20,6 +23,7 @@ const CONVERSION_PERFORMANCE_PROOF: &str = "conversion_performance";
 const HEIC_PROOF: &str = "heic";
 const SOURCE_AGE_PROOF: &str = "source_age";
 const UPLOAD_PROOF: &str = "upload";
+const UPLOADED_HEIC_DELETE_PROOF: &str = "uploaded_heic_delete";
 const ICLOUDPD_LOCAL_MIRROR_PROOF: &str = "icloudpd_local_mirror";
 const DELETE_ELIGIBILITY_PROOF: &str = "delete_eligibility";
 const DELETE_APPROVAL_PROOF: &str = "delete_approval";
@@ -194,6 +198,17 @@ pub struct DeleteExecutionProof {
     pub deleted_record_name: String,
     pub confirmed_deleted_change_tag: String,
     pub uploaded_heic_asset_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UploadedHeicDeleteProof {
+    pub uploaded_heic_asset_id: String,
+    pub uploaded_heic_master_record_name: String,
+    pub matched_heic_sha256: String,
+    pub size_bytes: u64,
+    pub old_record_change_tag: String,
+    pub deleted_record_name: String,
+    pub confirmed_deleted_change_tag: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -380,6 +395,62 @@ pub fn record_upload_proof<'a>(
         UPLOAD_PROOF,
         &proof,
     )
+}
+
+pub fn uploaded_heic_delete_request(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<CloudKitUploadedHeicResolveRequest, WorkflowError> {
+    let (upload, heic) = uploaded_heic_delete_inputs(manifest, asset_id)?;
+    Ok(CloudKitUploadedHeicResolveRequest {
+        uploaded_asset_id: upload.uploaded_heic_asset_id,
+        expected_heic_sha256: upload.uploaded_heic_sha256,
+        expected_size_bytes: heic.size_bytes,
+    })
+}
+
+pub fn record_uploaded_heic_delete<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    resolved: CloudKitUploadedHeicAsset,
+    outcome: CloudKitDeleteOutcome,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    let (upload, heic) = uploaded_heic_delete_inputs(manifest, asset_id)?;
+    require_matching_str(
+        UPLOADED_HEIC_DELETE_PROOF,
+        "uploaded_heic_asset_id",
+        &upload.uploaded_heic_asset_id,
+        &resolved.record_name,
+    )?;
+    require_matching_str(
+        UPLOADED_HEIC_DELETE_PROOF,
+        "matched_heic_sha256",
+        &upload.uploaded_heic_sha256,
+        &resolved.matched_heic_sha256,
+    )?;
+    require_matching_u64(
+        UPLOADED_HEIC_DELETE_PROOF,
+        "size_bytes",
+        heic.size_bytes,
+        resolved.size_bytes,
+    )?;
+    require_matching_str(
+        UPLOADED_HEIC_DELETE_PROOF,
+        "deleted_record_name",
+        &resolved.record_name,
+        &outcome.record_name,
+    )?;
+    let proof = UploadedHeicDeleteProof {
+        uploaded_heic_asset_id: upload.uploaded_heic_asset_id,
+        uploaded_heic_master_record_name: resolved.master_record_name,
+        matched_heic_sha256: resolved.matched_heic_sha256,
+        size_bytes: resolved.size_bytes,
+        old_record_change_tag: resolved.record_change_tag,
+        deleted_record_name: outcome.record_name,
+        confirmed_deleted_change_tag: outcome.record_change_tag,
+    };
+    validate_uploaded_heic_delete_proof(&proof)?;
+    insert_workflow_proof(manifest, asset_id, UPLOADED_HEIC_DELETE_PROOF, &proof)
 }
 
 pub fn record_icloudpd_local_mirror_proof<'a>(
@@ -1255,6 +1326,76 @@ fn validate_original_asset_proof(
         &proof.matched_raw_sha256,
     )?;
 
+    Ok(())
+}
+
+fn uploaded_heic_delete_inputs(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<(UploadProof, HeicVerificationProof), WorkflowError> {
+    manifest.get(asset_id)?;
+    let upload = stored_proof::<UploadProof>(manifest, asset_id, UPLOAD_PROOF)?;
+    require_non_empty("uploaded_heic_asset_id", &upload.uploaded_heic_asset_id)?;
+    require_non_empty("uploaded_heic_sha256", &upload.uploaded_heic_sha256)?;
+    let uploaded_heic_path =
+        upload
+            .uploaded_heic_path
+            .as_ref()
+            .ok_or(WorkflowError::EmptyProofField {
+                field: "uploaded_heic_path",
+            })?;
+    require_non_empty_path("uploaded_heic_path", uploaded_heic_path)?;
+    let heic = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
+    validate_heic_verification_flags(&heic)?;
+    require_matching_str(
+        HEIC_PROOF,
+        "uploaded_heic_sha256",
+        &heic.heic_sha256,
+        &upload.uploaded_heic_sha256,
+    )?;
+    require_matching_path(
+        HEIC_PROOF,
+        "uploaded_heic_path",
+        &heic.heic_path,
+        uploaded_heic_path,
+    )?;
+    require_positive_u64(HEIC_PROOF, "size_bytes", heic.size_bytes)?;
+    if let Ok(original) =
+        stored_proof::<OriginalAssetProof>(manifest, asset_id, ORIGINAL_ASSET_PROOF)
+    {
+        if original.record_name == upload.uploaded_heic_asset_id {
+            return Err(WorkflowError::InvalidProofField {
+                proof_key: UPLOAD_PROOF,
+                field: "uploaded_heic_asset_id",
+                reason: "uploaded HEIC asset id must not match the original RAW asset record",
+            });
+        }
+    }
+    Ok((upload, heic))
+}
+
+fn validate_uploaded_heic_delete_proof(
+    proof: &UploadedHeicDeleteProof,
+) -> Result<(), WorkflowError> {
+    require_non_empty("uploaded_heic_asset_id", &proof.uploaded_heic_asset_id)?;
+    require_non_empty(
+        "uploaded_heic_master_record_name",
+        &proof.uploaded_heic_master_record_name,
+    )?;
+    require_non_empty("matched_heic_sha256", &proof.matched_heic_sha256)?;
+    require_positive_u64(UPLOADED_HEIC_DELETE_PROOF, "size_bytes", proof.size_bytes)?;
+    require_non_empty("old_record_change_tag", &proof.old_record_change_tag)?;
+    require_non_empty("deleted_record_name", &proof.deleted_record_name)?;
+    require_non_empty(
+        "confirmed_deleted_change_tag",
+        &proof.confirmed_deleted_change_tag,
+    )?;
+    require_matching_str(
+        UPLOADED_HEIC_DELETE_PROOF,
+        "deleted_record_name",
+        &proof.uploaded_heic_asset_id,
+        &proof.deleted_record_name,
+    )?;
     Ok(())
 }
 

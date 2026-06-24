@@ -26,7 +26,7 @@ use crate::monitor::{
 };
 use crate::proof::NasRawProof;
 use crate::upload::{
-    CloudKitDeleteClient, CloudKitOriginalAssetBatchResolveRequest,
+    CloudKitDeleteClient, CloudKitDeleteRequest, CloudKitOriginalAssetBatchResolveRequest,
     CloudKitOriginalAssetResolveRequest, CloudKitOriginalAssetResolveTarget, IcloudUploadRequest,
     ReqwestCloudKitDeleteTransport, UploadError, build_upload_proof, load_cloudkit_delete_session,
     run_icloud_upload, verify_local_heic,
@@ -38,7 +38,8 @@ use crate::workflow::{
     prove_and_record_nas, record_conversion_performance, record_conversion_result,
     record_delete_execution, record_heic_verification, record_icloudpd_local_mirror_proof,
     record_original_asset_batch_proofs, record_original_asset_proof, record_source_age_proof,
-    record_stage_failure, record_upload_proof, upload_ready_heic_proof,
+    record_stage_failure, record_upload_proof, record_uploaded_heic_delete,
+    upload_ready_heic_proof, uploaded_heic_delete_request,
 };
 
 const DAY_SECONDS: u64 = 24 * 60 * 60;
@@ -200,6 +201,16 @@ enum WorkflowCommand {
     #[command(about = "Upload with an external Photos upload session not produced by icloudpd")]
     UploadHeic(WorkflowUploadHeicArgs),
     UploadVerified(WorkflowUploadVerifiedArgs),
+    #[command(
+        name = "uploaded-heic-delete-plan",
+        about = "Resolve and hash-verify the uploaded HEIC replacement asset without deleting it"
+    )]
+    UploadedHeicDeletePlan(WorkflowDeleteUploadedHeicArgs),
+    #[command(
+        name = "delete-uploaded-heic",
+        about = "Delete the uploaded HEIC replacement asset after hash-verifying its CloudKit resource"
+    )]
+    DeleteUploadedHeic(WorkflowDeleteUploadedHeicArgs),
     #[command(name = "icloudpd-local-mirror")]
     IcloudpdLocalMirror(WorkflowIcloudpdLocalMirrorArgs),
     OriginalAssetVerified(WorkflowOriginalAssetVerifiedArgs),
@@ -363,6 +374,16 @@ struct WorkflowUploadVerifiedArgs {
     uploaded_heic_sha256: String,
     #[arg(long, value_name = "PATH")]
     uploaded_heic_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct WorkflowDeleteUploadedHeicArgs {
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+    #[arg(long)]
+    asset_id: String,
+    #[arg(long, value_name = "PATH", help = "CloudKit delete session JSON")]
+    session: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -574,6 +595,10 @@ fn run_workflow<W: Write>(args: WorkflowArgs, writer: &mut W) -> Result<(), CliE
         WorkflowCommand::HeicVerified(args) => workflow_heic_verified(args),
         WorkflowCommand::UploadHeic(args) => workflow_upload_heic(args),
         WorkflowCommand::UploadVerified(args) => workflow_upload_verified(args),
+        WorkflowCommand::UploadedHeicDeletePlan(args) => {
+            workflow_uploaded_heic_delete_plan(args, writer)
+        }
+        WorkflowCommand::DeleteUploadedHeic(args) => workflow_delete_uploaded_heic(args),
         WorkflowCommand::IcloudpdLocalMirror(args) => workflow_icloudpd_local_mirror(args),
         WorkflowCommand::OriginalAssetVerified(args) => workflow_original_asset_verified(args),
         WorkflowCommand::OriginalAssetResolve(args) => workflow_original_asset_resolve(args),
@@ -817,6 +842,39 @@ fn workflow_upload_verified(args: WorkflowUploadVerifiedArgs) -> Result<(), CliE
             uploaded_heic_path: args.uploaded_heic_path,
         },
     )?;
+    save_manifest(&manifest, &args.manifest)
+}
+
+fn workflow_uploaded_heic_delete_plan<W: Write>(
+    args: WorkflowDeleteUploadedHeicArgs,
+    writer: &mut W,
+) -> Result<(), CliError> {
+    let manifest = load_manifest_for_write(&args.manifest)?;
+    let request = uploaded_heic_delete_request(&manifest, &args.asset_id)?;
+    let session = load_cloudkit_delete_session(&args.session)?;
+    let transport = ReqwestCloudKitDeleteTransport::new()?;
+    let mut client = CloudKitDeleteClient::new(transport);
+    let resolved = client.resolve_uploaded_heic_asset(&session, &request)?;
+    serde_json::to_writer_pretty(&mut *writer, &resolved)?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn workflow_delete_uploaded_heic(args: WorkflowDeleteUploadedHeicArgs) -> Result<(), CliError> {
+    let mut manifest = load_manifest_for_write(&args.manifest)?;
+    let request = uploaded_heic_delete_request(&manifest, &args.asset_id)?;
+    let session = load_cloudkit_delete_session(&args.session)?;
+    let transport = ReqwestCloudKitDeleteTransport::new()?;
+    let mut client = CloudKitDeleteClient::new(transport);
+    let resolved = client.resolve_uploaded_heic_asset(&session, &request)?;
+    let outcome = client.delete_cpl_asset(
+        &session,
+        &CloudKitDeleteRequest {
+            record_name: resolved.record_name.clone(),
+            record_change_tag: resolved.record_change_tag.clone(),
+        },
+    )?;
+    record_uploaded_heic_delete(&mut manifest, &args.asset_id, resolved, outcome)?;
     save_manifest(&manifest, &args.manifest)
 }
 
