@@ -16,9 +16,11 @@ use crate::conversion_execution::{
     is_executable_file,
 };
 use crate::manifest::{AssetRecord, Manifest, ManifestError};
+use crate::proof::NasRawProof;
 use crate::upload::{
-    CloudKitDeleteClient, IcloudUploadRequest, ReqwestCloudKitDeleteTransport, UploadError,
-    build_upload_proof, load_cloudkit_delete_session, run_icloud_upload, verify_local_heic,
+    CloudKitDeleteClient, CloudKitOriginalAssetResolveRequest, IcloudUploadRequest,
+    ReqwestCloudKitDeleteTransport, UploadError, build_upload_proof, load_cloudkit_delete_session,
+    run_icloud_upload, verify_local_heic,
 };
 use crate::workflow::{
     ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, OriginalAssetProof,
@@ -92,6 +94,11 @@ enum WorkflowCommand {
     UploadHeic(WorkflowUploadHeicArgs),
     UploadVerified(WorkflowUploadVerifiedArgs),
     OriginalAssetVerified(WorkflowOriginalAssetVerifiedArgs),
+    #[command(
+        name = "original-asset-resolve",
+        about = "Resolve the original RAW CPLAsset identity from CloudKit records/query"
+    )]
+    OriginalAssetResolve(WorkflowOriginalAssetResolveArgs),
     MarkDeleteEligible(WorkflowAssetArgs),
     ApproveDelete(WorkflowApproveDeleteArgs),
     Failed(WorkflowFailedArgs),
@@ -245,6 +252,24 @@ struct WorkflowOriginalAssetVerifiedArgs {
 }
 
 #[derive(Debug, Args)]
+struct WorkflowOriginalAssetResolveArgs {
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+    #[arg(long)]
+    asset_id: String,
+    #[arg(long, value_name = "PATH", help = "CloudKit delete session JSON")]
+    session: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    start_rank: u64,
+    #[arg(long, default_value_t = 200)]
+    page_size: u64,
+    #[arg(long, default_value_t = 100)]
+    max_pages: u64,
+    #[arg(long, default_value_t = 2)]
+    capture_tolerance_seconds: u64,
+}
+
+#[derive(Debug, Args)]
 struct WorkflowAssetArgs {
     #[arg(long, value_name = "PATH")]
     manifest: PathBuf,
@@ -378,6 +403,7 @@ fn run_workflow<W: Write>(args: WorkflowArgs, writer: &mut W) -> Result<(), CliE
         WorkflowCommand::UploadHeic(args) => workflow_upload_heic(args),
         WorkflowCommand::UploadVerified(args) => workflow_upload_verified(args),
         WorkflowCommand::OriginalAssetVerified(args) => workflow_original_asset_verified(args),
+        WorkflowCommand::OriginalAssetResolve(args) => workflow_original_asset_resolve(args),
         WorkflowCommand::MarkDeleteEligible(args) => workflow_mark_delete_eligible(args),
         WorkflowCommand::ApproveDelete(args) => workflow_approve_delete(args),
         WorkflowCommand::Failed(args) => workflow_failed(args),
@@ -528,6 +554,30 @@ fn workflow_original_asset_verified(
     save_manifest(&manifest, &args.manifest)
 }
 
+fn workflow_original_asset_resolve(args: WorkflowOriginalAssetResolveArgs) -> Result<(), CliError> {
+    let mut manifest = load_manifest_for_write(&args.manifest)?;
+    let (nas, source_age, filename) =
+        original_asset_resolve_manifest_inputs(&manifest, &args.asset_id)?;
+    let session = load_cloudkit_delete_session(&args.session)?;
+    let transport = ReqwestCloudKitDeleteTransport::new()?;
+    let mut client = CloudKitDeleteClient::new(transport);
+    let proof = client.resolve_original_asset(
+        &session,
+        &CloudKitOriginalAssetResolveRequest {
+            raw_size_bytes: nas.size_bytes,
+            source_captured_unix_seconds: source_age.source_captured_unix_seconds,
+            capture_tolerance_seconds: args.capture_tolerance_seconds,
+            filename,
+            matched_raw_sha256: nas.sha256,
+            start_rank: args.start_rank,
+            page_size: args.page_size,
+            max_pages: args.max_pages,
+        },
+    )?;
+    record_original_asset_proof(&mut manifest, &args.asset_id, proof)?;
+    save_manifest(&manifest, &args.manifest)
+}
+
 fn workflow_mark_delete_eligible(args: WorkflowAssetArgs) -> Result<(), CliError> {
     let mut manifest = load_manifest_for_write(&args.manifest)?;
     mark_delete_eligible(&mut manifest, &args.asset_id)?;
@@ -577,6 +627,43 @@ fn load_manifest_for_write(path: &Path) -> Result<Manifest, CliError> {
             source,
         }),
     }
+}
+
+fn original_asset_resolve_manifest_inputs(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<(NasRawProof, SourceAgeProof, String), CliError> {
+    let record = manifest.get(asset_id).map_err(WorkflowError::Manifest)?;
+    let nas = decode_workflow_proof::<NasRawProof>(record, "nas")?;
+    let source_age = decode_workflow_proof::<SourceAgeProof>(record, "source_age")?;
+    let filename = record
+        .raw_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .ok_or(WorkflowError::EmptyProofField { field: "filename" })?
+        .to_string();
+    Ok((nas, source_age, filename))
+}
+
+fn decode_workflow_proof<T: serde::de::DeserializeOwned>(
+    record: &AssetRecord,
+    proof_key: &'static str,
+) -> Result<T, CliError> {
+    let value = record
+        .proofs
+        .get(proof_key)
+        .ok_or_else(|| WorkflowError::MissingProof {
+            asset_id: record.asset_id.clone(),
+            proof_key: proof_key.to_string(),
+        })?;
+    serde_json::from_value(value.clone())
+        .map_err(|source| WorkflowError::ProofDecode {
+            asset_id: record.asset_id.clone(),
+            proof_key,
+            source,
+        })
+        .map_err(CliError::Workflow)
 }
 
 fn save_manifest(manifest: &Manifest, path: &Path) -> Result<(), CliError> {

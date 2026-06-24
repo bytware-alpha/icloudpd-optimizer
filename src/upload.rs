@@ -12,7 +12,7 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
-use crate::workflow::{HeicVerificationProof, UploadProof};
+use crate::workflow::{HeicVerificationProof, OriginalAssetProof, UploadProof};
 
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_UPLOAD_RESPONSE_BYTES: u64 = 1024 * 1024;
@@ -106,6 +106,18 @@ pub struct CloudKitDeleteOutcome {
     pub record_change_tag: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudKitOriginalAssetResolveRequest {
+    pub raw_size_bytes: u64,
+    pub source_captured_unix_seconds: u64,
+    pub capture_tolerance_seconds: u64,
+    pub filename: String,
+    pub matched_raw_sha256: String,
+    pub start_rank: u64,
+    pub page_size: u64,
+    pub max_pages: u64,
+}
+
 pub fn load_upload_session(path: &Path) -> Result<UploadSession, UploadError> {
     let json = std::fs::read_to_string(path).map_err(|source| UploadError::ReadSession {
         path: path.to_path_buf(),
@@ -192,6 +204,12 @@ pub trait CloudKitDeleteTransport {
         session: &CloudKitDeleteSession,
         payload: Value,
     ) -> Result<Value, UploadError>;
+
+    fn post_records_query(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError>;
 }
 
 impl<T: CloudKitDeleteTransport + ?Sized> CloudKitDeleteTransport for &mut T {
@@ -201,6 +219,14 @@ impl<T: CloudKitDeleteTransport + ?Sized> CloudKitDeleteTransport for &mut T {
         payload: Value,
     ) -> Result<Value, UploadError> {
         (**self).post_records_modify(session, payload)
+    }
+
+    fn post_records_query(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        (**self).post_records_query(session, payload)
     }
 }
 
@@ -365,6 +391,36 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
             .post_records_modify(session, cloudkit_delete_payload(request))?;
         parse_cloudkit_delete_response(response, request)
     }
+
+    pub fn resolve_original_asset(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        request: &CloudKitOriginalAssetResolveRequest,
+    ) -> Result<OriginalAssetProof, UploadError> {
+        validate_original_asset_resolve_request(request)?;
+        let mut matches = Vec::new();
+        for page in 0..request.max_pages {
+            let start_rank = request.start_rank + page.saturating_mul(request.page_size);
+            let payload = cloudkit_original_asset_query_payload(start_rank, request.page_size);
+            let response = self.transport.post_records_query(session, payload)?;
+            let page_result = parse_original_asset_query_response(response, request)?;
+            let record_count = page_result.record_count;
+            let page_matches = page_result.matches;
+            matches.extend(page_matches);
+            if matches.len() > 1 {
+                return Err(UploadError::OriginalAssetResolveNotUnique {
+                    matches: matches.len(),
+                });
+            }
+            if record_count < request.page_size as usize {
+                break;
+            }
+        }
+        match matches.len() {
+            1 => Ok(matches.remove(0)),
+            count => Err(UploadError::OriginalAssetResolveNotUnique { matches: count }),
+        }
+    }
 }
 
 pub struct ReqwestPhotosUploadTransport {
@@ -492,6 +548,29 @@ impl CloudKitDeleteTransport for ReqwestCloudKitDeleteTransport {
             })?;
         read_json_response(response, "records_modify")
     }
+
+    fn post_records_query(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        let url = cloudkit_records_query_url(session)?;
+        let response = self
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "text/plain;charset=UTF-8")
+            .header(
+                reqwest::header::COOKIE,
+                cookie_header_for(&session.cookies)?,
+            )
+            .body(payload.to_string())
+            .send()
+            .map_err(|source| UploadError::Network {
+                operation: "records_query",
+                source,
+            })?;
+        read_json_response(response, "records_query")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -588,6 +667,28 @@ fn cloudkit_delete_payload(request: &CloudKitDeleteRequest) -> Value {
                 }
             }
         }],
+        "zoneID": {"zoneName": PRIMARY_SYNC_ZONE}
+    })
+}
+
+fn cloudkit_original_asset_query_payload(start_rank: u64, page_size: u64) -> Value {
+    json!({
+        "query": {
+            "recordType": "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"
+        },
+        "direction": "ASCENDING",
+        "startRank": start_rank,
+        "resultsLimit": page_size,
+        "desiredKeys": [
+            "masterRef",
+            "assetDate",
+            "resOriginal",
+            "resOriginalAlt",
+            "resSidecar",
+            "resVideoComplement",
+            "resOriginalVideoComplement",
+            "resVideoComplementOriginal"
+        ],
         "zoneID": {"zoneName": PRIMARY_SYNC_ZONE}
     })
 }
@@ -754,6 +855,256 @@ fn parse_cloudkit_delete_response(
     })
 }
 
+struct OriginalAssetQueryPage {
+    record_count: usize,
+    matches: Vec<OriginalAssetProof>,
+}
+
+#[derive(Clone)]
+struct CloudKitAssetRecord {
+    record_name: String,
+    record_change_tag: String,
+    master_record_name: String,
+    asset_date_unix_seconds: u64,
+}
+
+fn parse_original_asset_query_response(
+    value: Value,
+    request: &CloudKitOriginalAssetResolveRequest,
+) -> Result<OriginalAssetQueryPage, UploadError> {
+    let records = value.get("records").and_then(Value::as_array).ok_or(
+        UploadError::InvalidCloudKitOriginalAssetResponse(
+            "records/query response must include records",
+        ),
+    )?;
+    let mut assets = Vec::new();
+    let mut masters = std::collections::BTreeMap::new();
+
+    for record in records {
+        if record.get("serverErrorCode").is_some() {
+            return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                "records/query returned a record error",
+            ));
+        }
+        let record_type = required_record_string(record, "recordType")?;
+        match record_type {
+            "CPLAsset" => assets.push(parse_cloudkit_asset_record(record)?),
+            "CPLMaster" => {
+                let record_name = required_record_string(record, "recordName")?.to_string();
+                masters.insert(record_name, record);
+            }
+            _ => {}
+        }
+    }
+
+    let mut matches = Vec::new();
+    for asset in assets {
+        let master = masters.get(&asset.master_record_name).ok_or(
+            UploadError::InvalidCloudKitOriginalAssetResponse(
+                "records/query returned an asset without its master",
+            ),
+        )?;
+        if !asset_date_matches(
+            asset.asset_date_unix_seconds,
+            request.source_captured_unix_seconds,
+            request.capture_tolerance_seconds,
+        ) {
+            continue;
+        }
+        if master_has_matching_raw_resource(master, request.raw_size_bytes)? {
+            matches.push(OriginalAssetProof {
+                record_name: asset.record_name,
+                record_change_tag: asset.record_change_tag,
+                record_type: "CPLAsset".to_string(),
+                filename: request.filename.clone(),
+                size_bytes: request.raw_size_bytes,
+                matched_raw_sha256: request.matched_raw_sha256.clone(),
+            });
+        }
+    }
+
+    Ok(OriginalAssetQueryPage {
+        record_count: records.len(),
+        matches,
+    })
+}
+
+fn parse_cloudkit_asset_record(record: &Value) -> Result<CloudKitAssetRecord, UploadError> {
+    let record_name = required_record_string(record, "recordName")?;
+    let record_change_tag = required_record_string(record, "recordChangeTag")?;
+    if record_name.trim().is_empty() || record_change_tag.trim().is_empty() {
+        return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "CPLAsset identity cannot be empty",
+        ));
+    }
+    let fields = record_fields(record)?;
+    let master_record_name = field_value(fields, "masterRef")
+        .and_then(master_ref_record_name)
+        .ok_or(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "CPLAsset missing masterRef",
+        ))?;
+    if master_record_name.trim().is_empty() {
+        return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "CPLAsset masterRef cannot be empty",
+        ));
+    }
+    let asset_date_unix_seconds = field_value(fields, "assetDate")
+        .and_then(cloudkit_unix_seconds)
+        .ok_or(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "CPLAsset missing assetDate",
+        ))?;
+    Ok(CloudKitAssetRecord {
+        record_name: record_name.to_string(),
+        record_change_tag: record_change_tag.to_string(),
+        master_record_name: master_record_name.to_string(),
+        asset_date_unix_seconds,
+    })
+}
+
+fn master_has_matching_raw_resource(
+    master: &Value,
+    raw_size_bytes: u64,
+) -> Result<bool, UploadError> {
+    let fields = record_fields(master)?;
+    let mut saw_resource = false;
+    for prefix in [
+        "resOriginal",
+        "resOriginalAlt",
+        "resSidecar",
+        "resVideoComplement",
+        "resOriginalVideoComplement",
+        "resVideoComplementOriginal",
+    ] {
+        for (name, field) in fields {
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            saw_resource = true;
+            let Some(resource) = field_value_object(field) else {
+                return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                    "CPLMaster resource field is malformed",
+                ));
+            };
+            let Some(size_bytes) = resource_size_bytes(resource) else {
+                return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                    "CPLMaster resource missing size",
+                ));
+            };
+            if size_bytes != raw_size_bytes {
+                continue;
+            }
+            if resource_type_is_raw(resource) {
+                return Ok(true);
+            }
+        }
+    }
+    if !saw_resource {
+        return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "CPLMaster missing original resources",
+        ));
+    }
+    Ok(false)
+}
+
+fn required_record_string<'a>(
+    record: &'a Value,
+    key: &'static str,
+) -> Result<&'a str, UploadError> {
+    record.get(key).and_then(Value::as_str).ok_or(
+        UploadError::InvalidCloudKitOriginalAssetResponse(match key {
+            "recordName" => "record missing recordName",
+            "recordType" => "record missing recordType",
+            _ => "record missing recordChangeTag",
+        }),
+    )
+}
+
+fn record_fields(record: &Value) -> Result<&Map<String, Value>, UploadError> {
+    record.get("fields").and_then(Value::as_object).ok_or(
+        UploadError::InvalidCloudKitOriginalAssetResponse("record missing fields"),
+    )
+}
+
+fn field_value<'a>(fields: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
+    fields.get(key).and_then(|field| field.get("value"))
+}
+
+fn field_value_object(field: &Value) -> Option<&Map<String, Value>> {
+    field
+        .get("value")
+        .and_then(Value::as_object)
+        .or_else(|| field.as_object())
+}
+
+fn master_ref_record_name(value: &Value) -> Option<&str> {
+    value
+        .get("recordName")
+        .and_then(Value::as_str)
+        .or_else(|| value.as_str())
+}
+
+fn cloudkit_unix_seconds(value: &Value) -> Option<u64> {
+    let numeric = value
+        .as_i64()
+        .map(|value| value as f64)
+        .or_else(|| value.as_u64().map(|value| value as f64))
+        .or_else(|| value.as_f64())?;
+    if !numeric.is_finite() || numeric < 0.0 {
+        return None;
+    }
+    let seconds = if numeric >= 10_000_000_000.0 {
+        numeric / 1000.0
+    } else {
+        numeric
+    };
+    Some(seconds.round() as u64)
+}
+
+fn asset_date_matches(asset_date: u64, source_captured: u64, tolerance: u64) -> bool {
+    asset_date.abs_diff(source_captured) <= tolerance
+}
+
+fn resource_size_bytes(resource: &Map<String, Value>) -> Option<u64> {
+    ["size", "sizeBytes", "fileSize", "resourceSize"]
+        .iter()
+        .find_map(|key| resource_field_u64(resource, key))
+}
+
+fn resource_type_is_raw(resource: &Map<String, Value>) -> bool {
+    [
+        "type",
+        "resourceType",
+        "uti",
+        "fileType",
+        "contentType",
+        "mimeType",
+        "uniformTypeIdentifier",
+    ]
+    .iter()
+    .filter_map(|key| resource_field_str(resource, key))
+    .any(|value| {
+        let value = value.to_ascii_lowercase();
+        value == "dng"
+            || value.contains("raw")
+            || value.contains("digital-negative")
+            || value.contains("adobe.raw-image")
+    })
+}
+
+fn resource_field_u64(resource: &Map<String, Value>, key: &str) -> Option<u64> {
+    let value = resource.get(key)?;
+    value
+        .as_u64()
+        .or_else(|| value.get("value").and_then(Value::as_u64))
+}
+
+fn resource_field_str<'a>(resource: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    let value = resource.get(key)?;
+    value
+        .as_str()
+        .or_else(|| value.get("value").and_then(Value::as_str))
+}
+
 fn validate_single_file_upload_request(
     single_file: &SingleFileUploadRequest,
 ) -> Result<(), UploadError> {
@@ -793,6 +1144,19 @@ fn photosupload_service_url(
 fn cloudkit_records_modify_url(session: &CloudKitDeleteSession) -> Result<Url, UploadError> {
     let mut base = session.ckdatabasews_url.clone();
     base.set_path("/database/1/com.apple.photos.cloud/production/private/records/modify");
+    {
+        let mut query = base.query_pairs_mut();
+        query.clear();
+        for param in &session.cloudkit_query_params {
+            query.append_pair(&param.name, &param.value);
+        }
+    }
+    Ok(base)
+}
+
+fn cloudkit_records_query_url(session: &CloudKitDeleteSession) -> Result<Url, UploadError> {
+    let mut base = session.ckdatabasews_url.clone();
+    base.set_path("/database/1/com.apple.photos.cloud/production/private/records/query");
     {
         let mut query = base.query_pairs_mut();
         query.clear();
@@ -1328,6 +1692,37 @@ fn validate_cloudkit_delete_request(request: &CloudKitDeleteRequest) -> Result<(
     Ok(())
 }
 
+fn validate_original_asset_resolve_request(
+    request: &CloudKitOriginalAssetResolveRequest,
+) -> Result<(), UploadError> {
+    if request.raw_size_bytes == 0 {
+        return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
+            "raw size must be positive",
+        ));
+    }
+    if request.filename.trim().is_empty() {
+        return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
+            "filename is required",
+        ));
+    }
+    if request.matched_raw_sha256.trim().is_empty() {
+        return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
+            "matched RAW SHA-256 is required",
+        ));
+    }
+    if request.page_size == 0 {
+        return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
+            "page size must be positive",
+        ));
+    }
+    if request.max_pages == 0 {
+        return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
+            "max pages must be positive",
+        ));
+    }
+    Ok(())
+}
+
 fn reject_cloudkit_identity_chars(value: &str, field: &'static str) -> Result<(), UploadError> {
     if value.chars().any(char::is_control) {
         return Err(UploadError::InvalidCloudKitDeleteRequest(match field {
@@ -1466,6 +1861,19 @@ mod tests {
         );
         assert!(!url.query().unwrap_or_default().contains("ckWebAuthToken"));
     }
+
+    #[test]
+    fn cloudkit_records_query_url_uses_pyi_cloud_query_params() {
+        let session = valid_delete_session();
+
+        let url = cloudkit_records_query_url(&session).expect("URL should build");
+
+        assert_eq!(
+            url.as_str(),
+            "https://p140-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query?clientBuildNumber=2522Project44&clientMasteringNumber=2522B2&clientId=4f0b58d4-ff9d-4dc5-8f0b-9c4efc4fdb27&dsid=123456789&remapEnums=True&getCurrentSyncToken=True"
+        );
+        assert!(!url.query().unwrap_or_default().contains("ckWebAuthToken"));
+    }
 }
 
 fn hash_file_sha256(path: &Path) -> Result<String, UploadError> {
@@ -1544,6 +1952,14 @@ pub enum UploadError {
     InvalidCloudKitDeleteRequest(&'static str),
     #[error("invalid CloudKit delete response: {0}")]
     InvalidCloudKitDeleteResponse(&'static str),
+    #[error("invalid CloudKit original asset request: {0}")]
+    InvalidCloudKitOriginalAssetRequest(&'static str),
+    #[error("invalid CloudKit original asset response: {0}")]
+    InvalidCloudKitOriginalAssetResponse(&'static str),
+    #[error(
+        "CloudKit original asset resolver found {matches} matching candidates; expected exactly one"
+    )]
+    OriginalAssetResolveNotUnique { matches: usize },
     #[error(
         "signed upload size mismatch: expected {expected} bytes, service reported {actual} bytes"
     )]

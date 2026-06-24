@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 
 use icloudpd_optimizer::upload::{
     CloudKitDeleteClient, CloudKitDeleteRequest, CloudKitDeleteSession, CloudKitDeleteTransport,
-    IcloudUploadOutcome, IcloudUploadRequest, IcloudUploadResponse, PhotosUploadClient,
-    PhotosUploadEndpoint, PhotosUploadTransport, SingleFileUploadRequest, UploadError,
-    UploadSession, build_upload_proof, load_upload_session, run_icloud_upload,
+    CloudKitOriginalAssetResolveRequest, IcloudUploadOutcome, IcloudUploadRequest,
+    IcloudUploadResponse, PhotosUploadClient, PhotosUploadEndpoint, PhotosUploadTransport,
+    SingleFileUploadRequest, UploadError, UploadSession, build_upload_proof, load_upload_session,
+    run_icloud_upload,
 };
 use icloudpd_optimizer::workflow::HeicVerificationProof;
 use serde_json::{Value, json};
@@ -65,6 +66,45 @@ fn valid_delete_session_json() -> String {
         ]
     })
     .to_string()
+}
+
+fn cloudkit_raw_pair(asset_name: &str, master_name: &str, change_tag: &str) -> Value {
+    json!([
+        {
+            "recordName": asset_name,
+            "recordType": "CPLAsset",
+            "recordChangeTag": change_tag,
+            "fields": {
+                "masterRef": {"value": {"recordName": master_name}},
+                "assetDate": {"value": 1_800_000_000_000_i64}
+            }
+        },
+        {
+            "recordName": master_name,
+            "recordType": "CPLMaster",
+            "fields": {
+                "resOriginal": {
+                    "value": {
+                        "size": {"value": 42},
+                        "type": {"value": "com.adobe.raw-image"}
+                    }
+                }
+            }
+        }
+    ])
+}
+
+fn original_asset_resolve_request() -> CloudKitOriginalAssetResolveRequest {
+    CloudKitOriginalAssetResolveRequest {
+        raw_size_bytes: 42,
+        source_captured_unix_seconds: 1_800_000_000,
+        capture_tolerance_seconds: 2,
+        filename: "IMG_0001.dng".to_string(),
+        matched_raw_sha256: "raw-sha256".to_string(),
+        start_rank: 0,
+        page_size: 200,
+        max_pages: 100,
+    }
 }
 
 #[test]
@@ -279,7 +319,9 @@ fn cloudkit_delete_client_rejects_missing_or_unsuccessful_delete_confirmation() 
     for response in cases {
         let mut transport = FakeCloudKitDeleteTransport {
             payloads: Vec::new(),
+            query_payloads: Vec::new(),
             response,
+            query_responses: Vec::new(),
         };
 
         let error = CloudKitDeleteClient::new(&mut transport)
@@ -297,6 +339,125 @@ fn cloudkit_delete_client_rejects_missing_or_unsuccessful_delete_confirmation() 
             UploadError::InvalidCloudKitDeleteResponse(_)
         ));
     }
+}
+
+#[test]
+fn cloudkit_original_asset_resolver_records_exact_raw_match() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut transport = FakeCloudKitDeleteTransport::query_responses(vec![json!({
+        "records": cloudkit_raw_pair("CPLAsset-original-123", "CPLMaster-raw-123", "change-tag-1")
+    })]);
+
+    let proof = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_asset(&session, &original_asset_resolve_request())
+        .expect("exactly one RAW candidate should resolve");
+
+    assert_eq!(proof.record_name, "CPLAsset-original-123");
+    assert_eq!(proof.record_change_tag, "change-tag-1");
+    assert_eq!(proof.record_type, "CPLAsset");
+    assert_eq!(proof.filename, "IMG_0001.dng");
+    assert_eq!(proof.size_bytes, 42);
+    assert_eq!(proof.matched_raw_sha256, "raw-sha256");
+    assert_eq!(transport.query_payloads.len(), 1);
+    assert_eq!(
+        transport.query_payloads[0]["query"]["recordType"],
+        "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"
+    );
+    assert_eq!(transport.query_payloads[0]["direction"], "ASCENDING");
+    assert_eq!(transport.query_payloads[0]["startRank"], 0);
+    assert_eq!(transport.query_payloads[0]["resultsLimit"], 200);
+    assert_eq!(
+        transport.query_payloads[0]["zoneID"],
+        json!({"zoneName": "PrimarySync"})
+    );
+}
+
+#[test]
+fn cloudkit_original_asset_resolver_zero_matches_fails_closed() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut transport = FakeCloudKitDeleteTransport::query_responses(vec![json!({"records": []})]);
+
+    let error = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_asset(&session, &original_asset_resolve_request())
+        .expect_err("zero candidates must fail closed");
+
+    assert!(matches!(
+        error,
+        UploadError::OriginalAssetResolveNotUnique { matches: 0 }
+    ));
+}
+
+#[test]
+fn cloudkit_original_asset_resolver_multiple_matches_fails_closed() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut records = cloudkit_raw_pair("CPLAsset-original-123", "CPLMaster-raw-123", "tag-1");
+    records
+        .as_array_mut()
+        .expect("records should be array")
+        .extend(
+            cloudkit_raw_pair("CPLAsset-original-456", "CPLMaster-raw-456", "tag-2")
+                .as_array()
+                .expect("records should be array")
+                .clone(),
+        );
+    let mut transport =
+        FakeCloudKitDeleteTransport::query_responses(vec![json!({"records": records})]);
+
+    let error = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_asset(&session, &original_asset_resolve_request())
+        .expect_err("multiple candidates must fail closed");
+
+    assert!(matches!(
+        error,
+        UploadError::OriginalAssetResolveNotUnique { matches: 2 }
+    ));
+}
+
+#[test]
+fn cloudkit_original_asset_resolver_rejects_non_raw_same_size_resource() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut records = cloudkit_raw_pair("CPLAsset-original-123", "CPLMaster-raw-123", "tag-1");
+    records[1]["fields"]["resOriginal"]["value"]["type"] = json!("public.jpeg");
+    let mut transport =
+        FakeCloudKitDeleteTransport::query_responses(vec![json!({"records": records})]);
+
+    let error = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_asset(&session, &original_asset_resolve_request())
+        .expect_err("JPEG resource must not match RAW identity");
+
+    assert!(matches!(
+        error,
+        UploadError::OriginalAssetResolveNotUnique { matches: 0 }
+    ));
+}
+
+#[test]
+fn cloudkit_original_asset_resolver_malformed_response_fails_closed() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut transport = FakeCloudKitDeleteTransport::query_responses(vec![json!({
+        "records": [{
+            "recordName": "CPLAsset-original-123",
+            "recordType": "CPLAsset",
+            "recordChangeTag": "tag-1",
+            "fields": {
+                "assetDate": {"value": 1_800_000_000_000_i64}
+            }
+        }]
+    })]);
+
+    let error = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_asset(&session, &original_asset_resolve_request())
+        .expect_err("malformed asset/master pairing must fail closed");
+
+    assert!(matches!(
+        error,
+        UploadError::InvalidCloudKitOriginalAssetResponse(_)
+    ));
 }
 
 #[test]
@@ -803,13 +964,16 @@ impl PhotosUploadTransport for FakePhotosTransport {
 
 struct FakeCloudKitDeleteTransport {
     payloads: Vec<Value>,
+    query_payloads: Vec<Value>,
     response: Value,
+    query_responses: Vec<Value>,
 }
 
 impl FakeCloudKitDeleteTransport {
     fn success() -> Self {
         Self {
             payloads: Vec::new(),
+            query_payloads: Vec::new(),
             response: json!({
                 "records": [{
                     "recordName": "CPLAsset-original-123",
@@ -819,6 +983,16 @@ impl FakeCloudKitDeleteTransport {
                     }
                 }]
             }),
+            query_responses: Vec::new(),
+        }
+    }
+
+    fn query_responses(query_responses: Vec<Value>) -> Self {
+        Self {
+            payloads: Vec::new(),
+            query_payloads: Vec::new(),
+            response: json!({"records": []}),
+            query_responses,
         }
     }
 }
@@ -831,5 +1005,14 @@ impl CloudKitDeleteTransport for FakeCloudKitDeleteTransport {
     ) -> Result<Value, UploadError> {
         self.payloads.push(payload);
         Ok(self.response.clone())
+    }
+
+    fn post_records_query(
+        &mut self,
+        _session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        self.query_payloads.push(payload);
+        Ok(self.query_responses.remove(0))
     }
 }
