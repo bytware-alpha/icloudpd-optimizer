@@ -428,6 +428,68 @@ fn cloudkit_original_asset_resolver_zero_matches_fails_closed() {
 }
 
 #[test]
+fn cloudkit_original_asset_resolver_short_page_with_continuation_keeps_scanning() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut request = original_asset_resolve_request();
+    request.page_size = 200;
+    request.max_pages = 2;
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![
+            json!({"records": [], "continuationMarker": "next-page"}),
+            json!({
+                "records": cloudkit_raw_pair(
+                    "CPLAsset-original-123",
+                    "CPLMaster-raw-123",
+                    "change-tag-1",
+                )
+            }),
+        ],
+        vec![b"raw-bytes".to_vec()],
+    );
+
+    let proof = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_asset(&session, &request)
+        .expect("later exact match should resolve after continued short page");
+
+    assert_eq!(proof.record_name, "CPLAsset-original-123");
+    assert_eq!(transport.query_payloads.len(), 2);
+    assert_eq!(
+        transport.query_payloads[1]["query"]["filterBy"][1]["fieldValue"]["value"],
+        200
+    );
+}
+
+#[test]
+fn cloudkit_original_asset_resolver_short_page_without_continuation_stops() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut request = original_asset_resolve_request();
+    request.page_size = 200;
+    request.max_pages = 2;
+    let mut transport = FakeCloudKitDeleteTransport::query_responses(vec![
+        json!({"records": []}),
+        json!({
+            "records": cloudkit_raw_pair(
+                "CPLAsset-original-123",
+                "CPLMaster-raw-123",
+                "change-tag-1",
+            )
+        }),
+    ]);
+
+    let error = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_asset(&session, &request)
+        .expect_err("absence of continuation proves exhaustion");
+
+    assert!(matches!(
+        error,
+        UploadError::OriginalAssetResolveNotUnique { matches: 0 }
+    ));
+    assert_eq!(transport.query_payloads.len(), 1);
+}
+
+#[test]
 fn cloudkit_original_asset_resolver_fails_when_max_pages_reached_without_exhaustion() {
     let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
         .expect("session should load");
@@ -436,7 +498,8 @@ fn cloudkit_original_asset_resolver_fails_when_max_pages_reached_without_exhaust
     request.max_pages = 1;
     let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
         vec![json!({
-            "records": cloudkit_raw_pair("CPLAsset-original-123", "CPLMaster-raw-123", "change-tag-1")
+            "records": cloudkit_raw_pair("CPLAsset-original-123", "CPLMaster-raw-123", "change-tag-1"),
+            "continuationMarker": "next-page"
         })],
         vec![b"raw-bytes".to_vec()],
     );

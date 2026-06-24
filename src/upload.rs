@@ -428,7 +428,7 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
             let payload = cloudkit_original_asset_query_payload(start_rank, request.page_size);
             let response = self.transport.post_records_query(session, payload)?;
             let page_result = parse_original_asset_query_response(response, request)?;
-            let record_count = page_result.record_count;
+            let has_continuation_marker = page_result.has_continuation_marker;
             for candidate in page_result.matches {
                 let download = self.transport.download_resource(
                     session,
@@ -450,7 +450,7 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
                     matches: matches.len(),
                 });
             }
-            if record_count < request.page_size as usize {
+            if !has_continuation_marker {
                 exhausted = true;
                 break;
             }
@@ -999,7 +999,7 @@ fn parse_cloudkit_delete_response(
 }
 
 struct OriginalAssetQueryPage {
-    record_count: usize,
+    has_continuation_marker: bool,
     matches: Vec<OriginalAssetCandidate>,
 }
 
@@ -1025,6 +1025,9 @@ fn parse_original_asset_query_response(
             "records/query response must include records",
         ),
     )?;
+    let has_continuation_marker = value
+        .as_object()
+        .is_some_and(|response| response.contains_key("continuationMarker"));
     let mut assets = Vec::new();
     let mut masters = std::collections::BTreeMap::new();
 
@@ -1077,7 +1080,7 @@ fn parse_original_asset_query_response(
     }
 
     Ok(OriginalAssetQueryPage {
-        record_count: records.len(),
+        has_continuation_marker,
         matches,
     })
 }
