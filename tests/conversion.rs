@@ -36,9 +36,31 @@ fn plans_exact_sips_exiftool_and_verification_commands() {
         plan_conversion_for_target(TargetPlatform::new("macos", "aarch64"), &raw, &output, 90)
             .expect("conversion should plan");
 
-    assert_eq!(plan.convert.program, "sips");
+    let conversion_programs: Vec<_> = plan
+        .conversion_commands
+        .iter()
+        .map(|command| command.program.as_str())
+        .collect();
+    assert_eq!(conversion_programs, vec!["exiftool", "exiftool", "sips"]);
+    assert_eq!(plan.convert.program, "exiftool");
     assert_eq!(
-        args(&plan.convert),
+        args(&plan.conversion_commands[0]),
+        vec!["-b", "-PreviewImage", "/nas/raw/IMG_0001.dng"]
+    );
+    assert_eq!(
+        plan.conversion_commands[0].stdout_path,
+        Some(PathBuf::from("/staging/IMG_0001.embedded-preview.jpg"))
+    );
+    assert_eq!(
+        args(&plan.conversion_commands[1]),
+        vec![
+            "-overwrite_original",
+            "-Orientation#=1",
+            "/staging/IMG_0001.embedded-preview.jpg"
+        ]
+    );
+    assert_eq!(
+        args(&plan.conversion_commands[2]),
         vec![
             "-s",
             "format",
@@ -46,7 +68,7 @@ fn plans_exact_sips_exiftool_and_verification_commands() {
             "-s",
             "formatOptions",
             "90",
-            "/nas/raw/IMG_0001.dng",
+            "/staging/IMG_0001.embedded-preview.jpg",
             "--out",
             "/staging/IMG_0001.heic"
         ]
@@ -58,6 +80,8 @@ fn plans_exact_sips_exiftool_and_verification_commands() {
             "-TagsFromFile",
             "/nas/raw/IMG_0001.dng",
             "-all:all",
+            "-Orientation#=1",
+            "-QuickTime:Rotation#=0",
             "-overwrite_original",
             "/staging/IMG_0001.heic"
         ]
@@ -73,7 +97,7 @@ fn plans_exact_sips_exiftool_and_verification_commands() {
             "-s",
             "format",
             "png",
-            "/nas/raw/IMG_0001.dng",
+            "/staging/IMG_0001.embedded-preview.jpg",
             "--out",
             "/staging/IMG_0001.raw-preview.png"
         ]
@@ -134,7 +158,7 @@ fn includes_requested_heic_quality_in_sips_format_options() {
     .expect("conversion should plan");
 
     assert_eq!(
-        args(&plan.convert),
+        args(&plan.conversion_commands[2]),
         vec![
             "-s",
             "format",
@@ -142,7 +166,7 @@ fn includes_requested_heic_quality_in_sips_format_options() {
             "-s",
             "formatOptions",
             "82",
-            "/nas/raw/IMG_0002.cr2",
+            "/staging/IMG_0002.embedded-preview.jpg",
             "--out",
             "/staging/IMG_0002.heic"
         ]
@@ -303,15 +327,18 @@ fn plans_do_not_include_delete_or_upload_commands() {
     .expect("conversion should plan");
 
     let all_plans = [
-        &plan.convert,
-        &plan.metadata,
-        &plan.verify_image,
-        &plan.render_raw_preview,
-        &plan.render_heic_preview,
-        &plan.verify_visual_content,
-        &plan.verify_visual_match,
-        &plan.verify_metadata,
-    ];
+        plan.conversion_commands.as_slice(),
+        &[
+            plan.metadata,
+            plan.verify_image,
+            plan.render_raw_preview,
+            plan.render_heic_preview,
+            plan.verify_visual_content,
+            plan.verify_visual_match,
+            plan.verify_metadata,
+        ],
+    ]
+    .concat();
 
     assert!(
         all_plans

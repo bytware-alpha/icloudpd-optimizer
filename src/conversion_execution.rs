@@ -1,8 +1,10 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -29,6 +31,89 @@ pub fn execute_measured_conversion(
     request: ConversionExecutionRequest,
 ) -> Result<Manifest, ConversionExecutionError> {
     execute_measured_conversion_for_target(manifest, request, TargetPlatform::current())
+}
+
+pub fn execute_measured_conversions(
+    manifest: &Manifest,
+    requests: Vec<ConversionExecutionRequest>,
+    jobs: usize,
+) -> Result<Manifest, ConversionExecutionError> {
+    execute_measured_conversions_for_target(manifest, requests, jobs, TargetPlatform::current())
+}
+
+fn execute_measured_conversions_for_target(
+    manifest: &Manifest,
+    requests: Vec<ConversionExecutionRequest>,
+    jobs: usize,
+    target: TargetPlatform,
+) -> Result<Manifest, ConversionExecutionError> {
+    if jobs == 0 {
+        return Err(ConversionExecutionError::InvalidBatchJobs { jobs });
+    }
+    if requests.is_empty() {
+        return Err(ConversionExecutionError::EmptyBatch);
+    }
+    reject_duplicate_batch_inputs(&requests)?;
+
+    let mut updated = manifest.clone();
+    for chunk in requests.chunks(jobs) {
+        let mut handles = Vec::with_capacity(chunk.len());
+        for request in chunk {
+            let manifest_snapshot = updated.clone();
+            let request = request.clone();
+            let asset_id = request.asset_id.clone();
+            handles.push((
+                asset_id.clone(),
+                thread::spawn(move || {
+                    execute_measured_conversion_for_target(&manifest_snapshot, request, target)
+                        .map(|manifest| (asset_id, manifest))
+                }),
+            ));
+        }
+
+        let mut chunk_results = Vec::with_capacity(handles.len());
+        for (asset_id, handle) in handles {
+            let result =
+                handle
+                    .join()
+                    .map_err(|_| ConversionExecutionError::BatchWorkerPanicked {
+                        asset_id: asset_id.clone(),
+                    })?;
+            let (asset_id, manifest) =
+                result.map_err(|source| ConversionExecutionError::BatchConversionFailed {
+                    asset_id: asset_id.clone(),
+                    source: Box::new(source),
+                })?;
+            chunk_results.push((asset_id, manifest));
+        }
+
+        for (asset_id, manifest) in chunk_results {
+            let record = manifest.get(&asset_id)?.clone();
+            updated.upsert(record);
+        }
+    }
+
+    Ok(updated)
+}
+
+fn reject_duplicate_batch_inputs(
+    requests: &[ConversionExecutionRequest],
+) -> Result<(), ConversionExecutionError> {
+    let mut asset_ids = BTreeSet::new();
+    let mut output_paths = BTreeSet::new();
+    for request in requests {
+        if !asset_ids.insert(request.asset_id.clone()) {
+            return Err(ConversionExecutionError::DuplicateBatchAsset {
+                asset_id: request.asset_id.clone(),
+            });
+        }
+        if !output_paths.insert(request.output_path.clone()) {
+            return Err(ConversionExecutionError::DuplicateBatchOutput {
+                path: request.output_path.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn execute_measured_conversion_for_target(
@@ -577,6 +662,21 @@ pub enum ConversionExecutionError {
     OutputEmpty { path: PathBuf },
     #[error("converted output changed while inspecting {path}; refusing to record a stale proof")]
     OutputChanged { path: PathBuf },
+    #[error("batch conversion requires at least one worker; got {jobs}")]
+    InvalidBatchJobs { jobs: usize },
+    #[error("batch conversion requires at least one asset")]
+    EmptyBatch,
+    #[error("batch conversion has duplicate asset id {asset_id}")]
+    DuplicateBatchAsset { asset_id: String },
+    #[error("batch conversion has duplicate output path {path}")]
+    DuplicateBatchOutput { path: PathBuf },
+    #[error("batch conversion worker panicked for {asset_id}")]
+    BatchWorkerPanicked { asset_id: String },
+    #[error("batch conversion failed for {asset_id}: {source}")]
+    BatchConversionFailed {
+        asset_id: String,
+        source: Box<ConversionExecutionError>,
+    },
 }
 
 #[cfg(test)]
@@ -672,6 +772,126 @@ mod tests {
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
             "exiftool-preview\nheif-enc\nexiftool-metadata\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_batch_conversion_records_all_assets_after_parallel_success() {
+        let tool_dir = fake_linux_conversion_tools();
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_1 = tempdir.path().join("IMG_0001.dng");
+        let raw_2 = tempdir.path().join("IMG_0002.dng");
+        fs::write(&raw_1, b"raw-1").expect("raw 1 should be written");
+        fs::write(&raw_2, b"raw-2").expect("raw 2 should be written");
+        let output_1 = tempdir.path().join("asset-1.heic");
+        let output_2 = tempdir.path().join("asset-2.heic");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest =
+            nas_verified_manifest_with_assets(&[("asset-1", &raw_1), ("asset-2", &raw_2)]);
+
+        let updated = execute_measured_conversions_for_target(
+            &manifest,
+            vec![
+                ConversionExecutionRequest {
+                    asset_id: "asset-1".to_string(),
+                    output_path: output_1.clone(),
+                    heic_quality: 91,
+                    conversion_tool_version: Some("linux-tools-batch".to_string()),
+                },
+                ConversionExecutionRequest {
+                    asset_id: "asset-2".to_string(),
+                    output_path: output_2.clone(),
+                    heic_quality: 91,
+                    conversion_tool_version: Some("linux-tools-batch".to_string()),
+                },
+            ],
+            2,
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect("batch conversion should complete");
+
+        for (asset_id, output_path) in [("asset-1", output_1), ("asset-2", output_2)] {
+            let heic = fs::read(&output_path).expect("heic output should be readable");
+            let record = updated.get(asset_id).expect("asset should exist");
+            assert_eq!(record.state, State::Converted);
+            assert_eq!(
+                record.proofs["conversion"]["heic_sha256"],
+                format!("{:x}", Sha256::digest(&heic))
+            );
+            assert_eq!(
+                record.proofs["conversion_performance"]["conversion_tool"],
+                "exiftool+heif-enc"
+            );
+            assert_eq!(
+                record.proofs["conversion_performance"]["conversion_tool_version"],
+                "linux-tools-batch"
+            );
+        }
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist").state,
+            State::NasVerified
+        );
+        assert_eq!(
+            manifest.get("asset-2").expect("asset should exist").state,
+            State::NasVerified
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_batch_conversion_failure_returns_error_without_advancing_manifest() {
+        let tool_dir = fake_linux_conversion_tools();
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_1 = tempdir.path().join("IMG_0001.dng");
+        let raw_2 = tempdir.path().join("IMG_0002.dng");
+        fs::write(&raw_1, b"raw-1").expect("raw 1 should be written");
+        fs::write(&raw_2, b"raw-2").expect("raw 2 should be written");
+        let output_1 = tempdir.path().join("asset-1.heic");
+        let output_2 = tempdir.path().join("asset-2.heic");
+        fs::write(&output_2, b"existing-output").expect("preexisting output should be written");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest =
+            nas_verified_manifest_with_assets(&[("asset-1", &raw_1), ("asset-2", &raw_2)]);
+
+        let error = execute_measured_conversions_for_target(
+            &manifest,
+            vec![
+                ConversionExecutionRequest {
+                    asset_id: "asset-1".to_string(),
+                    output_path: output_1,
+                    heic_quality: 91,
+                    conversion_tool_version: None,
+                },
+                ConversionExecutionRequest {
+                    asset_id: "asset-2".to_string(),
+                    output_path: output_2.clone(),
+                    heic_quality: 91,
+                    conversion_tool_version: None,
+                },
+            ],
+            2,
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("batch conversion must fail closed when any asset fails");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::BatchConversionFailed { asset_id, source }
+                if asset_id == "asset-2"
+                    && matches!(source.as_ref(), ConversionExecutionError::OutputAlreadyExists { path } if *path == output_2)
+        ));
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist").state,
+            State::NasVerified
+        );
+        assert_eq!(
+            manifest.get("asset-2").expect("asset should exist").state,
+            State::NasVerified
         );
     }
 
@@ -1017,22 +1237,28 @@ exit 0
     }
 
     fn nas_verified_manifest(raw_path: &Path) -> Manifest {
+        nas_verified_manifest_with_assets(&[("asset-1", raw_path)])
+    }
+
+    fn nas_verified_manifest_with_assets(assets: &[(&str, &Path)]) -> Manifest {
         let mut manifest = Manifest::new();
-        discover_raw_asset(&mut manifest, "asset-1", raw_path.to_path_buf())
-            .expect("asset should be discovered");
-        record_nas_proof(
-            &mut manifest,
-            "asset-1",
-            NasRawProof {
-                canonical_path: raw_path.to_path_buf(),
-                relative_path: PathBuf::from("IMG_0001.dng"),
-                size_bytes: 9,
-                modified_unix_seconds: 1_700_000_000,
-                age_seconds: 40 * 24 * 60 * 60,
-                sha256: "raw-sha256".to_string(),
-            },
-        )
-        .expect("nas proof should be recorded");
+        for (index, (asset_id, raw_path)) in assets.iter().enumerate() {
+            discover_raw_asset(&mut manifest, *asset_id, raw_path.to_path_buf())
+                .expect("asset should be discovered");
+            record_nas_proof(
+                &mut manifest,
+                asset_id,
+                NasRawProof {
+                    canonical_path: raw_path.to_path_buf(),
+                    relative_path: PathBuf::from(format!("IMG_{:04}.dng", index + 1)),
+                    size_bytes: 9,
+                    modified_unix_seconds: 1_700_000_000,
+                    age_seconds: 40 * 24 * 60 * 60,
+                    sha256: "raw-sha256".to_string(),
+                },
+            )
+            .expect("nas proof should be recorded");
+        }
         manifest
     }
 

@@ -177,6 +177,16 @@ struct PreDeleteFacts {
     source_age_seconds: u64,
 }
 
+struct DeleteEligibilityValidationFacts<'a> {
+    original: &'a OriginalAssetProof,
+    upload: &'a UploadProof,
+    uploaded_heic_path: &'a Path,
+    heic: &'a HeicVerificationProof,
+    mirror: &'a IcloudpdLocalMirrorProof,
+    source_age: &'a SourceAgeProof,
+    source_age_seconds: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeleteExecutionProof {
     pub old_record_change_tag: String,
@@ -791,13 +801,15 @@ fn validate_delete_eligibility_chain(
         stored_proof::<DeleteEligibilityProof>(manifest, asset_id, DELETE_ELIGIBILITY_PROOF)?;
     validate_delete_eligibility_proof(
         &eligibility,
-        &facts.original,
-        &facts.upload,
-        &facts.uploaded_heic_path,
-        &facts.heic,
-        &facts.mirror,
-        &facts.source_age,
-        facts.source_age_seconds,
+        DeleteEligibilityValidationFacts {
+            original: &facts.original,
+            upload: &facts.upload,
+            uploaded_heic_path: &facts.uploaded_heic_path,
+            heic: &facts.heic,
+            mirror: &facts.mirror,
+            source_age: &facts.source_age,
+            source_age_seconds: facts.source_age_seconds,
+        },
     )?;
 
     Ok(())
@@ -1077,13 +1089,7 @@ fn validate_icloudpd_local_mirror_proof(
 
 fn validate_delete_eligibility_proof(
     eligibility: &DeleteEligibilityProof,
-    original: &OriginalAssetProof,
-    upload: &UploadProof,
-    uploaded_heic_path: &Path,
-    heic: &HeicVerificationProof,
-    mirror: &IcloudpdLocalMirrorProof,
-    source_age: &SourceAgeProof,
-    source_age_seconds: u64,
+    facts: DeleteEligibilityValidationFacts<'_>,
 ) -> Result<(), WorkflowError> {
     require_matching_str(
         DELETE_ELIGIBILITY_PROOF,
@@ -1124,103 +1130,103 @@ fn validate_delete_eligibility_proof(
     require_matching_str(
         DELETE_ELIGIBILITY_PROOF,
         "uploaded_heic_asset_id",
-        &upload.uploaded_heic_asset_id,
+        &facts.upload.uploaded_heic_asset_id,
         &eligibility.uploaded_heic_asset_id,
     )?;
     require_matching_str(
         DELETE_ELIGIBILITY_PROOF,
         "uploaded_heic_sha256",
-        &upload.uploaded_heic_sha256,
+        &facts.upload.uploaded_heic_sha256,
         &eligibility.uploaded_heic_sha256,
     )?;
     require_matching_path(
         DELETE_ELIGIBILITY_PROOF,
         "uploaded_heic_path",
-        uploaded_heic_path,
+        facts.uploaded_heic_path,
         &eligibility.uploaded_heic_path,
     )?;
     require_matching_str(
         DELETE_ELIGIBILITY_PROOF,
         "verified_heic_sha256",
-        &heic.heic_sha256,
+        &facts.heic.heic_sha256,
         &eligibility.verified_heic_sha256,
     )?;
     require_matching_path(
         DELETE_ELIGIBILITY_PROOF,
         "verified_heic_path",
-        &heic.heic_path,
+        &facts.heic.heic_path,
         &eligibility.verified_heic_path,
     )?;
     require_matching_path(
         DELETE_ELIGIBILITY_PROOF,
         "icloudpd_download_path",
-        &mirror.icloudpd_download_path,
+        &facts.mirror.icloudpd_download_path,
         &eligibility.icloudpd_download_path,
     )?;
     require_matching_str(
         DELETE_ELIGIBILITY_PROOF,
         "mirrored_heic_sha256",
-        &mirror.uploaded_heic_sha256,
+        &facts.mirror.uploaded_heic_sha256,
         &eligibility.mirrored_heic_sha256,
     )?;
     require_matching_u64(
         DELETE_ELIGIBILITY_PROOF,
         "mirrored_size_bytes",
-        mirror.size_bytes,
+        facts.mirror.size_bytes,
         eligibility.mirrored_size_bytes,
     )?;
     require_matching_u64(
         DELETE_ELIGIBILITY_PROOF,
         "source_captured_unix_seconds",
-        source_age.source_captured_unix_seconds,
+        facts.source_age.source_captured_unix_seconds,
         eligibility.source_captured_unix_seconds,
     )?;
     require_matching_u64(
         DELETE_ELIGIBILITY_PROOF,
         "source_age_seconds",
-        source_age_seconds,
+        facts.source_age_seconds,
         eligibility.source_age_seconds,
     )?;
     require_matching_u64(
         DELETE_ELIGIBILITY_PROOF,
         "min_source_age_seconds",
-        source_age.min_age_seconds,
+        facts.source_age.min_age_seconds,
         eligibility.min_source_age_seconds,
     )?;
     require_matching_str(
         DELETE_ELIGIBILITY_PROOF,
         "original_record_name",
-        &original.record_name,
+        &facts.original.record_name,
         &eligibility.original_record_name,
     )?;
     require_matching_str(
         DELETE_ELIGIBILITY_PROOF,
         "original_record_change_tag",
-        &original.record_change_tag,
+        &facts.original.record_change_tag,
         &eligibility.original_record_change_tag,
     )?;
     require_matching_str(
         DELETE_ELIGIBILITY_PROOF,
         "original_record_type",
-        &original.record_type,
+        &facts.original.record_type,
         &eligibility.original_record_type,
     )?;
     require_matching_str(
         DELETE_ELIGIBILITY_PROOF,
         "original_filename",
-        &original.filename,
+        &facts.original.filename,
         &eligibility.original_filename,
     )?;
     require_matching_u64(
         DELETE_ELIGIBILITY_PROOF,
         "original_size_bytes",
-        original.size_bytes,
+        facts.original.size_bytes,
         eligibility.original_size_bytes,
     )?;
     require_matching_str(
         DELETE_ELIGIBILITY_PROOF,
         "matched_raw_sha256",
-        &original.matched_raw_sha256,
+        &facts.original.matched_raw_sha256,
         &eligibility.matched_raw_sha256,
     )?;
 

@@ -13,7 +13,7 @@ use crate::conversion_backend::{
 };
 use crate::conversion_execution::{
     ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversion,
-    is_executable_file,
+    execute_measured_conversions, is_executable_file,
 };
 use crate::local_mirror::{
     IcloudpdLocalMirrorRequest, LocalMirrorError, ensure_icloudpd_local_mirror,
@@ -90,6 +90,11 @@ enum WorkflowCommand {
     NasVerified(WorkflowNasVerifiedArgs),
     #[command(about = "Run the actual conversion and record measured performance proofs")]
     Convert(WorkflowConvertArgs),
+    #[command(
+        name = "convert-batch",
+        about = "Run multiple conversions with bounded parallelism and one manifest save"
+    )]
+    ConvertBatch(WorkflowConvertBatchArgs),
     #[command(name = "conversion-recorded", alias = "conversion-result")]
     ConversionResult(WorkflowConversionResultArgs),
     #[command(name = "conversion-performance")]
@@ -163,6 +168,26 @@ struct WorkflowConvertArgs {
     output_path: PathBuf,
     #[arg(long, help = "HEIC quality used by the measured performance run")]
     heic_quality: u8,
+    #[arg(long)]
+    conversion_tool_version: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct WorkflowConvertBatchArgs {
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+    #[arg(long)]
+    asset_id: Vec<String>,
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory for <asset-id>.heic outputs"
+    )]
+    output_dir: PathBuf,
+    #[arg(long, help = "HEIC quality used by the measured performance run")]
+    heic_quality: u8,
+    #[arg(long, default_value_t = 1, help = "Maximum conversions to run at once")]
+    jobs: usize,
     #[arg(long)]
     conversion_tool_version: Option<String>,
 }
@@ -369,6 +394,8 @@ pub enum CliError {
     Upload(#[from] UploadError),
     #[error("local mirror failed: {0}")]
     LocalMirror(#[from] LocalMirrorError),
+    #[error("unsafe batch asset id for output filename: {asset_id}")]
+    UnsafeBatchAssetId { asset_id: String },
     #[error("failed to write JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("failed to write output: {0}")]
@@ -439,6 +466,7 @@ fn run_workflow<W: Write>(args: WorkflowArgs, writer: &mut W) -> Result<(), CliE
     match args.command {
         WorkflowCommand::NasVerified(args) => workflow_nas_verified(args),
         WorkflowCommand::Convert(args) => workflow_convert(args),
+        WorkflowCommand::ConvertBatch(args) => workflow_convert_batch(args),
         WorkflowCommand::ConversionResult(args) => workflow_conversion_result(args),
         WorkflowCommand::ConversionPerformance(args) => workflow_conversion_performance(args),
         WorkflowCommand::HeicVerified(args) => workflow_heic_verified(args),
@@ -494,6 +522,28 @@ fn workflow_convert(args: WorkflowConvertArgs) -> Result<(), CliError> {
             conversion_tool_version: args.conversion_tool_version,
         },
     )?;
+    save_manifest(&updated, &args.manifest)
+}
+
+fn workflow_convert_batch(args: WorkflowConvertBatchArgs) -> Result<(), CliError> {
+    let manifest = load_manifest_for_write(&args.manifest)?;
+    let asset_ids = convert_batch_target_asset_ids(&manifest, &args.asset_id);
+    if asset_ids.is_empty() {
+        return Err(ConversionExecutionError::EmptyBatch.into());
+    }
+    let requests = asset_ids
+        .into_iter()
+        .map(|asset_id| {
+            let output_path = convert_batch_output_path(&args.output_dir, &asset_id)?;
+            Ok(ConversionExecutionRequest {
+                asset_id,
+                output_path,
+                heic_quality: args.heic_quality,
+                conversion_tool_version: args.conversion_tool_version.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+    let updated = execute_measured_conversions(&manifest, requests, args.jobs)?;
     save_manifest(&updated, &args.manifest)
 }
 
@@ -761,6 +811,32 @@ fn original_asset_batch_target_asset_ids(manifest: &Manifest, requested: &[Strin
         })
         .map(|record| record.asset_id.clone())
         .collect()
+}
+
+fn convert_batch_target_asset_ids(manifest: &Manifest, requested: &[String]) -> Vec<String> {
+    if !requested.is_empty() {
+        return requested.to_vec();
+    }
+    manifest
+        .records()
+        .values()
+        .filter(|record| record.state == State::NasVerified)
+        .map(|record| record.asset_id.clone())
+        .collect()
+}
+
+fn convert_batch_output_path(output_dir: &Path, asset_id: &str) -> Result<PathBuf, CliError> {
+    if asset_id.trim().is_empty()
+        || asset_id.contains('/')
+        || asset_id.contains('\\')
+        || asset_id == "."
+        || asset_id == ".."
+    {
+        return Err(CliError::UnsafeBatchAssetId {
+            asset_id: asset_id.to_string(),
+        });
+    }
+    Ok(output_dir.join(format!("{asset_id}.heic")))
 }
 
 fn decode_workflow_proof<T: serde::de::DeserializeOwned>(

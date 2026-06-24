@@ -108,6 +108,7 @@ pub fn plan_conversion_for_target(
             output_arg,
             raw_preview_arg,
             heic_preview_arg,
+            output_path,
             heic_quality,
         ),
     }
@@ -118,9 +119,29 @@ fn macos_conversion_plan(
     output_arg: OsString,
     raw_preview_arg: OsString,
     heic_preview_arg: OsString,
+    output_path: &Path,
     heic_quality: u8,
 ) -> Result<ConversionPlan, ConversionError> {
-    let convert = CommandPlan::new(
+    let embedded_preview_path = intermediate_preview_path(output_path);
+    let embedded_preview_arg = embedded_preview_path.as_os_str().to_os_string();
+    let extract_preview = CommandPlan::new(
+        "exiftool",
+        vec![
+            OsString::from("-b"),
+            OsString::from("-PreviewImage"),
+            raw_arg.clone(),
+        ],
+    )
+    .with_stdout_file(embedded_preview_path);
+    let normalize_preview_orientation = CommandPlan::new(
+        "exiftool",
+        vec![
+            OsString::from("-overwrite_original"),
+            OsString::from("-Orientation#=1"),
+            embedded_preview_arg.clone(),
+        ],
+    );
+    let encode = CommandPlan::new(
         "sips",
         vec![
             OsString::from("-s"),
@@ -129,21 +150,23 @@ fn macos_conversion_plan(
             OsString::from("-s"),
             OsString::from("formatOptions"),
             OsString::from(heic_quality.to_string()),
-            raw_arg.clone(),
+            embedded_preview_arg.clone(),
             OsString::from("--out"),
             output_arg.clone(),
         ],
     );
 
     Ok(ConversionPlan {
-        convert: convert.clone(),
-        conversion_commands: vec![convert],
+        convert: extract_preview.clone(),
+        conversion_commands: vec![extract_preview, normalize_preview_orientation, encode],
         metadata: CommandPlan::new(
             "exiftool",
             vec![
                 OsString::from("-TagsFromFile"),
                 raw_arg.clone(),
                 OsString::from("-all:all"),
+                OsString::from("-Orientation#=1"),
+                OsString::from("-QuickTime:Rotation#=0"),
                 OsString::from("-overwrite_original"),
                 output_arg.clone(),
             ],
@@ -157,7 +180,7 @@ fn macos_conversion_plan(
                 OsString::from("-s"),
                 OsString::from("format"),
                 OsString::from("png"),
-                raw_arg,
+                embedded_preview_arg,
                 OsString::from("--out"),
                 raw_preview_arg.clone(),
             ],
