@@ -454,9 +454,18 @@ fn cloudkit_original_asset_resolver_short_page_with_continuation_keeps_scanning(
 
     assert_eq!(proof.record_name, "CPLAsset-original-123");
     assert_eq!(transport.query_payloads.len(), 2);
+    assert!(
+        transport.query_payloads[0]
+            .get("continuationMarker")
+            .is_none()
+    );
+    assert_eq!(
+        transport.query_payloads[1]["continuationMarker"],
+        json!("next-page")
+    );
     assert_eq!(
         transport.query_payloads[1]["query"]["filterBy"][1]["fieldValue"]["value"],
-        200
+        0
     );
 }
 
@@ -487,6 +496,30 @@ fn cloudkit_original_asset_resolver_short_page_without_continuation_stops() {
         UploadError::OriginalAssetResolveNotUnique { matches: 0 }
     ));
     assert_eq!(transport.query_payloads.len(), 1);
+}
+
+#[test]
+fn cloudkit_original_asset_resolver_rejects_malformed_continuation_markers() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+
+    for continuation_marker in [json!(""), json!("   "), json!(42), json!(true)] {
+        let mut request = original_asset_resolve_request();
+        request.max_pages = 1;
+        let mut transport = FakeCloudKitDeleteTransport::query_responses(vec![json!({
+            "records": [],
+            "continuationMarker": continuation_marker,
+        })]);
+
+        let error = CloudKitDeleteClient::new(&mut transport)
+            .resolve_original_asset(&session, &request)
+            .expect_err("malformed continuation markers must fail closed");
+
+        assert!(matches!(
+            error,
+            UploadError::InvalidCloudKitOriginalAssetResponse(_)
+        ));
+    }
 }
 
 #[test]

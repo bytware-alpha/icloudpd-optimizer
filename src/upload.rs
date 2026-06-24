@@ -423,12 +423,15 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
         validate_original_asset_pagination_range(request)?;
         let mut matches = Vec::new();
         let mut exhausted = false;
-        for page in 0..request.max_pages {
-            let start_rank = original_asset_query_start_rank(request, page)?;
-            let payload = cloudkit_original_asset_query_payload(start_rank, request.page_size);
+        let mut continuation_marker = None;
+        for _ in 0..request.max_pages {
+            let payload = cloudkit_original_asset_query_payload(
+                request.start_rank,
+                request.page_size,
+                continuation_marker.as_deref(),
+            );
             let response = self.transport.post_records_query(session, payload)?;
             let page_result = parse_original_asset_query_response(response, request)?;
-            let has_continuation_marker = page_result.has_continuation_marker;
             for candidate in page_result.matches {
                 let download = self.transport.download_resource(
                     session,
@@ -450,7 +453,9 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
                     matches: matches.len(),
                 });
             }
-            if !has_continuation_marker {
+            if let Some(marker) = page_result.continuation_marker {
+                continuation_marker = Some(marker);
+            } else {
                 exhausted = true;
                 break;
             }
@@ -775,8 +780,12 @@ fn cloudkit_delete_payload(request: &CloudKitDeleteRequest) -> Value {
     })
 }
 
-fn cloudkit_original_asset_query_payload(start_rank: u64, page_size: u64) -> Value {
-    json!({
+fn cloudkit_original_asset_query_payload(
+    start_rank: u64,
+    page_size: u64,
+    continuation_marker: Option<&str>,
+) -> Value {
+    let mut payload = json!({
         "query": {
             "recordType": "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
             "filterBy": [
@@ -818,7 +827,11 @@ fn cloudkit_original_asset_query_payload(start_rank: u64, page_size: u64) -> Val
             "resOriginalVidComplHeight"
         ],
         "zoneID": {"zoneName": PRIMARY_SYNC_ZONE}
-    })
+    });
+    if let Some(marker) = continuation_marker {
+        payload["continuationMarker"] = json!(marker);
+    }
+    payload
 }
 
 fn original_asset_query_start_rank(
@@ -999,7 +1012,7 @@ fn parse_cloudkit_delete_response(
 }
 
 struct OriginalAssetQueryPage {
-    has_continuation_marker: bool,
+    continuation_marker: Option<String>,
     matches: Vec<OriginalAssetCandidate>,
 }
 
@@ -1025,9 +1038,7 @@ fn parse_original_asset_query_response(
             "records/query response must include records",
         ),
     )?;
-    let has_continuation_marker = value
-        .as_object()
-        .is_some_and(|response| response.contains_key("continuationMarker"));
+    let continuation_marker = parse_cloudkit_continuation_marker(&value)?;
     let mut assets = Vec::new();
     let mut masters = std::collections::BTreeMap::new();
 
@@ -1080,9 +1091,27 @@ fn parse_original_asset_query_response(
     }
 
     Ok(OriginalAssetQueryPage {
-        has_continuation_marker,
+        continuation_marker,
         matches,
     })
+}
+
+fn parse_cloudkit_continuation_marker(value: &Value) -> Result<Option<String>, UploadError> {
+    let Some(response) = value.as_object() else {
+        return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "records/query response must be an object",
+        ));
+    };
+    let Some(marker) = response.get("continuationMarker") else {
+        return Ok(None);
+    };
+    let marker = marker
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "records/query continuationMarker must be a non-empty string",
+        ))?;
+    Ok(Some(marker.to_string()))
 }
 
 fn parse_cloudkit_asset_record(record: &Value) -> Result<CloudKitAssetRecord, UploadError> {
