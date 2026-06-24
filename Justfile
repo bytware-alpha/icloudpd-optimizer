@@ -36,8 +36,7 @@ setup:
         ;;
       *)
         printf 'skip: sips\n'
-        printf '  note: Linux workflow convert uses dcraw_emu, ImageMagick, and heif-enc instead of sips.\n'
-        require_tool dcraw_emu 'Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y libraw-bin'
+        printf '  note: Linux workflow convert uses exiftool, ImageMagick, and heif-enc instead of sips.\n'
         require_tool heif-enc 'Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y libheif-examples'
         ;;
     esac

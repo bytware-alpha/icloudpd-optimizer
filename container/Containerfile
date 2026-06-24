@@ -11,7 +11,6 @@ RUN apt-get update \
     imagemagick \
     libheif-examples \
     libimage-exiftool-perl \
-    libraw-bin \
   && rm -rf /var/lib/apt/lists/* \
   && printf '%s\n' \
     '#!/bin/sh' \

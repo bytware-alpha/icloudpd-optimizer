@@ -762,9 +762,9 @@ fn setup_and_install_docs_scope_platform_conversion_tools() {
 
     assert!(justfile.contains("Darwin"));
     assert!(justfile.contains("require_tool sips"));
-    assert!(justfile.contains("require_tool dcraw_emu"));
+    assert!(!justfile.contains("require_tool dcraw_emu"));
     assert!(justfile.contains("require_tool heif-enc"));
-    assert!(justfile.contains("Linux workflow convert uses dcraw_emu"));
+    assert!(justfile.contains("Linux workflow convert uses exiftool"));
 
     assert!(
         readme.contains("`doctor --json` is authoritative for platform-specific required tools")
@@ -772,7 +772,7 @@ fn setup_and_install_docs_scope_platform_conversion_tools() {
     assert!(readme.contains("macOS host-native `workflow convert` requirements"));
     assert!(readme.contains("Linux source and OCI installs do not require `sips`"));
     assert!(readme.contains("Linux-native `workflow convert` requirements"));
-    assert!(readme.contains("dcraw_emu"));
+    assert!(!readme.contains("dcraw_emu"));
     assert!(readme.contains("heif-enc"));
     assert!(!readme.contains("You will also need these tools available on `PATH`:\n\n- `sips`"));
 }
@@ -811,6 +811,10 @@ fn container_image_provides_magick_command_on_bookworm() {
     assert!(
         containerfile.contains("/usr/local/bin/magick"),
         "doctor requires magick, so the Linux image must provide that command"
+    );
+    assert!(
+        !containerfile.contains("libraw-bin"),
+        "Linux conversion uses the embedded preview path and should not ship the old raw-render decoder"
     );
     assert!(
         containerfile.contains("exec /usr/bin/compare"),
@@ -856,7 +860,7 @@ fn doctor_json_reports_platform_backend_support_and_required_tools() {
     assert_eq!(shown["conversion_backend"]["name"], backend.name);
     assert_eq!(
         shown["conversion_backend"]["workflow_convert_supported"],
-        cfg!(target_os = "macos")
+        backend.workflow_convert_supported
     );
     assert_eq!(shown["conversion_backend"]["reason"], backend.reason);
     assert_eq!(
@@ -887,7 +891,7 @@ fn backend_report_marks_linux_workflow_convert_supported_without_sips() {
     assert!(!required_tools_for_target(target).contains(&"sips"));
     assert_eq!(
         required_tools_for_target(target),
-        ["dcraw_emu", "heif-enc", "heif-info", "magick", "exiftool"]
+        ["heif-enc", "heif-info", "magick", "exiftool"]
     );
 }
 
@@ -1252,7 +1256,7 @@ fn workflow_convert_ignores_empty_path_segments_without_mutating_manifest_or_out
     assert!(!output_path.exists());
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[test]
 fn workflow_convert_fails_closed_on_unsupported_backend_without_mutating_manifest_or_output() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");

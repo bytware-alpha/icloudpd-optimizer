@@ -54,9 +54,10 @@ The current CLI can:
 - print a JSON delete plan for manual review.
 
 `workflow convert` is platform-native and fail-closed. On macOS it uses `sips`.
-On Linux it uses LibRaw's `dcraw_emu`, ImageMagick, and `heif-enc`. Do not run it
-inside the Alpine `docker-icloudpd` auth container; use the host install or the
-separate optimizer OCI image.
+On Linux it extracts the DNG embedded rendered preview with `exiftool`, encodes
+HEIC with `heif-enc`, and validates previews with ImageMagick. Do not run it inside
+the Alpine `docker-icloudpd` auth container; use the host install or the separate
+optimizer OCI image.
 
 ## Install
 
@@ -97,7 +98,6 @@ upload, delete-plan, and Linux-native `workflow convert` workflows.
 
 Linux-native `workflow convert` requirements:
 
-- `dcraw_emu`
 - `heif-enc`
 - `heif-info`
 - `magick`
@@ -128,9 +128,10 @@ podman run --rm icloudpd-optimizer:local doctor --json
 ```
 
 The Linux image supports manifest, proof, upload, delete-plan, and Linux-native
-`workflow convert` operations. The conversion backend renders RAW with `dcraw_emu`,
-normalizes the rendered TIFF with ImageMagick, encodes HEIC with `heif-enc`, and
-records measured conversion performance before any upload/delete workflow can proceed.
+`workflow convert` operations. The conversion backend extracts the DNG embedded
+rendered preview with `exiftool`, encodes HEIC with `heif-enc`, validates previews
+with ImageMagick, and records measured conversion performance before any
+upload/delete workflow can proceed.
 
 ## Quick Start
 
@@ -335,8 +336,8 @@ just setup
 `just setup` checks Rust tooling, builds the CLI, runs `icloudpd-optimizer doctor
 --json`, and prints install commands for missing runtime tools such as `heif-info`,
 ImageMagick, and `exiftool`. On Darwin/macOS it also requires `sips` for
-host-native `workflow convert`; on Linux it requires `dcraw_emu` and `heif-enc`
-for the container-native conversion backend.
+host-native `workflow convert`; on Linux it requires `heif-enc` for the
+container-native conversion backend.
 
 Run the normal project gate before opening a pull request:
 

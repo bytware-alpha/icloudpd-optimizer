@@ -1,5 +1,5 @@
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -142,12 +142,7 @@ fn run_planned_command(
     let resolved_program = resolve_sanitized_path_tool(&plan.program)?;
     let mut command = Command::new(resolved_program);
     let stdout = match &plan.stdout_path {
-        Some(path) => Stdio::from(File::create(path).map_err(|source| {
-            ConversionExecutionError::OutputUnreadable {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?),
+        Some(path) => Stdio::from(create_new_stdout_file(path)?),
         None => Stdio::null(),
     };
     command.args(&plan.args).stdin(Stdio::null()).stdout(stdout);
@@ -163,6 +158,25 @@ fn run_planned_command(
         inspect_required_intermediate_output(path)?;
     }
     Ok(outcome.resource_usage)
+}
+
+fn create_new_stdout_file(path: &Path) -> Result<File, ConversionExecutionError> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::AlreadyExists {
+                ConversionExecutionError::OutputAlreadyExists {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                ConversionExecutionError::OutputUnreadable {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            }
+        })
 }
 
 fn remove_failed_output(path: &Path) {
@@ -830,6 +844,101 @@ exit 0
     }
 
     #[cfg(unix)]
+    #[test]
+    fn linux_refuses_preexisting_preview_intermediate_without_mutating_it_or_recording_proofs() {
+        let tool_dir = fake_linux_conversion_tools();
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        let preview_path = embedded_preview_path(&output_path);
+        fs::write(&preview_path, b"existing-preview").expect("preview should be written");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest = nas_verified_manifest(&raw_path);
+
+        let error = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("preexisting preview intermediate should fail closed");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::OutputAlreadyExists { path } if path == preview_path
+        ));
+        assert_eq!(
+            fs::read(&preview_path).expect("preview should remain readable"),
+            b"existing-preview"
+        );
+        assert!(!output_path.exists());
+        assert!(!log_path.exists());
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::NasVerified);
+        assert!(!record.proofs.contains_key("conversion"));
+        assert!(!record.proofs.contains_key("conversion_performance"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_refuses_symlink_preview_intermediate_without_mutating_target_or_recording_proofs() {
+        let tool_dir = fake_linux_conversion_tools();
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        let preview_path = embedded_preview_path(&output_path);
+        let symlink_target = tempdir.path().join("protected-preview-target.jpg");
+        fs::write(&symlink_target, b"protected-preview").expect("symlink target should be written");
+        std::os::unix::fs::symlink(&symlink_target, &preview_path)
+            .expect("preview symlink should be created");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest = nas_verified_manifest(&raw_path);
+
+        let error = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("symlink preview intermediate should fail closed");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::OutputAlreadyExists { path } if path == preview_path
+        ));
+        assert_eq!(
+            fs::read(&symlink_target).expect("symlink target should remain readable"),
+            b"protected-preview"
+        );
+        assert!(
+            fs::symlink_metadata(&preview_path)
+                .expect("preview symlink should remain")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!output_path.exists());
+        assert!(!log_path.exists());
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::NasVerified);
+        assert!(!record.proofs.contains_key("conversion"));
+        assert!(!record.proofs.contains_key("conversion_performance"));
+    }
+
+    #[cfg(unix)]
     fn fake_linux_conversion_tools() -> tempfile::TempDir {
         fake_linux_conversion_tools_with_preview_and_heif_enc(
             DEFAULT_PREVIEW_EXTRACTION_SCRIPT,
@@ -868,6 +977,12 @@ if [ "$preview_bytes" != "embedded-preview-jpeg" ]; then
 fi
 printf 'heic-bytes-from-preview' > "$out"
 "#;
+
+    fn embedded_preview_path(output_path: &Path) -> PathBuf {
+        let mut preview_path = output_path.to_path_buf();
+        preview_path.set_extension("embedded-preview.jpg");
+        preview_path
+    }
 
     #[cfg(unix)]
     fn fake_linux_conversion_tools_with_preview_and_heif_enc(
