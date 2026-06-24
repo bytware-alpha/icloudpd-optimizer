@@ -421,6 +421,7 @@ fn workflow_conversion_performance(
             user_cpu_time_millis: args.user_cpu_time_millis,
             system_cpu_time_millis: args.system_cpu_time_millis,
             peak_rss_kib: args.peak_rss_kib,
+            conversion_command_timings: Vec::new(),
         },
     )?;
     save_manifest(&manifest, &args.manifest)

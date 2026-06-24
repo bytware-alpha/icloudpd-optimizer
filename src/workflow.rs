@@ -51,6 +51,13 @@ pub struct ConversionPerformanceInput {
     pub user_cpu_time_millis: Option<u64>,
     pub system_cpu_time_millis: Option<u64>,
     pub peak_rss_kib: Option<u64>,
+    pub conversion_command_timings: Vec<ConversionCommandTiming>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ConversionCommandTiming {
+    pub program: String,
+    pub wall_time_millis: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -72,6 +79,8 @@ pub struct ConversionPerformanceProof {
     pub system_cpu_time_millis: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_rss_kib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conversion_command_timings: Vec<ConversionCommandTiming>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -235,6 +244,7 @@ pub fn record_conversion_performance<'a>(
         user_cpu_time_millis: input.user_cpu_time_millis,
         system_cpu_time_millis: input.system_cpu_time_millis,
         peak_rss_kib: input.peak_rss_kib,
+        conversion_command_timings: input.conversion_command_timings,
     };
     validate_conversion_performance_proof(&proof, &nas, &conversion)?;
     insert_workflow_proof(manifest, asset_id, CONVERSION_PERFORMANCE_PROOF, &proof)
@@ -846,6 +856,17 @@ fn validate_conversion_performance_proof(
             field: "peak_rss_kib",
             reason: "must be greater than zero",
         });
+    }
+    for command_timing in &proof.conversion_command_timings {
+        require_non_empty(
+            "conversion_command_timings.program",
+            &command_timing.program,
+        )?;
+        require_positive_u64(
+            CONVERSION_PERFORMANCE_PROOF,
+            "conversion_command_timings.wall_time_millis",
+            command_timing.wall_time_millis,
+        )?;
     }
     require_matching_u64(
         CONVERSION_PERFORMANCE_PROOF,

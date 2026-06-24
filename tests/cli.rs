@@ -174,6 +174,7 @@ fn conversion_performance_input() -> ConversionPerformanceInput {
         user_cpu_time_millis: Some(1_100),
         system_cpu_time_millis: Some(90),
         peak_rss_kib: Some(256_000),
+        conversion_command_timings: Vec::new(),
     }
 }
 

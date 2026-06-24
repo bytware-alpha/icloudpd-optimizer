@@ -12,7 +12,7 @@ use crate::conversion::{CommandPlan, ConversionError, plan_conversion_for_target
 use crate::conversion_backend::{TargetPlatform, backend_report_for_target};
 use crate::manifest::{Manifest, ManifestError, State};
 use crate::workflow::{
-    ConversionPerformanceInput, ConversionResultProof, WorkflowError,
+    ConversionCommandTiming, ConversionPerformanceInput, ConversionResultProof, WorkflowError,
     record_conversion_performance, record_conversion_result,
 };
 
@@ -65,12 +65,12 @@ fn execute_measured_conversion_for_target(
     refuse_preexisting_output(&request.output_path)?;
     let total_started = Instant::now();
     let convert_started = Instant::now();
-    let convert_usage = run_planned_commands("conversion", &plan.conversion_commands)?;
+    let convert_outcome = run_planned_commands("conversion", &plan.conversion_commands)?;
     let convert_wall_time_millis = positive_millis(convert_started.elapsed());
     let metadata_usage = run_planned_command("metadata", &plan.metadata)?;
     let output = inspect_output(&request.output_path)?;
     let total_wall_time_millis = positive_millis(total_started.elapsed());
-    let resource_usage = convert_usage.combine(metadata_usage);
+    let resource_usage = convert_outcome.resource_usage.combine(metadata_usage);
 
     let mut updated = manifest.clone();
     record_conversion_result(
@@ -95,6 +95,7 @@ fn execute_measured_conversion_for_target(
             user_cpu_time_millis: resource_usage.user_cpu_time_millis,
             system_cpu_time_millis: resource_usage.system_cpu_time_millis,
             peak_rss_kib: resource_usage.peak_rss_kib,
+            conversion_command_timings: convert_outcome.command_timings,
         },
     )?;
 
@@ -150,12 +151,23 @@ fn run_planned_command(
 fn run_planned_commands(
     stage: &'static str,
     plans: &[CommandPlan],
-) -> Result<ChildResourceUsage, ConversionExecutionError> {
+) -> Result<PlannedCommandsOutcome, ConversionExecutionError> {
     let mut resource_usage = ChildResourceUsage::default();
+    let mut command_timings = Vec::with_capacity(plans.len());
     for plan in plans {
-        resource_usage = resource_usage.combine(run_planned_command(stage, plan)?);
+        let started = Instant::now();
+        let command_usage = run_planned_command(stage, plan)?;
+        let wall_time_millis = positive_millis(started.elapsed());
+        resource_usage = resource_usage.combine(command_usage);
+        command_timings.push(ConversionCommandTiming {
+            program: plan.program.clone(),
+            wall_time_millis,
+        });
     }
-    Ok(resource_usage)
+    Ok(PlannedCommandsOutcome {
+        resource_usage,
+        command_timings,
+    })
 }
 
 fn resolve_sanitized_path_tool(program: &str) -> Result<PathBuf, ConversionExecutionError> {
@@ -369,6 +381,11 @@ struct CommandOutcome {
     resource_usage: ChildResourceUsage,
 }
 
+struct PlannedCommandsOutcome {
+    resource_usage: ChildResourceUsage,
+    command_timings: Vec<ConversionCommandTiming>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ChildResourceUsage {
     user_cpu_time_millis: Option<u64>,
@@ -579,6 +596,22 @@ mod tests {
                     .as_u64()
                     .expect("convert wall time should be present")
         );
+        let command_timings = record.proofs["conversion_performance"]["conversion_command_timings"]
+            .as_array()
+            .expect("command timings should be present");
+        assert_eq!(command_timings.len(), 3);
+        for (timing, program) in command_timings
+            .iter()
+            .zip(["dcraw_emu", "magick", "heif-enc"])
+        {
+            assert_eq!(timing["program"], program);
+            assert!(
+                timing["wall_time_millis"]
+                    .as_u64()
+                    .expect("command timing should record positive millis")
+                    > 0
+            );
+        }
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
             "dcraw_emu\nmagick\nheif-enc\nexiftool\n"

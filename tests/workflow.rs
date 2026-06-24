@@ -6,11 +6,12 @@ use filetime::{FileTime, set_file_mtime};
 use icloudpd_optimizer::manifest::{AssetRecord, Manifest, ManifestError, State};
 use icloudpd_optimizer::proof::{NasRawProof, ProofError, prove_nas_raw};
 use icloudpd_optimizer::workflow::{
-    ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, SourceAgeProof,
-    UploadProof, WorkflowError, approve_delete, build_delete_plan, discover_raw_asset,
-    mark_delete_eligible, prove_and_record_nas, record_conversion_performance,
-    record_conversion_result, record_heic_verification, record_nas_proof, record_source_age_proof,
-    record_stage_failure, record_upload_proof, upload_ready_heic_proof,
+    ConversionCommandTiming, ConversionPerformanceInput, ConversionPerformanceProof,
+    ConversionResultProof, HeicVerificationProof, SourceAgeProof, UploadProof, WorkflowError,
+    approve_delete, build_delete_plan, discover_raw_asset, mark_delete_eligible,
+    prove_and_record_nas, record_conversion_performance, record_conversion_result,
+    record_heic_verification, record_nas_proof, record_source_age_proof, record_stage_failure,
+    record_upload_proof, upload_ready_heic_proof,
 };
 use serde_json::json;
 
@@ -47,6 +48,7 @@ fn conversion_performance_input() -> ConversionPerformanceInput {
         user_cpu_time_millis: Some(1_100),
         system_cpu_time_millis: Some(90),
         peak_rss_kib: Some(256_000),
+        conversion_command_timings: Vec::new(),
     }
 }
 
@@ -757,6 +759,75 @@ fn conversion_performance_records_derived_sizes_and_metrics() {
     assert_eq!(proof["user_cpu_time_millis"], 1_100);
     assert_eq!(proof["system_cpu_time_millis"], 90);
     assert_eq!(proof["peak_rss_kib"], 256_000);
+    assert!(proof.get("conversion_command_timings").is_none());
+}
+
+#[test]
+fn conversion_performance_records_ordered_command_timings() {
+    let mut manifest = converted_manifest();
+
+    let record = record_conversion_performance(
+        &mut manifest,
+        "asset-1",
+        ConversionPerformanceInput {
+            conversion_command_timings: vec![
+                ConversionCommandTiming {
+                    program: "dcraw_emu".to_string(),
+                    wall_time_millis: 4_888,
+                },
+                ConversionCommandTiming {
+                    program: "magick".to_string(),
+                    wall_time_millis: 29_267,
+                },
+                ConversionCommandTiming {
+                    program: "heif-enc".to_string(),
+                    wall_time_millis: 80_798,
+                },
+            ],
+            ..conversion_performance_input()
+        },
+    )
+    .expect("conversion performance should record command timings");
+
+    assert_eq!(
+        record.proofs["conversion_performance"]["conversion_command_timings"],
+        json!([
+            {
+                "program": "dcraw_emu",
+                "wall_time_millis": 4_888
+            },
+            {
+                "program": "magick",
+                "wall_time_millis": 29_267
+            },
+            {
+                "program": "heif-enc",
+                "wall_time_millis": 80_798
+            }
+        ])
+    );
+}
+
+#[test]
+fn conversion_performance_accepts_legacy_proof_without_command_timings() {
+    let proof: ConversionPerformanceProof = serde_json::from_value(json!({
+        "schema_version": 1,
+        "measured_at_unix_seconds": 1_800_000_100,
+        "measurement_method": "monotonic_wall_clock",
+        "conversion_tool": "magick",
+        "conversion_tool_version": "7.1.1-41",
+        "heic_quality": 90,
+        "raw_size_bytes": 42,
+        "heic_size_bytes": 24,
+        "convert_wall_time_millis": 1_250,
+        "total_wall_time_millis": 1_500,
+        "user_cpu_time_millis": 1_100,
+        "system_cpu_time_millis": 90,
+        "peak_rss_kib": 256_000
+    }))
+    .expect("legacy conversion performance proof should deserialize");
+
+    assert_eq!(proof.conversion_command_timings, Vec::new());
 }
 
 #[test]
@@ -837,6 +908,26 @@ fn invalid_conversion_performance_metrics_fail_without_mutation() {
                 ..conversion_performance_input()
             },
         ),
+        (
+            "conversion_command_timings.program",
+            ConversionPerformanceInput {
+                conversion_command_timings: vec![ConversionCommandTiming {
+                    program: "  ".to_string(),
+                    wall_time_millis: 1,
+                }],
+                ..conversion_performance_input()
+            },
+        ),
+        (
+            "conversion_command_timings.wall_time_millis",
+            ConversionPerformanceInput {
+                conversion_command_timings: vec![ConversionCommandTiming {
+                    program: "magick".to_string(),
+                    wall_time_millis: 0,
+                }],
+                ..conversion_performance_input()
+            },
+        ),
     ];
 
     for (field, input) in cases {
@@ -846,7 +937,10 @@ fn invalid_conversion_performance_metrics_fail_without_mutation() {
         let error = record_conversion_performance(&mut manifest, "asset-1", input)
             .expect_err("invalid conversion performance metrics must fail closed");
 
-        if matches!(field, "conversion_tool" | "conversion_tool_version") {
+        if matches!(
+            field,
+            "conversion_tool" | "conversion_tool_version" | "conversion_command_timings.program"
+        ) {
             assert!(matches!(
                 error,
                 WorkflowError::EmptyProofField { field: actual } if actual == field
