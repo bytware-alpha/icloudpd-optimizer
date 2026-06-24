@@ -415,6 +415,7 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
                 source,
             }
         })?;
+        ensure_scan_root_access(&download_root)?;
         let now = SystemTime::now();
         let mut pending_capacity = config
             .max_conversions_per_scan
@@ -989,6 +990,30 @@ fn should_skip_new_monitor_work(had_lifecycle_pending_at_start: bool) -> bool {
     had_lifecycle_pending_at_start
 }
 
+fn ensure_scan_root_access(path: &Path) -> Result<(), MonitorError> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path =
+            CString::new(path.as_os_str().as_bytes()).map_err(|_| MonitorError::InvalidConfig {
+                message: format!(
+                    "scan root path contains an interior NUL byte: {}",
+                    path.display()
+                ),
+            })?;
+        let status = unsafe { libc::access(c_path.as_ptr(), libc::R_OK | libc::X_OK) };
+        if status != 0 {
+            return Err(MonitorError::DownloadRootAccess {
+                path: path.to_path_buf(),
+                source: io::Error::last_os_error(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn log_monitor_event(event: &str, scan_started_unix_seconds: u64, fields: serde_json::Value) {
     eprintln!(
         "{}",
@@ -1421,6 +1446,10 @@ pub enum MonitorError {
     CreateDir { path: PathBuf, source: io::Error },
     #[error("failed to canonicalize monitor root {path}: {source}")]
     CanonicalizeRoot { path: PathBuf, source: io::Error },
+    #[error(
+        "monitor root {path} is not accessible for scanning: {source}; on macOS launchd jobs, grant the optimizer process access to network volumes or Full Disk Access"
+    )]
+    DownloadRootAccess { path: PathBuf, source: io::Error },
     #[error("failed to read directory {path}: {source}")]
     ReadDir { path: PathBuf, source: io::Error },
     #[error("failed to read directory entry under {path}: {source}")]
@@ -1529,5 +1558,25 @@ mod tests {
 
         assert_eq!(pending_lifecycle_count(&manifest), 0);
         assert!(should_skip_new_monitor_work(had_lifecycle_pending_at_start));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_root_access_check_rejects_unreadable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let path = tempdir.path();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000))
+            .expect("permissions should be restricted");
+
+        let result = ensure_scan_root_access(path);
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("permissions should be restored");
+        assert!(matches!(
+            result,
+            Err(MonitorError::DownloadRootAccess { .. })
+        ));
     }
 }
