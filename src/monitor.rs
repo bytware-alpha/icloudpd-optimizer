@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -383,8 +384,27 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
     };
     let had_lifecycle_pending_at_start =
         config.full_lifecycle && pending_lifecycle_count(&manifest) > 0;
+    log_monitor_event(
+        "scan_started",
+        started,
+        json!({
+            "full_lifecycle": config.full_lifecycle,
+            "had_lifecycle_pending_at_start": had_lifecycle_pending_at_start,
+            "max_conversions_per_scan": config.max_conversions_per_scan,
+            "max_lifecycle_per_scan": config.max_lifecycle_per_scan,
+            "scan_recursive": config.scan_recursive,
+        }),
+    );
 
     if config.full_lifecycle {
+        log_monitor_event(
+            "lifecycle_started",
+            started,
+            json!({
+                "pending_lifecycle": pending_lifecycle_count(&manifest),
+                "position": "before_discovery",
+            }),
+        );
         run_lifecycle_stages(config, &mut manifest, &mut summary)?;
     }
 
@@ -400,6 +420,14 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
             .max_conversions_per_scan
             .saturating_sub(pending_conversion_count(&manifest));
         if pending_capacity > 0 {
+            log_monitor_event(
+                "discovery_started",
+                started,
+                json!({
+                    "pending_capacity": pending_capacity,
+                    "scan_recursive": config.scan_recursive,
+                }),
+            );
             visit_raw_paths(&download_root, config.scan_recursive, &mut |raw_path| {
                 if pending_capacity == 0 {
                     return Ok(VisitDecision::Stop);
@@ -453,6 +481,17 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
                 }
                 Ok(VisitDecision::Continue)
             })?;
+            log_monitor_event(
+                "discovery_finished",
+                started,
+                json!({
+                    "raw_files_seen": summary.raw_files_seen,
+                    "candidates_verified": summary.candidates_verified,
+                    "skipped_known": summary.skipped_known,
+                    "skipped_not_ready": summary.skipped_not_ready,
+                    "failures": summary.failures,
+                }),
+            );
         }
 
         manifest
@@ -462,6 +501,14 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
         let requests = conversion_requests(&manifest, config);
         summary.conversions_attempted = requests.len() as u64;
         if !requests.is_empty() {
+            log_monitor_event(
+                "conversions_started",
+                started,
+                json!({
+                    "requests": requests.len(),
+                    "jobs": config.jobs,
+                }),
+            );
             match execute_measured_conversions(&manifest, requests, config.jobs) {
                 Ok(updated) => {
                     summary.conversions_completed = summary.conversions_attempted;
@@ -478,8 +525,25 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
         }
 
         if config.full_lifecycle {
+            log_monitor_event(
+                "lifecycle_started",
+                started,
+                json!({
+                    "pending_lifecycle": pending_lifecycle_count(&manifest),
+                    "position": "after_conversions",
+                }),
+            );
             run_lifecycle_stages(config, &mut manifest, &mut summary)?;
         }
+    } else {
+        log_monitor_event(
+            "new_work_skipped",
+            started,
+            json!({
+                "reason": "lifecycle_pending_at_scan_start",
+                "pending_lifecycle_after_lifecycle": pending_lifecycle_count(&manifest),
+            }),
+        );
     }
 
     manifest
@@ -490,6 +554,20 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
     summary.state_counts = state_counts(&manifest);
     stats.apply_scan(&summary);
     stats.save_atomic(&config.stats_path)?;
+    log_monitor_event(
+        "scan_finished",
+        started,
+        json!({
+            "finished_unix_seconds": summary.finished_unix_seconds,
+            "raw_files_seen": summary.raw_files_seen,
+            "candidates_verified": summary.candidates_verified,
+            "conversions_attempted": summary.conversions_attempted,
+            "conversions_completed": summary.conversions_completed,
+            "uploads_completed": summary.uploads_completed,
+            "originals_deleted": summary.originals_deleted,
+            "failures": summary.failures,
+        }),
+    );
 
     Ok(summary)
 }
@@ -909,6 +987,18 @@ fn pending_lifecycle_count(manifest: &Manifest) -> usize {
 
 fn should_skip_new_monitor_work(had_lifecycle_pending_at_start: bool) -> bool {
     had_lifecycle_pending_at_start
+}
+
+fn log_monitor_event(event: &str, scan_started_unix_seconds: u64, fields: serde_json::Value) {
+    eprintln!(
+        "{}",
+        json!({
+            "event": event,
+            "scan_started_unix_seconds": scan_started_unix_seconds,
+            "at_unix_seconds": current_unix_seconds(),
+            "fields": fields,
+        })
+    );
 }
 
 fn asset_ids_matching(
