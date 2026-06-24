@@ -919,7 +919,7 @@ fn monitor_run_once_converts_matching_old_raw_and_writes_stats() {
         .assert()
         .success();
 
-    binary()
+    let run_output = binary()
         .args([
             "monitor",
             "run",
@@ -929,7 +929,15 @@ fn monitor_run_once_converts_matching_old_raw_and_writes_stats() {
         ])
         .env("PATH", tool_dir.path())
         .assert()
-        .success();
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let run_lines = String::from_utf8(run_output).expect("run output should be utf8");
+    let scan_summary: Value =
+        serde_json::from_str(run_lines.trim()).expect("run should log scan summary json");
+    assert_eq!(scan_summary["raw_files_seen"], 1);
+    assert_eq!(scan_summary["conversions_completed"], 1);
 
     let manifest = Manifest::load(&manifest_path).expect("manifest should load");
     let record = manifest
@@ -964,7 +972,91 @@ fn monitor_run_once_converts_matching_old_raw_and_writes_stats() {
     assert_eq!(stats["candidates_verified"], 1);
     assert_eq!(stats["conversions_attempted"], 1);
     assert_eq!(stats["conversions_completed"], 1);
+    assert_eq!(stats["uploads_completed"], 0);
+    assert_eq!(stats["originals_deleted"], 0);
+    assert_eq!(stats["bytes_saved"], 0);
     assert_eq!(stats["state_counts"]["converted"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn monitor_init_can_enable_guarded_full_lifecycle_config() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let config_path = tempdir.path().join("monitor.json");
+    let download_root = tempdir.path().join("download");
+    let heic_dir = tempdir.path().join("heic");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let upload_session = tempdir.path().join("upload-session.json");
+    let delete_session = tempdir.path().join("delete-session.json");
+    let mirror_root = tempdir.path().join("mirror");
+
+    binary()
+        .args([
+            "monitor",
+            "init",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--download-root",
+            download_root
+                .to_str()
+                .expect("download root should be utf8"),
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--heic-output-dir",
+            heic_dir.to_str().expect("heic dir should be utf8"),
+            "--min-age-days",
+            "30",
+            "--full-lifecycle",
+            "--auto-delete",
+            "--upload-session",
+            upload_session
+                .to_str()
+                .expect("upload session should be utf8"),
+            "--delete-session",
+            delete_session
+                .to_str()
+                .expect("delete session should be utf8"),
+            "--mirror-root",
+            mirror_root.to_str().expect("mirror root should be utf8"),
+            "--delete-operator",
+            "launchd-service",
+            "--max-lifecycle-per-scan",
+            "3",
+            "--cloudkit-page-size",
+            "50",
+            "--cloudkit-max-pages",
+            "12",
+            "--capture-tolerance-seconds",
+            "4",
+        ])
+        .assert()
+        .success();
+
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).expect("config should be readable"))
+            .expect("config should be json");
+    assert_eq!(config["min_age_days"], 30);
+    assert_eq!(config["full_lifecycle"], true);
+    assert_eq!(config["auto_delete"], true);
+    assert_eq!(
+        config["upload_session_path"],
+        upload_session.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        config["delete_session_path"],
+        delete_session.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        config["mirror_root"],
+        mirror_root.to_string_lossy().as_ref()
+    );
+    assert_eq!(config["delete_operator"], "launchd-service");
+    assert_eq!(config["max_lifecycle_per_scan"], 3);
+    assert_eq!(config["cloudkit_page_size"], 50);
+    assert_eq!(config["cloudkit_max_pages"], 12);
+    assert_eq!(config["capture_tolerance_seconds"], 4);
 }
 
 #[cfg(unix)]
@@ -1146,6 +1238,9 @@ fn monitor_stats_tui_and_launchd_plist_are_simple_and_non_secret() {
         .clone();
     let stats_text = String::from_utf8(stats_output).expect("stats should be utf8");
     assert!(stats_text.contains("icloudpd-optimizer monitor"));
+    assert!(stats_text.contains("uploaded: 0"));
+    assert!(stats_text.contains("deleted originals: 0"));
+    assert!(stats_text.contains("saved: 0.00 GiB"));
     assert!(!stats_text.to_ascii_lowercase().contains("password"));
     assert!(!stats_text.to_ascii_lowercase().contains("token"));
 
@@ -1174,6 +1269,18 @@ fn monitor_stats_tui_and_launchd_plist_are_simple_and_non_secret() {
             config_path.to_str().expect("config path should be utf8"),
             "--bin",
             "/usr/local/bin/icloudpd-optimizer",
+            "--stdout",
+            tempdir
+                .path()
+                .join("monitor.stdout.log")
+                .to_str()
+                .expect("stdout path should be utf8"),
+            "--stderr",
+            tempdir
+                .path()
+                .join("monitor.stderr.log")
+                .to_str()
+                .expect("stderr path should be utf8"),
         ])
         .assert()
         .success()
@@ -1183,6 +1290,12 @@ fn monitor_stats_tui_and_launchd_plist_are_simple_and_non_secret() {
     let plist = String::from_utf8(plist_output).expect("plist should be utf8");
     assert!(plist.contains("<string>monitor</string>"));
     assert!(plist.contains("<string>run</string>"));
+    assert!(plist.contains("<key>StandardOutPath</key>"));
+    assert!(plist.contains("monitor.stdout.log"));
+    assert!(plist.contains("<key>StandardErrorPath</key>"));
+    assert!(plist.contains("monitor.stderr.log"));
+    assert!(plist.contains("<key>EnvironmentVariables</key>"));
+    assert!(plist.contains("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
     assert!(!plist.contains("/config"));
     assert!(!plist.to_ascii_lowercase().contains("password"));
     assert!(!plist.to_ascii_lowercase().contains("token"));

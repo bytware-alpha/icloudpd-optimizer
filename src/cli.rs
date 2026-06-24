@@ -21,8 +21,8 @@ use crate::local_mirror::{
 };
 use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
 use crate::monitor::{
-    MonitorConfig, MonitorError, MonitorStats, launchd_plist, render_tui, run_monitor_once,
-    write_launchd_plist,
+    MonitorConfig, MonitorError, MonitorScanSummary, MonitorStats, launchd_plist, render_tui,
+    run_monitor_once, write_launchd_plist,
 };
 use crate::proof::NasRawProof;
 use crate::upload::{
@@ -142,6 +142,28 @@ struct MonitorInitArgs {
     #[arg(long)]
     conversion_tool_version: Option<String>,
     #[arg(long, action = clap::ArgAction::SetTrue)]
+    full_lifecycle: bool,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    auto_delete: bool,
+    #[arg(long, value_name = "PATH")]
+    upload_session: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    delete_session: Option<PathBuf>,
+    #[arg(long, value_name = "DIR")]
+    mirror_root: Option<PathBuf>,
+    #[arg(long, default_value = "icloudpd-optimizer-monitor")]
+    delete_operator: String,
+    #[arg(long, default_value_t = 5)]
+    max_lifecycle_per_scan: usize,
+    #[arg(long, default_value_t = 2)]
+    capture_tolerance_seconds: u64,
+    #[arg(long, default_value_t = 0)]
+    cloudkit_start_rank: u64,
+    #[arg(long, default_value_t = 200)]
+    cloudkit_page_size: u64,
+    #[arg(long, default_value_t = 2000)]
+    cloudkit_max_pages: u64,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
     force: bool,
 }
 
@@ -179,6 +201,10 @@ struct MonitorLaunchdPlistArgs {
     label: String,
     #[arg(long, value_name = "PATH")]
     bin: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    stdout: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    stderr: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     output: Option<PathBuf>,
 }
@@ -616,7 +642,7 @@ fn run_workflow<W: Write>(args: WorkflowArgs, writer: &mut W) -> Result<(), CliE
 fn run_monitor<W: Write>(args: MonitorArgs, writer: &mut W) -> Result<(), CliError> {
     match args.command {
         MonitorCommand::Init(args) => monitor_init(args),
-        MonitorCommand::Run(args) => monitor_run(args),
+        MonitorCommand::Run(args) => monitor_run(args, writer),
         MonitorCommand::Stats(args) => monitor_stats(args, writer),
         MonitorCommand::Tui(args) => monitor_tui(args, writer),
         MonitorCommand::LaunchdPlist(args) => monitor_launchd_plist(args, writer),
@@ -640,23 +666,43 @@ fn monitor_init(args: MonitorInitArgs) -> Result<(), CliError> {
     config.heic_quality = args.heic_quality;
     config.max_conversions_per_scan = args.max_conversions_per_scan;
     config.conversion_tool_version = args.conversion_tool_version;
+    config.full_lifecycle = args.full_lifecycle;
+    config.auto_delete = args.auto_delete;
+    config.upload_session_path = args.upload_session;
+    config.delete_session_path = args.delete_session;
+    config.mirror_root = args.mirror_root;
+    config.delete_operator = args.delete_operator;
+    config.max_lifecycle_per_scan = args.max_lifecycle_per_scan;
+    config.capture_tolerance_seconds = args.capture_tolerance_seconds;
+    config.cloudkit_start_rank = args.cloudkit_start_rank;
+    config.cloudkit_page_size = args.cloudkit_page_size;
+    config.cloudkit_max_pages = args.cloudkit_max_pages;
     config.validate()?;
     config.save_atomic(args.config)?;
     Ok(())
 }
 
-fn monitor_run(args: MonitorRunArgs) -> Result<(), CliError> {
+fn monitor_run<W: Write>(args: MonitorRunArgs, writer: &mut W) -> Result<(), CliError> {
     let config = MonitorConfig::load(&args.config)?;
     config.validate()?;
-    if args.once {
-        run_monitor_once(&config)?;
-        return Ok(());
-    }
-
     loop {
-        run_monitor_once(&config)?;
+        let summary = run_monitor_once(&config)?;
+        write_scan_summary(writer, &summary)?;
+        if args.once {
+            return Ok(());
+        }
         thread::sleep(Duration::from_secs(config.scan_interval_seconds));
     }
+}
+
+fn write_scan_summary<W: Write>(
+    writer: &mut W,
+    summary: &MonitorScanSummary,
+) -> Result<(), CliError> {
+    serde_json::to_writer(&mut *writer, summary)?;
+    writeln!(writer)?;
+    writer.flush()?;
+    Ok(())
 }
 
 fn monitor_stats<W: Write>(args: MonitorStatsArgs, writer: &mut W) -> Result<(), CliError> {
@@ -692,10 +738,32 @@ fn monitor_launchd_plist<W: Write>(
         Some(path) => path,
         None => env::current_exe()?,
     };
+    let stdout_path = args
+        .stdout
+        .unwrap_or_else(|| args.config.with_extension("stdout.log"));
+    let stderr_path = args
+        .stderr
+        .unwrap_or_else(|| args.config.with_extension("stderr.log"));
     if let Some(output) = args.output {
-        write_launchd_plist(&args.label, &binary, &args.config, &output)?;
+        write_launchd_plist(
+            &args.label,
+            &binary,
+            &args.config,
+            &stdout_path,
+            &stderr_path,
+            &output,
+        )?;
     } else {
-        writer.write_all(launchd_plist(&args.label, &binary, &args.config)?.as_bytes())?;
+        writer.write_all(
+            launchd_plist(
+                &args.label,
+                &binary,
+                &args.config,
+                &stdout_path,
+                &stderr_path,
+            )?
+            .as_bytes(),
+        )?;
     }
     Ok(())
 }

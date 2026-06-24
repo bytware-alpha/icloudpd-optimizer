@@ -3,6 +3,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -12,15 +13,55 @@ use thiserror::Error;
 use crate::conversion_execution::{
     ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversions,
 };
-use crate::manifest::{Manifest, ManifestError, State};
-use crate::proof::{MIN_RAW_AGE_DAYS, ProofError};
-use crate::workflow::{WorkflowError, prove_and_record_nas};
+use crate::local_mirror::{
+    IcloudpdLocalMirrorRequest, LocalMirrorError, ensure_icloudpd_local_mirror,
+};
+use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
+use crate::proof::{MIN_RAW_AGE_DAYS, NasRawProof, ProofError};
+use crate::upload::{
+    CloudKitDeleteClient, CloudKitOriginalAssetBatchResolveRequest,
+    CloudKitOriginalAssetResolveTarget, ReqwestCloudKitDeleteTransport, UploadError,
+    build_upload_proof, load_cloudkit_delete_session, run_icloud_upload, verify_local_heic,
+};
+use crate::workflow::{
+    ConversionResultProof, HeicVerificationProof, SourceAgeProof, WorkflowError, approve_delete,
+    approved_original_delete_request, icloudpd_local_mirror_ready_proofs, mark_delete_eligible,
+    prove_and_record_nas, record_delete_execution, record_heic_verification,
+    record_icloudpd_local_mirror_proof, record_original_asset_batch_proofs,
+    record_source_age_proof, record_stage_failure, record_upload_proof, upload_ready_heic_proof,
+};
 
 const MONITOR_CONFIG_SCHEMA_VERSION: u64 = 1;
 const MONITOR_STATS_SCHEMA_VERSION: u64 = 1;
+const DEFAULT_CAPTURE_TOLERANCE_SECONDS: u64 = 2;
+const DEFAULT_CLOUDKIT_PAGE_SIZE: u64 = 200;
+const DEFAULT_CLOUDKIT_MAX_PAGES: u64 = 2000;
+const MONITOR_VISUAL_RMSE_MAX: f64 = 0.02;
+const MONITOR_HEIC_STDEV_MIN: f64 = 0.005;
+const DEFAULT_LAUNCHD_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const RAW_EXTENSIONS: &[&str] = &[
     "dng", "cr2", "cr3", "nef", "arw", "raf", "rw2", "orf", "pef", "srw", "raw",
 ];
+
+fn default_delete_operator() -> String {
+    "icloudpd-optimizer-monitor".to_string()
+}
+
+fn default_max_lifecycle_per_scan() -> usize {
+    5
+}
+
+fn default_capture_tolerance_seconds() -> u64 {
+    DEFAULT_CAPTURE_TOLERANCE_SECONDS
+}
+
+fn default_cloudkit_page_size() -> u64 {
+    DEFAULT_CLOUDKIT_PAGE_SIZE
+}
+
+fn default_cloudkit_max_pages() -> u64 {
+    DEFAULT_CLOUDKIT_MAX_PAGES
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MonitorConfig {
@@ -36,6 +77,28 @@ pub struct MonitorConfig {
     pub heic_quality: u8,
     pub max_conversions_per_scan: usize,
     pub conversion_tool_version: Option<String>,
+    #[serde(default)]
+    pub full_lifecycle: bool,
+    #[serde(default)]
+    pub auto_delete: bool,
+    #[serde(default)]
+    pub upload_session_path: Option<PathBuf>,
+    #[serde(default)]
+    pub delete_session_path: Option<PathBuf>,
+    #[serde(default)]
+    pub mirror_root: Option<PathBuf>,
+    #[serde(default = "default_delete_operator")]
+    pub delete_operator: String,
+    #[serde(default = "default_max_lifecycle_per_scan")]
+    pub max_lifecycle_per_scan: usize,
+    #[serde(default = "default_capture_tolerance_seconds")]
+    pub capture_tolerance_seconds: u64,
+    #[serde(default)]
+    pub cloudkit_start_rank: u64,
+    #[serde(default = "default_cloudkit_page_size")]
+    pub cloudkit_page_size: u64,
+    #[serde(default = "default_cloudkit_max_pages")]
+    pub cloudkit_max_pages: u64,
 }
 
 impl MonitorConfig {
@@ -59,6 +122,17 @@ impl MonitorConfig {
             heic_quality: 90,
             max_conversions_per_scan: 25,
             conversion_tool_version: None,
+            full_lifecycle: false,
+            auto_delete: false,
+            upload_session_path: None,
+            delete_session_path: None,
+            mirror_root: None,
+            delete_operator: default_delete_operator(),
+            max_lifecycle_per_scan: default_max_lifecycle_per_scan(),
+            capture_tolerance_seconds: default_capture_tolerance_seconds(),
+            cloudkit_start_rank: 0,
+            cloudkit_page_size: default_cloudkit_page_size(),
+            cloudkit_max_pages: default_cloudkit_max_pages(),
         }
     }
 
@@ -116,6 +190,42 @@ impl MonitorConfig {
                 message: "max_conversions_per_scan must be greater than 0".to_string(),
             });
         }
+        if self.max_lifecycle_per_scan == 0 {
+            return Err(MonitorError::InvalidConfig {
+                message: "max_lifecycle_per_scan must be greater than 0".to_string(),
+            });
+        }
+        if self.full_lifecycle && self.upload_session_path.is_none() {
+            return Err(MonitorError::InvalidConfig {
+                message: "full_lifecycle requires upload_session_path".to_string(),
+            });
+        }
+        if self.full_lifecycle && self.delete_session_path.is_none() {
+            return Err(MonitorError::InvalidConfig {
+                message: "full_lifecycle requires delete_session_path".to_string(),
+            });
+        }
+        if self.auto_delete && !self.full_lifecycle {
+            return Err(MonitorError::InvalidConfig {
+                message: "auto_delete requires full_lifecycle".to_string(),
+            });
+        }
+        if self.auto_delete && self.delete_operator.trim().is_empty() {
+            return Err(MonitorError::InvalidConfig {
+                message: "delete_operator must be non-empty when auto_delete is enabled"
+                    .to_string(),
+            });
+        }
+        if self.cloudkit_page_size == 0 {
+            return Err(MonitorError::InvalidConfig {
+                message: "cloudkit_page_size must be greater than 0".to_string(),
+            });
+        }
+        if self.cloudkit_max_pages == 0 {
+            return Err(MonitorError::InvalidConfig {
+                message: "cloudkit_max_pages must be greater than 0".to_string(),
+            });
+        }
         Ok(())
     }
 }
@@ -129,6 +239,15 @@ pub struct MonitorStats {
     pub candidates_verified: u64,
     pub conversions_attempted: u64,
     pub conversions_completed: u64,
+    pub heics_verified: u64,
+    pub originals_resolved: u64,
+    pub uploads_attempted: u64,
+    pub uploads_completed: u64,
+    pub mirrors_recorded: u64,
+    pub originals_deleted: u64,
+    pub uploaded_heic_bytes: u64,
+    pub deleted_raw_bytes: u64,
+    pub bytes_saved: u64,
     pub skipped_known: u64,
     pub skipped_not_ready: u64,
     pub failures: u64,
@@ -180,6 +299,29 @@ impl MonitorStats {
         self.conversions_completed = self
             .conversions_completed
             .saturating_add(summary.conversions_completed);
+        self.heics_verified = self.heics_verified.saturating_add(summary.heics_verified);
+        self.originals_resolved = self
+            .originals_resolved
+            .saturating_add(summary.originals_resolved);
+        self.uploads_attempted = self
+            .uploads_attempted
+            .saturating_add(summary.uploads_attempted);
+        self.uploads_completed = self
+            .uploads_completed
+            .saturating_add(summary.uploads_completed);
+        self.mirrors_recorded = self
+            .mirrors_recorded
+            .saturating_add(summary.mirrors_recorded);
+        self.originals_deleted = self
+            .originals_deleted
+            .saturating_add(summary.originals_deleted);
+        self.uploaded_heic_bytes = self
+            .uploaded_heic_bytes
+            .saturating_add(summary.uploaded_heic_bytes);
+        self.deleted_raw_bytes = self
+            .deleted_raw_bytes
+            .saturating_add(summary.deleted_raw_bytes);
+        self.bytes_saved = self.bytes_saved.saturating_add(summary.bytes_saved);
         self.skipped_known = self.skipped_known.saturating_add(summary.skipped_known);
         self.skipped_not_ready = self
             .skipped_not_ready
@@ -197,6 +339,15 @@ pub struct MonitorScanSummary {
     pub candidates_verified: u64,
     pub conversions_attempted: u64,
     pub conversions_completed: u64,
+    pub heics_verified: u64,
+    pub originals_resolved: u64,
+    pub uploads_attempted: u64,
+    pub uploads_completed: u64,
+    pub mirrors_recorded: u64,
+    pub originals_deleted: u64,
+    pub uploaded_heic_bytes: u64,
+    pub deleted_raw_bytes: u64,
+    pub bytes_saved: u64,
     pub skipped_known: u64,
     pub skipped_not_ready: u64,
     pub failures: u64,
@@ -264,7 +415,17 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
                 config.min_age_days,
                 now,
             ) {
-                Ok(_) => {
+                Ok(record) => {
+                    let nas = decode_monitor_proof::<NasRawProof>(record, "nas")?;
+                    record_source_age_proof(
+                        &mut manifest,
+                        &asset_id,
+                        SourceAgeProof {
+                            source_captured_unix_seconds: nas.modified_unix_seconds,
+                            verified_at_unix_seconds: started,
+                            min_age_seconds: config.min_age_days.saturating_mul(24 * 60 * 60),
+                        },
+                    )?;
                     summary.candidates_verified = summary.candidates_verified.saturating_add(1);
                     pending_capacity = pending_capacity.saturating_sub(1);
                 }
@@ -302,6 +463,10 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
         }
     }
 
+    if config.full_lifecycle {
+        run_lifecycle_stages(config, &mut manifest, &mut summary)?;
+    }
+
     summary.finished_unix_seconds = current_unix_seconds();
     summary.state_counts = state_counts(&manifest);
     stats.apply_scan(&summary);
@@ -332,6 +497,10 @@ pub fn render_tui(config: &MonitorConfig, stats: &MonitorStats) -> String {
             "\n",
             "scans: {scans_completed}/{scans_started}  raw seen: {raw_seen}  ",
             "verified: {verified}  converted: {converted}/{attempted}\n",
+            "heic verified: {heics_verified}  original proofs: {originals_resolved}  ",
+            "uploaded: {uploads_completed}/{uploads_attempted}  deleted originals: {originals_deleted}\n",
+            "uploaded bytes: {uploaded_heic_bytes}  deleted RAW bytes: {deleted_raw_bytes}  ",
+            "saved: {saved_gib} GiB\n",
             "skipped known: {skipped_known}  skipped not ready: {skipped_not_ready}  ",
             "failures: {failures}\n",
             "last scan: {last_scan}  interval: {interval}s  jobs: {jobs}\n",
@@ -349,6 +518,14 @@ pub fn render_tui(config: &MonitorConfig, stats: &MonitorStats) -> String {
         verified = stats.candidates_verified,
         converted = stats.conversions_completed,
         attempted = stats.conversions_attempted,
+        heics_verified = stats.heics_verified,
+        originals_resolved = stats.originals_resolved,
+        uploads_completed = stats.uploads_completed,
+        uploads_attempted = stats.uploads_attempted,
+        originals_deleted = stats.originals_deleted,
+        uploaded_heic_bytes = stats.uploaded_heic_bytes,
+        deleted_raw_bytes = stats.deleted_raw_bytes,
+        saved_gib = format_gib(stats.bytes_saved),
         skipped_known = stats.skipped_known,
         skipped_not_ready = stats.skipped_not_ready,
         failures = stats.failures,
@@ -363,7 +540,13 @@ pub fn render_tui(config: &MonitorConfig, stats: &MonitorStats) -> String {
     )
 }
 
-pub fn launchd_plist(label: &str, binary: &Path, config: &Path) -> Result<String, MonitorError> {
+pub fn launchd_plist(
+    label: &str,
+    binary: &Path,
+    config: &Path,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<String, MonitorError> {
     validate_launchd_label(label)?;
     Ok(format!(
         concat!(
@@ -386,12 +569,24 @@ pub fn launchd_plist(label: &str, binary: &Path, config: &Path) -> Result<String
             "  <true/>\n",
             "  <key>KeepAlive</key>\n",
             "  <true/>\n",
+            "  <key>EnvironmentVariables</key>\n",
+            "  <dict>\n",
+            "    <key>PATH</key>\n",
+            "    <string>{launchd_path}</string>\n",
+            "  </dict>\n",
+            "  <key>StandardOutPath</key>\n",
+            "  <string>{stdout_path}</string>\n",
+            "  <key>StandardErrorPath</key>\n",
+            "  <string>{stderr_path}</string>\n",
             "</dict>\n",
             "</plist>\n"
         ),
         label = escape_xml(label),
         binary = escape_xml(&binary.display().to_string()),
         config = escape_xml(&config.display().to_string()),
+        launchd_path = escape_xml(DEFAULT_LAUNCHD_PATH),
+        stdout_path = escape_xml(&stdout_path.display().to_string()),
+        stderr_path = escape_xml(&stderr_path.display().to_string()),
     ))
 }
 
@@ -399,9 +594,11 @@ pub fn write_launchd_plist(
     label: &str,
     binary: &Path,
     config: &Path,
+    stdout_path: &Path,
+    stderr_path: &Path,
     output: &Path,
 ) -> Result<(), MonitorError> {
-    let plist = launchd_plist(label, binary, config)?;
+    let plist = launchd_plist(label, binary, config, stdout_path, stderr_path)?;
     write_text_atomic(output, &plist).map_err(|source| MonitorError::WriteLaunchdPlist {
         path: output.to_path_buf(),
         source,
@@ -428,12 +625,480 @@ fn conversion_requests(
         .collect()
 }
 
+fn run_lifecycle_stages(
+    config: &MonitorConfig,
+    manifest: &mut Manifest,
+    summary: &mut MonitorScanSummary,
+) -> Result<(), MonitorError> {
+    verify_converted_heics(config, manifest, summary)?;
+    resolve_original_assets(config, manifest, summary)?;
+    upload_verified_heics(config, manifest, summary)?;
+    record_local_mirrors(config, manifest, summary)?;
+    if config.auto_delete {
+        delete_original_assets(config, manifest, summary)?;
+    }
+    Ok(())
+}
+
+fn verify_converted_heics(
+    config: &MonitorConfig,
+    manifest: &mut Manifest,
+    summary: &mut MonitorScanSummary,
+) -> Result<(), MonitorError> {
+    let asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
+        record.state == State::Converted && !record.proofs.contains_key("heic")
+    });
+    for asset_id in asset_ids {
+        match verify_converted_heic(manifest, &asset_id) {
+            Ok(proof) => {
+                record_heic_verification(manifest, &asset_id, proof)?;
+                manifest
+                    .save_atomic(&config.manifest_path)
+                    .map_err(MonitorError::Manifest)?;
+                summary.heics_verified = summary.heics_verified.saturating_add(1);
+            }
+            Err(error) => record_monitor_failure(summary, error),
+        }
+    }
+    Ok(())
+}
+
+fn resolve_original_assets(
+    config: &MonitorConfig,
+    manifest: &mut Manifest,
+    summary: &mut MonitorScanSummary,
+) -> Result<(), MonitorError> {
+    let asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
+        record.state == State::ConversionVerified && !record.proofs.contains_key("original_asset")
+    });
+    if asset_ids.is_empty() {
+        return Ok(());
+    }
+
+    let targets = asset_ids
+        .iter()
+        .map(|asset_id| original_asset_resolve_target(manifest, asset_id, config))
+        .collect::<Result<Vec<_>, MonitorError>>()?;
+    let session_path = required_path(&config.delete_session_path, "delete_session_path")?;
+    let session = load_cloudkit_delete_session(session_path)?;
+    let transport = ReqwestCloudKitDeleteTransport::new()?;
+    let mut client = CloudKitDeleteClient::new(transport);
+    match client.resolve_original_assets_batch(
+        &session,
+        &CloudKitOriginalAssetBatchResolveRequest {
+            targets,
+            start_rank: config.cloudkit_start_rank,
+            page_size: config.cloudkit_page_size,
+            max_pages: config.cloudkit_max_pages,
+        },
+    ) {
+        Ok(proofs) => {
+            let resolved = proofs.len() as u64;
+            record_original_asset_batch_proofs(manifest, &asset_ids, proofs)?;
+            manifest
+                .save_atomic(&config.manifest_path)
+                .map_err(MonitorError::Manifest)?;
+            summary.originals_resolved = summary.originals_resolved.saturating_add(resolved);
+        }
+        Err(error) => {
+            let should_fail_records = matches!(
+                &error,
+                UploadError::OriginalAssetResolveNotUnique { .. }
+                    | UploadError::OriginalAssetResolveIncomplete { .. }
+            );
+            let message = error.to_string();
+            record_monitor_failure(summary, message.clone());
+            if should_fail_records {
+                record_lifecycle_failure_for_assets(
+                    manifest,
+                    &asset_ids,
+                    "original_asset_resolve",
+                    &message,
+                )?;
+                manifest
+                    .save_atomic(&config.manifest_path)
+                    .map_err(MonitorError::Manifest)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn upload_verified_heics(
+    config: &MonitorConfig,
+    manifest: &mut Manifest,
+    summary: &mut MonitorScanSummary,
+) -> Result<(), MonitorError> {
+    let asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
+        record.state == State::ConversionVerified
+            && record.proofs.contains_key("original_asset")
+            && !record.proofs.contains_key("upload")
+    });
+    let session_path = required_path(&config.upload_session_path, "upload_session_path")?;
+    for asset_id in asset_ids {
+        summary.uploads_attempted = summary.uploads_attempted.saturating_add(1);
+        let result = (|| -> Result<(), MonitorError> {
+            let heic = upload_ready_heic_proof(manifest, &asset_id)?;
+            verify_local_heic(&heic)?;
+            let response = run_icloud_upload(&crate::upload::IcloudUploadRequest {
+                session_path: session_path.to_path_buf(),
+                heic_path: heic.heic_path.clone(),
+            })?;
+            let uploaded_bytes = heic.size_bytes;
+            let proof = build_upload_proof(&heic, &response)?;
+            record_upload_proof(manifest, &asset_id, proof)?;
+            manifest
+                .save_atomic(&config.manifest_path)
+                .map_err(MonitorError::Manifest)?;
+            summary.uploads_completed = summary.uploads_completed.saturating_add(1);
+            summary.uploaded_heic_bytes =
+                summary.uploaded_heic_bytes.saturating_add(uploaded_bytes);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            record_monitor_failure(summary, error);
+        }
+    }
+    Ok(())
+}
+
+fn record_local_mirrors(
+    config: &MonitorConfig,
+    manifest: &mut Manifest,
+    summary: &mut MonitorScanSummary,
+) -> Result<(), MonitorError> {
+    let asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
+        record.state == State::UploadVerified
+            && !record.proofs.contains_key("icloudpd_local_mirror")
+    });
+    let mirror_root = config.mirror_root.as_ref().unwrap_or(&config.download_root);
+    for asset_id in asset_ids {
+        let result = (|| -> Result<(), MonitorError> {
+            let (upload, heic) = icloudpd_local_mirror_ready_proofs(manifest, &asset_id)?;
+            let uploaded_heic_path =
+                upload
+                    .uploaded_heic_path
+                    .clone()
+                    .ok_or(WorkflowError::EmptyProofField {
+                        field: "uploaded_heic_path",
+                    })?;
+            let proof = ensure_icloudpd_local_mirror(IcloudpdLocalMirrorRequest {
+                uploaded_heic_asset_id: upload.uploaded_heic_asset_id,
+                uploaded_heic_sha256: upload.uploaded_heic_sha256,
+                uploaded_heic_path,
+                size_bytes: heic.size_bytes,
+                icloudpd_download_path: mirror_root.join(format!("{asset_id}.HEIC")),
+            })?;
+            record_icloudpd_local_mirror_proof(manifest, &asset_id, proof)?;
+            manifest
+                .save_atomic(&config.manifest_path)
+                .map_err(MonitorError::Manifest)?;
+            summary.mirrors_recorded = summary.mirrors_recorded.saturating_add(1);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            record_monitor_failure(summary, error);
+        }
+    }
+    Ok(())
+}
+
+fn delete_original_assets(
+    config: &MonitorConfig,
+    manifest: &mut Manifest,
+    summary: &mut MonitorScanSummary,
+) -> Result<(), MonitorError> {
+    let session_path = required_path(&config.delete_session_path, "delete_session_path")?;
+    let session = load_cloudkit_delete_session(session_path)?;
+    let transport = ReqwestCloudKitDeleteTransport::new()?;
+    let mut client = CloudKitDeleteClient::new(transport);
+
+    let mut asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
+        record.state == State::UploadVerified
+    });
+    asset_ids.extend(asset_ids_matching(
+        manifest,
+        config
+            .max_lifecycle_per_scan
+            .saturating_sub(asset_ids.len()),
+        |record| matches!(record.state, State::DeleteEligible | State::DeleteApproved),
+    ));
+
+    for asset_id in asset_ids {
+        let result = (|| -> Result<(), MonitorError> {
+            if manifest.get(&asset_id)?.state == State::UploadVerified {
+                mark_delete_eligible(manifest, &asset_id)?;
+                manifest
+                    .save_atomic(&config.manifest_path)
+                    .map_err(MonitorError::Manifest)?;
+            }
+            if manifest.get(&asset_id)?.state == State::DeleteEligible {
+                approve_delete(manifest, &asset_id, &config.delete_operator)?;
+                manifest
+                    .save_atomic(&config.manifest_path)
+                    .map_err(MonitorError::Manifest)?;
+            }
+            if manifest.get(&asset_id)?.state != State::DeleteApproved {
+                return Ok(());
+            }
+            let raw_bytes = raw_size_bytes(manifest, &asset_id)?;
+            let heic_bytes = heic_size_bytes(manifest, &asset_id)?;
+            let request = approved_original_delete_request(manifest, &asset_id)?;
+            let outcome = client.delete_original(&session, &request)?;
+            record_delete_execution(manifest, &asset_id, outcome)?;
+            manifest
+                .save_atomic(&config.manifest_path)
+                .map_err(MonitorError::Manifest)?;
+            summary.originals_deleted = summary.originals_deleted.saturating_add(1);
+            summary.deleted_raw_bytes = summary.deleted_raw_bytes.saturating_add(raw_bytes);
+            summary.bytes_saved = summary
+                .bytes_saved
+                .saturating_add(raw_bytes.saturating_sub(heic_bytes));
+            Ok(())
+        })();
+        if let Err(error) = result {
+            record_monitor_failure(summary, error);
+        }
+    }
+    Ok(())
+}
+
 fn pending_conversion_count(manifest: &Manifest) -> usize {
     manifest
         .records()
         .values()
         .filter(|record| record.state == State::NasVerified)
         .count()
+}
+
+fn asset_ids_matching(
+    manifest: &Manifest,
+    limit: usize,
+    predicate: impl Fn(&AssetRecord) -> bool,
+) -> Vec<String> {
+    manifest
+        .records()
+        .values()
+        .filter(|record| predicate(record))
+        .take(limit)
+        .map(|record| record.asset_id.clone())
+        .collect()
+}
+
+fn verify_converted_heic(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<HeicVerificationProof, MonitorError> {
+    let record = manifest.get(asset_id)?;
+    let conversion = decode_monitor_proof::<ConversionResultProof>(record, "conversion")?;
+    command_status_ok("heif-info", &[conversion.heic_path.as_path()])?;
+    let orientation = command_stdout(
+        "exiftool",
+        &["-s", "-s", "-s", "-n", "-Orientation"],
+        [conversion.heic_path.as_path()],
+    )?;
+    let metadata_copied = orientation.trim() == "1";
+    let oriented_preview = oriented_preview_path(&conversion.heic_path);
+    let visual_match_ok = if oriented_preview.exists() {
+        image_rmse(&oriented_preview, &conversion.heic_path)? <= MONITOR_VISUAL_RMSE_MAX
+    } else {
+        false
+    };
+    let visual_content_ok = image_stdev(&conversion.heic_path)? >= MONITOR_HEIC_STDEV_MIN;
+
+    Ok(HeicVerificationProof {
+        heic_path: conversion.heic_path,
+        heic_sha256: conversion.heic_sha256,
+        size_bytes: conversion.size_bytes,
+        heif_info_ok: true,
+        metadata_copied,
+        visual_content_ok,
+        visual_match_ok,
+    })
+}
+
+fn original_asset_resolve_target(
+    manifest: &Manifest,
+    asset_id: &str,
+    config: &MonitorConfig,
+) -> Result<CloudKitOriginalAssetResolveTarget, MonitorError> {
+    let record = manifest.get(asset_id)?;
+    let nas = decode_monitor_proof::<NasRawProof>(record, "nas")?;
+    let source_age = decode_monitor_proof::<SourceAgeProof>(record, "source_age")?;
+    let filename = record
+        .raw_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .ok_or(WorkflowError::EmptyProofField { field: "filename" })?
+        .to_string();
+    Ok(CloudKitOriginalAssetResolveTarget {
+        asset_id: asset_id.to_string(),
+        raw_size_bytes: nas.size_bytes,
+        source_captured_unix_seconds: source_age.source_captured_unix_seconds,
+        capture_tolerance_seconds: config.capture_tolerance_seconds,
+        filename,
+        matched_raw_sha256: nas.sha256,
+    })
+}
+
+fn raw_size_bytes(manifest: &Manifest, asset_id: &str) -> Result<u64, MonitorError> {
+    let record = manifest.get(asset_id)?;
+    Ok(decode_monitor_proof::<NasRawProof>(record, "nas")?.size_bytes)
+}
+
+fn heic_size_bytes(manifest: &Manifest, asset_id: &str) -> Result<u64, MonitorError> {
+    let record = manifest.get(asset_id)?;
+    Ok(decode_monitor_proof::<HeicVerificationProof>(record, "heic")?.size_bytes)
+}
+
+fn decode_monitor_proof<T: serde::de::DeserializeOwned>(
+    record: &AssetRecord,
+    proof_key: &'static str,
+) -> Result<T, MonitorError> {
+    let value = record
+        .proofs
+        .get(proof_key)
+        .ok_or_else(|| WorkflowError::MissingProof {
+            asset_id: record.asset_id.clone(),
+            proof_key: proof_key.to_string(),
+        })?;
+    serde_json::from_value(value.clone())
+        .map_err(|source| WorkflowError::ProofDecode {
+            asset_id: record.asset_id.clone(),
+            proof_key,
+            source,
+        })
+        .map_err(MonitorError::Workflow)
+}
+
+fn required_path<'a>(
+    value: &'a Option<PathBuf>,
+    field: &'static str,
+) -> Result<&'a Path, MonitorError> {
+    value.as_deref().ok_or_else(|| MonitorError::InvalidConfig {
+        message: format!("{field} is required"),
+    })
+}
+
+fn oriented_preview_path(heic_path: &Path) -> PathBuf {
+    let mut preview_path = heic_path.to_path_buf();
+    preview_path.set_extension("oriented-preview.jpg");
+    preview_path
+}
+
+fn image_rmse(reference: &Path, candidate: &Path) -> Result<f64, MonitorError> {
+    let output = Command::new("magick")
+        .args(["compare", "-metric", "RMSE"])
+        .arg(reference)
+        .arg(candidate)
+        .arg("null:")
+        .output()
+        .map_err(|source| MonitorError::CommandIo {
+            program: "magick",
+            source,
+        })?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    parse_parenthesized_float(&stderr).ok_or_else(|| MonitorError::CommandFailed {
+        program: "magick",
+        message: format!("failed to parse RMSE from {stderr:?}"),
+    })
+}
+
+fn image_stdev(path: &Path) -> Result<f64, MonitorError> {
+    let output = Command::new("magick")
+        .arg(path)
+        .args([
+            "-colorspace",
+            "RGB",
+            "-format",
+            "%[fx:standard_deviation]",
+            "info:",
+        ])
+        .output()
+        .map_err(|source| MonitorError::CommandIo {
+            program: "magick",
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(MonitorError::CommandFailed {
+            program: "magick",
+            message: format!("exited with {}", output.status),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| MonitorError::CommandFailed {
+            program: "magick",
+            message: format!("failed to parse standard deviation from {stdout:?}"),
+        })
+}
+
+fn command_status_ok(program: &'static str, paths: &[&Path]) -> Result<(), MonitorError> {
+    let output = Command::new(program)
+        .args(paths)
+        .output()
+        .map_err(|source| MonitorError::CommandIo { program, source })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(MonitorError::CommandFailed {
+            program,
+            message: format!("exited with {}", output.status),
+        })
+    }
+}
+
+fn command_stdout<const N: usize>(
+    program: &'static str,
+    args: &[&str],
+    paths: [&Path; N],
+) -> Result<String, MonitorError> {
+    let mut command = Command::new(program);
+    command.args(args);
+    for path in paths {
+        command.arg(path);
+    }
+    let output = command
+        .output()
+        .map_err(|source| MonitorError::CommandIo { program, source })?;
+    if !output.status.success() {
+        return Err(MonitorError::CommandFailed {
+            program,
+            message: format!("exited with {}", output.status),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn parse_parenthesized_float(value: &str) -> Option<f64> {
+    let start = value.find('(')?;
+    let rest = &value[start + 1..];
+    let end = rest.find(')')?;
+    rest[..end].trim().parse().ok()
+}
+
+fn record_monitor_failure(summary: &mut MonitorScanSummary, error: impl ToString) {
+    summary.failures = summary.failures.saturating_add(1);
+    summary.last_error = Some(error.to_string());
+}
+
+fn record_lifecycle_failure_for_assets(
+    manifest: &mut Manifest,
+    asset_ids: &[String],
+    stage: &str,
+    message: &str,
+) -> Result<(), MonitorError> {
+    for asset_id in asset_ids {
+        record_stage_failure(manifest, asset_id, stage, message)?;
+    }
+    Ok(())
+}
+
+fn format_gib(bytes: u64) -> String {
+    format!("{:.2}", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
 }
 
 fn load_manifest_for_monitor(path: &Path) -> Result<Manifest, MonitorError> {
@@ -635,8 +1300,60 @@ pub enum MonitorError {
     Workflow(#[from] WorkflowError),
     #[error("conversion error: {0}")]
     Conversion(#[from] ConversionExecutionError),
+    #[error("upload error: {0}")]
+    Upload(#[from] UploadError),
+    #[error("local mirror error: {0}")]
+    LocalMirror(#[from] LocalMirrorError),
+    #[error("failed to run {program}: {source}")]
+    CommandIo {
+        program: &'static str,
+        source: io::Error,
+    },
+    #[error("{program} failed: {message}")]
+    CommandFailed {
+        program: &'static str,
+        message: String,
+    },
     #[error("invalid launchd label {label}")]
     InvalidLaunchdLabel { label: String },
     #[error("failed to write launchd plist {path}: {source}")]
     WriteLaunchdPlist { path: PathBuf, source: io::Error },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn lifecycle_failure_marks_batch_records_failed_without_dropping_proofs() {
+        let mut manifest = Manifest::new();
+        for asset_id in ["asset-a", "asset-b"] {
+            let mut record =
+                AssetRecord::new(asset_id, PathBuf::from(format!("/raw/{asset_id}.DNG")));
+            record.state = State::ConversionVerified;
+            record
+                .proofs
+                .insert("heic".to_string(), json!({"sha256": "kept"}));
+            manifest.upsert(record);
+        }
+
+        let asset_ids = vec!["asset-a".to_string(), "asset-b".to_string()];
+        record_lifecycle_failure_for_assets(
+            &mut manifest,
+            &asset_ids,
+            "original_asset_resolve",
+            "CloudKit original asset resolver found 0 matching candidates; expected exactly one",
+        )
+        .expect("failure should be recorded");
+
+        for asset_id in asset_ids {
+            let record = manifest.get(&asset_id).expect("record should exist");
+            assert_eq!(record.state, State::Failed);
+            assert_eq!(record.proofs["heic"], json!({"sha256": "kept"}));
+            assert_eq!(record.failures.len(), 1);
+            assert_eq!(record.failures[0].stage, "original_asset_resolve");
+            assert!(record.failures[0].message.contains("0 matching candidates"));
+        }
+    }
 }
