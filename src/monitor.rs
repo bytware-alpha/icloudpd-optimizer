@@ -381,103 +381,110 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
         started_unix_seconds: started,
         ..MonitorScanSummary::default()
     };
+    let had_lifecycle_pending_at_start =
+        config.full_lifecycle && pending_lifecycle_count(&manifest) > 0;
 
     if config.full_lifecycle {
         run_lifecycle_stages(config, &mut manifest, &mut summary)?;
     }
 
-    let download_root = fs::canonicalize(&config.download_root).map_err(|source| {
-        MonitorError::CanonicalizeRoot {
-            path: config.download_root.clone(),
-            source,
-        }
-    })?;
-    let now = SystemTime::now();
-    let mut pending_capacity = config
-        .max_conversions_per_scan
-        .saturating_sub(pending_conversion_count(&manifest));
-    let lifecycle_pending = config.full_lifecycle && pending_lifecycle_count(&manifest) > 0;
-    if pending_capacity > 0 && !lifecycle_pending {
-        visit_raw_paths(&download_root, config.scan_recursive, &mut |raw_path| {
-            if pending_capacity == 0 {
-                return Ok(VisitDecision::Stop);
+    if !should_skip_new_monitor_work(had_lifecycle_pending_at_start) {
+        let download_root = fs::canonicalize(&config.download_root).map_err(|source| {
+            MonitorError::CanonicalizeRoot {
+                path: config.download_root.clone(),
+                source,
             }
-            summary.raw_files_seen = summary.raw_files_seen.saturating_add(1);
-            let asset_id = monitor_asset_id(&download_root, &raw_path)?;
-            match manifest.records().get(&asset_id).map(|record| record.state) {
-                Some(State::Converted)
-                | Some(State::ConversionVerified)
-                | Some(State::UploadVerified)
-                | Some(State::DeleteEligible)
-                | Some(State::DeleteApproved)
-                | Some(State::Deleted)
-                | Some(State::Failed) => {
-                    summary.skipped_known = summary.skipped_known.saturating_add(1);
-                    return Ok(VisitDecision::Continue);
+        })?;
+        let now = SystemTime::now();
+        let mut pending_capacity = config
+            .max_conversions_per_scan
+            .saturating_sub(pending_conversion_count(&manifest));
+        if pending_capacity > 0 {
+            visit_raw_paths(&download_root, config.scan_recursive, &mut |raw_path| {
+                if pending_capacity == 0 {
+                    return Ok(VisitDecision::Stop);
                 }
-                Some(State::NasVerified) => return Ok(VisitDecision::Continue),
-                Some(State::Discovered) | None => {}
-            }
+                summary.raw_files_seen = summary.raw_files_seen.saturating_add(1);
+                let asset_id = monitor_asset_id(&download_root, &raw_path)?;
+                match manifest.records().get(&asset_id).map(|record| record.state) {
+                    Some(State::Converted)
+                    | Some(State::ConversionVerified)
+                    | Some(State::UploadVerified)
+                    | Some(State::DeleteEligible)
+                    | Some(State::DeleteApproved)
+                    | Some(State::Deleted)
+                    | Some(State::Failed) => {
+                        summary.skipped_known = summary.skipped_known.saturating_add(1);
+                        return Ok(VisitDecision::Continue);
+                    }
+                    Some(State::NasVerified) => return Ok(VisitDecision::Continue),
+                    Some(State::Discovered) | None => {}
+                }
 
-            match prove_and_record_nas(
-                &mut manifest,
-                &asset_id,
-                &raw_path,
-                &config.nas_root,
-                config.min_age_days,
-                now,
-            ) {
-                Ok(record) => {
-                    let nas = decode_monitor_proof::<NasRawProof>(record, "nas")?;
-                    record_source_age_proof(
-                        &mut manifest,
-                        &asset_id,
-                        SourceAgeProof {
-                            source_captured_unix_seconds: nas.modified_unix_seconds,
-                            verified_at_unix_seconds: started,
-                            min_age_seconds: config.min_age_days.saturating_mul(24 * 60 * 60),
-                        },
-                    )?;
-                    summary.candidates_verified = summary.candidates_verified.saturating_add(1);
-                    pending_capacity = pending_capacity.saturating_sub(1);
+                match prove_and_record_nas(
+                    &mut manifest,
+                    &asset_id,
+                    &raw_path,
+                    &config.nas_root,
+                    config.min_age_days,
+                    now,
+                ) {
+                    Ok(record) => {
+                        let nas = decode_monitor_proof::<NasRawProof>(record, "nas")?;
+                        record_source_age_proof(
+                            &mut manifest,
+                            &asset_id,
+                            SourceAgeProof {
+                                source_captured_unix_seconds: nas.modified_unix_seconds,
+                                verified_at_unix_seconds: started,
+                                min_age_seconds: config.min_age_days.saturating_mul(24 * 60 * 60),
+                            },
+                        )?;
+                        summary.candidates_verified = summary.candidates_verified.saturating_add(1);
+                        pending_capacity = pending_capacity.saturating_sub(1);
+                    }
+                    Err(error) if workflow_error_is_not_ready(&error) => {
+                        summary.skipped_not_ready = summary.skipped_not_ready.saturating_add(1);
+                    }
+                    Err(error) => {
+                        summary.failures = summary.failures.saturating_add(1);
+                        summary.last_error = Some(error.to_string());
+                    }
                 }
-                Err(error) if workflow_error_is_not_ready(&error) => {
-                    summary.skipped_not_ready = summary.skipped_not_ready.saturating_add(1);
+                Ok(VisitDecision::Continue)
+            })?;
+        }
+
+        manifest
+            .save_atomic(&config.manifest_path)
+            .map_err(MonitorError::Manifest)?;
+
+        let requests = conversion_requests(&manifest, config);
+        summary.conversions_attempted = requests.len() as u64;
+        if !requests.is_empty() {
+            match execute_measured_conversions(&manifest, requests, config.jobs) {
+                Ok(updated) => {
+                    summary.conversions_completed = summary.conversions_attempted;
+                    manifest = updated;
+                    manifest
+                        .save_atomic(&config.manifest_path)
+                        .map_err(MonitorError::Manifest)?;
                 }
                 Err(error) => {
                     summary.failures = summary.failures.saturating_add(1);
                     summary.last_error = Some(error.to_string());
                 }
             }
-            Ok(VisitDecision::Continue)
-        })?;
+        }
+
+        if config.full_lifecycle {
+            run_lifecycle_stages(config, &mut manifest, &mut summary)?;
+        }
     }
 
     manifest
         .save_atomic(&config.manifest_path)
         .map_err(MonitorError::Manifest)?;
-
-    let requests = conversion_requests(&manifest, config);
-    summary.conversions_attempted = requests.len() as u64;
-    if !requests.is_empty() {
-        match execute_measured_conversions(&manifest, requests, config.jobs) {
-            Ok(updated) => {
-                summary.conversions_completed = summary.conversions_attempted;
-                manifest = updated;
-                manifest
-                    .save_atomic(&config.manifest_path)
-                    .map_err(MonitorError::Manifest)?;
-            }
-            Err(error) => {
-                summary.failures = summary.failures.saturating_add(1);
-                summary.last_error = Some(error.to_string());
-            }
-        }
-    }
-
-    if config.full_lifecycle && !lifecycle_pending {
-        run_lifecycle_stages(config, &mut manifest, &mut summary)?;
-    }
 
     summary.finished_unix_seconds = current_unix_seconds();
     summary.state_counts = state_counts(&manifest);
@@ -898,6 +905,10 @@ fn pending_lifecycle_count(manifest: &Manifest) -> usize {
             )
         })
         .count()
+}
+
+fn should_skip_new_monitor_work(had_lifecycle_pending_at_start: bool) -> bool {
+    had_lifecycle_pending_at_start
 }
 
 fn asset_ids_matching(
@@ -1412,5 +1423,21 @@ mod tests {
         }
 
         assert_eq!(pending_lifecycle_count(&manifest), 5);
+    }
+
+    #[test]
+    fn scan_start_lifecycle_work_suppresses_new_monitor_work_for_entire_scan() {
+        let mut record = AssetRecord::new("asset", PathBuf::from("/raw/asset.DNG"));
+        record.state = State::ConversionVerified;
+        let mut manifest = Manifest::new();
+        manifest.upsert(record);
+
+        let had_lifecycle_pending_at_start = pending_lifecycle_count(&manifest) > 0;
+        manifest
+            .record_failure("asset", "original_asset_resolve", "no matching candidate")
+            .expect("failure should be recorded");
+
+        assert_eq!(pending_lifecycle_count(&manifest), 0);
+        assert!(should_skip_new_monitor_work(had_lifecycle_pending_at_start));
     }
 }
