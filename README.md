@@ -185,8 +185,11 @@ A safe side-by-side shape is:
 icloudpd-optimizer workflow nas-verified --manifest manifest.json --asset-id IMG_0001 --raw-path /photos/raw/IMG_0001.dng --nas-root /photos --min-age-days 30
 
 # 3. Run workflow convert to create the HEIC and record measured conversion proofs.
-# 4. Record HEIC validation, upload proof, age proof, and approval.
-# 5. Emit a delete plan for manual review.
+# 4. Record HEIC validation, upload proof, and source age proof.
+# 5. Mirror the uploaded HEIC to the local path icloudpd will download.
+icloudpd-optimizer workflow icloudpd-local-mirror --manifest manifest.json --asset-id IMG_0001 --download-path /photos/IMG_0001.HEIC
+
+# 6. Record approval and emit a delete plan for manual review.
 icloudpd-optimizer workflow delete-plan --manifest manifest.json --asset-id IMG_0001
 ```
 
@@ -309,6 +312,10 @@ manifest proof. If the session is invalid, the iCloud service rejects the upload
 local file changes, the manifest is not updated. Until a supported session handoff
 exists, prefer recording upload proof with `workflow upload-verified` after an operator
 has independently verified the iCloud asset id and uploaded HEIC identity.
+
+After upload verification, record `workflow icloudpd-local-mirror` with the explicit
+path that `icloudpd` will use for the uploaded HEIC before requesting delete
+eligibility.
 
 ## Safety Model
 

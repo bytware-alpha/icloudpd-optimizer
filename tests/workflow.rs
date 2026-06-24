@@ -8,12 +8,13 @@ use icloudpd_optimizer::proof::{NasRawProof, ProofError, prove_nas_raw};
 use icloudpd_optimizer::upload::CloudKitDeleteOutcome;
 use icloudpd_optimizer::workflow::{
     ConversionCommandTiming, ConversionPerformanceInput, ConversionPerformanceProof,
-    ConversionResultProof, HeicVerificationProof, OriginalAssetProof, SourceAgeProof, UploadProof,
-    WorkflowError, approve_delete, build_delete_plan, discover_raw_asset, mark_delete_eligible,
-    prove_and_record_nas, record_conversion_performance, record_conversion_result,
-    record_delete_execution, record_heic_verification, record_nas_proof,
-    record_original_asset_batch_proofs, record_original_asset_proof, record_source_age_proof,
-    record_stage_failure, record_upload_proof, upload_ready_heic_proof,
+    ConversionResultProof, HeicVerificationProof, IcloudpdLocalMirrorProof, OriginalAssetProof,
+    SourceAgeProof, UploadProof, WorkflowError, approve_delete, build_delete_plan,
+    discover_raw_asset, mark_delete_eligible, prove_and_record_nas, record_conversion_performance,
+    record_conversion_result, record_delete_execution, record_heic_verification,
+    record_icloudpd_local_mirror_proof, record_nas_proof, record_original_asset_batch_proofs,
+    record_original_asset_proof, record_source_age_proof, record_stage_failure,
+    record_upload_proof, upload_ready_heic_proof,
 };
 use serde_json::json;
 
@@ -90,6 +91,16 @@ fn upload_proof() -> UploadProof {
     }
 }
 
+fn local_mirror_proof() -> IcloudpdLocalMirrorProof {
+    IcloudpdLocalMirrorProof {
+        uploaded_heic_asset_id: "icloud-heic-asset-1".to_string(),
+        uploaded_heic_sha256: "heic-sha256".to_string(),
+        uploaded_heic_path: PathBuf::from("/staging/IMG_0001.heic"),
+        icloudpd_download_path: PathBuf::from("/PrimarySync/IMG_0001.HEIC"),
+        size_bytes: 24,
+    }
+}
+
 fn original_asset_proof() -> OriginalAssetProof {
     OriginalAssetProof {
         record_name: "original-record-1".to_string(),
@@ -154,6 +165,8 @@ fn upload_verified_manifest() -> Manifest {
     let mut manifest = source_age_verified_manifest();
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
+    record_icloudpd_local_mirror_proof(&mut manifest, "asset-1", local_mirror_proof())
+        .expect("local mirror proof should record");
     record_original_asset_proof(&mut manifest, "asset-1", original_asset_proof())
         .expect("original asset proof should record");
     manifest
@@ -182,6 +195,8 @@ fn real_upload_verified_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {
         .expect("source age proof should record");
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
+    record_icloudpd_local_mirror_proof(&mut manifest, "asset-1", local_mirror_proof())
+        .expect("local mirror proof should record");
     let nas = manifest.get("asset-1").expect("asset should exist").proofs["nas"].clone();
     record_original_asset_proof(
         &mut manifest,
@@ -276,6 +291,24 @@ fn two_asset_upload_verified_manifest() -> Manifest {
             },
         )
         .expect("upload proof should record");
+        record_icloudpd_local_mirror_proof(
+            &mut manifest,
+            asset_id,
+            IcloudpdLocalMirrorProof {
+                uploaded_heic_asset_id: format!("icloud-{asset_id}"),
+                uploaded_heic_sha256: heic_sha256.to_string(),
+                uploaded_heic_path: PathBuf::from(heic_path),
+                icloudpd_download_path: PathBuf::from(format!(
+                    "/PrimarySync/{}",
+                    Path::new(heic_path)
+                        .file_name()
+                        .expect("heic path should have filename")
+                        .to_string_lossy()
+                )),
+                size_bytes: heic_size,
+            },
+        )
+        .expect("local mirror proof should record");
     }
     manifest
 }
@@ -658,6 +691,7 @@ fn valid_ordered_workflow_reaches_delete_plan_without_deleting() {
             "heic",
             "source_age",
             "upload",
+            "icloudpd_local_mirror",
             "delete_eligibility",
             "delete_approval"
         ]
@@ -673,6 +707,14 @@ fn valid_ordered_workflow_reaches_delete_plan_without_deleting() {
     assert_eq!(
         plan.proofs["delete_eligibility"]["conversion_performance_proof_key"],
         "conversion_performance"
+    );
+    assert_eq!(
+        plan.proofs["icloudpd_local_mirror"]["icloudpd_download_path"],
+        "/PrimarySync/IMG_0001.HEIC"
+    );
+    assert_eq!(
+        plan.proofs["delete_eligibility"]["icloudpd_local_mirror_proof_key"],
+        "icloudpd_local_mirror"
     );
     assert_eq!(
         plan.proofs["delete_eligibility"]["original_asset_proof_key"],
@@ -998,6 +1040,34 @@ fn delete_plan_revalidates_upload_hash_and_path_against_heic() {
             error,
             WorkflowError::ProofMismatch {
                 proof_key: "heic",
+                field: actual,
+                ..
+            } if actual == field
+        ));
+    }
+}
+
+#[test]
+fn delete_plan_revalidates_icloudpd_local_mirror_binding() {
+    let cases = [
+        ("uploaded_heic_asset_id", json!("other-heic-asset")),
+        ("uploaded_heic_sha256", json!("other-heic-sha256")),
+        ("uploaded_heic_path", json!("/other/IMG_0001.heic")),
+        ("size_bytes", json!(25)),
+    ];
+
+    for (field, value) in cases {
+        let (_tempdir, manifest) = forged_delete_approved_manifest(|record| {
+            proof_mut(record, "icloudpd_local_mirror")[field] = value;
+        });
+
+        let error = build_delete_plan(&manifest, "asset-1")
+            .expect_err("forged local mirror proof must block delete plan");
+
+        assert!(matches!(
+            error,
+            WorkflowError::ProofMismatch {
+                proof_key: "icloudpd_local_mirror",
                 field: actual,
                 ..
             } if actual == field
@@ -1777,6 +1847,122 @@ fn upload_proof_requires_uploaded_path_without_mutation() {
 }
 
 #[test]
+fn icloudpd_local_mirror_proof_records_uploaded_heic_download_identity() {
+    let mut manifest = source_age_verified_manifest();
+    record_upload_proof(&mut manifest, "asset-1", upload_proof())
+        .expect("upload proof should record");
+
+    let record = record_icloudpd_local_mirror_proof(&mut manifest, "asset-1", local_mirror_proof())
+        .expect("local mirror proof should record");
+
+    assert_eq!(record.state, State::UploadVerified);
+    assert_eq!(
+        record.proofs["icloudpd_local_mirror"]["uploaded_heic_asset_id"],
+        "icloud-heic-asset-1"
+    );
+    assert_eq!(
+        record.proofs["icloudpd_local_mirror"]["uploaded_heic_sha256"],
+        "heic-sha256"
+    );
+    assert_eq!(
+        record.proofs["icloudpd_local_mirror"]["uploaded_heic_path"],
+        "/staging/IMG_0001.heic"
+    );
+    assert_eq!(
+        record.proofs["icloudpd_local_mirror"]["icloudpd_download_path"],
+        "/PrimarySync/IMG_0001.HEIC"
+    );
+    assert_eq!(record.proofs["icloudpd_local_mirror"]["size_bytes"], 24);
+}
+
+#[test]
+fn icloudpd_local_mirror_proof_validates_upload_and_heic_binding_without_mutation() {
+    let cases = [
+        (
+            "uploaded_heic_asset_id",
+            IcloudpdLocalMirrorProof {
+                uploaded_heic_asset_id: "other-heic-asset".to_string(),
+                ..local_mirror_proof()
+            },
+        ),
+        (
+            "uploaded_heic_sha256",
+            IcloudpdLocalMirrorProof {
+                uploaded_heic_sha256: "other-heic-sha256".to_string(),
+                ..local_mirror_proof()
+            },
+        ),
+        (
+            "uploaded_heic_path",
+            IcloudpdLocalMirrorProof {
+                uploaded_heic_path: PathBuf::from("/other/IMG_0001.heic"),
+                ..local_mirror_proof()
+            },
+        ),
+        (
+            "size_bytes",
+            IcloudpdLocalMirrorProof {
+                size_bytes: 25,
+                ..local_mirror_proof()
+            },
+        ),
+    ];
+
+    for (field, proof) in cases {
+        let mut manifest = source_age_verified_manifest();
+        record_upload_proof(&mut manifest, "asset-1", upload_proof())
+            .expect("upload proof should record");
+        let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+        let error = record_icloudpd_local_mirror_proof(&mut manifest, "asset-1", proof)
+            .expect_err("mirror proof must bind to verified upload facts");
+
+        assert!(matches!(
+            error,
+            WorkflowError::ProofMismatch {
+                proof_key: "icloudpd_local_mirror",
+                field: actual,
+                ..
+            } if actual == field
+        ));
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist"),
+            &before
+        );
+        assert!(!before.proofs.contains_key("icloudpd_local_mirror"));
+    }
+}
+
+#[test]
+fn icloudpd_local_mirror_proof_rejects_empty_download_path_without_mutation() {
+    let mut manifest = source_age_verified_manifest();
+    record_upload_proof(&mut manifest, "asset-1", upload_proof())
+        .expect("upload proof should record");
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = record_icloudpd_local_mirror_proof(
+        &mut manifest,
+        "asset-1",
+        IcloudpdLocalMirrorProof {
+            icloudpd_download_path: PathBuf::new(),
+            ..local_mirror_proof()
+        },
+    )
+    .expect_err("download path is required");
+
+    assert!(matches!(
+        error,
+        WorkflowError::EmptyProofField {
+            field: "icloudpd_download_path"
+        }
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+}
+
+#[test]
 fn delete_eligibility_requires_conversion_performance_without_mutation() {
     let mut manifest = upload_verified_manifest();
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
@@ -1799,6 +1985,98 @@ fn delete_eligibility_requires_conversion_performance_without_mutation() {
         &before
     );
     assert!(!before.proofs.contains_key("delete_eligibility"));
+}
+
+#[test]
+fn delete_eligibility_requires_icloudpd_local_mirror_without_mutation() {
+    let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    record.proofs.remove("icloudpd_local_mirror");
+    manifest.upsert(record);
+    let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+    let error = mark_delete_eligible(&mut manifest, "asset-1")
+        .expect_err("delete eligibility must require local iCloudPD mirror proof");
+
+    assert!(matches!(
+        error,
+        WorkflowError::MissingProof {
+            proof_key,
+            ..
+        } if proof_key == "icloudpd_local_mirror"
+    ));
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist"),
+        &before
+    );
+    assert!(!before.proofs.contains_key("delete_eligibility"));
+}
+
+#[test]
+fn delete_eligibility_records_icloudpd_local_mirror_binding() {
+    let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+
+    mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
+
+    let record = manifest.get("asset-1").expect("asset should exist");
+    assert_eq!(
+        record.proofs["delete_eligibility"]["icloudpd_local_mirror_proof_key"],
+        "icloudpd_local_mirror"
+    );
+    assert_eq!(
+        record.proofs["delete_eligibility"]["icloudpd_download_path"],
+        "/PrimarySync/IMG_0001.HEIC"
+    );
+    assert_eq!(
+        record.proofs["delete_eligibility"]["mirrored_heic_sha256"],
+        "heic-sha256"
+    );
+    assert_eq!(
+        record.proofs["delete_eligibility"]["mirrored_size_bytes"],
+        24
+    );
+}
+
+#[test]
+fn icloudpd_local_mirror_proof_repairs_existing_delete_states() {
+    for approved in [false, true] {
+        let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+        mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
+        if approved {
+            approve_delete(&mut manifest, "asset-1", "operator").expect("approval should record");
+        }
+        let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+        record.proofs.remove("icloudpd_local_mirror");
+        let eligibility = proof_mut(&mut record, "delete_eligibility")
+            .as_object_mut()
+            .expect("eligibility proof should be an object");
+        eligibility.remove("icloudpd_local_mirror_proof_key");
+        eligibility.remove("icloudpd_download_path");
+        eligibility.remove("mirrored_heic_sha256");
+        eligibility.remove("mirrored_size_bytes");
+        manifest.upsert(record);
+
+        record_icloudpd_local_mirror_proof(&mut manifest, "asset-1", local_mirror_proof())
+            .expect("recording mirror proof should repair legacy delete state");
+
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(
+            record.state,
+            if approved {
+                State::DeleteApproved
+            } else {
+                State::DeleteEligible
+            }
+        );
+        assert_eq!(
+            record.proofs["delete_eligibility"]["icloudpd_local_mirror_proof_key"],
+            "icloudpd_local_mirror"
+        );
+        assert!(record.proofs.contains_key("icloudpd_local_mirror"));
+        if approved {
+            build_delete_plan(&manifest, "asset-1").expect("repaired approved record should plan");
+        }
+    }
 }
 
 #[test]
@@ -2115,6 +2393,42 @@ fn delete_approval_revalidates_upload_binding_without_mutation() {
             error,
             WorkflowError::ProofMismatch {
                 proof_key: "heic",
+                field: actual,
+                ..
+            } if actual == field
+        ));
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist"),
+            &before
+        );
+        assert!(!before.proofs.contains_key("delete_approval"));
+    }
+}
+
+#[test]
+fn delete_approval_revalidates_icloudpd_local_mirror_without_mutation() {
+    let cases = [
+        ("uploaded_heic_asset_id", json!("other-heic-asset")),
+        ("uploaded_heic_sha256", json!("other-heic-sha256")),
+        ("uploaded_heic_path", json!("/other/IMG_0001.heic")),
+        ("size_bytes", json!(25)),
+    ];
+
+    for (field, value) in cases {
+        let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+        mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
+        let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+        proof_mut(&mut record, "icloudpd_local_mirror")[field] = value;
+        manifest.upsert(record);
+        let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+        let error = approve_delete(&mut manifest, "asset-1", "operator")
+            .expect_err("forged local mirror proof must block delete approval");
+
+        assert!(matches!(
+            error,
+            WorkflowError::ProofMismatch {
+                proof_key: "icloudpd_local_mirror",
                 field: actual,
                 ..
             } if actual == field

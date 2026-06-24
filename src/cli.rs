@@ -15,6 +15,9 @@ use crate::conversion_execution::{
     ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversion,
     is_executable_file,
 };
+use crate::local_mirror::{
+    IcloudpdLocalMirrorRequest, LocalMirrorError, ensure_icloudpd_local_mirror,
+};
 use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
 use crate::proof::NasRawProof;
 use crate::upload::{
@@ -26,8 +29,9 @@ use crate::upload::{
 use crate::workflow::{
     ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, OriginalAssetProof,
     SourceAgeProof, UploadProof, WorkflowError, approve_delete, approved_original_delete_request,
-    build_delete_plan, mark_delete_eligible, prove_and_record_nas, record_conversion_performance,
-    record_conversion_result, record_delete_execution, record_heic_verification,
+    build_delete_plan, icloudpd_local_mirror_ready_proofs, mark_delete_eligible,
+    prove_and_record_nas, record_conversion_performance, record_conversion_result,
+    record_delete_execution, record_heic_verification, record_icloudpd_local_mirror_proof,
     record_original_asset_batch_proofs, record_original_asset_proof, record_source_age_proof,
     record_stage_failure, record_upload_proof, upload_ready_heic_proof,
 };
@@ -94,6 +98,8 @@ enum WorkflowCommand {
     #[command(about = "Upload with an external Photos upload session not produced by icloudpd")]
     UploadHeic(WorkflowUploadHeicArgs),
     UploadVerified(WorkflowUploadVerifiedArgs),
+    #[command(name = "icloudpd-local-mirror")]
+    IcloudpdLocalMirror(WorkflowIcloudpdLocalMirrorArgs),
     OriginalAssetVerified(WorkflowOriginalAssetVerifiedArgs),
     #[command(
         name = "original-asset-resolve",
@@ -238,6 +244,16 @@ struct WorkflowUploadVerifiedArgs {
 }
 
 #[derive(Debug, Args)]
+struct WorkflowIcloudpdLocalMirrorArgs {
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+    #[arg(long)]
+    asset_id: String,
+    #[arg(long, value_name = "PATH")]
+    download_path: PathBuf,
+}
+
+#[derive(Debug, Args)]
 struct WorkflowOriginalAssetVerifiedArgs {
     #[arg(long, value_name = "PATH")]
     manifest: PathBuf,
@@ -351,6 +367,8 @@ pub enum CliError {
     Conversion(#[from] ConversionExecutionError),
     #[error("upload failed: {0}")]
     Upload(#[from] UploadError),
+    #[error("local mirror failed: {0}")]
+    LocalMirror(#[from] LocalMirrorError),
     #[error("failed to write JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("failed to write output: {0}")]
@@ -426,6 +444,7 @@ fn run_workflow<W: Write>(args: WorkflowArgs, writer: &mut W) -> Result<(), CliE
         WorkflowCommand::HeicVerified(args) => workflow_heic_verified(args),
         WorkflowCommand::UploadHeic(args) => workflow_upload_heic(args),
         WorkflowCommand::UploadVerified(args) => workflow_upload_verified(args),
+        WorkflowCommand::IcloudpdLocalMirror(args) => workflow_icloudpd_local_mirror(args),
         WorkflowCommand::OriginalAssetVerified(args) => workflow_original_asset_verified(args),
         WorkflowCommand::OriginalAssetResolve(args) => workflow_original_asset_resolve(args),
         WorkflowCommand::OriginalAssetsResolveBatch(args) => {
@@ -559,6 +578,27 @@ fn workflow_upload_verified(args: WorkflowUploadVerifiedArgs) -> Result<(), CliE
             uploaded_heic_path: args.uploaded_heic_path,
         },
     )?;
+    save_manifest(&manifest, &args.manifest)
+}
+
+fn workflow_icloudpd_local_mirror(args: WorkflowIcloudpdLocalMirrorArgs) -> Result<(), CliError> {
+    let mut manifest = load_manifest_for_write(&args.manifest)?;
+    let (upload, heic) = icloudpd_local_mirror_ready_proofs(&manifest, &args.asset_id)?;
+    let uploaded_heic_path =
+        upload
+            .uploaded_heic_path
+            .clone()
+            .ok_or(WorkflowError::EmptyProofField {
+                field: "uploaded_heic_path",
+            })?;
+    let proof = ensure_icloudpd_local_mirror(IcloudpdLocalMirrorRequest {
+        uploaded_heic_asset_id: upload.uploaded_heic_asset_id,
+        uploaded_heic_sha256: upload.uploaded_heic_sha256,
+        uploaded_heic_path,
+        size_bytes: heic.size_bytes,
+        icloudpd_download_path: args.download_path,
+    })?;
+    record_icloudpd_local_mirror_proof(&mut manifest, &args.asset_id, proof)?;
     save_manifest(&manifest, &args.manifest)
 }
 

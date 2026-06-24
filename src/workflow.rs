@@ -20,12 +20,13 @@ const CONVERSION_PERFORMANCE_PROOF: &str = "conversion_performance";
 const HEIC_PROOF: &str = "heic";
 const SOURCE_AGE_PROOF: &str = "source_age";
 const UPLOAD_PROOF: &str = "upload";
+const ICLOUDPD_LOCAL_MIRROR_PROOF: &str = "icloudpd_local_mirror";
 const DELETE_ELIGIBILITY_PROOF: &str = "delete_eligibility";
 const DELETE_APPROVAL_PROOF: &str = "delete_approval";
 const DELETE_EXECUTION_PROOF: &str = "delete";
 const CONVERSION_PERFORMANCE_SCHEMA_VERSION: u8 = 1;
 const CONVERSION_PERFORMANCE_MEASUREMENT_METHOD: &str = "monotonic_wall_clock";
-const DELETE_PLAN_PROOFS: [&str; 9] = [
+const DELETE_PLAN_PROOFS: [&str; 10] = [
     NAS_PROOF,
     ORIGINAL_ASSET_PROOF,
     CONVERSION_PROOF,
@@ -33,6 +34,7 @@ const DELETE_PLAN_PROOFS: [&str; 9] = [
     HEIC_PROOF,
     SOURCE_AGE_PROOF,
     UPLOAD_PROOF,
+    ICLOUDPD_LOCAL_MIRROR_PROOF,
     DELETE_ELIGIBILITY_PROOF,
     DELETE_APPROVAL_PROOF,
 ];
@@ -108,6 +110,15 @@ pub struct UploadProof {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct IcloudpdLocalMirrorProof {
+    pub uploaded_heic_asset_id: String,
+    pub uploaded_heic_sha256: String,
+    pub uploaded_heic_path: PathBuf,
+    pub icloudpd_download_path: PathBuf,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OriginalAssetProof {
     pub record_name: String,
     pub record_change_tag: String,
@@ -131,11 +142,15 @@ struct DeleteEligibilityProof {
     conversion_performance_proof_key: String,
     heic_proof_key: String,
     source_age_proof_key: String,
+    icloudpd_local_mirror_proof_key: String,
     uploaded_heic_asset_id: String,
     uploaded_heic_sha256: String,
     uploaded_heic_path: PathBuf,
     verified_heic_sha256: String,
     verified_heic_path: PathBuf,
+    icloudpd_download_path: PathBuf,
+    mirrored_heic_sha256: String,
+    mirrored_size_bytes: u64,
     source_captured_unix_seconds: u64,
     source_age_seconds: u64,
     min_source_age_seconds: u64,
@@ -157,6 +172,7 @@ struct PreDeleteFacts {
     upload: UploadProof,
     uploaded_heic_path: PathBuf,
     heic: HeicVerificationProof,
+    mirror: IcloudpdLocalMirrorProof,
     source_age: SourceAgeProof,
     source_age_seconds: u64,
 }
@@ -355,6 +371,44 @@ pub fn record_upload_proof<'a>(
     )
 }
 
+pub fn record_icloudpd_local_mirror_proof<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    proof: IcloudpdLocalMirrorProof,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    let state = manifest.get(asset_id)?.state;
+    if !matches!(
+        state,
+        State::UploadVerified | State::DeleteEligible | State::DeleteApproved
+    ) {
+        return Err(WorkflowError::IcloudpdLocalMirrorUnavailable {
+            asset_id: asset_id.to_string(),
+            state,
+        });
+    }
+
+    validate_candidate_icloudpd_local_mirror(manifest, asset_id, &proof)?;
+
+    let mut staged = manifest.clone();
+    insert_workflow_proof(&mut staged, asset_id, ICLOUDPD_LOCAL_MIRROR_PROOF, &proof)?;
+    if matches!(state, State::DeleteEligible | State::DeleteApproved) {
+        let facts = validate_pre_delete_facts(&staged, asset_id)?;
+        let eligibility_proof = delete_eligibility_proof(&facts);
+        insert_workflow_proof(
+            &mut staged,
+            asset_id,
+            DELETE_ELIGIBILITY_PROOF,
+            &eligibility_proof,
+        )?;
+        if state == State::DeleteApproved {
+            validate_delete_approval_proof(&staged, asset_id)?;
+        }
+    }
+
+    *manifest = staged;
+    manifest.get(asset_id).map_err(WorkflowError::Manifest)
+}
+
 pub fn record_original_asset_proof<'a>(
     manifest: &'a mut Manifest,
     asset_id: &str,
@@ -440,6 +494,25 @@ pub fn upload_ready_heic_proof(
     Ok(proof)
 }
 
+pub fn icloudpd_local_mirror_ready_proofs(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<(UploadProof, HeicVerificationProof), WorkflowError> {
+    let state = manifest.get(asset_id)?.state;
+    if !matches!(
+        state,
+        State::UploadVerified | State::DeleteEligible | State::DeleteApproved
+    ) {
+        return Err(WorkflowError::IcloudpdLocalMirrorUnavailable {
+            asset_id: asset_id.to_string(),
+            state,
+        });
+    }
+
+    let (upload, heic, _) = validate_icloudpd_local_mirror_inputs(manifest, asset_id)?;
+    Ok((upload, heic))
+}
+
 pub fn record_source_age_proof<'a>(
     manifest: &'a mut Manifest,
     asset_id: &str,
@@ -470,27 +543,7 @@ pub fn mark_delete_eligible<'a>(
     }
     require_valid_conversion_performance(manifest, asset_id)?;
     let facts = validate_pre_delete_facts(manifest, asset_id)?;
-    let proof = json!({
-        "upload_proof_key": UPLOAD_PROOF,
-        "original_asset_proof_key": ORIGINAL_ASSET_PROOF,
-        "conversion_performance_proof_key": CONVERSION_PERFORMANCE_PROOF,
-        "heic_proof_key": HEIC_PROOF,
-        "source_age_proof_key": SOURCE_AGE_PROOF,
-        "uploaded_heic_asset_id": &facts.upload.uploaded_heic_asset_id,
-        "uploaded_heic_sha256": &facts.upload.uploaded_heic_sha256,
-        "uploaded_heic_path": &facts.uploaded_heic_path,
-        "verified_heic_sha256": &facts.heic.heic_sha256,
-        "verified_heic_path": &facts.heic.heic_path,
-        "source_captured_unix_seconds": facts.source_age.source_captured_unix_seconds,
-        "source_age_seconds": facts.source_age_seconds,
-        "min_source_age_seconds": facts.source_age.min_age_seconds,
-        "original_record_name": &facts.original.record_name,
-        "original_record_change_tag": &facts.original.record_change_tag,
-        "original_record_type": &facts.original.record_type,
-        "original_filename": &facts.original.filename,
-        "original_size_bytes": facts.original.size_bytes,
-        "matched_raw_sha256": &facts.original.matched_raw_sha256,
-    });
+    let proof = delete_eligibility_proof(&facts);
 
     manifest
         .transition(
@@ -688,11 +741,11 @@ fn validate_pre_delete_facts(
     let uploaded_heic_path =
         upload
             .uploaded_heic_path
-            .as_ref()
+            .clone()
             .ok_or(WorkflowError::EmptyProofField {
                 field: "uploaded_heic_path",
             })?;
-    require_non_empty_path("uploaded_heic_path", uploaded_heic_path)?;
+    require_non_empty_path("uploaded_heic_path", &uploaded_heic_path)?;
     require_matching_str(
         HEIC_PROOF,
         "uploaded_heic_sha256",
@@ -703,9 +756,8 @@ fn validate_pre_delete_facts(
         HEIC_PROOF,
         "uploaded_heic_path",
         &heic.heic_path,
-        uploaded_heic_path,
+        &uploaded_heic_path,
     )?;
-    let uploaded_heic_path = uploaded_heic_path.clone();
 
     let source_age = stored_proof::<SourceAgeProof>(manifest, asset_id, SOURCE_AGE_PROOF)?;
     let source_age_seconds = source_age_seconds(asset_id, &source_age)?;
@@ -715,12 +767,16 @@ fn validate_pre_delete_facts(
     validate_stored_conversion_performance(manifest, asset_id, &nas, &conversion)?;
     let original = stored_proof::<OriginalAssetProof>(manifest, asset_id, ORIGINAL_ASSET_PROOF)?;
     validate_original_asset_proof(&original, &nas)?;
+    let mirror =
+        stored_proof::<IcloudpdLocalMirrorProof>(manifest, asset_id, ICLOUDPD_LOCAL_MIRROR_PROOF)?;
+    validate_icloudpd_local_mirror_proof(&mirror, &upload, &uploaded_heic_path, &heic)?;
 
     Ok(PreDeleteFacts {
         original,
         upload,
         uploaded_heic_path,
         heic,
+        mirror,
         source_age,
         source_age_seconds,
     })
@@ -739,6 +795,7 @@ fn validate_delete_eligibility_chain(
         &facts.upload,
         &facts.uploaded_heic_path,
         &facts.heic,
+        &facts.mirror,
         &facts.source_age,
         facts.source_age_seconds,
     )?;
@@ -756,6 +813,34 @@ fn validate_delete_approval_proof(
     }
 
     Ok(())
+}
+
+fn delete_eligibility_proof(facts: &PreDeleteFacts) -> Value {
+    json!({
+        "upload_proof_key": UPLOAD_PROOF,
+        "original_asset_proof_key": ORIGINAL_ASSET_PROOF,
+        "conversion_performance_proof_key": CONVERSION_PERFORMANCE_PROOF,
+        "heic_proof_key": HEIC_PROOF,
+        "source_age_proof_key": SOURCE_AGE_PROOF,
+        "icloudpd_local_mirror_proof_key": ICLOUDPD_LOCAL_MIRROR_PROOF,
+        "uploaded_heic_asset_id": &facts.upload.uploaded_heic_asset_id,
+        "uploaded_heic_sha256": &facts.upload.uploaded_heic_sha256,
+        "uploaded_heic_path": &facts.uploaded_heic_path,
+        "verified_heic_sha256": &facts.heic.heic_sha256,
+        "verified_heic_path": &facts.heic.heic_path,
+        "icloudpd_download_path": &facts.mirror.icloudpd_download_path,
+        "mirrored_heic_sha256": &facts.mirror.uploaded_heic_sha256,
+        "mirrored_size_bytes": facts.mirror.size_bytes,
+        "source_captured_unix_seconds": facts.source_age.source_captured_unix_seconds,
+        "source_age_seconds": facts.source_age_seconds,
+        "min_source_age_seconds": facts.source_age.min_age_seconds,
+        "original_record_name": &facts.original.record_name,
+        "original_record_change_tag": &facts.original.record_change_tag,
+        "original_record_type": &facts.original.record_type,
+        "original_filename": &facts.original.filename,
+        "original_size_bytes": facts.original.size_bytes,
+        "matched_raw_sha256": &facts.original.matched_raw_sha256,
+    })
 }
 
 fn validate_nas_proof(
@@ -877,12 +962,126 @@ fn derive_nas_root_from_proof(proof: &NasRawProof) -> Result<PathBuf, WorkflowEr
     Ok(root)
 }
 
+fn validate_candidate_icloudpd_local_mirror(
+    manifest: &Manifest,
+    asset_id: &str,
+    proof: &IcloudpdLocalMirrorProof,
+) -> Result<(), WorkflowError> {
+    let (upload, heic, uploaded_heic_path) =
+        validate_icloudpd_local_mirror_inputs(manifest, asset_id)?;
+    validate_icloudpd_local_mirror_proof(proof, &upload, &uploaded_heic_path, &heic)
+}
+
+fn validate_icloudpd_local_mirror_inputs(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<(UploadProof, HeicVerificationProof, PathBuf), WorkflowError> {
+    let (_, conversion) = require_valid_conversion_performance(manifest, asset_id)?;
+    let heic = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
+    require_matching_path(
+        CONVERSION_PROOF,
+        "heic_path",
+        &conversion.heic_path,
+        &heic.heic_path,
+    )?;
+    require_matching_str(
+        CONVERSION_PROOF,
+        "heic_sha256",
+        &conversion.heic_sha256,
+        &heic.heic_sha256,
+    )?;
+    require_matching_u64(
+        CONVERSION_PROOF,
+        "size_bytes",
+        conversion.size_bytes,
+        heic.size_bytes,
+    )?;
+    validate_heic_verification_flags(&heic)?;
+    let upload = stored_proof::<UploadProof>(manifest, asset_id, UPLOAD_PROOF)?;
+    require_non_empty("uploaded_heic_asset_id", &upload.uploaded_heic_asset_id)?;
+    require_non_empty("uploaded_heic_sha256", &upload.uploaded_heic_sha256)?;
+    let uploaded_heic_path =
+        upload
+            .uploaded_heic_path
+            .clone()
+            .ok_or(WorkflowError::EmptyProofField {
+                field: "uploaded_heic_path",
+            })?;
+    require_non_empty_path("uploaded_heic_path", &uploaded_heic_path)?;
+    require_matching_str(
+        HEIC_PROOF,
+        "uploaded_heic_sha256",
+        &heic.heic_sha256,
+        &upload.uploaded_heic_sha256,
+    )?;
+    require_matching_path(
+        HEIC_PROOF,
+        "uploaded_heic_path",
+        &heic.heic_path,
+        &uploaded_heic_path,
+    )?;
+
+    Ok((upload, heic, uploaded_heic_path))
+}
+
+fn validate_icloudpd_local_mirror_proof(
+    proof: &IcloudpdLocalMirrorProof,
+    upload: &UploadProof,
+    uploaded_heic_path: &Path,
+    heic: &HeicVerificationProof,
+) -> Result<(), WorkflowError> {
+    require_non_empty("uploaded_heic_asset_id", &proof.uploaded_heic_asset_id)?;
+    require_non_empty("uploaded_heic_sha256", &proof.uploaded_heic_sha256)?;
+    require_non_empty_path("uploaded_heic_path", &proof.uploaded_heic_path)?;
+    require_non_empty_path("icloudpd_download_path", &proof.icloudpd_download_path)?;
+    require_positive_u64(ICLOUDPD_LOCAL_MIRROR_PROOF, "size_bytes", proof.size_bytes)?;
+    require_matching_str(
+        ICLOUDPD_LOCAL_MIRROR_PROOF,
+        "uploaded_heic_asset_id",
+        &upload.uploaded_heic_asset_id,
+        &proof.uploaded_heic_asset_id,
+    )?;
+    require_matching_str(
+        ICLOUDPD_LOCAL_MIRROR_PROOF,
+        "uploaded_heic_sha256",
+        &upload.uploaded_heic_sha256,
+        &proof.uploaded_heic_sha256,
+    )?;
+    require_matching_str(
+        ICLOUDPD_LOCAL_MIRROR_PROOF,
+        "uploaded_heic_sha256",
+        &heic.heic_sha256,
+        &proof.uploaded_heic_sha256,
+    )?;
+    require_matching_path(
+        ICLOUDPD_LOCAL_MIRROR_PROOF,
+        "uploaded_heic_path",
+        uploaded_heic_path,
+        &proof.uploaded_heic_path,
+    )?;
+    require_matching_path(
+        ICLOUDPD_LOCAL_MIRROR_PROOF,
+        "uploaded_heic_path",
+        &heic.heic_path,
+        &proof.uploaded_heic_path,
+    )?;
+    require_matching_u64(
+        ICLOUDPD_LOCAL_MIRROR_PROOF,
+        "size_bytes",
+        heic.size_bytes,
+        proof.size_bytes,
+    )?;
+
+    Ok(())
+}
+
 fn validate_delete_eligibility_proof(
     eligibility: &DeleteEligibilityProof,
     original: &OriginalAssetProof,
     upload: &UploadProof,
     uploaded_heic_path: &Path,
     heic: &HeicVerificationProof,
+    mirror: &IcloudpdLocalMirrorProof,
     source_age: &SourceAgeProof,
     source_age_seconds: u64,
 ) -> Result<(), WorkflowError> {
@@ -918,6 +1117,12 @@ fn validate_delete_eligibility_proof(
     )?;
     require_matching_str(
         DELETE_ELIGIBILITY_PROOF,
+        "icloudpd_local_mirror_proof_key",
+        ICLOUDPD_LOCAL_MIRROR_PROOF,
+        &eligibility.icloudpd_local_mirror_proof_key,
+    )?;
+    require_matching_str(
+        DELETE_ELIGIBILITY_PROOF,
         "uploaded_heic_asset_id",
         &upload.uploaded_heic_asset_id,
         &eligibility.uploaded_heic_asset_id,
@@ -945,6 +1150,24 @@ fn validate_delete_eligibility_proof(
         "verified_heic_path",
         &heic.heic_path,
         &eligibility.verified_heic_path,
+    )?;
+    require_matching_path(
+        DELETE_ELIGIBILITY_PROOF,
+        "icloudpd_download_path",
+        &mirror.icloudpd_download_path,
+        &eligibility.icloudpd_download_path,
+    )?;
+    require_matching_str(
+        DELETE_ELIGIBILITY_PROOF,
+        "mirrored_heic_sha256",
+        &mirror.uploaded_heic_sha256,
+        &eligibility.mirrored_heic_sha256,
+    )?;
+    require_matching_u64(
+        DELETE_ELIGIBILITY_PROOF,
+        "mirrored_size_bytes",
+        mirror.size_bytes,
+        eligibility.mirrored_size_bytes,
     )?;
     require_matching_u64(
         DELETE_ELIGIBILITY_PROOF,
@@ -1402,6 +1625,10 @@ pub enum WorkflowError {
     UploadUnavailable { asset_id: String, state: State },
     #[error("delete plan unavailable for {asset_id}: state is {state}; delete approval required")]
     DeletePlanUnavailable { asset_id: String, state: State },
+    #[error(
+        "iCloudPD local mirror unavailable for {asset_id}: state is {state}; upload verification required"
+    )]
+    IcloudpdLocalMirrorUnavailable { asset_id: String, state: State },
     #[error("delete approval operator is required")]
     EmptyOperator,
     #[error("workflow proof field {field} is required")]

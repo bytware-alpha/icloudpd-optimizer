@@ -375,6 +375,18 @@ fn manifest_with_real_delete_approval(tempdir: &std::path::Path) -> (PathBuf, Pa
     let nas_root = tempdir.join("nas");
     fs::create_dir_all(&nas_root).expect("nas root should be created");
     let raw_path = write_old_raw(&nas_root, "camera/IMG_0001.dng", b"raw-bytes");
+    let heic_path = tempdir.join("staging").join("IMG_0001.heic");
+    let download_path = tempdir.join("PrimarySync").join("IMG_0001.HEIC");
+    fs::create_dir_all(heic_path.parent().expect("heic path should have parent"))
+        .expect("heic parent should be created");
+    fs::create_dir_all(
+        download_path
+            .parent()
+            .expect("download path should have parent"),
+    )
+    .expect("download parent should be created");
+    fs::write(&heic_path, b"heic-bytes").expect("verified HEIC should be written");
+    let heic_sha256 = sha256_hex(b"heic-bytes");
     let source_captured = source_captured_days_ago(40);
     let manifest_arg = manifest_path
         .to_str()
@@ -408,11 +420,11 @@ fn manifest_with_real_delete_approval(tempdir: &std::path::Path) -> (PathBuf, Pa
             "--asset-id",
             "asset-1",
             "--heic-path",
-            "/staging/IMG_0001.heic",
+            heic_path.to_str().expect("heic path should be utf8"),
             "--heic-sha256",
-            "heic-sha256",
+            &heic_sha256,
             "--size-bytes",
-            "24",
+            "10",
         ])
         .assert()
         .success();
@@ -426,11 +438,11 @@ fn manifest_with_real_delete_approval(tempdir: &std::path::Path) -> (PathBuf, Pa
             "--asset-id",
             "asset-1",
             "--heic-path",
-            "/staging/IMG_0001.heic",
+            heic_path.to_str().expect("heic path should be utf8"),
             "--heic-sha256",
-            "heic-sha256",
+            &heic_sha256,
             "--size-bytes",
-            "24",
+            "10",
             "--heif-info-ok",
             "--metadata-copied",
             "--visual-content-ok",
@@ -449,9 +461,24 @@ fn manifest_with_real_delete_approval(tempdir: &std::path::Path) -> (PathBuf, Pa
             "--uploaded-heic-asset-id",
             "icloud-heic-asset-1",
             "--uploaded-heic-sha256",
-            "heic-sha256",
+            &heic_sha256,
             "--uploaded-heic-path",
-            "/staging/IMG_0001.heic",
+            heic_path.to_str().expect("heic path should be utf8"),
+        ])
+        .assert()
+        .success();
+    binary()
+        .args([
+            "workflow",
+            "icloudpd-local-mirror",
+            "--manifest",
+            manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--download-path",
+            download_path
+                .to_str()
+                .expect("download path should be utf8"),
         ])
         .assert()
         .success();
@@ -1965,6 +1992,372 @@ fn workflow_upload_verified_mismatch_fails_without_mutating_manifest() {
     }
 }
 
+fn manifest_with_real_upload_verified(
+    manifest_path: &std::path::Path,
+    heic_path: &std::path::Path,
+    heic_bytes: &[u8],
+) -> String {
+    fs::create_dir_all(heic_path.parent().expect("heic path should have parent"))
+        .expect("heic parent should be created");
+    fs::write(heic_path, heic_bytes).expect("verified HEIC should be written");
+    manifest_with_real_conversion_verified(manifest_path, heic_path.to_path_buf(), heic_bytes);
+    let manifest_arg = manifest_path
+        .to_str()
+        .expect("manifest path should be utf8")
+        .to_string();
+    binary()
+        .args([
+            "workflow",
+            "upload-verified",
+            "--manifest",
+            &manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--uploaded-heic-asset-id",
+            "icloud-heic-asset-1",
+            "--uploaded-heic-sha256",
+            &sha256_hex(heic_bytes),
+            "--uploaded-heic-path",
+            heic_path.to_str().expect("heic path should be utf8"),
+        ])
+        .assert()
+        .success();
+    manifest_arg
+}
+
+#[test]
+fn workflow_icloudpd_local_mirror_copies_missing_destination_and_records_proof() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let heic_path = tempdir.path().join("staging").join("IMG_0001.heic");
+    let download_path = tempdir.path().join("PrimarySync").join("IMG_0001.HEIC");
+    fs::create_dir_all(download_path.parent().expect("download should have parent"))
+        .expect("download parent should be created");
+    let heic_bytes = b"heic-bytes";
+    let manifest_arg = manifest_with_real_upload_verified(&manifest_path, &heic_path, heic_bytes);
+
+    binary()
+        .args([
+            "workflow",
+            "icloudpd-local-mirror",
+            "--manifest",
+            &manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--download-path",
+            download_path
+                .to_str()
+                .expect("download path should be utf8"),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(&download_path).expect("download mirror should be readable"),
+        heic_bytes
+    );
+    let manifest = Manifest::load(&manifest_path).expect("manifest should load");
+    let record = manifest.get("asset-1").expect("asset should exist");
+    assert_eq!(
+        record.proofs["icloudpd_local_mirror"]["uploaded_heic_asset_id"],
+        "icloud-heic-asset-1"
+    );
+    assert_eq!(
+        record.proofs["icloudpd_local_mirror"]["uploaded_heic_sha256"],
+        sha256_hex(heic_bytes)
+    );
+    assert_eq!(
+        record.proofs["icloudpd_local_mirror"]["icloudpd_download_path"],
+        download_path.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        record.proofs["icloudpd_local_mirror"]["size_bytes"],
+        heic_bytes.len() as u64
+    );
+}
+
+#[test]
+fn workflow_icloudpd_local_mirror_accepts_existing_matching_destination_without_overwrite() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let heic_path = tempdir.path().join("staging").join("IMG_0001.heic");
+    let download_path = tempdir.path().join("PrimarySync").join("IMG_0001.HEIC");
+    fs::create_dir_all(download_path.parent().expect("download should have parent"))
+        .expect("download parent should be created");
+    let heic_bytes = b"heic-bytes";
+    let manifest_arg = manifest_with_real_upload_verified(&manifest_path, &heic_path, heic_bytes);
+    fs::write(&download_path, heic_bytes).expect("existing mirror should be written");
+    let old_mtime = FileTime::from_unix_time(1_700_000_000, 0);
+    set_file_mtime(&download_path, old_mtime).expect("mtime should be set");
+
+    binary()
+        .args([
+            "workflow",
+            "icloudpd-local-mirror",
+            "--manifest",
+            &manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--download-path",
+            download_path
+                .to_str()
+                .expect("download path should be utf8"),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(&download_path).expect("existing mirror should be readable"),
+        heic_bytes
+    );
+    assert_eq!(
+        FileTime::from_last_modification_time(
+            &fs::metadata(&download_path).expect("metadata should be readable")
+        ),
+        old_mtime
+    );
+}
+
+#[test]
+fn workflow_icloudpd_local_mirror_rejects_existing_mismatch_without_mutating_manifest_or_file() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let heic_path = tempdir.path().join("staging").join("IMG_0001.heic");
+    let download_path = tempdir.path().join("PrimarySync").join("IMG_0001.HEIC");
+    fs::create_dir_all(download_path.parent().expect("download should have parent"))
+        .expect("download parent should be created");
+    let heic_bytes = b"heic-bytes";
+    let manifest_arg = manifest_with_real_upload_verified(&manifest_path, &heic_path, heic_bytes);
+    fs::write(&download_path, b"other-bytes").expect("mismatched mirror should be written");
+    let before_manifest = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+    let before_download = fs::read(&download_path).expect("download should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "icloudpd-local-mirror",
+            "--manifest",
+            &manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--download-path",
+            download_path
+                .to_str()
+                .expect("download path should be utf8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mismatch"));
+
+    assert_eq!(
+        fs::read_to_string(&manifest_path).expect("manifest should remain readable"),
+        before_manifest
+    );
+    assert_eq!(
+        fs::read(&download_path).expect("download should remain readable"),
+        before_download
+    );
+}
+
+#[test]
+fn workflow_icloudpd_local_mirror_rejects_directory_destination_without_mutating_manifest() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let heic_path = tempdir.path().join("staging").join("IMG_0001.heic");
+    let download_path = tempdir.path().join("PrimarySync");
+    fs::create_dir_all(&download_path).expect("download directory should be created");
+    let manifest_arg =
+        manifest_with_real_upload_verified(&manifest_path, &heic_path, b"heic-bytes");
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "icloudpd-local-mirror",
+            "--manifest",
+            &manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--download-path",
+            download_path
+                .to_str()
+                .expect("download path should be utf8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("directory"));
+
+    assert_eq!(
+        fs::read_to_string(&manifest_path).expect("manifest should remain readable"),
+        before
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workflow_icloudpd_local_mirror_rejects_symlink_destination_without_mutating_manifest() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let heic_path = tempdir.path().join("staging").join("IMG_0001.heic");
+    let download_path = tempdir.path().join("PrimarySync").join("IMG_0001.HEIC");
+    let target_path = tempdir.path().join("target.HEIC");
+    fs::create_dir_all(download_path.parent().expect("download should have parent"))
+        .expect("download parent should be created");
+    fs::write(&target_path, b"heic-bytes").expect("symlink target should be written");
+    std::os::unix::fs::symlink(&target_path, &download_path)
+        .expect("download symlink should be created");
+    let manifest_arg =
+        manifest_with_real_upload_verified(&manifest_path, &heic_path, b"heic-bytes");
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "icloudpd-local-mirror",
+            "--manifest",
+            &manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--download-path",
+            download_path
+                .to_str()
+                .expect("download path should be utf8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("symlink"));
+
+    assert_eq!(
+        fs::read_to_string(&manifest_path).expect("manifest should remain readable"),
+        before
+    );
+    assert_eq!(
+        fs::read(&target_path).expect("symlink target should remain readable"),
+        b"heic-bytes"
+    );
+}
+
+#[test]
+fn workflow_icloudpd_local_mirror_rejects_directory_source_without_mutating_manifest() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let heic_path = tempdir.path().join("staging").join("IMG_0001.heic");
+    let download_path = tempdir.path().join("PrimarySync").join("IMG_0001.HEIC");
+    fs::create_dir_all(&heic_path).expect("source directory should be created");
+    fs::create_dir_all(download_path.parent().expect("download should have parent"))
+        .expect("download parent should be created");
+    manifest_with_real_conversion_verified(&manifest_path, heic_path.clone(), b"heic-bytes");
+    let manifest_arg = manifest_path
+        .to_str()
+        .expect("manifest path should be utf8")
+        .to_string();
+    binary()
+        .args([
+            "workflow",
+            "upload-verified",
+            "--manifest",
+            &manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--uploaded-heic-asset-id",
+            "icloud-heic-asset-1",
+            "--uploaded-heic-sha256",
+            &sha256_hex(b"heic-bytes"),
+            "--uploaded-heic-path",
+            heic_path.to_str().expect("heic path should be utf8"),
+        ])
+        .assert()
+        .success();
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "icloudpd-local-mirror",
+            "--manifest",
+            &manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--download-path",
+            download_path
+                .to_str()
+                .expect("download path should be utf8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("uploaded_heic_path"))
+        .stderr(predicate::str::contains("directory"));
+
+    assert_eq!(
+        fs::read_to_string(&manifest_path).expect("manifest should remain readable"),
+        before
+    );
+    assert!(!download_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn workflow_icloudpd_local_mirror_rejects_symlink_source_without_mutating_manifest() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let heic_path = tempdir.path().join("staging").join("IMG_0001.heic");
+    let target_path = tempdir.path().join("target.HEIC");
+    let download_path = tempdir.path().join("PrimarySync").join("IMG_0001.HEIC");
+    fs::create_dir_all(heic_path.parent().expect("heic should have parent"))
+        .expect("heic parent should be created");
+    fs::create_dir_all(download_path.parent().expect("download should have parent"))
+        .expect("download parent should be created");
+    fs::write(&target_path, b"heic-bytes").expect("symlink target should be written");
+    std::os::unix::fs::symlink(&target_path, &heic_path).expect("source symlink should be created");
+    manifest_with_real_conversion_verified(&manifest_path, heic_path.clone(), b"heic-bytes");
+    let manifest_arg = manifest_path
+        .to_str()
+        .expect("manifest path should be utf8")
+        .to_string();
+    binary()
+        .args([
+            "workflow",
+            "upload-verified",
+            "--manifest",
+            &manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--uploaded-heic-asset-id",
+            "icloud-heic-asset-1",
+            "--uploaded-heic-sha256",
+            &sha256_hex(b"heic-bytes"),
+            "--uploaded-heic-path",
+            heic_path.to_str().expect("heic path should be utf8"),
+        ])
+        .assert()
+        .success();
+    let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
+
+    binary()
+        .args([
+            "workflow",
+            "icloudpd-local-mirror",
+            "--manifest",
+            &manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--download-path",
+            download_path
+                .to_str()
+                .expect("download path should be utf8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("uploaded_heic_path"))
+        .stderr(predicate::str::contains("symlink"));
+
+    assert_eq!(
+        fs::read_to_string(&manifest_path).expect("manifest should remain readable"),
+        before
+    );
+    assert!(!download_path.exists());
+}
+
 #[test]
 fn workflow_mark_delete_eligible_requires_source_age_without_mutating_manifest() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
@@ -2243,6 +2636,10 @@ fn workflow_delete_plan_prints_json_and_does_not_mutate_manifest() {
     assert_eq!(shown["raw_path"], raw_path.to_string_lossy().as_ref());
     assert_eq!(
         shown["proofs"]["upload"]["uploaded_heic_asset_id"],
+        "icloud-heic-asset-1"
+    );
+    assert_eq!(
+        shown["proofs"]["icloudpd_local_mirror"]["uploaded_heic_asset_id"],
         "icloud-heic-asset-1"
     );
     assert_eq!(

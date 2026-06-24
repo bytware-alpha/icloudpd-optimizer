@@ -2,6 +2,7 @@ pub mod cli;
 pub mod conversion;
 pub mod conversion_backend;
 pub mod conversion_execution;
+pub mod local_mirror;
 pub mod manifest;
 pub mod proof;
 pub mod upload;
