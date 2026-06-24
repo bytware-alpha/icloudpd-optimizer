@@ -674,20 +674,44 @@ fn cloudkit_delete_payload(request: &CloudKitDeleteRequest) -> Value {
 fn cloudkit_original_asset_query_payload(start_rank: u64, page_size: u64) -> Value {
     json!({
         "query": {
-            "recordType": "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"
+            "recordType": "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+            "filterBy": [
+                {
+                    "fieldName": "direction",
+                    "comparator": "EQUALS",
+                    "fieldValue": {"type": "STRING", "value": "ASCENDING"}
+                },
+                {
+                    "fieldName": "startRank",
+                    "comparator": "EQUALS",
+                    "fieldValue": {"type": "INT64", "value": start_rank}
+                }
+            ]
         },
-        "direction": "ASCENDING",
-        "startRank": start_rank,
         "resultsLimit": page_size,
         "desiredKeys": [
             "masterRef",
             "assetDate",
-            "resOriginal",
-            "resOriginalAlt",
-            "resSidecar",
-            "resVideoComplement",
-            "resOriginalVideoComplement",
-            "resVideoComplementOriginal"
+            "resOriginalRes",
+            "resOriginalFileType",
+            "resOriginalFingerprint",
+            "resOriginalWidth",
+            "resOriginalHeight",
+            "resOriginalAltRes",
+            "resOriginalAltFileType",
+            "resOriginalAltFingerprint",
+            "resOriginalAltWidth",
+            "resOriginalAltHeight",
+            "resSidecarRes",
+            "resSidecarFileType",
+            "resSidecarFingerprint",
+            "resSidecarWidth",
+            "resSidecarHeight",
+            "resOriginalVidComplRes",
+            "resOriginalVidComplFileType",
+            "resOriginalVidComplFingerprint",
+            "resOriginalVidComplWidth",
+            "resOriginalVidComplHeight"
         ],
         "zoneID": {"zoneName": PRIMARY_SYNC_ZONE}
     })
@@ -971,31 +995,34 @@ fn master_has_matching_raw_resource(
         "resOriginal",
         "resOriginalAlt",
         "resSidecar",
-        "resVideoComplement",
-        "resOriginalVideoComplement",
-        "resVideoComplementOriginal",
+        "resOriginalVidCompl",
     ] {
-        for (name, field) in fields {
-            if !name.starts_with(prefix) {
-                continue;
-            }
-            saw_resource = true;
-            let Some(resource) = field_value_object(field) else {
-                return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
-                    "CPLMaster resource field is malformed",
-                ));
-            };
-            let Some(size_bytes) = resource_size_bytes(resource) else {
-                return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
-                    "CPLMaster resource missing size",
-                ));
-            };
-            if size_bytes != raw_size_bytes {
-                continue;
-            }
-            if resource_type_is_raw(resource) {
-                return Ok(true);
-            }
+        let res_key = format!("{prefix}Res");
+        let Some(resource_field) = fields.get(&res_key) else {
+            continue;
+        };
+        saw_resource = true;
+        let Some(resource) = field_value_object(resource_field) else {
+            return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                "CPLMaster resource field is malformed",
+            ));
+        };
+        let Some(size_bytes) = resource_size_bytes(resource) else {
+            return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                "CPLMaster resource missing size",
+            ));
+        };
+        if size_bytes != raw_size_bytes {
+            continue;
+        }
+        let file_type_key = format!("{prefix}FileType");
+        let Some(file_type) = field_string(fields, &file_type_key) else {
+            return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                "CPLMaster resource missing file type",
+            ));
+        };
+        if resource_type_is_raw(file_type) {
+            return Ok(true);
         }
     }
     if !saw_resource {
@@ -1036,6 +1063,10 @@ fn field_value_object(field: &Value) -> Option<&Map<String, Value>> {
         .or_else(|| field.as_object())
 }
 
+fn field_string<'a>(fields: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    field_value(fields, key).and_then(Value::as_str)
+}
+
 fn master_ref_record_name(value: &Value) -> Option<&str> {
     value
         .get("recordName")
@@ -1070,25 +1101,12 @@ fn resource_size_bytes(resource: &Map<String, Value>) -> Option<u64> {
         .find_map(|key| resource_field_u64(resource, key))
 }
 
-fn resource_type_is_raw(resource: &Map<String, Value>) -> bool {
-    [
-        "type",
-        "resourceType",
-        "uti",
-        "fileType",
-        "contentType",
-        "mimeType",
-        "uniformTypeIdentifier",
-    ]
-    .iter()
-    .filter_map(|key| resource_field_str(resource, key))
-    .any(|value| {
-        let value = value.to_ascii_lowercase();
-        value == "dng"
-            || value.contains("raw")
-            || value.contains("digital-negative")
-            || value.contains("adobe.raw-image")
-    })
+fn resource_type_is_raw(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value == "dng"
+        || value.contains("raw")
+        || value.contains("digital-negative")
+        || value.contains("adobe.raw-image")
 }
 
 fn resource_field_u64(resource: &Map<String, Value>, key: &str) -> Option<u64> {
@@ -1096,13 +1114,6 @@ fn resource_field_u64(resource: &Map<String, Value>, key: &str) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.get("value").and_then(Value::as_u64))
-}
-
-fn resource_field_str<'a>(resource: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
-    let value = resource.get(key)?;
-    value
-        .as_str()
-        .or_else(|| value.get("value").and_then(Value::as_str))
 }
 
 fn validate_single_file_upload_request(

@@ -83,12 +83,15 @@ fn cloudkit_raw_pair(asset_name: &str, master_name: &str, change_tag: &str) -> V
             "recordName": master_name,
             "recordType": "CPLMaster",
             "fields": {
-                "resOriginal": {
+                "resOriginalRes": {
                     "value": {
-                        "size": {"value": 42},
-                        "type": {"value": "com.adobe.raw-image"}
+                        "size": 42
                     }
-                }
+                },
+                "resOriginalFileType": {"value": "com.adobe.raw-image"},
+                "resOriginalFingerprint": {"value": "fingerprint-123"},
+                "resOriginalWidth": {"value": 8064},
+                "resOriginalHeight": {"value": 6048}
             }
         }
     ])
@@ -364,9 +367,33 @@ fn cloudkit_original_asset_resolver_records_exact_raw_match() {
         transport.query_payloads[0]["query"]["recordType"],
         "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"
     );
-    assert_eq!(transport.query_payloads[0]["direction"], "ASCENDING");
-    assert_eq!(transport.query_payloads[0]["startRank"], 0);
+    assert!(transport.query_payloads[0].get("direction").is_none());
+    assert!(transport.query_payloads[0].get("startRank").is_none());
+    assert_eq!(
+        transport.query_payloads[0]["query"]["filterBy"],
+        json!([
+            {
+                "fieldName": "direction",
+                "comparator": "EQUALS",
+                "fieldValue": {"type": "STRING", "value": "ASCENDING"}
+            },
+            {
+                "fieldName": "startRank",
+                "comparator": "EQUALS",
+                "fieldValue": {"type": "INT64", "value": 0}
+            }
+        ])
+    );
     assert_eq!(transport.query_payloads[0]["resultsLimit"], 200);
+    let desired_keys = transport.query_payloads[0]["desiredKeys"]
+        .as_array()
+        .expect("desiredKeys should be an array");
+    assert!(desired_keys.contains(&json!("resOriginalRes")));
+    assert!(desired_keys.contains(&json!("resOriginalFileType")));
+    assert!(desired_keys.contains(&json!("resOriginalAltRes")));
+    assert!(desired_keys.contains(&json!("resOriginalVidComplFileType")));
+    assert!(!desired_keys.contains(&json!("resOriginal")));
+    assert!(!desired_keys.contains(&json!("resOriginalAlt")));
     assert_eq!(
         transport.query_payloads[0]["zoneID"],
         json!({"zoneName": "PrimarySync"})
@@ -421,7 +448,7 @@ fn cloudkit_original_asset_resolver_rejects_non_raw_same_size_resource() {
     let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
         .expect("session should load");
     let mut records = cloudkit_raw_pair("CPLAsset-original-123", "CPLMaster-raw-123", "tag-1");
-    records[1]["fields"]["resOriginal"]["value"]["type"] = json!("public.jpeg");
+    records[1]["fields"]["resOriginalFileType"]["value"] = json!("public.jpeg");
     let mut transport =
         FakeCloudKitDeleteTransport::query_responses(vec![json!({"records": records})]);
 
