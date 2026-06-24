@@ -558,6 +558,10 @@ pub struct ReqwestCloudKitDeleteTransport {
     client: reqwest::blocking::Client,
 }
 
+const CLOUDKIT_ORIGIN: &str = "https://www.icloud.com";
+const CLOUDKIT_REFERER: &str = "https://www.icloud.com/";
+const CLOUDKIT_BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+
 impl ReqwestCloudKitDeleteTransport {
     pub fn new() -> Result<Self, UploadError> {
         let client = reqwest::blocking::Client::builder()
@@ -579,11 +583,7 @@ impl CloudKitDeleteTransport for ReqwestCloudKitDeleteTransport {
         let response = self
             .client
             .post(url)
-            .header(reqwest::header::CONTENT_TYPE, "text/plain;charset=UTF-8")
-            .header(
-                reqwest::header::COOKIE,
-                cookie_header_for(&session.cookies)?,
-            )
+            .headers(cloudkit_records_request_headers(session)?)
             .body(payload.to_string())
             .send()
             .map_err(|source| UploadError::Network {
@@ -602,11 +602,7 @@ impl CloudKitDeleteTransport for ReqwestCloudKitDeleteTransport {
         let response = self
             .client
             .post(url)
-            .header(reqwest::header::CONTENT_TYPE, "text/plain;charset=UTF-8")
-            .header(
-                reqwest::header::COOKIE,
-                cookie_header_for(&session.cookies)?,
-            )
+            .headers(cloudkit_records_request_headers(session)?)
             .body(payload.to_string())
             .send()
             .map_err(|source| UploadError::Network {
@@ -626,10 +622,7 @@ impl CloudKitDeleteTransport for ReqwestCloudKitDeleteTransport {
         let mut response = self
             .client
             .get(download_url.clone())
-            .header(
-                reqwest::header::COOKIE,
-                cookie_header_for(&session.cookies)?,
-            )
+            .headers(cloudkit_resource_download_headers(session)?)
             .send()
             .map_err(|source| UploadError::Network {
                 operation: "resource_download",
@@ -1381,6 +1374,47 @@ fn cookie_header(session: &UploadSession) -> Result<String, UploadError> {
     cookie_header_for(&session.cookies)
 }
 
+fn cloudkit_records_request_headers(
+    session: &CloudKitDeleteSession,
+) -> Result<reqwest::header::HeaderMap, UploadError> {
+    let mut headers = cloudkit_authenticated_headers(session)?;
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("text/plain;charset=UTF-8"),
+    );
+    headers.insert(
+        reqwest::header::ORIGIN,
+        reqwest::header::HeaderValue::from_static(CLOUDKIT_ORIGIN),
+    );
+    headers.insert(
+        reqwest::header::REFERER,
+        reqwest::header::HeaderValue::from_static(CLOUDKIT_REFERER),
+    );
+    Ok(headers)
+}
+
+fn cloudkit_resource_download_headers(
+    session: &CloudKitDeleteSession,
+) -> Result<reqwest::header::HeaderMap, UploadError> {
+    cloudkit_authenticated_headers(session)
+}
+
+fn cloudkit_authenticated_headers(
+    session: &CloudKitDeleteSession,
+) -> Result<reqwest::header::HeaderMap, UploadError> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static(CLOUDKIT_BROWSER_USER_AGENT),
+    );
+    headers.insert(
+        reqwest::header::COOKIE,
+        reqwest::header::HeaderValue::from_str(&cookie_header_for(&session.cookies)?)
+            .map_err(|_| UploadError::InvalidSession("cookies cannot form a header".to_string()))?,
+    );
+    Ok(headers)
+}
+
 fn cookie_header_for(cookies: &[UploadCookie]) -> Result<String, UploadError> {
     let value = cookies
         .iter()
@@ -2061,6 +2095,43 @@ mod tests {
             "https://p140-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query?clientBuildNumber=2522Project44&clientMasteringNumber=2522B2&clientId=4f0b58d4-ff9d-4dc5-8f0b-9c4efc4fdb27&dsid=123456789&remapEnums=True&getCurrentSyncToken=True"
         );
         assert!(!url.query().unwrap_or_default().contains("ckWebAuthToken"));
+    }
+
+    #[test]
+    fn cloudkit_records_headers_include_browser_context_without_exposing_token_shortcuts() {
+        let session = valid_delete_session();
+
+        let headers = cloudkit_records_request_headers(&session).expect("headers should build");
+
+        assert_eq!(
+            headers.get(reqwest::header::CONTENT_TYPE).unwrap(),
+            "text/plain;charset=UTF-8"
+        );
+        assert_eq!(
+            headers.get(reqwest::header::ORIGIN).unwrap(),
+            "https://www.icloud.com"
+        );
+        assert_eq!(
+            headers.get(reqwest::header::REFERER).unwrap(),
+            "https://www.icloud.com/"
+        );
+        let user_agent = headers
+            .get(reqwest::header::USER_AGENT)
+            .expect("User-Agent should be present")
+            .to_str()
+            .expect("User-Agent should be visible");
+        assert!(user_agent.contains("Mozilla/5.0"));
+        assert!(!user_agent.trim().is_empty());
+        assert!(headers.contains_key(reqwest::header::COOKIE));
+        assert!(
+            !headers
+                .iter()
+                .filter(|(name, _)| **name != reqwest::header::COOKIE)
+                .any(|(_, value)| value
+                    .to_str()
+                    .unwrap_or_default()
+                    .contains("web-auth-token"))
+        );
     }
 }
 
