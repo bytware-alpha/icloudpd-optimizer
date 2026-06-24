@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -119,6 +120,24 @@ pub struct CloudKitOriginalAssetResolveRequest {
     pub capture_tolerance_seconds: u64,
     pub filename: String,
     pub matched_raw_sha256: String,
+    pub start_rank: u64,
+    pub page_size: u64,
+    pub max_pages: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudKitOriginalAssetResolveTarget {
+    pub asset_id: String,
+    pub raw_size_bytes: u64,
+    pub source_captured_unix_seconds: u64,
+    pub capture_tolerance_seconds: u64,
+    pub filename: String,
+    pub matched_raw_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudKitOriginalAssetBatchResolveRequest {
+    pub targets: Vec<CloudKitOriginalAssetResolveTarget>,
     pub start_rank: u64,
     pub page_size: u64,
     pub max_pages: u64,
@@ -469,6 +488,92 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
             1 => Ok(matches.remove(0)),
             count => Err(UploadError::OriginalAssetResolveNotUnique { matches: count }),
         }
+    }
+
+    pub fn resolve_original_assets_batch(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        request: &CloudKitOriginalAssetBatchResolveRequest,
+    ) -> Result<BTreeMap<String, OriginalAssetProof>, UploadError> {
+        validate_original_asset_batch_resolve_request(request)?;
+        validate_original_asset_batch_pagination_range(request)?;
+        let mut matches: BTreeMap<String, Vec<OriginalAssetProof>> = request
+            .targets
+            .iter()
+            .map(|target| (target.asset_id.clone(), Vec::new()))
+            .collect();
+        let target_index = OriginalAssetTargetIndex::new(&request.targets);
+        let mut exhausted = false;
+        let mut continuation_marker = None;
+        for _ in 0..request.max_pages {
+            let payload = cloudkit_original_asset_query_payload(
+                request.start_rank,
+                request.page_size,
+                continuation_marker.as_deref(),
+            );
+            let response = self.transport.post_records_query(session, payload)?;
+            let page_result = parse_original_asset_batch_query_response(
+                response,
+                &request.targets,
+                &target_index,
+            )?;
+            for candidate in page_result.matches {
+                let download = self.transport.download_resource(
+                    session,
+                    &candidate.download_url,
+                    candidate.raw_size_bytes,
+                )?;
+                if download.size_bytes != candidate.raw_size_bytes {
+                    return Err(UploadError::CloudKitOriginalAssetDownloadSizeMismatch {
+                        expected: candidate.raw_size_bytes,
+                        actual: download.size_bytes,
+                    });
+                }
+                if download.sha256 != candidate.matched_raw_sha256 {
+                    return Err(UploadError::OriginalAssetResolveHashMismatch {
+                        asset_id: candidate.asset_id,
+                    });
+                }
+                let target_matches = matches.get_mut(&candidate.asset_id).ok_or(
+                    UploadError::InvalidCloudKitOriginalAssetResponse(
+                        "records/query matched an unknown batch target",
+                    ),
+                )?;
+                target_matches.push(candidate.proof);
+                if target_matches.len() > 1 {
+                    return Err(UploadError::OriginalAssetResolveNotUnique {
+                        matches: target_matches.len(),
+                    });
+                }
+            }
+            if let Some(marker) = page_result.continuation_marker {
+                continuation_marker = Some(marker);
+            } else {
+                exhausted = true;
+                break;
+            }
+        }
+        let exact_matches = matches.values().map(Vec::len).sum();
+        if !exhausted {
+            return Err(UploadError::OriginalAssetResolveIncomplete {
+                matches: exact_matches,
+            });
+        }
+        let mut proofs = BTreeMap::new();
+        for target in &request.targets {
+            let mut target_matches = matches.remove(&target.asset_id).ok_or(
+                UploadError::InvalidCloudKitOriginalAssetResponse(
+                    "records/query missing a batch target",
+                ),
+            )?;
+            match target_matches.len() {
+                1 => {
+                    proofs.insert(target.asset_id.clone(), target_matches.remove(0));
+                }
+                count => return Err(UploadError::OriginalAssetResolveNotUnique { matches: count }),
+            }
+        }
+        Ok(proofs)
     }
 }
 
@@ -835,14 +940,16 @@ fn cloudkit_original_asset_query_payload(
 }
 
 fn original_asset_query_start_rank(
-    request: &CloudKitOriginalAssetResolveRequest,
+    start_rank: u64,
+    page_size: u64,
     page: u64,
 ) -> Result<u64, UploadError> {
-    let offset = page.checked_mul(request.page_size).ok_or(
-        UploadError::InvalidCloudKitOriginalAssetRequest("pagination start rank overflow"),
-    )?;
-    request
-        .start_rank
+    let offset =
+        page.checked_mul(page_size)
+            .ok_or(UploadError::InvalidCloudKitOriginalAssetRequest(
+                "pagination start rank overflow",
+            ))?;
+    start_rank
         .checked_add(offset)
         .ok_or(UploadError::InvalidCloudKitOriginalAssetRequest(
             "pagination start rank overflow",
@@ -1021,6 +1128,42 @@ struct OriginalAssetCandidate {
     download_url: Url,
 }
 
+struct OriginalAssetBatchCandidate {
+    asset_id: String,
+    raw_size_bytes: u64,
+    matched_raw_sha256: String,
+    proof: OriginalAssetProof,
+    download_url: Url,
+}
+
+struct OriginalAssetTargetIndex {
+    target_indexes_by_size: BTreeMap<u64, Vec<usize>>,
+    target_sizes: std::collections::BTreeSet<u64>,
+}
+
+impl OriginalAssetTargetIndex {
+    fn new(targets: &[CloudKitOriginalAssetResolveTarget]) -> Self {
+        let mut target_indexes_by_size: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        for (index, target) in targets.iter().enumerate() {
+            target_indexes_by_size
+                .entry(target.raw_size_bytes)
+                .or_default()
+                .push(index);
+        }
+        let target_sizes = target_indexes_by_size.keys().copied().collect();
+        Self {
+            target_indexes_by_size,
+            target_sizes,
+        }
+    }
+
+    fn indexes_for_size(&self, size_bytes: u64) -> Option<&[usize]> {
+        self.target_indexes_by_size
+            .get(&size_bytes)
+            .map(Vec::as_slice)
+    }
+}
+
 #[derive(Clone)]
 struct CloudKitAssetRecord {
     record_name: String,
@@ -1094,6 +1237,88 @@ fn parse_original_asset_query_response(
         continuation_marker,
         matches,
     })
+}
+
+fn parse_original_asset_batch_query_response(
+    value: Value,
+    targets: &[CloudKitOriginalAssetResolveTarget],
+    target_index: &OriginalAssetTargetIndex,
+) -> Result<OriginalAssetBatchQueryPage, UploadError> {
+    let records = value.get("records").and_then(Value::as_array).ok_or(
+        UploadError::InvalidCloudKitOriginalAssetResponse(
+            "records/query response must include records",
+        ),
+    )?;
+    let continuation_marker = parse_cloudkit_continuation_marker(&value)?;
+    let mut assets = Vec::new();
+    let mut masters = BTreeMap::new();
+
+    for record in records {
+        if record.get("serverErrorCode").is_some() {
+            return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                "records/query returned a record error",
+            ));
+        }
+        let record_type = required_record_string(record, "recordType")?;
+        match record_type {
+            "CPLAsset" => assets.push(parse_cloudkit_asset_record(record)?),
+            "CPLMaster" => {
+                let record_name = required_record_string(record, "recordName")?.to_string();
+                masters.insert(record_name, record);
+            }
+            _ => {}
+        }
+    }
+
+    let mut matches = Vec::new();
+    for asset in assets {
+        let master = masters.get(&asset.master_record_name).ok_or(
+            UploadError::InvalidCloudKitOriginalAssetResponse(
+                "records/query returned an asset without its master",
+            ),
+        )?;
+        for (raw_size_bytes, download_url) in
+            master_matching_raw_resource_urls(master, &target_index.target_sizes)?
+        {
+            let Some(target_indexes) = target_index.indexes_for_size(raw_size_bytes) else {
+                continue;
+            };
+            for target_index in target_indexes {
+                let target = &targets[*target_index];
+                if !asset_date_matches(
+                    asset.asset_date_unix_seconds,
+                    target.source_captured_unix_seconds,
+                    target.capture_tolerance_seconds,
+                ) {
+                    continue;
+                }
+                matches.push(OriginalAssetBatchCandidate {
+                    asset_id: target.asset_id.clone(),
+                    raw_size_bytes: target.raw_size_bytes,
+                    matched_raw_sha256: target.matched_raw_sha256.clone(),
+                    proof: OriginalAssetProof {
+                        record_name: asset.record_name.clone(),
+                        record_change_tag: asset.record_change_tag.clone(),
+                        record_type: "CPLAsset".to_string(),
+                        filename: target.filename.clone(),
+                        size_bytes: target.raw_size_bytes,
+                        matched_raw_sha256: target.matched_raw_sha256.clone(),
+                    },
+                    download_url: download_url.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(OriginalAssetBatchQueryPage {
+        continuation_marker,
+        matches,
+    })
+}
+
+struct OriginalAssetBatchQueryPage {
+    continuation_marker: Option<String>,
+    matches: Vec<OriginalAssetBatchCandidate>,
 }
 
 fn parse_cloudkit_continuation_marker(value: &Value) -> Result<Option<String>, UploadError> {
@@ -1192,6 +1417,55 @@ fn master_matching_raw_resource_url(
         ));
     }
     Ok(None)
+}
+
+fn master_matching_raw_resource_urls(
+    master: &Value,
+    target_sizes: &std::collections::BTreeSet<u64>,
+) -> Result<Vec<(u64, Url)>, UploadError> {
+    let fields = record_fields(master)?;
+    let mut saw_resource = false;
+    let mut matches = Vec::new();
+    for prefix in [
+        "resOriginal",
+        "resOriginalAlt",
+        "resSidecar",
+        "resOriginalVidCompl",
+    ] {
+        let res_key = format!("{prefix}Res");
+        let Some(resource_field) = fields.get(&res_key) else {
+            continue;
+        };
+        saw_resource = true;
+        let Some(resource) = field_value_object(resource_field) else {
+            return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                "CPLMaster resource field is malformed",
+            ));
+        };
+        let Some(size_bytes) = resource_size_bytes(resource) else {
+            return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                "CPLMaster resource missing size",
+            ));
+        };
+        if !target_sizes.contains(&size_bytes) {
+            continue;
+        }
+        let file_type_key = format!("{prefix}FileType");
+        let Some(file_type) = field_string(fields, &file_type_key) else {
+            return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                "CPLMaster resource missing file type",
+            ));
+        };
+        if resource_type_is_raw(file_type) {
+            matches.push((size_bytes, resource_download_url(resource)?));
+        }
+    }
+    if !saw_resource {
+        return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "CPLMaster missing original resources",
+        ));
+    }
+    Ok(matches)
 }
 
 fn required_record_string<'a>(
@@ -1942,21 +2216,11 @@ fn validate_cloudkit_delete_request(request: &CloudKitDeleteRequest) -> Result<(
 fn validate_original_asset_resolve_request(
     request: &CloudKitOriginalAssetResolveRequest,
 ) -> Result<(), UploadError> {
-    if request.raw_size_bytes == 0 {
-        return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
-            "raw size must be positive",
-        ));
-    }
-    if request.filename.trim().is_empty() {
-        return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
-            "filename is required",
-        ));
-    }
-    if request.matched_raw_sha256.trim().is_empty() {
-        return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
-            "matched RAW SHA-256 is required",
-        ));
-    }
+    validate_original_asset_target_fields(
+        request.raw_size_bytes,
+        &request.filename,
+        &request.matched_raw_sha256,
+    )?;
     if request.page_size == 0 {
         return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
             "page size must be positive",
@@ -1970,10 +2234,79 @@ fn validate_original_asset_resolve_request(
     Ok(())
 }
 
+fn validate_original_asset_batch_resolve_request(
+    request: &CloudKitOriginalAssetBatchResolveRequest,
+) -> Result<(), UploadError> {
+    if request.targets.is_empty() {
+        return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
+            "batch targets are required",
+        ));
+    }
+    if request.page_size == 0 {
+        return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
+            "page size must be positive",
+        ));
+    }
+    if request.max_pages == 0 {
+        return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
+            "max pages must be positive",
+        ));
+    }
+    let mut asset_ids = std::collections::BTreeSet::new();
+    for target in &request.targets {
+        if target.asset_id.trim().is_empty() {
+            return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
+                "asset id is required",
+            ));
+        }
+        if !asset_ids.insert(target.asset_id.as_str()) {
+            return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
+                "duplicate asset id in batch targets",
+            ));
+        }
+        validate_original_asset_target_fields(
+            target.raw_size_bytes,
+            &target.filename,
+            &target.matched_raw_sha256,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_original_asset_target_fields(
+    raw_size_bytes: u64,
+    filename: &str,
+    matched_raw_sha256: &str,
+) -> Result<(), UploadError> {
+    if raw_size_bytes == 0 {
+        return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
+            "raw size must be positive",
+        ));
+    }
+    if filename.trim().is_empty() {
+        return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
+            "filename is required",
+        ));
+    }
+    if matched_raw_sha256.trim().is_empty() {
+        return Err(UploadError::InvalidCloudKitOriginalAssetRequest(
+            "matched RAW SHA-256 is required",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_original_asset_pagination_range(
     request: &CloudKitOriginalAssetResolveRequest,
 ) -> Result<(), UploadError> {
-    original_asset_query_start_rank(request, request.max_pages - 1)?;
+    original_asset_query_start_rank(request.start_rank, request.page_size, request.max_pages - 1)?;
+    Ok(())
+}
+
+fn validate_original_asset_batch_pagination_range(
+    request: &CloudKitOriginalAssetBatchResolveRequest,
+) -> Result<(), UploadError> {
+    original_asset_query_start_rank(request.start_rank, request.page_size, request.max_pages - 1)?;
     Ok(())
 }
 
@@ -2255,6 +2588,10 @@ pub enum UploadError {
         "CloudKit original asset resolver reached the scan limit with {matches} matching candidates; exact uniqueness is unproven"
     )]
     OriginalAssetResolveIncomplete { matches: usize },
+    #[error(
+        "CloudKit original asset resolver found a candidate for {asset_id} whose bytes do not match the NAS proof"
+    )]
+    OriginalAssetResolveHashMismatch { asset_id: String },
     #[error(
         "CloudKit original asset download size mismatch: expected {expected} bytes, downloaded {actual} bytes"
     )]

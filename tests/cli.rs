@@ -2289,6 +2289,28 @@ fn workflow_original_asset_resolve_help_exposes_cloudkit_scan_controls() {
 }
 
 #[test]
+fn workflow_original_assets_resolve_batch_help_exposes_cloudkit_scan_controls() {
+    let output = binary()
+        .args(["workflow", "original-assets-resolve-batch", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(output).expect("help should be utf8");
+
+    assert!(help.contains("--manifest"));
+    assert!(help.contains("--asset-id"));
+    assert!(help.contains("--session"));
+    assert!(help.contains("--start-rank"));
+    assert!(help.contains("--page-size"));
+    assert!(help.contains("--max-pages"));
+    assert!(help.contains("--capture-tolerance-seconds"));
+    assert!(!help.contains("--record-name"));
+    assert!(!help.contains("--record-change-tag"));
+}
+
+#[test]
 fn workflow_delete_execute_rejects_missing_session_without_mutating_manifest() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let (manifest_path, _, _) = manifest_with_real_delete_approval(tempdir.path());

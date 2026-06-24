@@ -12,8 +12,8 @@ use icloudpd_optimizer::workflow::{
     WorkflowError, approve_delete, build_delete_plan, discover_raw_asset, mark_delete_eligible,
     prove_and_record_nas, record_conversion_performance, record_conversion_result,
     record_delete_execution, record_heic_verification, record_nas_proof,
-    record_original_asset_proof, record_source_age_proof, record_stage_failure,
-    record_upload_proof, upload_ready_heic_proof,
+    record_original_asset_batch_proofs, record_original_asset_proof, record_source_age_proof,
+    record_stage_failure, record_upload_proof, upload_ready_heic_proof,
 };
 use serde_json::json;
 
@@ -200,12 +200,205 @@ fn real_upload_verified_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {
     (tempdir, manifest, canonical_raw_path)
 }
 
+fn two_asset_upload_verified_manifest() -> Manifest {
+    let mut manifest = Manifest::new();
+    for (asset_id, filename, raw_bytes, raw_sha256, heic_path, heic_sha256, heic_size) in [
+        (
+            "asset-1",
+            "IMG_0001.dng",
+            b"raw-bytes".as_slice(),
+            "raw-sha256-1",
+            "/staging/IMG_0001.heic",
+            "heic-sha256-1",
+            10,
+        ),
+        (
+            "asset-2",
+            "IMG_0002.dng",
+            b"other-bytes".as_slice(),
+            "raw-sha256-2",
+            "/staging/IMG_0002.heic",
+            "heic-sha256-2",
+            11,
+        ),
+    ] {
+        let raw_path = PathBuf::from(format!("/nas/photos/{filename}"));
+        discover_raw_asset(&mut manifest, asset_id, raw_path.clone())
+            .expect("asset should be discovered");
+        record_nas_proof(
+            &mut manifest,
+            asset_id,
+            NasRawProof {
+                canonical_path: raw_path.clone(),
+                relative_path: PathBuf::from(format!("photos/{filename}")),
+                size_bytes: raw_bytes.len() as u64,
+                modified_unix_seconds: 1_700_000_000,
+                age_seconds: 40 * DAY,
+                sha256: raw_sha256.to_string(),
+            },
+        )
+        .expect("nas proof should record");
+        record_conversion_result(
+            &mut manifest,
+            asset_id,
+            ConversionResultProof {
+                heic_path: PathBuf::from(heic_path),
+                heic_sha256: heic_sha256.to_string(),
+                size_bytes: heic_size,
+            },
+        )
+        .expect("conversion should record");
+        record_conversion_performance(&mut manifest, asset_id, conversion_performance_input())
+            .expect("conversion performance should record");
+        record_heic_verification(
+            &mut manifest,
+            asset_id,
+            HeicVerificationProof {
+                heic_path: PathBuf::from(heic_path),
+                heic_sha256: heic_sha256.to_string(),
+                size_bytes: heic_size,
+                heif_info_ok: true,
+                metadata_copied: true,
+                visual_content_ok: true,
+                visual_match_ok: true,
+            },
+        )
+        .expect("heic verification should record");
+        record_source_age_proof(&mut manifest, asset_id, old_source_age_proof())
+            .expect("source age proof should record");
+        record_upload_proof(
+            &mut manifest,
+            asset_id,
+            UploadProof {
+                uploaded_heic_asset_id: format!("icloud-{asset_id}"),
+                uploaded_heic_sha256: heic_sha256.to_string(),
+                uploaded_heic_path: Some(PathBuf::from(heic_path)),
+            },
+        )
+        .expect("upload proof should record");
+    }
+    manifest
+}
+
 fn real_delete_approved_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {
     let (tempdir, mut manifest, canonical_raw_path) = real_upload_verified_manifest();
     mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
     approve_delete(&mut manifest, "asset-1", "operator").expect("approval should record");
 
     (tempdir, manifest, canonical_raw_path)
+}
+
+#[test]
+fn record_original_asset_batch_proofs_rejects_missing_result_without_partial_mutation() {
+    let mut manifest = two_asset_upload_verified_manifest();
+    let before = manifest.clone();
+    let mut proofs = std::collections::BTreeMap::new();
+    proofs.insert(
+        "asset-1".to_string(),
+        OriginalAssetProof {
+            record_name: "CPLAsset-original-123".to_string(),
+            record_change_tag: "tag-1".to_string(),
+            record_type: "CPLAsset".to_string(),
+            filename: "IMG_0001.dng".to_string(),
+            size_bytes: 9,
+            matched_raw_sha256: "raw-sha256-1".to_string(),
+        },
+    );
+
+    let error = record_original_asset_batch_proofs(
+        &mut manifest,
+        &["asset-1".to_string(), "asset-2".to_string()],
+        proofs,
+    )
+    .expect_err("missing batch result must fail atomically");
+
+    assert!(matches!(
+        error,
+        WorkflowError::MissingBatchOriginalAssetProof { .. }
+    ));
+    assert_eq!(manifest, before);
+}
+
+#[test]
+fn record_original_asset_batch_proofs_keeps_records_upload_verified_without_delete_state() {
+    let mut manifest = two_asset_upload_verified_manifest();
+    let mut proofs = std::collections::BTreeMap::new();
+    proofs.insert(
+        "asset-1".to_string(),
+        OriginalAssetProof {
+            record_name: "CPLAsset-original-123".to_string(),
+            record_change_tag: "tag-1".to_string(),
+            record_type: "CPLAsset".to_string(),
+            filename: "IMG_0001.dng".to_string(),
+            size_bytes: 9,
+            matched_raw_sha256: "raw-sha256-1".to_string(),
+        },
+    );
+    proofs.insert(
+        "asset-2".to_string(),
+        OriginalAssetProof {
+            record_name: "CPLAsset-original-456".to_string(),
+            record_change_tag: "tag-2".to_string(),
+            record_type: "CPLAsset".to_string(),
+            filename: "IMG_0002.dng".to_string(),
+            size_bytes: 11,
+            matched_raw_sha256: "raw-sha256-2".to_string(),
+        },
+    );
+
+    record_original_asset_batch_proofs(
+        &mut manifest,
+        &["asset-1".to_string(), "asset-2".to_string()],
+        proofs,
+    )
+    .expect("complete batch proofs should record");
+
+    for asset_id in ["asset-1", "asset-2"] {
+        let record = manifest.get(asset_id).expect("asset should exist");
+        assert_eq!(record.state, State::UploadVerified);
+        assert!(record.proofs.contains_key("original_asset"));
+        assert!(!record.proofs.contains_key("delete_eligibility"));
+        assert!(!record.proofs.contains_key("delete_approval"));
+        assert!(!record.proofs.contains_key("delete"));
+    }
+}
+
+#[test]
+fn record_original_asset_batch_proofs_rejects_extra_result_without_mutating() {
+    let mut manifest = two_asset_upload_verified_manifest();
+    let before = manifest.clone();
+    let mut proofs = std::collections::BTreeMap::new();
+    proofs.insert(
+        "asset-1".to_string(),
+        OriginalAssetProof {
+            record_name: "CPLAsset-original-123".to_string(),
+            record_change_tag: "tag-1".to_string(),
+            record_type: "CPLAsset".to_string(),
+            filename: "IMG_0001.dng".to_string(),
+            size_bytes: 9,
+            matched_raw_sha256: "raw-sha256-1".to_string(),
+        },
+    );
+    proofs.insert(
+        "asset-3".to_string(),
+        OriginalAssetProof {
+            record_name: "CPLAsset-original-789".to_string(),
+            record_change_tag: "tag-3".to_string(),
+            record_type: "CPLAsset".to_string(),
+            filename: "IMG_0003.dng".to_string(),
+            size_bytes: 12,
+            matched_raw_sha256: "raw-sha256-3".to_string(),
+        },
+    );
+
+    let error = record_original_asset_batch_proofs(&mut manifest, &["asset-1".to_string()], proofs)
+        .expect_err("unexpected batch result must fail atomically");
+
+    assert!(matches!(
+        error,
+        WorkflowError::UnexpectedBatchOriginalAssetProof { .. }
+    ));
+    assert_eq!(manifest, before);
 }
 
 fn forged_delete_approved_manifest(

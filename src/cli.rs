@@ -15,10 +15,11 @@ use crate::conversion_execution::{
     ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversion,
     is_executable_file,
 };
-use crate::manifest::{AssetRecord, Manifest, ManifestError};
+use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
 use crate::proof::NasRawProof;
 use crate::upload::{
-    CloudKitDeleteClient, CloudKitOriginalAssetResolveRequest, IcloudUploadRequest,
+    CloudKitDeleteClient, CloudKitOriginalAssetBatchResolveRequest,
+    CloudKitOriginalAssetResolveRequest, CloudKitOriginalAssetResolveTarget, IcloudUploadRequest,
     ReqwestCloudKitDeleteTransport, UploadError, build_upload_proof, load_cloudkit_delete_session,
     run_icloud_upload, verify_local_heic,
 };
@@ -27,8 +28,8 @@ use crate::workflow::{
     SourceAgeProof, UploadProof, WorkflowError, approve_delete, approved_original_delete_request,
     build_delete_plan, mark_delete_eligible, prove_and_record_nas, record_conversion_performance,
     record_conversion_result, record_delete_execution, record_heic_verification,
-    record_original_asset_proof, record_source_age_proof, record_stage_failure,
-    record_upload_proof, upload_ready_heic_proof,
+    record_original_asset_batch_proofs, record_original_asset_proof, record_source_age_proof,
+    record_stage_failure, record_upload_proof, upload_ready_heic_proof,
 };
 
 const DAY_SECONDS: u64 = 24 * 60 * 60;
@@ -99,6 +100,11 @@ enum WorkflowCommand {
         about = "Resolve the original RAW CPLAsset identity from CloudKit records/query"
     )]
     OriginalAssetResolve(WorkflowOriginalAssetResolveArgs),
+    #[command(
+        name = "original-assets-resolve-batch",
+        about = "Resolve original RAW CPLAsset identities for multiple manifest records in one CloudKit scan"
+    )]
+    OriginalAssetsResolveBatch(WorkflowOriginalAssetsResolveBatchArgs),
     MarkDeleteEligible(WorkflowAssetArgs),
     ApproveDelete(WorkflowApproveDeleteArgs),
     Failed(WorkflowFailedArgs),
@@ -270,6 +276,24 @@ struct WorkflowOriginalAssetResolveArgs {
 }
 
 #[derive(Debug, Args)]
+struct WorkflowOriginalAssetsResolveBatchArgs {
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+    #[arg(long)]
+    asset_id: Vec<String>,
+    #[arg(long, value_name = "PATH", help = "CloudKit delete session JSON")]
+    session: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    start_rank: u64,
+    #[arg(long, default_value_t = 200)]
+    page_size: u64,
+    #[arg(long, default_value_t = 100)]
+    max_pages: u64,
+    #[arg(long, default_value_t = 2)]
+    capture_tolerance_seconds: u64,
+}
+
+#[derive(Debug, Args)]
 struct WorkflowAssetArgs {
     #[arg(long, value_name = "PATH")]
     manifest: PathBuf,
@@ -404,6 +428,9 @@ fn run_workflow<W: Write>(args: WorkflowArgs, writer: &mut W) -> Result<(), CliE
         WorkflowCommand::UploadVerified(args) => workflow_upload_verified(args),
         WorkflowCommand::OriginalAssetVerified(args) => workflow_original_asset_verified(args),
         WorkflowCommand::OriginalAssetResolve(args) => workflow_original_asset_resolve(args),
+        WorkflowCommand::OriginalAssetsResolveBatch(args) => {
+            workflow_original_assets_resolve_batch(args)
+        }
         WorkflowCommand::MarkDeleteEligible(args) => workflow_mark_delete_eligible(args),
         WorkflowCommand::ApproveDelete(args) => workflow_approve_delete(args),
         WorkflowCommand::Failed(args) => workflow_failed(args),
@@ -578,6 +605,42 @@ fn workflow_original_asset_resolve(args: WorkflowOriginalAssetResolveArgs) -> Re
     save_manifest(&manifest, &args.manifest)
 }
 
+fn workflow_original_assets_resolve_batch(
+    args: WorkflowOriginalAssetsResolveBatchArgs,
+) -> Result<(), CliError> {
+    let mut manifest = load_manifest_for_write(&args.manifest)?;
+    let asset_ids = original_asset_batch_target_asset_ids(&manifest, &args.asset_id);
+    let targets: Vec<CloudKitOriginalAssetResolveTarget> = asset_ids
+        .iter()
+        .map(|asset_id| {
+            let (nas, source_age, filename) =
+                original_asset_resolve_manifest_inputs(&manifest, asset_id)?;
+            Ok(CloudKitOriginalAssetResolveTarget {
+                asset_id: asset_id.clone(),
+                raw_size_bytes: nas.size_bytes,
+                source_captured_unix_seconds: source_age.source_captured_unix_seconds,
+                capture_tolerance_seconds: args.capture_tolerance_seconds,
+                filename,
+                matched_raw_sha256: nas.sha256,
+            })
+        })
+        .collect::<Result<_, CliError>>()?;
+    let session = load_cloudkit_delete_session(&args.session)?;
+    let transport = ReqwestCloudKitDeleteTransport::new()?;
+    let mut client = CloudKitDeleteClient::new(transport);
+    let proofs = client.resolve_original_assets_batch(
+        &session,
+        &CloudKitOriginalAssetBatchResolveRequest {
+            targets,
+            start_rank: args.start_rank,
+            page_size: args.page_size,
+            max_pages: args.max_pages,
+        },
+    )?;
+    record_original_asset_batch_proofs(&mut manifest, &asset_ids, proofs)?;
+    save_manifest(&manifest, &args.manifest)
+}
+
 fn workflow_mark_delete_eligible(args: WorkflowAssetArgs) -> Result<(), CliError> {
     let mut manifest = load_manifest_for_write(&args.manifest)?;
     mark_delete_eligible(&mut manifest, &args.asset_id)?;
@@ -644,6 +707,20 @@ fn original_asset_resolve_manifest_inputs(
         .ok_or(WorkflowError::EmptyProofField { field: "filename" })?
         .to_string();
     Ok((nas, source_age, filename))
+}
+
+fn original_asset_batch_target_asset_ids(manifest: &Manifest, requested: &[String]) -> Vec<String> {
+    if !requested.is_empty() {
+        return requested.to_vec();
+    }
+    manifest
+        .records()
+        .values()
+        .filter(|record| {
+            record.state == State::UploadVerified && !record.proofs.contains_key("original_asset")
+        })
+        .map(|record| record.asset_id.clone())
+        .collect()
 }
 
 fn decode_workflow_proof<T: serde::de::DeserializeOwned>(

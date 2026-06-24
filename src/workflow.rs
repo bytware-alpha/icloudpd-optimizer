@@ -365,6 +365,42 @@ pub fn record_original_asset_proof<'a>(
     insert_workflow_proof(manifest, asset_id, ORIGINAL_ASSET_PROOF, &proof)
 }
 
+pub fn record_original_asset_batch_proofs(
+    manifest: &mut Manifest,
+    asset_ids: &[String],
+    proofs: BTreeMap<String, OriginalAssetProof>,
+) -> Result<(), WorkflowError> {
+    let requested: std::collections::BTreeSet<&str> =
+        asset_ids.iter().map(String::as_str).collect();
+    for asset_id in asset_ids {
+        if !proofs.contains_key(asset_id) {
+            return Err(WorkflowError::MissingBatchOriginalAssetProof {
+                asset_id: asset_id.clone(),
+            });
+        }
+    }
+    for asset_id in proofs.keys() {
+        if !requested.contains(asset_id.as_str()) {
+            return Err(WorkflowError::UnexpectedBatchOriginalAssetProof {
+                asset_id: asset_id.clone(),
+            });
+        }
+    }
+
+    let mut staged = manifest.clone();
+    for asset_id in asset_ids {
+        let proof =
+            proofs
+                .get(asset_id)
+                .ok_or_else(|| WorkflowError::MissingBatchOriginalAssetProof {
+                    asset_id: asset_id.clone(),
+                })?;
+        record_original_asset_proof(&mut staged, asset_id, proof.clone())?;
+    }
+    *manifest = staged;
+    Ok(())
+}
+
 pub fn upload_ready_heic_proof(
     manifest: &Manifest,
     asset_id: &str,
@@ -1289,6 +1325,10 @@ pub enum WorkflowError {
     },
     #[error("required proof {proof_key} is missing for {asset_id}")]
     MissingProof { asset_id: String, proof_key: String },
+    #[error("batch original asset proof is missing for {asset_id}")]
+    MissingBatchOriginalAssetProof { asset_id: String },
+    #[error("batch original asset proof was not requested for {asset_id}")]
+    UnexpectedBatchOriginalAssetProof { asset_id: String },
     #[error("stored proof {proof_key} for {asset_id} could not be decoded: {source}")]
     ProofDecode {
         asset_id: String,
