@@ -31,6 +31,17 @@ fn write_session(path: &Path, body: &str) {
     fs::write(path, body).expect("session should be written");
 }
 
+fn valid_cloudkit_query_params() -> Vec<Value> {
+    vec![
+        json!({"name": "clientBuildNumber", "value": "2522Project44"}),
+        json!({"name": "clientMasteringNumber", "value": "2522B2"}),
+        json!({"name": "clientId", "value": "4f0b58d4-ff9d-4dc5-8f0b-9c4efc4fdb27"}),
+        json!({"name": "dsid", "value": "123456789"}),
+        json!({"name": "remapEnums", "value": "True"}),
+        json!({"name": "getCurrentSyncToken", "value": "True"}),
+    ]
+}
+
 fn valid_session_json() -> String {
     serde_json::json!({
         "dsid": "123456789",
@@ -47,7 +58,7 @@ fn valid_delete_session_json() -> String {
     serde_json::json!({
         "dsid": "123456789",
         "ckdatabasews_url": "https://p140-ckdatabasews.icloud.com:443",
-        "cloudkit_token": "cloudkit-token",
+        "cloudkit_query_params": valid_cloudkit_query_params(),
         "cookies": [
             {"name": "X-APPLE-WEBAUTH-TOKEN", "value": "web-auth-token"},
             {"name": "session", "value": "abc123"}
@@ -66,7 +77,9 @@ fn load_cloudkit_delete_session_accepts_current_ckdatabasews_origin_url() {
         session.ckdatabasews_url.as_str(),
         "https://p140-ckdatabasews.icloud.com/"
     );
-    assert_eq!(session.cloudkit_token, "cloudkit-token");
+    assert_eq!(session.cloudkit_query_params.len(), 6);
+    assert_eq!(session.cloudkit_query_params[0].name, "clientBuildNumber");
+    assert_eq!(session.cloudkit_query_params[0].value, "2522Project44");
     assert_eq!(session.cookies.len(), 2);
 }
 
@@ -74,7 +87,7 @@ fn load_cloudkit_delete_session_accepts_current_ckdatabasews_origin_url() {
 fn load_cloudkit_delete_session_accepts_webservices_ckdatabasews_url() {
     let json = serde_json::json!({
         "dsid": "123456789",
-        "cloudkit_token": "cloudkit-token",
+        "cloudkit_query_params": valid_cloudkit_query_params(),
         "webservices": {
             "ckdatabasews": {"url": "https://p140-ckdatabasews.icloud.com:443"}
         },
@@ -96,7 +109,7 @@ fn load_cloudkit_delete_session_fails_closed_on_missing_auth_material_or_bad_end
     let cases = [
         serde_json::json!({
             "ckdatabasews_url": "https://p140-ckdatabasews.icloud.com:443",
-            "cloudkit_token": "cloudkit-token",
+            "cloudkit_query_params": valid_cloudkit_query_params(),
             "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "web-auth-token"}]
         }),
         serde_json::json!({
@@ -107,18 +120,18 @@ fn load_cloudkit_delete_session_fails_closed_on_missing_auth_material_or_bad_end
         serde_json::json!({
             "dsid": "123456789",
             "ckdatabasews_url": "https://p140-ckdatabasews.icloud.com:443",
-            "cloudkit_token": "cloudkit-token"
+            "cloudkit_query_params": valid_cloudkit_query_params()
         }),
         serde_json::json!({
             "dsid": "123456789",
             "ckdatabasews_url": "https://evil.example",
-            "cloudkit_token": "cloudkit-token",
+            "cloudkit_query_params": valid_cloudkit_query_params(),
             "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "web-auth-token"}]
         }),
         serde_json::json!({
             "dsid": "123456789",
             "ckdatabasews_url": "https://p140-photosupload.icloud.com:443",
-            "cloudkit_token": "cloudkit-token",
+            "cloudkit_query_params": valid_cloudkit_query_params(),
             "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "web-auth-token"}]
         }),
     ];
@@ -132,7 +145,60 @@ fn load_cloudkit_delete_session_fails_closed_on_missing_auth_material_or_bad_end
             "{body} returned {error:?}"
         );
         assert!(!error.to_string().contains("web-auth-token"));
-        assert!(!error.to_string().contains("cloudkit-token"));
+        assert!(!error.to_string().contains("2522Project44"));
+    }
+}
+
+#[test]
+fn load_cloudkit_delete_session_rejects_incomplete_duplicate_or_smuggled_query_params() {
+    let mut missing_required = valid_cloudkit_query_params();
+    missing_required.retain(|param| param["name"] != "clientMasteringNumber");
+
+    let mut duplicate = valid_cloudkit_query_params();
+    duplicate.push(json!({"name": "clientBuildNumber", "value": "2522Project45"}));
+
+    let mut unknown = valid_cloudkit_query_params();
+    unknown.push(json!({"name": "ckWebAuthToken", "value": "legacy-token"}));
+
+    let mut smuggled_name = valid_cloudkit_query_params();
+    smuggled_name[0] =
+        json!({"name": "clientBuildNumber&ckWebAuthToken", "value": "2522Project44"});
+
+    let mut smuggled_value = valid_cloudkit_query_params();
+    smuggled_value[0] =
+        json!({"name": "clientBuildNumber", "value": "2522Project44&ckWebAuthToken=legacy-token"});
+
+    let mut control_value = valid_cloudkit_query_params();
+    control_value[0] =
+        json!({"name": "clientBuildNumber", "value": "2522Project44\nInjected: yes"});
+
+    let mut mismatched_dsid = valid_cloudkit_query_params();
+    mismatched_dsid[3] = json!({"name": "dsid", "value": "987654321"});
+
+    let cases = [
+        missing_required,
+        duplicate,
+        unknown,
+        smuggled_name,
+        smuggled_value,
+        control_value,
+        mismatched_dsid,
+    ];
+
+    for cloudkit_query_params in cases {
+        let json = serde_json::json!({
+            "dsid": "123456789",
+            "ckdatabasews_url": "https://p140-ckdatabasews.icloud.com:443",
+            "cloudkit_query_params": cloudkit_query_params,
+            "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "web-auth-token"}]
+        })
+        .to_string();
+
+        let error = CloudKitDeleteSession::from_json(&json)
+            .expect_err("invalid CloudKit params should fail closed");
+
+        assert!(matches!(error, UploadError::InvalidSession(_)));
+        assert!(!error.to_string().contains("legacy-token"));
     }
 }
 
