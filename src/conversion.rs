@@ -124,6 +124,8 @@ fn macos_conversion_plan(
 ) -> Result<ConversionPlan, ConversionError> {
     let embedded_preview_path = intermediate_preview_path(output_path);
     let embedded_preview_arg = embedded_preview_path.as_os_str().to_os_string();
+    let oriented_preview_path = oriented_preview_path(output_path);
+    let oriented_preview_arg = oriented_preview_path.as_os_str().to_os_string();
     let extract_preview = CommandPlan::new(
         "exiftool",
         vec![
@@ -133,14 +135,15 @@ fn macos_conversion_plan(
         ],
     )
     .with_stdout_file(embedded_preview_path);
-    let normalize_preview_orientation = CommandPlan::new(
-        "exiftool",
+    let orient_preview_pixels = CommandPlan::new(
+        "magick",
         vec![
-            OsString::from("-overwrite_original"),
-            OsString::from("-Orientation#=1"),
             embedded_preview_arg.clone(),
+            OsString::from("-auto-orient"),
+            OsString::from("jpg:-"),
         ],
-    );
+    )
+    .with_stdout_file(oriented_preview_path);
     let encode = CommandPlan::new(
         "sips",
         vec![
@@ -150,7 +153,7 @@ fn macos_conversion_plan(
             OsString::from("-s"),
             OsString::from("formatOptions"),
             OsString::from(heic_quality.to_string()),
-            embedded_preview_arg.clone(),
+            oriented_preview_arg.clone(),
             OsString::from("--out"),
             output_arg.clone(),
         ],
@@ -158,7 +161,7 @@ fn macos_conversion_plan(
 
     Ok(ConversionPlan {
         convert: extract_preview.clone(),
-        conversion_commands: vec![extract_preview, normalize_preview_orientation, encode],
+        conversion_commands: vec![extract_preview, orient_preview_pixels, encode],
         metadata: CommandPlan::new(
             "exiftool",
             vec![
@@ -180,7 +183,7 @@ fn macos_conversion_plan(
                 OsString::from("-s"),
                 OsString::from("format"),
                 OsString::from("png"),
-                embedded_preview_arg,
+                oriented_preview_arg,
                 OsString::from("--out"),
                 raw_preview_arg.clone(),
             ],
@@ -243,6 +246,8 @@ fn linux_conversion_plan(
 ) -> Result<ConversionPlan, ConversionError> {
     let embedded_preview_path = intermediate_preview_path(output_path);
     let embedded_preview_arg = embedded_preview_path.as_os_str().to_os_string();
+    let oriented_preview_path = oriented_preview_path(output_path);
+    let oriented_preview_arg = oriented_preview_path.as_os_str().to_os_string();
     let extract_preview = CommandPlan::new(
         "exiftool",
         vec![
@@ -252,12 +257,21 @@ fn linux_conversion_plan(
         ],
     )
     .with_stdout_file(embedded_preview_path);
+    let orient_preview_pixels = CommandPlan::new(
+        "magick",
+        vec![
+            embedded_preview_arg.clone(),
+            OsString::from("-auto-orient"),
+            OsString::from("jpg:-"),
+        ],
+    )
+    .with_stdout_file(oriented_preview_path);
     let encode = CommandPlan::new(
         "heif-enc",
         vec![
             OsString::from("-q"),
             OsString::from(heic_quality.to_string()),
-            embedded_preview_arg.clone(),
+            oriented_preview_arg.clone(),
             OsString::from("-o"),
             output_arg.clone(),
         ],
@@ -265,13 +279,15 @@ fn linux_conversion_plan(
 
     Ok(ConversionPlan {
         convert: extract_preview.clone(),
-        conversion_commands: vec![extract_preview, encode],
+        conversion_commands: vec![extract_preview, orient_preview_pixels, encode],
         metadata: CommandPlan::new(
             "exiftool",
             vec![
                 OsString::from("-TagsFromFile"),
                 raw_arg.clone(),
                 OsString::from("-all:all"),
+                OsString::from("-Orientation#=1"),
+                OsString::from("-QuickTime:Rotation#=0"),
                 OsString::from("-overwrite_original"),
                 output_arg.clone(),
             ],
@@ -280,7 +296,7 @@ fn linux_conversion_plan(
         render_raw_preview: CommandPlan::new(
             "magick",
             vec![
-                embedded_preview_arg,
+                oriented_preview_arg,
                 OsString::from("-resize"),
                 OsString::from("512x512"),
                 raw_preview_arg.clone(),
@@ -333,6 +349,12 @@ fn linux_conversion_plan(
 fn intermediate_preview_path(output_path: &Path) -> PathBuf {
     let mut preview_path = output_path.to_path_buf();
     preview_path.set_extension("embedded-preview.jpg");
+    preview_path
+}
+
+fn oriented_preview_path(output_path: &Path) -> PathBuf {
+    let mut preview_path = output_path.to_path_buf();
+    preview_path.set_extension("oriented-preview.jpg");
     preview_path
 }
 

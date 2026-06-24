@@ -122,6 +122,16 @@ exit 0
 "#,
     );
     write_executable_with_body(
+        &directory.join("magick"),
+        r#"#!/bin/sh
+if [ "$2" = "-auto-orient" ]; then
+  printf 'oriented-preview-jpeg'
+  exit 0
+fi
+exit 0
+"#,
+    );
+    write_executable_with_body(
         &directory.join("heif-enc"),
         r#"#!/bin/sh
 if [ "${FAIL_HEIF_ENC:-}" = "1" ]; then
@@ -1665,7 +1675,7 @@ fn workflow_convert_batch_runs_multiple_assets_with_bounded_parallelism() {
         );
         assert_eq!(
             record.proofs["conversion_performance"]["conversion_tool"],
-            "exiftool+exiftool+sips"
+            "exiftool+magick+sips"
         );
         assert_eq!(
             record.proofs["conversion_performance"]["conversion_tool_version"],
@@ -1831,7 +1841,7 @@ fn workflow_convert_runs_tools_and_records_conversion_and_performance_atomically
     assert_eq!(record.proofs["conversion"]["size_bytes"], heic.len() as u64);
     assert_eq!(
         record.proofs["conversion_performance"]["conversion_tool"],
-        "exiftool+exiftool+sips"
+        "exiftool+magick+sips"
     );
     assert_eq!(
         record.proofs["conversion_performance"]["conversion_tool_version"],

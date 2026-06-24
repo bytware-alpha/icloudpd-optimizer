@@ -771,7 +771,7 @@ mod tests {
         );
         assert_eq!(
             record.proofs["conversion_performance"]["conversion_tool"],
-            "exiftool+heif-enc"
+            "exiftool+magick+heif-enc"
         );
         assert_eq!(
             record.proofs["conversion_performance"]["conversion_tool_version"],
@@ -788,8 +788,11 @@ mod tests {
         let command_timings = record.proofs["conversion_performance"]["conversion_command_timings"]
             .as_array()
             .expect("command timings should be present");
-        assert_eq!(command_timings.len(), 2);
-        for (timing, program) in command_timings.iter().zip(["exiftool", "heif-enc"]) {
+        assert_eq!(command_timings.len(), 3);
+        for (timing, program) in command_timings
+            .iter()
+            .zip(["exiftool", "magick", "heif-enc"])
+        {
             assert_eq!(timing["program"], program);
             assert!(
                 timing["wall_time_millis"]
@@ -800,7 +803,7 @@ mod tests {
         }
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
-            "exiftool-preview\nheif-enc\nexiftool-metadata\n"
+            "exiftool-preview\nmagick-auto-orient\nheif-enc\nexiftool-metadata\n"
         );
     }
 
@@ -852,7 +855,7 @@ mod tests {
             );
             assert_eq!(
                 record.proofs["conversion_performance"]["conversion_tool"],
-                "exiftool+heif-enc"
+                "exiftool+magick+heif-enc"
             );
             assert_eq!(
                 record.proofs["conversion_performance"]["conversion_tool_version"],
@@ -989,7 +992,7 @@ exit 44
         assert!(!record.proofs.contains_key("conversion_performance"));
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
-            "exiftool-preview\nheif-enc\n"
+            "exiftool-preview\nmagick-auto-orient\nheif-enc\n"
         );
     }
 
@@ -1196,6 +1199,109 @@ exit 0
     }
 
     #[cfg(unix)]
+    #[test]
+    fn linux_refuses_preexisting_oriented_preview_without_mutating_it_or_recording_proofs() {
+        let tool_dir = fake_linux_conversion_tools();
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        let oriented_path = oriented_preview_path(&output_path);
+        fs::write(&oriented_path, b"existing-oriented-preview")
+            .expect("oriented preview should be written");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest = nas_verified_manifest(&raw_path);
+
+        let error = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("preexisting oriented preview should fail closed");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::OutputAlreadyExists { path } if path == oriented_path
+        ));
+        assert_eq!(
+            fs::read(&oriented_path).expect("oriented preview should remain readable"),
+            b"existing-oriented-preview"
+        );
+        assert!(!output_path.exists());
+        assert_eq!(
+            fs::read_to_string(log_path).expect("command log should be readable"),
+            "exiftool-preview\n"
+        );
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::NasVerified);
+        assert!(!record.proofs.contains_key("conversion"));
+        assert!(!record.proofs.contains_key("conversion_performance"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_refuses_symlink_oriented_preview_without_mutating_target_or_recording_proofs() {
+        let tool_dir = fake_linux_conversion_tools();
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        let oriented_path = oriented_preview_path(&output_path);
+        let symlink_target = tempdir.path().join("protected-oriented-preview-target.jpg");
+        fs::write(&symlink_target, b"protected-oriented-preview")
+            .expect("symlink target should be written");
+        std::os::unix::fs::symlink(&symlink_target, &oriented_path)
+            .expect("oriented preview symlink should be created");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest = nas_verified_manifest(&raw_path);
+
+        let error = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("symlink oriented preview should fail closed");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::OutputAlreadyExists { path } if path == oriented_path
+        ));
+        assert_eq!(
+            fs::read(&symlink_target).expect("symlink target should remain readable"),
+            b"protected-oriented-preview"
+        );
+        assert!(
+            fs::symlink_metadata(&oriented_path)
+                .expect("oriented preview symlink should remain")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!output_path.exists());
+        assert_eq!(
+            fs::read_to_string(log_path).expect("command log should be readable"),
+            "exiftool-preview\n"
+        );
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::NasVerified);
+        assert!(!record.proofs.contains_key("conversion"));
+        assert!(!record.proofs.contains_key("conversion_performance"));
+    }
+
+    #[cfg(unix)]
     fn fake_linux_conversion_tools() -> tempfile::TempDir {
         fake_linux_conversion_tools_with_preview_and_heif_enc(
             DEFAULT_PREVIEW_EXTRACTION_SCRIPT,
@@ -1229,7 +1335,7 @@ if [ -z "$out" ] || [ -z "$input" ]; then
 fi
 preview_bytes=""
 read -r preview_bytes < "$input"
-if [ "$preview_bytes" != "embedded-preview-jpeg" ]; then
+if [ "$preview_bytes" != "oriented-preview-jpeg" ]; then
   exit 46
 fi
 printf 'heic-bytes-from-preview' > "$out"
@@ -1241,6 +1347,12 @@ printf 'heic-bytes-from-preview' > "$out"
         preview_path
     }
 
+    fn oriented_preview_path(output_path: &Path) -> PathBuf {
+        let mut preview_path = output_path.to_path_buf();
+        preview_path.set_extension("oriented-preview.jpg");
+        preview_path
+    }
+
     #[cfg(unix)]
     fn fake_linux_conversion_tools_with_preview_and_heif_enc(
         preview_extraction_body: &str,
@@ -1248,6 +1360,17 @@ printf 'heic-bytes-from-preview' > "$out"
     ) -> tempfile::TempDir {
         let tempdir = tempfile::tempdir().expect("tool tempdir should be created");
         write_executable_script(&tempdir.path().join("heif-enc"), heif_enc_body);
+        write_executable_script(
+            &tempdir.path().join("magick"),
+            r#"#!/bin/sh
+if [ "$2" = "-auto-orient" ]; then
+  printf 'magick-auto-orient\n' >> "$EXECUTION_LOG"
+  printf 'oriented-preview-jpeg'
+  exit 0
+fi
+exit 47
+"#,
+        );
         let exiftool_body = format!(
             r#"#!/bin/sh
 if [ "$1" = "-b" ] && [ "$2" = "-PreviewImage" ]; then

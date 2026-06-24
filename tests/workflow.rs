@@ -1735,6 +1735,27 @@ fn upload_ready_revalidates_visual_proofs() {
 }
 
 #[test]
+fn upload_ready_rejects_legacy_raw_sensor_render_conversion_tool() {
+    let mut manifest = conversion_verified_manifest();
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    proof_mut(&mut record, "conversion_performance")["conversion_tool"] =
+        json!("dcraw_emu+magick+heif-enc");
+    manifest.upsert(record);
+
+    let error = upload_ready_heic_proof(&manifest, "asset-1")
+        .expect_err("legacy raw sensor render must not be upload-ready");
+
+    assert!(matches!(
+        error,
+        WorkflowError::InvalidProofField {
+            proof_key: "conversion_performance",
+            field: "conversion_tool",
+            ..
+        }
+    ));
+}
+
+#[test]
 fn upload_ready_requires_conversion_performance_proof() {
     let mut manifest = conversion_verified_manifest();
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();

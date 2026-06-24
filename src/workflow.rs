@@ -26,6 +26,7 @@ const DELETE_APPROVAL_PROOF: &str = "delete_approval";
 const DELETE_EXECUTION_PROOF: &str = "delete";
 const CONVERSION_PERFORMANCE_SCHEMA_VERSION: u8 = 1;
 const CONVERSION_PERFORMANCE_MEASUREMENT_METHOD: &str = "monotonic_wall_clock";
+const UNSAFE_LEGACY_RAW_SENSOR_RENDER_TOOL: &str = "dcraw_emu+magick+heif-enc";
 const DELETE_PLAN_PROOFS: [&str; 10] = [
     NAS_PROOF,
     ORIGINAL_ASSET_PROOF,
@@ -1292,6 +1293,13 @@ fn validate_conversion_performance_proof(
         &proof.measurement_method,
     )?;
     require_non_empty("conversion_tool", &proof.conversion_tool)?;
+    if proof.conversion_tool == UNSAFE_LEGACY_RAW_SENSOR_RENDER_TOOL {
+        return Err(WorkflowError::InvalidProofField {
+            proof_key: CONVERSION_PERFORMANCE_PROOF,
+            field: "conversion_tool",
+            reason: "legacy RAW sensor render is not upload-safe; rerun conversion with the embedded-preview auto-orient path",
+        });
+    }
     if let Some(version) = &proof.conversion_tool_version {
         require_non_empty("conversion_tool_version", version)?;
     }
