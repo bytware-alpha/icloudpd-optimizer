@@ -401,6 +401,48 @@ fn record_original_asset_batch_proofs_rejects_extra_result_without_mutating() {
     assert_eq!(manifest, before);
 }
 
+#[test]
+fn record_original_asset_batch_proofs_rejects_duplicate_original_identity_without_mutating() {
+    let mut manifest = two_asset_upload_verified_manifest();
+    let before = manifest.clone();
+    let mut proofs = std::collections::BTreeMap::new();
+    proofs.insert(
+        "asset-1".to_string(),
+        OriginalAssetProof {
+            record_name: "CPLAsset-original-123".to_string(),
+            record_change_tag: "tag-1".to_string(),
+            record_type: "CPLAsset".to_string(),
+            filename: "IMG_0001.dng".to_string(),
+            size_bytes: 9,
+            matched_raw_sha256: "raw-sha256-1".to_string(),
+        },
+    );
+    proofs.insert(
+        "asset-2".to_string(),
+        OriginalAssetProof {
+            record_name: "CPLAsset-original-123".to_string(),
+            record_change_tag: "tag-1".to_string(),
+            record_type: "CPLAsset".to_string(),
+            filename: "IMG_0002.dng".to_string(),
+            size_bytes: 11,
+            matched_raw_sha256: "raw-sha256-2".to_string(),
+        },
+    );
+
+    let error = record_original_asset_batch_proofs(
+        &mut manifest,
+        &["asset-1".to_string(), "asset-2".to_string()],
+        proofs,
+    )
+    .expect_err("duplicate original record identity must fail atomically");
+
+    assert!(matches!(
+        error,
+        WorkflowError::DuplicateBatchOriginalAssetProof { .. }
+    ));
+    assert_eq!(manifest, before);
+}
+
 fn forged_delete_approved_manifest(
     mutate: impl FnOnce(&mut AssetRecord),
 ) -> (tempfile::TempDir, Manifest) {

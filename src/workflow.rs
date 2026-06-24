@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -386,6 +386,7 @@ pub fn record_original_asset_batch_proofs(
             });
         }
     }
+    validate_batch_original_asset_unique_records(asset_ids, &proofs)?;
 
     let mut staged = manifest.clone();
     for asset_id in asset_ids {
@@ -398,6 +399,27 @@ pub fn record_original_asset_batch_proofs(
         record_original_asset_proof(&mut staged, asset_id, proof.clone())?;
     }
     *manifest = staged;
+    Ok(())
+}
+
+fn validate_batch_original_asset_unique_records(
+    asset_ids: &[String],
+    proofs: &BTreeMap<String, OriginalAssetProof>,
+) -> Result<(), WorkflowError> {
+    let mut original_record_names = BTreeSet::new();
+    for asset_id in asset_ids {
+        let proof =
+            proofs
+                .get(asset_id)
+                .ok_or_else(|| WorkflowError::MissingBatchOriginalAssetProof {
+                    asset_id: asset_id.clone(),
+                })?;
+        if !original_record_names.insert(proof.record_name.as_str()) {
+            return Err(WorkflowError::DuplicateBatchOriginalAssetProof {
+                original_record_name: proof.record_name.clone(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1329,6 +1351,8 @@ pub enum WorkflowError {
     MissingBatchOriginalAssetProof { asset_id: String },
     #[error("batch original asset proof was not requested for {asset_id}")]
     UnexpectedBatchOriginalAssetProof { asset_id: String },
+    #[error("batch original asset proof reused original recordName {original_record_name}")]
+    DuplicateBatchOriginalAssetProof { original_record_name: String },
     #[error("stored proof {proof_key} for {asset_id} could not be decoded: {source}")]
     ProofDecode {
         asset_id: String,

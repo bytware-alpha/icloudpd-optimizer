@@ -686,6 +686,38 @@ fn cloudkit_original_asset_batch_resolver_duplicate_candidate_for_one_target_fai
 }
 
 #[test]
+fn cloudkit_original_asset_batch_resolver_duplicate_original_for_two_targets_fails_closed() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let records = cloudkit_raw_pair_with(
+        "CPLAsset-original-123",
+        "CPLMaster-raw-123",
+        "tag-1",
+        9,
+        1_800_000_000_000,
+    );
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": records})],
+        vec![b"raw-bytes".to_vec()],
+    );
+
+    let error = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch(
+            &session,
+            &batch_resolve_request(vec![
+                batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes"),
+                batch_resolve_target("asset-2", "IMG_0002.dng", b"raw-bytes"),
+            ]),
+        )
+        .expect_err("one CloudKit original must not prove two local targets");
+
+    assert!(matches!(
+        error,
+        UploadError::OriginalAssetResolveNotUnique { matches: 2 }
+    ));
+}
+
+#[test]
 fn cloudkit_original_asset_batch_resolver_skips_wrong_hash_and_resolves_later_exact_match() {
     let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
         .expect("session should load");

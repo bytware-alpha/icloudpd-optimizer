@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -504,6 +504,7 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
             .collect();
         let target_index = OriginalAssetTargetIndex::new(&request.targets);
         let mut download_cache: BTreeMap<(String, u64), CloudKitResourceDownload> = BTreeMap::new();
+        let mut matched_original_record_names = BTreeSet::new();
         let mut exhausted = false;
         let mut continuation_marker = None;
         for _ in 0..request.max_pages {
@@ -542,6 +543,9 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
                 };
                 if download.sha256 != candidate.matched_raw_sha256 {
                     continue;
+                }
+                if !matched_original_record_names.insert(candidate.proof.record_name.clone()) {
+                    return Err(UploadError::OriginalAssetResolveNotUnique { matches: 2 });
                 }
                 let target_matches = matches.get_mut(&candidate.asset_id).ok_or(
                     UploadError::InvalidCloudKitOriginalAssetResponse(
@@ -2597,10 +2601,6 @@ pub enum UploadError {
         "CloudKit original asset resolver reached the scan limit with {matches} matching candidates; exact uniqueness is unproven"
     )]
     OriginalAssetResolveIncomplete { matches: usize },
-    #[error(
-        "CloudKit original asset resolver found a candidate for {asset_id} whose bytes do not match the NAS proof"
-    )]
-    OriginalAssetResolveHashMismatch { asset_id: String },
     #[error(
         "CloudKit original asset download size mismatch: expected {expected} bytes, downloaded {actual} bytes"
     )]
