@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use icloudpd_optimizer::upload::{
+    CloudKitDeleteClient, CloudKitDeleteRequest, CloudKitDeleteSession, CloudKitDeleteTransport,
     IcloudUploadOutcome, IcloudUploadRequest, IcloudUploadResponse, PhotosUploadClient,
     PhotosUploadEndpoint, PhotosUploadTransport, SingleFileUploadRequest, UploadError,
     UploadSession, build_upload_proof, load_upload_session, run_icloud_upload,
@@ -40,6 +41,196 @@ fn valid_session_json() -> String {
         ]
     })
     .to_string()
+}
+
+fn valid_delete_session_json() -> String {
+    serde_json::json!({
+        "dsid": "123456789",
+        "ckdatabasews_url": "https://p140-ckdatabasews.icloud.com:443",
+        "cloudkit_token": "cloudkit-token",
+        "cookies": [
+            {"name": "X-APPLE-WEBAUTH-TOKEN", "value": "web-auth-token"},
+            {"name": "session", "value": "abc123"}
+        ]
+    })
+    .to_string()
+}
+
+#[test]
+fn load_cloudkit_delete_session_accepts_current_ckdatabasews_origin_url() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("CloudKit delete session should load");
+
+    assert_eq!(session.dsid, "123456789");
+    assert_eq!(
+        session.ckdatabasews_url.as_str(),
+        "https://p140-ckdatabasews.icloud.com/"
+    );
+    assert_eq!(session.cloudkit_token, "cloudkit-token");
+    assert_eq!(session.cookies.len(), 2);
+}
+
+#[test]
+fn load_cloudkit_delete_session_accepts_webservices_ckdatabasews_url() {
+    let json = serde_json::json!({
+        "dsid": "123456789",
+        "cloudkit_token": "cloudkit-token",
+        "webservices": {
+            "ckdatabasews": {"url": "https://p140-ckdatabasews.icloud.com:443"}
+        },
+        "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "web-auth-token"}]
+    })
+    .to_string();
+
+    let session = CloudKitDeleteSession::from_json(&json)
+        .expect("webservices CloudKit URL should be supported");
+
+    assert_eq!(
+        session.ckdatabasews_url.as_str(),
+        "https://p140-ckdatabasews.icloud.com/"
+    );
+}
+
+#[test]
+fn load_cloudkit_delete_session_fails_closed_on_missing_auth_material_or_bad_endpoint() {
+    let cases = [
+        serde_json::json!({
+            "ckdatabasews_url": "https://p140-ckdatabasews.icloud.com:443",
+            "cloudkit_token": "cloudkit-token",
+            "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "web-auth-token"}]
+        }),
+        serde_json::json!({
+            "dsid": "123456789",
+            "ckdatabasews_url": "https://p140-ckdatabasews.icloud.com:443",
+            "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "web-auth-token"}]
+        }),
+        serde_json::json!({
+            "dsid": "123456789",
+            "ckdatabasews_url": "https://p140-ckdatabasews.icloud.com:443",
+            "cloudkit_token": "cloudkit-token"
+        }),
+        serde_json::json!({
+            "dsid": "123456789",
+            "ckdatabasews_url": "https://evil.example",
+            "cloudkit_token": "cloudkit-token",
+            "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "web-auth-token"}]
+        }),
+        serde_json::json!({
+            "dsid": "123456789",
+            "ckdatabasews_url": "https://p140-photosupload.icloud.com:443",
+            "cloudkit_token": "cloudkit-token",
+            "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "web-auth-token"}]
+        }),
+    ];
+
+    for body in cases {
+        let error = CloudKitDeleteSession::from_json(&body.to_string())
+            .expect_err("invalid delete session should fail closed");
+
+        assert!(
+            matches!(error, UploadError::InvalidSession(_)),
+            "{body} returned {error:?}"
+        );
+        assert!(!error.to_string().contains("web-auth-token"));
+        assert!(!error.to_string().contains("cloudkit-token"));
+    }
+}
+
+#[test]
+fn cloudkit_delete_client_posts_records_modify_update_and_confirms_deleted() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut transport = FakeCloudKitDeleteTransport::success();
+
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .delete_original(
+            &session,
+            &CloudKitDeleteRequest {
+                record_name: "CPLAsset-original-123".to_string(),
+                record_change_tag: "change-tag-1".to_string(),
+            },
+        )
+        .expect("confirmed CloudKit delete should succeed");
+
+    assert_eq!(outcome.record_name, "CPLAsset-original-123");
+    assert_eq!(outcome.record_change_tag, "change-tag-2");
+    assert_eq!(transport.payloads.len(), 1);
+    assert_eq!(
+        transport.payloads[0],
+        json!({
+            "atomic": true,
+            "desiredKeys": ["isDeleted"],
+            "operations": [{
+                "operationType": "update",
+                "record": {
+                    "recordName": "CPLAsset-original-123",
+                    "recordType": "CPLAsset",
+                    "recordChangeTag": "change-tag-1",
+                    "zoneID": {"zoneName": "PrimarySync"},
+                    "fields": {
+                        "isDeleted": {"value": 1}
+                    }
+                }
+            }]
+        })
+    );
+}
+
+#[test]
+fn cloudkit_delete_client_rejects_empty_identity_before_transport() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut transport = FakeCloudKitDeleteTransport::success();
+
+    let error = CloudKitDeleteClient::new(&mut transport)
+        .delete_original(
+            &session,
+            &CloudKitDeleteRequest {
+                record_name: " ".to_string(),
+                record_change_tag: "change-tag-1".to_string(),
+            },
+        )
+        .expect_err("empty original asset id should fail closed");
+
+    assert!(matches!(
+        error,
+        UploadError::InvalidCloudKitDeleteRequest(_)
+    ));
+    assert!(transport.payloads.is_empty());
+}
+
+#[test]
+fn cloudkit_delete_client_rejects_missing_or_unsuccessful_delete_confirmation() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let cases = [
+        json!({"records": []}),
+        json!({"records": [{"recordName": "CPLAsset-original-123", "recordChangeTag": "change-tag-2"}]}),
+        json!({"records": [{"recordName": "CPLAsset-original-123", "recordChangeTag": "change-tag-2", "fields": {"isDeleted": {"value": 0}}}]}),
+        json!({"records": [{"recordName": "CPLAsset-original-123", "recordChangeTag": "change-tag-2", "serverErrorCode": "ACCESS_DENIED"}]}),
+    ];
+
+    for response in cases {
+        let mut transport = FakeCloudKitDeleteTransport {
+            payloads: Vec::new(),
+            response,
+        };
+
+        let error = CloudKitDeleteClient::new(&mut transport)
+            .delete_original(
+                &session,
+                &CloudKitDeleteRequest {
+                    record_name: "CPLAsset-original-123".to_string(),
+                    record_change_tag: "change-tag-1".to_string(),
+                },
+            )
+            .expect_err("missing delete confirmation should fail closed");
+
+        assert!(matches!(
+            error,
+            UploadError::InvalidCloudKitDeleteResponse(_)
+        ));
+    }
 }
 
 #[test]
@@ -541,5 +732,38 @@ impl PhotosUploadTransport for FakePhotosTransport {
             sha256_hex(&bytes),
             bytes.len() as u64,
         ))
+    }
+}
+
+struct FakeCloudKitDeleteTransport {
+    payloads: Vec<Value>,
+    response: Value,
+}
+
+impl FakeCloudKitDeleteTransport {
+    fn success() -> Self {
+        Self {
+            payloads: Vec::new(),
+            response: json!({
+                "records": [{
+                    "recordName": "CPLAsset-original-123",
+                    "recordChangeTag": "change-tag-2",
+                    "fields": {
+                        "isDeleted": {"value": 1}
+                    }
+                }]
+            }),
+        }
+    }
+}
+
+impl CloudKitDeleteTransport for FakeCloudKitDeleteTransport {
+    fn post_records_modify(
+        &mut self,
+        _session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        self.payloads.push(payload);
+        Ok(self.response.clone())
     }
 }

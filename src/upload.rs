@@ -64,12 +64,53 @@ impl UploadSession {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudKitDeleteSession {
+    pub dsid: String,
+    pub ckdatabasews_url: Url,
+    pub cloudkit_token: String,
+    pub cookies: Vec<UploadCookie>,
+}
+
+impl CloudKitDeleteSession {
+    pub fn from_json(json: &str) -> Result<Self, UploadError> {
+        let raw: RawCloudKitDeleteSession = serde_json::from_str(json)
+            .map_err(|source| UploadError::DecodeSession { path: None, source })?;
+        raw.validate()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudKitDeleteRequest {
+    pub record_name: String,
+    pub record_change_tag: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudKitDeleteOutcome {
+    pub record_name: String,
+    pub record_change_tag: String,
+}
+
 pub fn load_upload_session(path: &Path) -> Result<UploadSession, UploadError> {
     let json = std::fs::read_to_string(path).map_err(|source| UploadError::ReadSession {
         path: path.to_path_buf(),
         source,
     })?;
     let raw: RawUploadSession =
+        serde_json::from_str(&json).map_err(|source| UploadError::DecodeSession {
+            path: Some(path.to_path_buf()),
+            source,
+        })?;
+    raw.validate()
+}
+
+pub fn load_cloudkit_delete_session(path: &Path) -> Result<CloudKitDeleteSession, UploadError> {
+    let json = std::fs::read_to_string(path).map_err(|source| UploadError::ReadSession {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let raw: RawCloudKitDeleteSession =
         serde_json::from_str(&json).map_err(|source| UploadError::DecodeSession {
             path: Some(path.to_path_buf()),
             source,
@@ -129,6 +170,24 @@ pub trait PhotosUploadTransport {
         upload_url: &Url,
         heic_path: &Path,
     ) -> Result<(SingleFileUploadRequest, String, u64), UploadError>;
+}
+
+pub trait CloudKitDeleteTransport {
+    fn post_records_modify(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError>;
+}
+
+impl<T: CloudKitDeleteTransport + ?Sized> CloudKitDeleteTransport for &mut T {
+    fn post_records_modify(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        (**self).post_records_modify(session, payload)
+    }
 }
 
 impl<T: PhotosUploadTransport + ?Sized> PhotosUploadTransport for &mut T {
@@ -272,6 +331,28 @@ impl<T: PhotosUploadTransport> PhotosUploadClient<T> {
     }
 }
 
+pub struct CloudKitDeleteClient<T> {
+    transport: T,
+}
+
+impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
+    pub fn new(transport: T) -> Self {
+        Self { transport }
+    }
+
+    pub fn delete_original(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        request: &CloudKitDeleteRequest,
+    ) -> Result<CloudKitDeleteOutcome, UploadError> {
+        validate_cloudkit_delete_request(request)?;
+        let response = self
+            .transport
+            .post_records_modify(session, cloudkit_delete_payload(request))?;
+        parse_cloudkit_delete_response(response, request)
+    }
+}
+
 pub struct ReqwestPhotosUploadTransport {
     client: reqwest::blocking::Client,
 }
@@ -359,6 +440,46 @@ impl PhotosUploadTransport for ReqwestPhotosUploadTransport {
     }
 }
 
+pub struct ReqwestCloudKitDeleteTransport {
+    client: reqwest::blocking::Client,
+}
+
+impl ReqwestCloudKitDeleteTransport {
+    pub fn new() -> Result<Self, UploadError> {
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|source| UploadError::HttpClient { source })?;
+        Ok(Self { client })
+    }
+}
+
+impl CloudKitDeleteTransport for ReqwestCloudKitDeleteTransport {
+    fn post_records_modify(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        let url = cloudkit_records_modify_url(session)?;
+        let response = self
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "text/plain;charset=UTF-8")
+            .header(
+                reqwest::header::COOKIE,
+                cookie_header_for(&session.cookies)?,
+            )
+            .body(payload.to_string())
+            .send()
+            .map_err(|source| UploadError::Network {
+                operation: "records_modify",
+                source,
+            })?;
+        read_json_response(response, "records_modify")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateUploadUrlResponse {
@@ -435,6 +556,25 @@ fn put_asset_payload(
             "timeZoneOffset": time_zone_offset_minutes,
             "singleFileUploadRequest": single_file,
         }],
+    })
+}
+
+fn cloudkit_delete_payload(request: &CloudKitDeleteRequest) -> Value {
+    json!({
+        "atomic": true,
+        "desiredKeys": ["isDeleted"],
+        "operations": [{
+            "operationType": "update",
+            "record": {
+                "recordName": request.record_name,
+                "recordType": "CPLAsset",
+                "recordChangeTag": request.record_change_tag,
+                "zoneID": {"zoneName": PRIMARY_SYNC_ZONE},
+                "fields": {
+                    "isDeleted": {"value": 1}
+                }
+            }
+        }]
     })
 }
 
@@ -546,6 +686,60 @@ fn parse_upload_status_response(
     Ok(UploadStatusState::InProgress)
 }
 
+fn parse_cloudkit_delete_response(
+    value: Value,
+    request: &CloudKitDeleteRequest,
+) -> Result<CloudKitDeleteOutcome, UploadError> {
+    let records = value.get("records").and_then(Value::as_array).ok_or(
+        UploadError::InvalidCloudKitDeleteResponse("records/modify response must include records"),
+    )?;
+    if records.len() != 1 {
+        return Err(UploadError::InvalidCloudKitDeleteResponse(
+            "records/modify must return exactly one record",
+        ));
+    }
+    let record = &records[0];
+    if record.get("serverErrorCode").is_some() {
+        return Err(UploadError::InvalidCloudKitDeleteResponse(
+            "records/modify returned a record error",
+        ));
+    }
+    let record_name = record.get("recordName").and_then(Value::as_str).ok_or(
+        UploadError::InvalidCloudKitDeleteResponse("records/modify response missing recordName"),
+    )?;
+    if record_name != request.record_name {
+        return Err(UploadError::InvalidCloudKitDeleteResponse(
+            "records/modify confirmed a different recordName",
+        ));
+    }
+    let record_change_tag = record
+        .get("recordChangeTag")
+        .and_then(Value::as_str)
+        .ok_or(UploadError::InvalidCloudKitDeleteResponse(
+            "records/modify response missing recordChangeTag",
+        ))?;
+    if record_change_tag.trim().is_empty() {
+        return Err(UploadError::InvalidCloudKitDeleteResponse(
+            "records/modify response returned an empty recordChangeTag",
+        ));
+    }
+    let is_deleted = record
+        .get("fields")
+        .and_then(|fields| fields.get("isDeleted"))
+        .and_then(|is_deleted| is_deleted.get("value"));
+    if !matches!(is_deleted.and_then(Value::as_i64), Some(1))
+        && !matches!(is_deleted.and_then(Value::as_bool), Some(true))
+    {
+        return Err(UploadError::InvalidCloudKitDeleteResponse(
+            "records/modify did not confirm isDeleted",
+        ));
+    }
+    Ok(CloudKitDeleteOutcome {
+        record_name: record_name.to_string(),
+        record_change_tag: record_change_tag.to_string(),
+    })
+}
+
 fn validate_single_file_upload_request(
     single_file: &SingleFileUploadRequest,
 ) -> Result<(), UploadError> {
@@ -582,6 +776,17 @@ fn photosupload_service_url(
     Ok(base)
 }
 
+fn cloudkit_records_modify_url(session: &CloudKitDeleteSession) -> Result<Url, UploadError> {
+    let mut base = session.ckdatabasews_url.clone();
+    base.set_path("/database/1/com.apple.photos.cloud/production/private/records/modify");
+    base.set_query(Some(&format!(
+        "dsid={}&ckWebAuthToken={}",
+        session.dsid,
+        url_escape_query_value(&session.cloudkit_token)
+    )));
+    Ok(base)
+}
+
 fn validate_signed_upload_url(url: &Url) -> Result<(), UploadError> {
     if url.scheme() != "https" {
         return Err(UploadError::InvalidPhotosUploadResponse(
@@ -612,8 +817,11 @@ fn validate_signed_upload_url(url: &Url) -> Result<(), UploadError> {
 }
 
 fn cookie_header(session: &UploadSession) -> Result<String, UploadError> {
-    let value = session
-        .cookies
+    cookie_header_for(&session.cookies)
+}
+
+fn cookie_header_for(cookies: &[UploadCookie]) -> Result<String, UploadError> {
+    let value = cookies
         .iter()
         .map(|cookie| format!("{}={}", cookie.name, cookie.value))
         .collect::<Vec<_>>()
@@ -621,6 +829,10 @@ fn cookie_header(session: &UploadSession) -> Result<String, UploadError> {
     reqwest::header::HeaderValue::from_str(&value)
         .map_err(|_| UploadError::InvalidSession("cookies cannot form a header".to_string()))?;
     Ok(value)
+}
+
+fn url_escape_query_value(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
 fn read_json_response(
@@ -723,13 +935,7 @@ struct RawUploadSession {
 
 impl RawUploadSession {
     fn validate(self) -> Result<UploadSession, UploadError> {
-        let dsid = required_nonempty(self.dsid, "dsid")?;
-        reject_control_chars(&dsid, "dsid")?;
-        if !dsid.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(UploadError::InvalidSession(
-                "dsid must contain only ASCII digits".to_string(),
-            ));
-        }
+        let dsid = validate_dsid(self.dsid)?;
         let photosupload_url = self
             .photosupload_url
             .or_else(|| {
@@ -788,8 +994,72 @@ impl RawUploadSession {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawCloudKitDeleteSession {
+    dsid: Option<String>,
+    ckdatabasews_url: Option<String>,
+    webservices: Option<RawWebServices>,
+    cloudkit_token: Option<String>,
+    cookies: Option<Vec<RawCookie>>,
+    #[serde(default)]
+    _cookiejar_path: Option<PathBuf>,
+}
+
+impl RawCloudKitDeleteSession {
+    fn validate(self) -> Result<CloudKitDeleteSession, UploadError> {
+        let dsid = validate_dsid(self.dsid)?;
+        let ckdatabasews_url = self
+            .ckdatabasews_url
+            .or_else(|| {
+                self.webservices
+                    .and_then(|webservices| webservices.ckdatabasews)
+                    .and_then(|ckdatabasews| ckdatabasews.url)
+            })
+            .ok_or_else(|| {
+                UploadError::InvalidSession(
+                    "ckdatabasews_url or webservices.ckdatabasews.url is required".to_string(),
+                )
+            })?;
+        let ckdatabasews_url = validate_ckdatabasews_url(&ckdatabasews_url)?;
+        let cloudkit_token = required_nonempty(self.cloudkit_token, "cloudkit_token")?;
+        reject_control_chars(&cloudkit_token, "cloudkit_token")?;
+        if cloudkit_token.trim() != cloudkit_token {
+            return Err(UploadError::InvalidSession(
+                "cloudkit_token must not include leading or trailing whitespace".to_string(),
+            ));
+        }
+        let cookies = self
+            .cookies
+            .ok_or_else(|| UploadError::InvalidSession("cookies are required".to_string()))?;
+        if cookies.is_empty() {
+            return Err(UploadError::InvalidSession(
+                "cookies cannot be empty".to_string(),
+            ));
+        }
+        let cookies: Vec<UploadCookie> = cookies
+            .into_iter()
+            .map(RawCookie::validate)
+            .collect::<Result<_, _>>()?;
+        if !cookies
+            .iter()
+            .any(|cookie| cookie.name == "X-APPLE-WEBAUTH-TOKEN")
+        {
+            return Err(UploadError::InvalidSession(
+                "missing X-APPLE-WEBAUTH-TOKEN cookie".to_string(),
+            ));
+        }
+        Ok(CloudKitDeleteSession {
+            dsid,
+            ckdatabasews_url,
+            cloudkit_token,
+            cookies,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct RawWebServices {
     photosupload: Option<RawServiceUrl>,
+    ckdatabasews: Option<RawServiceUrl>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -859,6 +1129,42 @@ fn validate_photosupload_url(raw_url: &str) -> Result<Url, UploadError> {
     Ok(url)
 }
 
+fn validate_ckdatabasews_url(raw_url: &str) -> Result<Url, UploadError> {
+    let url = Url::parse(raw_url).map_err(|_| {
+        UploadError::InvalidSession("ckdatabasews_url must be an absolute HTTPS URL".to_string())
+    })?;
+    if url.scheme() != "https" {
+        return Err(UploadError::InvalidSession(
+            "ckdatabasews_url must use https".to_string(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(UploadError::InvalidSession(
+            "ckdatabasews_url must not include credentials".to_string(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(UploadError::InvalidSession(
+            "ckdatabasews_url must not include query or fragment".to_string(),
+        ));
+    }
+    let host = url.host_str().ok_or_else(|| {
+        UploadError::InvalidSession("ckdatabasews_url host is required".to_string())
+    })?;
+    if !is_ckdatabasews_service_host(host) {
+        return Err(UploadError::InvalidSession(
+            "ckdatabasews_url host is not an Apple CloudKit database host".to_string(),
+        ));
+    }
+    let path = url.path().trim_end_matches('/');
+    if !path.is_empty() {
+        return Err(UploadError::InvalidSession(
+            "ckdatabasews_url path must be empty or /".to_string(),
+        ));
+    }
+    Ok(url)
+}
+
 fn is_allowed_icloud_host(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     host == "icloud.com"
@@ -877,6 +1183,51 @@ fn is_photosupload_service_host(host: &str) -> bool {
         || host.ends_with("-photosupload.icloud.com")
         || host == "photosupload.icloud.com.cn"
         || host.ends_with("-photosupload.icloud.com.cn")
+}
+
+fn is_ckdatabasews_service_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host == "ckdatabasews.icloud.com"
+        || host.ends_with("-ckdatabasews.icloud.com")
+        || host == "ckdatabasews.icloud.com.cn"
+        || host.ends_with("-ckdatabasews.icloud.com.cn")
+}
+
+fn validate_dsid(value: Option<String>) -> Result<String, UploadError> {
+    let dsid = required_nonempty(value, "dsid")?;
+    reject_control_chars(&dsid, "dsid")?;
+    if !dsid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(UploadError::InvalidSession(
+            "dsid must contain only ASCII digits".to_string(),
+        ));
+    }
+    Ok(dsid)
+}
+
+fn validate_cloudkit_delete_request(request: &CloudKitDeleteRequest) -> Result<(), UploadError> {
+    if request.record_name.trim().is_empty() {
+        return Err(UploadError::InvalidCloudKitDeleteRequest(
+            "original asset recordName is required",
+        ));
+    }
+    if request.record_change_tag.trim().is_empty() {
+        return Err(UploadError::InvalidCloudKitDeleteRequest(
+            "original asset recordChangeTag is required",
+        ));
+    }
+    reject_cloudkit_identity_chars(&request.record_name, "original asset recordName")?;
+    reject_cloudkit_identity_chars(&request.record_change_tag, "original asset recordChangeTag")?;
+    Ok(())
+}
+
+fn reject_cloudkit_identity_chars(value: &str, field: &'static str) -> Result<(), UploadError> {
+    if value.chars().any(char::is_control) {
+        return Err(UploadError::InvalidCloudKitDeleteRequest(match field {
+            "original asset recordName" => "original asset recordName contains control characters",
+            _ => "original asset recordChangeTag contains control characters",
+        }));
+    }
+    Ok(())
 }
 
 fn required_nonempty(value: Option<String>, field: &str) -> Result<String, UploadError> {
@@ -1031,6 +1382,10 @@ pub enum UploadError {
     },
     #[error("invalid iCloud Photos upload response: {0}")]
     InvalidPhotosUploadResponse(&'static str),
+    #[error("invalid CloudKit delete request: {0}")]
+    InvalidCloudKitDeleteRequest(&'static str),
+    #[error("invalid CloudKit delete response: {0}")]
+    InvalidCloudKitDeleteResponse(&'static str),
     #[error(
         "signed upload size mismatch: expected {expected} bytes, service reported {actual} bytes"
     )]
