@@ -139,6 +139,8 @@ struct MonitorInitArgs {
     heic_quality: u8,
     #[arg(long, default_value_t = 25)]
     max_conversions_per_scan: usize,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    no_recursive_scan: bool,
     #[arg(long)]
     conversion_tool_version: Option<String>,
     #[arg(long, action = clap::ArgAction::SetTrue)]
@@ -665,6 +667,7 @@ fn monitor_init(args: MonitorInitArgs) -> Result<(), CliError> {
     config.jobs = args.jobs;
     config.heic_quality = args.heic_quality;
     config.max_conversions_per_scan = args.max_conversions_per_scan;
+    config.scan_recursive = !args.no_recursive_scan;
     config.conversion_tool_version = args.conversion_tool_version;
     config.full_lifecycle = args.full_lifecycle;
     config.auto_delete = args.auto_delete;

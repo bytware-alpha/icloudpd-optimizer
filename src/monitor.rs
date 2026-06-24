@@ -63,6 +63,10 @@ fn default_cloudkit_max_pages() -> u64 {
     DEFAULT_CLOUDKIT_MAX_PAGES
 }
 
+fn default_scan_recursive() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MonitorConfig {
     pub schema_version: u64,
@@ -76,6 +80,8 @@ pub struct MonitorConfig {
     pub jobs: usize,
     pub heic_quality: u8,
     pub max_conversions_per_scan: usize,
+    #[serde(default = "default_scan_recursive")]
+    pub scan_recursive: bool,
     pub conversion_tool_version: Option<String>,
     #[serde(default)]
     pub full_lifecycle: bool,
@@ -121,6 +127,7 @@ impl MonitorConfig {
             jobs: 1,
             heic_quality: 90,
             max_conversions_per_scan: 25,
+            scan_recursive: true,
             conversion_tool_version: None,
             full_lifecycle: false,
             auto_delete: false,
@@ -386,7 +393,7 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
         .max_conversions_per_scan
         .saturating_sub(pending_conversion_count(&manifest));
     if pending_capacity > 0 {
-        visit_raw_paths(&download_root, &mut |raw_path| {
+        visit_raw_paths(&download_root, config.scan_recursive, &mut |raw_path| {
             if pending_capacity == 0 {
                 return Ok(VisitDecision::Stop);
             }
@@ -1118,13 +1125,15 @@ enum VisitDecision {
 
 fn visit_raw_paths(
     root: &Path,
+    recursive: bool,
     visitor: &mut impl FnMut(PathBuf) -> Result<VisitDecision, MonitorError>,
 ) -> Result<VisitDecision, MonitorError> {
-    visit_raw_paths_inner(root, visitor)
+    visit_raw_paths_inner(root, recursive, visitor)
 }
 
 fn visit_raw_paths_inner(
     directory: &Path,
+    recursive: bool,
     visitor: &mut impl FnMut(PathBuf) -> Result<VisitDecision, MonitorError>,
 ) -> Result<VisitDecision, MonitorError> {
     for entry in fs::read_dir(directory).map_err(|source| MonitorError::ReadDir {
@@ -1144,8 +1153,11 @@ fn visit_raw_paths_inner(
         if metadata.file_type().is_symlink() {
             continue;
         }
-        if metadata.is_dir() {
-            if matches!(visit_raw_paths_inner(&path, visitor)?, VisitDecision::Stop) {
+        if recursive && metadata.is_dir() {
+            if matches!(
+                visit_raw_paths_inner(&path, recursive, visitor)?,
+                VisitDecision::Stop
+            ) {
                 return Ok(VisitDecision::Stop);
             }
         } else if metadata.is_file()

@@ -1143,6 +1143,69 @@ fn monitor_run_once_honors_max_conversions_per_scan() {
 
 #[cfg(unix)]
 #[test]
+fn monitor_run_once_can_scan_download_root_non_recursively() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
+    write_fake_conversion_tools(tool_dir.path());
+    let config_path = tempdir.path().join("monitor.json");
+    let download_root = tempdir.path().join("download");
+    let heic_dir = tempdir.path().join("heic");
+    let manifest_path = tempdir.path().join("manifest.json");
+    fs::create_dir_all(&download_root).expect("download root should be created");
+    write_old_raw(&download_root, "IMG_ROOT.DNG", b"root-raw");
+    write_old_raw(&download_root, "nested/IMG_NESTED.DNG", b"nested-raw");
+
+    binary()
+        .args([
+            "monitor",
+            "init",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--download-root",
+            download_root
+                .to_str()
+                .expect("download root should be utf8"),
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--heic-output-dir",
+            heic_dir.to_str().expect("heic dir should be utf8"),
+            "--no-recursive-scan",
+        ])
+        .assert()
+        .success();
+
+    binary()
+        .args([
+            "monitor",
+            "run",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--once",
+        ])
+        .env("PATH", tool_dir.path())
+        .assert()
+        .success();
+
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).expect("config should be readable"))
+            .expect("config should be json");
+    assert_eq!(config["scan_recursive"], false);
+
+    let manifest = Manifest::load(&manifest_path).expect("manifest should load");
+    assert_eq!(manifest.records().len(), 1);
+    let record = manifest
+        .records()
+        .values()
+        .next()
+        .expect("one root record should exist");
+    assert_eq!(record.state, State::Converted);
+    assert!(record.raw_path.ends_with("IMG_ROOT.DNG"));
+}
+
+#[cfg(unix)]
+#[test]
 fn monitor_run_once_skips_young_raw_without_manifest_record() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let config_path = tempdir.path().join("monitor.json");
