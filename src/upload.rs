@@ -569,12 +569,12 @@ fn cloudkit_delete_payload(request: &CloudKitDeleteRequest) -> Value {
                 "recordName": request.record_name,
                 "recordType": "CPLAsset",
                 "recordChangeTag": request.record_change_tag,
-                "zoneID": {"zoneName": PRIMARY_SYNC_ZONE},
                 "fields": {
                     "isDeleted": {"value": 1}
                 }
             }
-        }]
+        }],
+        "zoneID": {"zoneName": PRIMARY_SYNC_ZONE}
     })
 }
 

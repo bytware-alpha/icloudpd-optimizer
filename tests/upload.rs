@@ -166,12 +166,12 @@ fn cloudkit_delete_client_posts_records_modify_update_and_confirms_deleted() {
                     "recordName": "CPLAsset-original-123",
                     "recordType": "CPLAsset",
                     "recordChangeTag": "change-tag-1",
-                    "zoneID": {"zoneName": "PrimarySync"},
                     "fields": {
                         "isDeleted": {"value": 1}
                     }
                 }
-            }]
+            }],
+            "zoneID": {"zoneName": "PrimarySync"}
         })
     );
 }
