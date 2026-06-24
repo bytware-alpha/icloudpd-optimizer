@@ -766,6 +766,61 @@ fn cloudkit_original_asset_batch_resolver_skips_wrong_hash_and_resolves_later_ex
 }
 
 #[test]
+fn cloudkit_original_asset_batch_resolver_ignores_out_of_window_malformed_master() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut records = cloudkit_raw_pair_with_url(
+        "CPLAsset-out-of-window",
+        "CPLMaster-out-of-window",
+        "tag-old",
+        9,
+        1_700_000_000_000,
+        "https://p140-icloud-content.icloud.com/out-of-window",
+    );
+    records[1]["fields"]
+        .as_object_mut()
+        .expect("fields should be an object")
+        .remove("resOriginalFileType");
+    records
+        .as_array_mut()
+        .expect("records should be array")
+        .extend(
+            cloudkit_raw_pair_with_url(
+                "CPLAsset-original-456",
+                "CPLMaster-raw-456",
+                "tag-2",
+                9,
+                1_800_000_000_000,
+                "https://p140-icloud-content.icloud.com/exact-original",
+            )
+            .as_array()
+            .expect("records should be array")
+            .clone(),
+        );
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": records})],
+        vec![b"raw-bytes".to_vec()],
+    );
+
+    let proofs = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch(
+            &session,
+            &batch_resolve_request(vec![batch_resolve_target(
+                "asset-1",
+                "IMG_0001.dng",
+                b"raw-bytes",
+            )]),
+        )
+        .expect("out-of-window malformed records should not abort batch resolution");
+
+    assert_eq!(proofs["asset-1"].record_name, "CPLAsset-original-456");
+    assert_eq!(
+        transport.downloaded_urls,
+        vec!["https://p140-icloud-content.icloud.com/exact-original".to_string()]
+    );
+}
+
+#[test]
 fn cloudkit_original_asset_batch_resolver_same_size_time_targets_resolve_by_exact_hash() {
     let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
         .expect("session should load");

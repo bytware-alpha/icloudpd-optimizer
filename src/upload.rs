@@ -1150,30 +1150,44 @@ struct OriginalAssetBatchCandidate {
 }
 
 struct OriginalAssetTargetIndex {
-    target_indexes_by_size: BTreeMap<u64, Vec<usize>>,
-    target_sizes: std::collections::BTreeSet<u64>,
+    target_date_windows: Vec<OriginalAssetTargetDateWindow>,
+}
+
+struct OriginalAssetTargetDateWindow {
+    start_unix_seconds: u64,
+    end_unix_seconds: u64,
+    target_index: usize,
 }
 
 impl OriginalAssetTargetIndex {
     fn new(targets: &[CloudKitOriginalAssetResolveTarget]) -> Self {
-        let mut target_indexes_by_size: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        let mut target_date_windows = Vec::with_capacity(targets.len());
         for (index, target) in targets.iter().enumerate() {
-            target_indexes_by_size
-                .entry(target.raw_size_bytes)
-                .or_default()
-                .push(index);
+            target_date_windows.push(OriginalAssetTargetDateWindow {
+                start_unix_seconds: target
+                    .source_captured_unix_seconds
+                    .saturating_sub(target.capture_tolerance_seconds),
+                end_unix_seconds: target
+                    .source_captured_unix_seconds
+                    .saturating_add(target.capture_tolerance_seconds),
+                target_index: index,
+            });
         }
-        let target_sizes = target_indexes_by_size.keys().copied().collect();
+        target_date_windows.sort_by_key(|window| window.start_unix_seconds);
         Self {
-            target_indexes_by_size,
-            target_sizes,
+            target_date_windows,
         }
     }
 
-    fn indexes_for_size(&self, size_bytes: u64) -> Option<&[usize]> {
-        self.target_indexes_by_size
-            .get(&size_bytes)
-            .map(Vec::as_slice)
+    fn indexes_for_asset_date(&self, asset_date_unix_seconds: u64) -> Vec<usize> {
+        let upper_bound = self
+            .target_date_windows
+            .partition_point(|window| window.start_unix_seconds <= asset_date_unix_seconds);
+        self.target_date_windows[..upper_bound]
+            .iter()
+            .filter(|window| asset_date_unix_seconds <= window.end_unix_seconds)
+            .map(|window| window.target_index)
+            .collect()
     }
 }
 
@@ -1285,26 +1299,36 @@ fn parse_original_asset_batch_query_response(
 
     let mut matches = Vec::new();
     for asset in assets {
+        let date_matching_target_indexes =
+            target_index.indexes_for_asset_date(asset.asset_date_unix_seconds);
+        if date_matching_target_indexes.is_empty() {
+            continue;
+        }
         let master = masters.get(&asset.master_record_name).ok_or(
             UploadError::InvalidCloudKitOriginalAssetResponse(
                 "records/query returned an asset without its master",
             ),
         )?;
+        let mut date_matching_target_indexes_by_size: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        for target_index in date_matching_target_indexes {
+            date_matching_target_indexes_by_size
+                .entry(targets[target_index].raw_size_bytes)
+                .or_default()
+                .push(target_index);
+        }
+        let date_matching_target_sizes = date_matching_target_indexes_by_size
+            .keys()
+            .copied()
+            .collect();
         for (raw_size_bytes, download_url) in
-            master_matching_raw_resource_urls(master, &target_index.target_sizes)?
+            master_matching_raw_resource_urls(master, &date_matching_target_sizes)?
         {
-            let Some(target_indexes) = target_index.indexes_for_size(raw_size_bytes) else {
+            let Some(target_indexes) = date_matching_target_indexes_by_size.get(&raw_size_bytes)
+            else {
                 continue;
             };
             for target_index in target_indexes {
                 let target = &targets[*target_index];
-                if !asset_date_matches(
-                    asset.asset_date_unix_seconds,
-                    target.source_captured_unix_seconds,
-                    target.capture_tolerance_seconds,
-                ) {
-                    continue;
-                }
                 matches.push(OriginalAssetBatchCandidate {
                     asset_id: target.asset_id.clone(),
                     raw_size_bytes: target.raw_size_bytes,
