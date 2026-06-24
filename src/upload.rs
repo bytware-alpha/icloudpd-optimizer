@@ -107,6 +107,12 @@ pub struct CloudKitDeleteOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudKitResourceDownload {
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CloudKitOriginalAssetResolveRequest {
     pub raw_size_bytes: u64,
     pub source_captured_unix_seconds: u64,
@@ -210,6 +216,13 @@ pub trait CloudKitDeleteTransport {
         session: &CloudKitDeleteSession,
         payload: Value,
     ) -> Result<Value, UploadError>;
+
+    fn download_resource(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        download_url: &Url,
+        expected_size_bytes: u64,
+    ) -> Result<CloudKitResourceDownload, UploadError>;
 }
 
 impl<T: CloudKitDeleteTransport + ?Sized> CloudKitDeleteTransport for &mut T {
@@ -227,6 +240,15 @@ impl<T: CloudKitDeleteTransport + ?Sized> CloudKitDeleteTransport for &mut T {
         payload: Value,
     ) -> Result<Value, UploadError> {
         (**self).post_records_query(session, payload)
+    }
+
+    fn download_resource(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        download_url: &Url,
+        expected_size_bytes: u64,
+    ) -> Result<CloudKitResourceDownload, UploadError> {
+        (**self).download_resource(session, download_url, expected_size_bytes)
     }
 }
 
@@ -407,8 +429,22 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
             let response = self.transport.post_records_query(session, payload)?;
             let page_result = parse_original_asset_query_response(response, request)?;
             let record_count = page_result.record_count;
-            let page_matches = page_result.matches;
-            matches.extend(page_matches);
+            for candidate in page_result.matches {
+                let download = self.transport.download_resource(
+                    session,
+                    &candidate.download_url,
+                    request.raw_size_bytes,
+                )?;
+                if download.size_bytes != request.raw_size_bytes {
+                    return Err(UploadError::CloudKitOriginalAssetDownloadSizeMismatch {
+                        expected: request.raw_size_bytes,
+                        actual: download.size_bytes,
+                    });
+                }
+                if download.sha256 == request.matched_raw_sha256 {
+                    matches.push(candidate.proof);
+                }
+            }
             if matches.len() > 1 {
                 return Err(UploadError::OriginalAssetResolveNotUnique {
                     matches: matches.len(),
@@ -578,6 +614,73 @@ impl CloudKitDeleteTransport for ReqwestCloudKitDeleteTransport {
                 source,
             })?;
         read_json_response(response, "records_query")
+    }
+
+    fn download_resource(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        download_url: &Url,
+        expected_size_bytes: u64,
+    ) -> Result<CloudKitResourceDownload, UploadError> {
+        validate_cloudkit_resource_download_url(download_url)?;
+        let mut response = self
+            .client
+            .get(download_url.clone())
+            .header(
+                reqwest::header::COOKIE,
+                cookie_header_for(&session.cookies)?,
+            )
+            .send()
+            .map_err(|source| UploadError::Network {
+                operation: "resource_download",
+                source,
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(UploadError::UploadHttpStatus {
+                operation: "resource_download",
+                status: status.as_u16(),
+            });
+        }
+
+        let mut hasher = Sha256::new();
+        let mut size_bytes = 0_u64;
+        let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+        loop {
+            let bytes_read =
+                response
+                    .read(&mut buffer)
+                    .map_err(|source| UploadError::ReadUploadResponse {
+                        operation: "resource_download",
+                        source,
+                    })?;
+            if bytes_read == 0 {
+                break;
+            }
+            size_bytes = size_bytes.checked_add(bytes_read as u64).ok_or(
+                UploadError::CloudKitOriginalAssetDownloadSizeMismatch {
+                    expected: expected_size_bytes,
+                    actual: u64::MAX,
+                },
+            )?;
+            if size_bytes > expected_size_bytes {
+                return Err(UploadError::CloudKitOriginalAssetDownloadSizeMismatch {
+                    expected: expected_size_bytes,
+                    actual: size_bytes,
+                });
+            }
+            hasher.update(&buffer[..bytes_read]);
+        }
+        if size_bytes != expected_size_bytes {
+            return Err(UploadError::CloudKitOriginalAssetDownloadSizeMismatch {
+                expected: expected_size_bytes,
+                actual: size_bytes,
+            });
+        }
+        Ok(CloudKitResourceDownload {
+            sha256: format!("{:x}", hasher.finalize()),
+            size_bytes,
+        })
     }
 }
 
@@ -904,7 +1007,12 @@ fn parse_cloudkit_delete_response(
 
 struct OriginalAssetQueryPage {
     record_count: usize,
-    matches: Vec<OriginalAssetProof>,
+    matches: Vec<OriginalAssetCandidate>,
+}
+
+struct OriginalAssetCandidate {
+    proof: OriginalAssetProof,
+    download_url: Url,
 }
 
 #[derive(Clone)]
@@ -958,14 +1066,19 @@ fn parse_original_asset_query_response(
         ) {
             continue;
         }
-        if master_has_matching_raw_resource(master, request.raw_size_bytes)? {
-            matches.push(OriginalAssetProof {
-                record_name: asset.record_name,
-                record_change_tag: asset.record_change_tag,
-                record_type: "CPLAsset".to_string(),
-                filename: request.filename.clone(),
-                size_bytes: request.raw_size_bytes,
-                matched_raw_sha256: request.matched_raw_sha256.clone(),
+        if let Some(download_url) =
+            master_matching_raw_resource_url(master, request.raw_size_bytes)?
+        {
+            matches.push(OriginalAssetCandidate {
+                proof: OriginalAssetProof {
+                    record_name: asset.record_name,
+                    record_change_tag: asset.record_change_tag,
+                    record_type: "CPLAsset".to_string(),
+                    filename: request.filename.clone(),
+                    size_bytes: request.raw_size_bytes,
+                    matched_raw_sha256: request.matched_raw_sha256.clone(),
+                },
+                download_url,
             });
         }
     }
@@ -1008,10 +1121,10 @@ fn parse_cloudkit_asset_record(record: &Value) -> Result<CloudKitAssetRecord, Up
     })
 }
 
-fn master_has_matching_raw_resource(
+fn master_matching_raw_resource_url(
     master: &Value,
     raw_size_bytes: u64,
-) -> Result<bool, UploadError> {
+) -> Result<Option<Url>, UploadError> {
     let fields = record_fields(master)?;
     let mut saw_resource = false;
     for prefix in [
@@ -1045,7 +1158,7 @@ fn master_has_matching_raw_resource(
             ));
         };
         if resource_type_is_raw(file_type) {
-            return Ok(true);
+            return Ok(Some(resource_download_url(resource)?));
         }
     }
     if !saw_resource {
@@ -1053,7 +1166,7 @@ fn master_has_matching_raw_resource(
             "CPLMaster missing original resources",
         ));
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn required_record_string<'a>(
@@ -1080,10 +1193,7 @@ fn field_value<'a>(fields: &'a Map<String, Value>, key: &str) -> Option<&'a Valu
 }
 
 fn field_value_object(field: &Value) -> Option<&Map<String, Value>> {
-    field
-        .get("value")
-        .and_then(Value::as_object)
-        .or_else(|| field.as_object())
+    field.get("value").and_then(Value::as_object)
 }
 
 fn field_string<'a>(fields: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -1119,9 +1229,24 @@ fn asset_date_matches(asset_date: u64, source_captured: u64, tolerance: u64) -> 
 }
 
 fn resource_size_bytes(resource: &Map<String, Value>) -> Option<u64> {
-    ["size", "sizeBytes", "fileSize", "resourceSize"]
-        .iter()
-        .find_map(|key| resource_field_u64(resource, key))
+    resource.get("size").and_then(Value::as_u64)
+}
+
+fn resource_download_url(resource: &Map<String, Value>) -> Result<Url, UploadError> {
+    let raw_url = resource
+        .get("downloadURL")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "CPLMaster resource missing downloadURL",
+        ))?;
+    let url = Url::parse(raw_url).map_err(|_| {
+        UploadError::InvalidCloudKitOriginalAssetResponse(
+            "CPLMaster resource downloadURL is invalid",
+        )
+    })?;
+    validate_cloudkit_resource_download_url(&url)?;
+    Ok(url)
 }
 
 fn resource_type_is_raw(value: &str) -> bool {
@@ -1130,13 +1255,6 @@ fn resource_type_is_raw(value: &str) -> bool {
         || value.contains("raw")
         || value.contains("digital-negative")
         || value.contains("adobe.raw-image")
-}
-
-fn resource_field_u64(resource: &Map<String, Value>, key: &str) -> Option<u64> {
-    let value = resource.get(key)?;
-    value
-        .as_u64()
-        .or_else(|| value.get("value").and_then(Value::as_u64))
 }
 
 fn validate_single_file_upload_request(
@@ -1225,6 +1343,35 @@ fn validate_signed_upload_url(url: &Url) -> Result<(), UploadError> {
     if !is_allowed_icloud_host(host) {
         return Err(UploadError::InvalidPhotosUploadResponse(
             "signed upload URL host is not an Apple iCloud host",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cloudkit_resource_download_url(url: &Url) -> Result<(), UploadError> {
+    if url.scheme() != "https" {
+        return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "resource downloadURL must use https",
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "resource downloadURL must not include credentials",
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "resource downloadURL must not include a fragment",
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "resource downloadURL host is required",
+        ))?;
+    if !is_allowed_icloud_host(host) {
+        return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "resource downloadURL host is not an Apple iCloud host",
         ));
     }
     Ok(())
@@ -2005,6 +2152,10 @@ pub enum UploadError {
         "CloudKit original asset resolver reached the scan limit with {matches} matching candidates; exact uniqueness is unproven"
     )]
     OriginalAssetResolveIncomplete { matches: usize },
+    #[error(
+        "CloudKit original asset download size mismatch: expected {expected} bytes, downloaded {actual} bytes"
+    )]
+    CloudKitOriginalAssetDownloadSizeMismatch { expected: u64, actual: u64 },
     #[error(
         "signed upload size mismatch: expected {expected} bytes, service reported {actual} bytes"
     )]
