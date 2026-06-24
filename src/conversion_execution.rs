@@ -771,7 +771,7 @@ mod tests {
         );
         assert_eq!(
             record.proofs["conversion_performance"]["conversion_tool"],
-            "exiftool+magick+heif-enc"
+            "exiftool+exiftool+magick+heif-enc"
         );
         assert_eq!(
             record.proofs["conversion_performance"]["conversion_tool_version"],
@@ -788,10 +788,10 @@ mod tests {
         let command_timings = record.proofs["conversion_performance"]["conversion_command_timings"]
             .as_array()
             .expect("command timings should be present");
-        assert_eq!(command_timings.len(), 3);
+        assert_eq!(command_timings.len(), 4);
         for (timing, program) in command_timings
             .iter()
-            .zip(["exiftool", "magick", "heif-enc"])
+            .zip(["exiftool", "exiftool", "magick", "heif-enc"])
         {
             assert_eq!(timing["program"], program);
             assert!(
@@ -803,7 +803,7 @@ mod tests {
         }
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
-            "exiftool-preview\nmagick-auto-orient\nheif-enc\nexiftool-metadata\n"
+            "exiftool-preview\nexiftool-preview-orientation\nmagick-auto-orient\nheif-enc\nexiftool-metadata\n"
         );
     }
 
@@ -855,7 +855,7 @@ mod tests {
             );
             assert_eq!(
                 record.proofs["conversion_performance"]["conversion_tool"],
-                "exiftool+magick+heif-enc"
+                "exiftool+exiftool+magick+heif-enc"
             );
             assert_eq!(
                 record.proofs["conversion_performance"]["conversion_tool_version"],
@@ -992,7 +992,7 @@ exit 44
         assert!(!record.proofs.contains_key("conversion_performance"));
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
-            "exiftool-preview\nmagick-auto-orient\nheif-enc\n"
+            "exiftool-preview\nexiftool-preview-orientation\nmagick-auto-orient\nheif-enc\n"
         );
     }
 
@@ -1042,6 +1042,52 @@ exit 41
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
             "exiftool-preview\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_preview_orientation_copy_failure_does_not_encode_or_record_proofs() {
+        let tool_dir = fake_linux_conversion_tools();
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let _failure_guard =
+            EnvVarGuard::install_value("FAIL_PREVIEW_ORIENTATION", OsString::from("1"));
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest = nas_verified_manifest(&raw_path);
+
+        let error = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("failing preview orientation copy should fail conversion");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::CommandFailed {
+                stage: "conversion",
+                program,
+                ..
+            } if program == "exiftool"
+        ));
+        assert!(!output_path.exists());
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::NasVerified);
+        assert!(!record.proofs.contains_key("conversion"));
+        assert!(!record.proofs.contains_key("conversion_performance"));
+        assert_eq!(
+            fs::read_to_string(log_path).expect("command log should be readable"),
+            "exiftool-preview\nexiftool-preview-orientation\n"
         );
     }
 
@@ -1237,7 +1283,7 @@ exit 0
         assert!(!output_path.exists());
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
-            "exiftool-preview\n"
+            "exiftool-preview\nexiftool-preview-orientation\n"
         );
         let record = manifest.get("asset-1").expect("asset should exist");
         assert_eq!(record.state, State::NasVerified);
@@ -1293,7 +1339,7 @@ exit 0
         assert!(!output_path.exists());
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
-            "exiftool-preview\n"
+            "exiftool-preview\nexiftool-preview-orientation\n"
         );
         let record = manifest.get("asset-1").expect("asset should exist");
         assert_eq!(record.state, State::NasVerified);
@@ -1375,6 +1421,13 @@ exit 47
             r#"#!/bin/sh
 if [ "$1" = "-b" ] && [ "$2" = "-PreviewImage" ]; then
 {preview_extraction_body}
+fi
+if [ "$1" = "-TagsFromFile" ] && [ "$3" = "-Orientation#" ]; then
+  printf 'exiftool-preview-orientation\n' >> "$EXECUTION_LOG"
+  if [ "${{FAIL_PREVIEW_ORIENTATION:-}}" = "1" ]; then
+    exit 48
+  fi
+  exit 0
 fi
 printf 'exiftool-metadata\n' >> "$EXECUTION_LOG"
 exit 0
@@ -1464,6 +1517,10 @@ exit 0
     #[cfg(unix)]
     impl EnvVarGuard {
         fn install(name: &'static str, value: &Path) -> Self {
+            Self::install_value(name, value.as_os_str().to_os_string())
+        }
+
+        fn install_value(name: &'static str, value: OsString) -> Self {
             let previous = env::var_os(name);
             unsafe {
                 env::set_var(name, value);

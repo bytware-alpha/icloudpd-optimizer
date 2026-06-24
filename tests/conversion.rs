@@ -41,7 +41,10 @@ fn plans_exact_sips_exiftool_and_verification_commands() {
         .iter()
         .map(|command| command.program.as_str())
         .collect();
-    assert_eq!(conversion_programs, vec!["exiftool", "magick", "sips"]);
+    assert_eq!(
+        conversion_programs,
+        vec!["exiftool", "exiftool", "magick", "sips"]
+    );
     assert_eq!(plan.convert.program, "exiftool");
     assert_eq!(
         args(&plan.conversion_commands[0]),
@@ -54,17 +57,28 @@ fn plans_exact_sips_exiftool_and_verification_commands() {
     assert_eq!(
         args(&plan.conversion_commands[1]),
         vec![
+            "-TagsFromFile",
+            "/nas/raw/IMG_0001.dng",
+            "-Orientation#",
+            "-overwrite_original",
+            "/staging/IMG_0001.embedded-preview.jpg"
+        ]
+    );
+    assert_eq!(plan.conversion_commands[1].stdout_path, None);
+    assert_eq!(
+        args(&plan.conversion_commands[2]),
+        vec![
             "/staging/IMG_0001.embedded-preview.jpg",
             "-auto-orient",
             "jpg:-"
         ]
     );
     assert_eq!(
-        plan.conversion_commands[1].stdout_path,
+        plan.conversion_commands[2].stdout_path,
         Some(PathBuf::from("/staging/IMG_0001.oriented-preview.jpg"))
     );
     assert_eq!(
-        args(&plan.conversion_commands[2]),
+        args(&plan.conversion_commands[3]),
         vec![
             "-s",
             "format",
@@ -162,7 +176,7 @@ fn includes_requested_heic_quality_in_sips_format_options() {
     .expect("conversion should plan");
 
     assert_eq!(
-        args(&plan.conversion_commands[2]),
+        args(&plan.conversion_commands[3]),
         vec![
             "-s",
             "format",
@@ -192,7 +206,10 @@ fn plans_linux_native_conversion_without_sips() {
         .iter()
         .map(|command| command.program.as_str())
         .collect();
-    assert_eq!(conversion_programs, vec!["exiftool", "magick", "heif-enc"]);
+    assert_eq!(
+        conversion_programs,
+        vec!["exiftool", "exiftool", "magick", "heif-enc"]
+    );
     assert_eq!(plan.convert.program, "exiftool");
     assert_eq!(
         args(&plan.conversion_commands[0]),
@@ -205,17 +222,28 @@ fn plans_linux_native_conversion_without_sips() {
     assert_eq!(
         args(&plan.conversion_commands[1]),
         vec![
+            "-TagsFromFile",
+            "/nas/raw/IMG_0006.dng",
+            "-Orientation#",
+            "-overwrite_original",
+            "/staging/IMG_0006.embedded-preview.jpg"
+        ]
+    );
+    assert_eq!(plan.conversion_commands[1].stdout_path, None);
+    assert_eq!(
+        args(&plan.conversion_commands[2]),
+        vec![
             "/staging/IMG_0006.embedded-preview.jpg",
             "-auto-orient",
             "jpg:-"
         ]
     );
     assert_eq!(
-        plan.conversion_commands[1].stdout_path,
+        plan.conversion_commands[2].stdout_path,
         Some(PathBuf::from("/staging/IMG_0006.oriented-preview.jpg"))
     );
     assert_eq!(
-        args(&plan.conversion_commands[2]),
+        args(&plan.conversion_commands[3]),
         vec![
             "-q",
             "88",
@@ -224,7 +252,7 @@ fn plans_linux_native_conversion_without_sips() {
             "/staging/IMG_0006.heic"
         ]
     );
-    assert_eq!(plan.conversion_commands[2].stdout_path, None);
+    assert_eq!(plan.conversion_commands[3].stdout_path, None);
     assert_eq!(plan.metadata.program, "exiftool");
     assert_eq!(
         args(&plan.metadata),

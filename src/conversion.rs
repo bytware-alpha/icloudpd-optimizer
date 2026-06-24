@@ -135,6 +135,16 @@ fn macos_conversion_plan(
         ],
     )
     .with_stdout_file(embedded_preview_path);
+    let copy_preview_orientation = CommandPlan::new(
+        "exiftool",
+        vec![
+            OsString::from("-TagsFromFile"),
+            raw_arg.clone(),
+            OsString::from("-Orientation#"),
+            OsString::from("-overwrite_original"),
+            embedded_preview_arg.clone(),
+        ],
+    );
     let orient_preview_pixels = CommandPlan::new(
         "magick",
         vec![
@@ -161,7 +171,12 @@ fn macos_conversion_plan(
 
     Ok(ConversionPlan {
         convert: extract_preview.clone(),
-        conversion_commands: vec![extract_preview, orient_preview_pixels, encode],
+        conversion_commands: vec![
+            extract_preview,
+            copy_preview_orientation,
+            orient_preview_pixels,
+            encode,
+        ],
         metadata: CommandPlan::new(
             "exiftool",
             vec![
@@ -257,6 +272,16 @@ fn linux_conversion_plan(
         ],
     )
     .with_stdout_file(embedded_preview_path);
+    let copy_preview_orientation = CommandPlan::new(
+        "exiftool",
+        vec![
+            OsString::from("-TagsFromFile"),
+            raw_arg.clone(),
+            OsString::from("-Orientation#"),
+            OsString::from("-overwrite_original"),
+            embedded_preview_arg.clone(),
+        ],
+    );
     let orient_preview_pixels = CommandPlan::new(
         "magick",
         vec![
@@ -279,7 +304,12 @@ fn linux_conversion_plan(
 
     Ok(ConversionPlan {
         convert: extract_preview.clone(),
-        conversion_commands: vec![extract_preview, orient_preview_pixels, encode],
+        conversion_commands: vec![
+            extract_preview,
+            copy_preview_orientation,
+            orient_preview_pixels,
+            encode,
+        ],
         metadata: CommandPlan::new(
             "exiftool",
             vec![
