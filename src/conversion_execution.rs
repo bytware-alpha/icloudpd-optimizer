@@ -3,7 +3,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +21,12 @@ use crate::workflow::{
     ConversionCommandTiming, ConversionPerformanceInput, ConversionResultProof, WorkflowError,
     record_conversion_performance, record_conversion_result,
 };
+
+const DEFAULT_CHILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const CHILD_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[cfg(test)]
+static TEST_CHILD_COMMAND_TIMEOUT: std::sync::Mutex<Option<Duration>> = std::sync::Mutex::new(None);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversionExecutionRequest {
@@ -60,14 +66,17 @@ fn execute_measured_conversions_for_target(
     reject_duplicate_batch_inputs(&requests)?;
 
     let mut updated = manifest.clone();
+    let mut completed_output_paths: Vec<PathBuf> = Vec::new();
     for chunk in requests.chunks(jobs) {
         let mut handles = Vec::with_capacity(chunk.len());
         for request in chunk {
             let manifest_snapshot = updated.clone();
             let request = request.clone();
             let asset_id = request.asset_id.clone();
+            let output_path = request.output_path.clone();
             handles.push((
                 asset_id.clone(),
+                output_path,
                 thread::spawn(move || {
                     execute_measured_conversion_for_target(&manifest_snapshot, request, target)
                         .map(|manifest| (asset_id, manifest))
@@ -77,9 +86,11 @@ fn execute_measured_conversions_for_target(
 
         let mut chunk_results = Vec::with_capacity(handles.len());
         let mut first_error = None;
-        for (asset_id, handle) in handles {
+        for (asset_id, output_path, handle) in handles {
             match handle.join() {
-                Ok(Ok((asset_id, manifest))) => chunk_results.push((asset_id, manifest)),
+                Ok(Ok((asset_id, manifest))) => {
+                    chunk_results.push((asset_id, output_path, manifest))
+                }
                 Ok(Err(source)) => {
                     first_error.get_or_insert_with(|| {
                         ConversionExecutionError::BatchConversionFailed {
@@ -99,34 +110,28 @@ fn execute_measured_conversions_for_target(
         }
 
         if let Some(error) = first_error {
-            for (_, manifest) in chunk_results {
-                remove_conversion_outputs(&manifest);
+            for path in &completed_output_paths {
+                remove_conversion_output_path(path);
+            }
+            for (_, path, _) in &chunk_results {
+                remove_conversion_output_path(path);
             }
             return Err(error);
         }
 
-        for (asset_id, manifest) in chunk_results {
+        for (asset_id, output_path, manifest) in chunk_results {
             let record = manifest.get(&asset_id)?.clone();
             updated.upsert(record);
+            completed_output_paths.push(output_path);
         }
     }
 
     Ok(updated)
 }
 
-fn remove_conversion_outputs(manifest: &Manifest) {
-    for record in manifest.records().values() {
-        if record.state == State::Converted {
-            if let Some(path) = record
-                .proofs
-                .get("conversion")
-                .and_then(|proof| proof.get("heic_path"))
-                .and_then(|path| path.as_str())
-            {
-                remove_failed_output(Path::new(path));
-            }
-        }
-    }
+fn remove_conversion_output_path(path: &Path) {
+    remove_failed_output(path);
+    remove_generated_intermediates(path);
 }
 
 fn reject_duplicate_batch_inputs(
@@ -275,7 +280,7 @@ fn run_planned_command(
         None => Stdio::null(),
     };
     command.args(&plan.args).stdin(Stdio::null()).stdout(stdout);
-    let outcome = wait_for_command_with_usage(command)?;
+    let outcome = wait_for_command_with_usage(stage, &plan.program, command)?;
     if !outcome.status.success() {
         return Err(ConversionExecutionError::CommandFailed {
             stage,
@@ -293,12 +298,13 @@ fn select_embedded_preview_tag(
     raw_path: &Path,
 ) -> Result<EmbeddedPreviewTag, ConversionExecutionError> {
     let resolved_program = resolve_sanitized_path_tool("exiftool")?;
-    let output = Command::new(resolved_program)
+    let mut command = Command::new(resolved_program);
+    command
         .args(["-j", "-PreviewImage", "-JpgFromRaw"])
         .arg(raw_path)
         .stdin(Stdio::null())
-        .output()
-        .map_err(ConversionExecutionError::Io)?;
+        .stderr(Stdio::null());
+    let output = run_command_with_output("preview_probe", "exiftool", command)?;
     if !output.status.success() {
         return Err(ConversionExecutionError::CommandFailed {
             stage: "preview_probe",
@@ -373,10 +379,20 @@ fn remove_generated_intermediates_after_error(
             remove_failed_output(&embedded_path);
         }
         _ => {
-            remove_failed_output(&embedded_path);
-            remove_failed_output(&oriented_path);
+            remove_generated_intermediates(output_path);
         }
     }
+}
+
+fn remove_generated_intermediates(output_path: &Path) {
+    remove_failed_output(&generated_intermediate_path(
+        output_path,
+        "embedded-preview.jpg",
+    ));
+    remove_failed_output(&generated_intermediate_path(
+        output_path,
+        "oriented-preview.jpg",
+    ));
 }
 
 fn generated_intermediate_path(output_path: &Path, extension: &str) -> PathBuf {
@@ -448,24 +464,48 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(unix)]
 fn wait_for_command_with_usage(
+    stage: &'static str,
+    program: &str,
     mut command: Command,
+) -> Result<CommandOutcome, ConversionExecutionError> {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+    let child = command.spawn()?;
+    wait_for_child_with_usage(stage, program, child)
+}
+
+#[cfg(unix)]
+fn wait_for_child_with_usage(
+    stage: &'static str,
+    program: &str,
+    child: Child,
 ) -> Result<CommandOutcome, ConversionExecutionError> {
     use std::mem::MaybeUninit;
     use std::os::unix::process::ExitStatusExt;
 
-    let child = command.spawn()?;
     let pid = child.id() as libc::pid_t;
     let mut status = 0;
     let mut usage = MaybeUninit::<libc::rusage>::zeroed();
+    let timeout = child_command_timeout();
+    let started = Instant::now();
 
     loop {
-        let result = unsafe { libc::wait4(pid, &mut status, 0, usage.as_mut_ptr()) };
-        if result >= 0 {
+        let result = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, usage.as_mut_ptr()) };
+        if result > 0 {
             let usage = unsafe { usage.assume_init() };
             return Ok(CommandOutcome {
                 status: ExitStatus::from_raw(status),
                 resource_usage: ChildResourceUsage::from_rusage(&usage),
             });
+        }
+        if result == 0 {
+            if started.elapsed() >= timeout {
+                kill_and_reap_unix_child(pid, &mut status, usage.as_mut_ptr())?;
+                return Err(command_timeout_error(stage, program, timeout));
+            }
+            thread::sleep(command_poll_interval(started.elapsed(), timeout));
+            continue;
         }
 
         let error = io::Error::last_os_error();
@@ -477,13 +517,131 @@ fn wait_for_command_with_usage(
 
 #[cfg(not(unix))]
 fn wait_for_command_with_usage(
+    stage: &'static str,
+    program: &str,
     mut command: Command,
 ) -> Result<CommandOutcome, ConversionExecutionError> {
-    let status = command.status()?;
-    Ok(CommandOutcome {
-        status,
-        resource_usage: ChildResourceUsage::default(),
+    let child = command.spawn()?;
+    wait_for_child_with_usage(stage, program, child)
+}
+
+#[cfg(not(unix))]
+fn wait_for_child_with_usage(
+    stage: &'static str,
+    program: &str,
+    mut child: Child,
+) -> Result<CommandOutcome, ConversionExecutionError> {
+    let timeout = child_command_timeout();
+    let started = Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(CommandOutcome {
+                status,
+                resource_usage: ChildResourceUsage::default(),
+            });
+        }
+        if started.elapsed() >= timeout {
+            child.kill()?;
+            let _ = child.wait()?;
+            return Err(command_timeout_error(stage, program, timeout));
+        }
+        thread::sleep(command_poll_interval(started.elapsed(), timeout));
+    }
+}
+
+fn run_command_with_output(
+    stage: &'static str,
+    program: &str,
+    mut command: Command,
+) -> Result<CommandOutput, ConversionExecutionError> {
+    command.stdout(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        ConversionExecutionError::Io(io::Error::other("child stdout was not piped"))
+    })?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let outcome = wait_for_child_with_usage(stage, program, child);
+    let stdout = match stdout_reader.join() {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(source)) => return Err(ConversionExecutionError::Io(source)),
+        Err(_) => {
+            return Err(ConversionExecutionError::Io(io::Error::other(
+                "child stdout reader panicked",
+            )));
+        }
+    };
+    let outcome = outcome?;
+
+    Ok(CommandOutput {
+        status: outcome.status,
+        stdout,
     })
+}
+
+fn child_command_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = *TEST_CHILD_COMMAND_TIMEOUT
+        .lock()
+        .expect("test child command timeout lock should not be poisoned")
+    {
+        return timeout;
+    }
+
+    DEFAULT_CHILD_COMMAND_TIMEOUT
+}
+
+fn command_poll_interval(elapsed: Duration, timeout: Duration) -> Duration {
+    timeout
+        .saturating_sub(elapsed)
+        .min(CHILD_COMMAND_POLL_INTERVAL)
+}
+
+fn command_timeout_error(
+    stage: &'static str,
+    program: &str,
+    timeout: Duration,
+) -> ConversionExecutionError {
+    ConversionExecutionError::CommandTimedOut {
+        stage,
+        program: program.to_string(),
+        timeout_millis: timeout.as_millis().max(1),
+    }
+}
+
+#[cfg(unix)]
+fn kill_and_reap_unix_child(
+    pid: libc::pid_t,
+    status: &mut libc::c_int,
+    usage: *mut libc::rusage,
+) -> io::Result<()> {
+    let kill_result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    if kill_result < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+
+    loop {
+        let wait_result = unsafe { libc::wait4(pid, status, 0, usage) };
+        if wait_result >= 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 fn inspect_output(path: &Path) -> Result<ConvertedOutput, ConversionExecutionError> {
@@ -638,6 +796,11 @@ struct CommandOutcome {
     resource_usage: ChildResourceUsage,
 }
 
+struct CommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+
 struct PlannedCommandsOutcome {
     resource_usage: ChildResourceUsage,
     command_timings: Vec<ConversionCommandTiming>,
@@ -763,6 +926,12 @@ pub enum ConversionExecutionError {
         stage: &'static str,
         program: String,
         status: String,
+    },
+    #[error("{stage} command timed out after {timeout_millis} ms: {program}")]
+    CommandTimedOut {
+        stage: &'static str,
+        program: String,
+        timeout_millis: u128,
     },
     #[error("failed to decode embedded preview probe output: {source}")]
     PreviewProbeDecode { source: serde_json::Error },
@@ -1070,6 +1239,190 @@ exit 0
 
     #[cfg(unix)]
     #[test]
+    fn linux_batch_timeout_removes_successful_peer_outputs_and_intermediates() {
+        let tool_dir = fake_linux_conversion_tools_with_preview_and_heif_enc(
+            DEFAULT_PREVIEW_EXTRACTION_SCRIPT,
+            r#"#!/bin/sh
+printf 'heif-enc\n' >> "$EXECUTION_LOG"
+out=""
+input=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-o" ]; then
+    out="$arg"
+  fi
+  if [ "$arg" != "-q" ] && [ "$arg" != "-o" ] && [ "$previous" != "-q" ] && [ "$previous" != "-o" ]; then
+    input="$arg"
+  fi
+  previous="$arg"
+done
+if [ -z "$out" ] || [ -z "$input" ]; then
+  exit 43
+fi
+case "$out" in
+  *asset-2*)
+    printf 'partial-heic' > "$out"
+    /bin/sleep 5
+    ;;
+esac
+printf 'heic-bytes-from-preview' > "$out"
+"#,
+        );
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let _timeout_guard = CommandTimeoutGuard::install(Duration::from_millis(500));
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_1 = tempdir.path().join("IMG_0001.dng");
+        let raw_2 = tempdir.path().join("IMG_0002.dng");
+        fs::write(&raw_1, b"raw-1").expect("raw 1 should be written");
+        fs::write(&raw_2, b"raw-2").expect("raw 2 should be written");
+        let output_1 = tempdir.path().join("asset-1.heic");
+        let output_2 = tempdir.path().join("asset-2.heic");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest =
+            nas_verified_manifest_with_assets(&[("asset-1", &raw_1), ("asset-2", &raw_2)]);
+
+        let error = execute_measured_conversions_for_target(
+            &manifest,
+            vec![
+                ConversionExecutionRequest {
+                    asset_id: "asset-1".to_string(),
+                    output_path: output_1.clone(),
+                    heic_quality: 91,
+                    conversion_tool_version: None,
+                },
+                ConversionExecutionRequest {
+                    asset_id: "asset-2".to_string(),
+                    output_path: output_2.clone(),
+                    heic_quality: 91,
+                    conversion_tool_version: None,
+                },
+            ],
+            2,
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("batch conversion must fail closed when a peer times out");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::BatchConversionFailed { asset_id, source }
+                if asset_id == "asset-2"
+                    && matches!(
+                        source.as_ref(),
+                        ConversionExecutionError::CommandTimedOut {
+                            stage: "conversion",
+                            program,
+                            ..
+                        } if program == "heif-enc"
+                    )
+        ));
+        for asset_id in ["asset-1", "asset-2"] {
+            assert_eq!(
+                manifest.get(asset_id).expect("asset should exist").state,
+                State::NasVerified
+            );
+        }
+        for output_path in [&output_1, &output_2] {
+            assert!(!output_path.exists());
+            assert!(!embedded_preview_path(output_path).exists());
+            assert!(!oriented_preview_path(output_path).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_batch_timeout_removes_outputs_from_completed_previous_chunks() {
+        let tool_dir = fake_linux_conversion_tools_with_preview_and_heif_enc(
+            DEFAULT_PREVIEW_EXTRACTION_SCRIPT,
+            r#"#!/bin/sh
+printf 'heif-enc\n' >> "$EXECUTION_LOG"
+out=""
+input=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-o" ]; then
+    out="$arg"
+  fi
+  if [ "$arg" != "-q" ] && [ "$arg" != "-o" ] && [ "$previous" != "-q" ] && [ "$previous" != "-o" ]; then
+    input="$arg"
+  fi
+  previous="$arg"
+done
+if [ -z "$out" ] || [ -z "$input" ]; then
+  exit 43
+fi
+case "$out" in
+  *asset-2*)
+    printf 'partial-heic' > "$out"
+    /bin/sleep 5
+    ;;
+esac
+printf 'heic-bytes-from-preview' > "$out"
+"#,
+        );
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let _timeout_guard = CommandTimeoutGuard::install(Duration::from_millis(500));
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_1 = tempdir.path().join("IMG_0001.dng");
+        let raw_2 = tempdir.path().join("IMG_0002.dng");
+        fs::write(&raw_1, b"raw-1").expect("raw 1 should be written");
+        fs::write(&raw_2, b"raw-2").expect("raw 2 should be written");
+        let output_1 = tempdir.path().join("asset-1.heic");
+        let output_2 = tempdir.path().join("asset-2.heic");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest =
+            nas_verified_manifest_with_assets(&[("asset-1", &raw_1), ("asset-2", &raw_2)]);
+
+        let error = execute_measured_conversions_for_target(
+            &manifest,
+            vec![
+                ConversionExecutionRequest {
+                    asset_id: "asset-1".to_string(),
+                    output_path: output_1.clone(),
+                    heic_quality: 91,
+                    conversion_tool_version: None,
+                },
+                ConversionExecutionRequest {
+                    asset_id: "asset-2".to_string(),
+                    output_path: output_2.clone(),
+                    heic_quality: 91,
+                    conversion_tool_version: None,
+                },
+            ],
+            1,
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("later chunk timeout must fail the whole batch");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::BatchConversionFailed { asset_id, source }
+                if asset_id == "asset-2"
+                    && matches!(
+                        source.as_ref(),
+                        ConversionExecutionError::CommandTimedOut {
+                            stage: "conversion",
+                            program,
+                            ..
+                        } if program == "heif-enc"
+                    )
+        ));
+        for asset_id in ["asset-1", "asset-2"] {
+            assert_eq!(
+                manifest.get(asset_id).expect("asset should exist").state,
+                State::NasVerified
+            );
+        }
+        for output_path in [&output_1, &output_2] {
+            assert!(!output_path.exists());
+            assert!(!embedded_preview_path(output_path).exists());
+            assert!(!oriented_preview_path(output_path).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn linux_conversion_chain_failure_removes_partial_output_and_does_not_record_proofs() {
         let tool_dir = fake_linux_conversion_tools_with_preview_and_heif_enc(
             DEFAULT_PREVIEW_EXTRACTION_SCRIPT,
@@ -1225,6 +1578,133 @@ exit 41
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
             "exiftool-preview\nexiftool-preview-orientation\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_preview_probe_timeout_fails_closed_without_recording_proofs() {
+        let tool_dir = fake_linux_conversion_tools_with_probe_preview_and_heif_enc(
+            "/bin/sleep 5\n",
+            DEFAULT_PREVIEW_EXTRACTION_SCRIPT,
+            DEFAULT_HEIF_ENC_SCRIPT,
+        );
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let _timeout_guard = CommandTimeoutGuard::install(Duration::from_millis(500));
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest = nas_verified_manifest(&raw_path);
+        let started = Instant::now();
+
+        let error = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("hung preview probe should time out");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout should return promptly"
+        );
+        assert!(
+            matches!(
+                error,
+                ConversionExecutionError::CommandTimedOut {
+                    stage: "preview_probe",
+                    ref program,
+                    ..
+                } if program == "exiftool"
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert!(!output_path.exists());
+        assert!(!embedded_preview_path(&output_path).exists());
+        assert!(!oriented_preview_path(&output_path).exists());
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::NasVerified);
+        assert!(!record.proofs.contains_key("conversion"));
+        assert!(!record.proofs.contains_key("conversion_performance"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_planned_command_timeout_removes_outputs_and_does_not_record_proofs() {
+        let tool_dir = fake_linux_conversion_tools_with_preview_and_heif_enc(
+            DEFAULT_PREVIEW_EXTRACTION_SCRIPT,
+            r#"#!/bin/sh
+printf 'heif-enc\n' >> "$EXECUTION_LOG"
+out=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-o" ]; then
+    out="$arg"
+  fi
+  previous="$arg"
+done
+if [ -n "$out" ]; then
+  printf 'partial-heic' > "$out"
+fi
+/bin/sleep 5
+"#,
+        );
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let _timeout_guard = CommandTimeoutGuard::install(Duration::from_millis(500));
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest = nas_verified_manifest(&raw_path);
+        let started = Instant::now();
+
+        let error = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("hung heif-enc should time out");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout should return promptly"
+        );
+        assert!(
+            matches!(
+                error,
+                ConversionExecutionError::CommandTimedOut {
+                    stage: "conversion",
+                    ref program,
+                    ..
+                } if program == "heif-enc"
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert!(!output_path.exists());
+        assert!(!embedded_preview_path(&output_path).exists());
+        assert!(!oriented_preview_path(&output_path).exists());
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::NasVerified);
+        assert!(!record.proofs.contains_key("conversion"));
+        assert!(!record.proofs.contains_key("conversion_performance"));
+        assert_eq!(
+            fs::read_to_string(log_path).expect("command log should be readable"),
+            "exiftool-preview\nexiftool-preview-orientation\nmagick-auto-orient\nheif-enc\n"
         );
     }
 
@@ -1541,6 +2021,19 @@ printf 'heic-bytes-from-preview' > "$out"
         preview_extraction_body: &str,
         heif_enc_body: &str,
     ) -> tempfile::TempDir {
+        fake_linux_conversion_tools_with_probe_preview_and_heif_enc(
+            "",
+            preview_extraction_body,
+            heif_enc_body,
+        )
+    }
+
+    #[cfg(unix)]
+    fn fake_linux_conversion_tools_with_probe_preview_and_heif_enc(
+        preview_probe_body: &str,
+        preview_extraction_body: &str,
+        heif_enc_body: &str,
+    ) -> tempfile::TempDir {
         let tempdir = tempfile::tempdir().expect("tool tempdir should be created");
         write_executable_script(&tempdir.path().join("heif-enc"), heif_enc_body);
         write_executable_script(
@@ -1558,6 +2051,7 @@ exit 47
             r#"#!/bin/sh
 preview_arg="${{FAKE_PREVIEW_ARG:--PreviewImage}}"
 if [ "$1" = "-j" ]; then
+{preview_probe_body}
   if [ "$preview_arg" = "-JpgFromRaw" ]; then
     printf '[{{"JpgFromRaw":"(Binary data 20 bytes, use -b option to extract)"}}]\n'
   else
@@ -1651,6 +2145,32 @@ exit 0
                     None => env::remove_var("PATH"),
                 }
             }
+        }
+    }
+
+    #[cfg(unix)]
+    struct CommandTimeoutGuard {
+        previous: Option<Duration>,
+    }
+
+    #[cfg(unix)]
+    impl CommandTimeoutGuard {
+        fn install(timeout: Duration) -> Self {
+            let mut configured = TEST_CHILD_COMMAND_TIMEOUT
+                .lock()
+                .expect("test child command timeout lock should not be poisoned");
+            let previous = configured.replace(timeout);
+            Self { previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CommandTimeoutGuard {
+        fn drop(&mut self) {
+            let mut configured = TEST_CHILD_COMMAND_TIMEOUT
+                .lock()
+                .expect("test child command timeout lock should not be poisoned");
+            *configured = self.previous;
         }
     }
 
