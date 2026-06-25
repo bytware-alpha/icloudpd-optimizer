@@ -17,6 +17,7 @@ pub struct ServiceInstallRequest {
     pub stdout_path: PathBuf,
     pub stderr_path: PathBuf,
     pub label: String,
+    pub associated_bundle_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -55,7 +56,7 @@ pub fn install_service(
         &request.stdout_path,
         &request.stderr_path,
         &request.plist_path,
-        None,
+        request.associated_bundle_id.as_deref(),
     )?;
 
     Ok(ServiceInstallSummary {

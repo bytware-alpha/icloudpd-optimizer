@@ -270,6 +270,8 @@ struct ServiceInstallArgs {
     config: PathBuf,
     #[arg(long, default_value = DEFAULT_SERVICE_LABEL)]
     label: String,
+    #[arg(long, value_name = "BUNDLE_ID")]
+    associated_bundle_id: Option<String>,
     #[arg(long, value_name = "PATH")]
     bin: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
@@ -801,6 +803,10 @@ fn service_install<W: Write>(args: ServiceInstallArgs, writer: &mut W) -> Result
         plist_path,
         stdout_path,
         stderr_path,
+        associated_bundle_id: Some(
+            args.associated_bundle_id
+                .unwrap_or_else(|| args.label.clone()),
+        ),
         label: args.label,
     })?;
     writeln!(writer, "installed service {}", summary.label)?;

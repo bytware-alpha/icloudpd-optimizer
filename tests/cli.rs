@@ -1547,7 +1547,7 @@ fn monitor_launchd_plist_rejects_invalid_associated_bundle_id() {
 }
 
 #[test]
-fn service_install_creates_plain_launchagent_for_installed_binary() {
+fn service_install_creates_launchagent_with_stable_associated_identifier() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let config_path = tempdir.path().join("monitor.json");
     let download_root = tempdir.path().join("download");
@@ -1609,7 +1609,8 @@ fn service_install_creates_plain_launchagent_for_installed_binary() {
 
     let launchd_plist = fs::read_to_string(&plist_path).expect("launchd plist should be readable");
     assert!(launchd_plist.contains(&bin_path.to_string_lossy().to_string()));
-    assert!(!launchd_plist.contains("<key>AssociatedBundleIdentifiers</key>"));
+    assert!(launchd_plist.contains("<key>AssociatedBundleIdentifiers</key>"));
+    assert!(launchd_plist.contains("<string>com.icloudpd-optimizer.monitor</string>"));
     assert!(!launchd_plist.contains("io.github.bytware-alpha.icloudpd-optimizer"));
     assert!(launchd_plist.contains(&config_path.to_string_lossy().to_string()));
     assert!(launchd_plist.contains(&stdout_path.to_string_lossy().to_string()));
