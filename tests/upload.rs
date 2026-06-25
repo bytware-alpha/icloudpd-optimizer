@@ -134,6 +134,58 @@ fn cloudkit_raw_pair_with_url(
     records
 }
 
+fn cloudkit_asset_raw_alt_pair_with_url(
+    asset_name: &str,
+    master_name: &str,
+    change_tag: &str,
+    size_bytes: u64,
+    asset_date_millis: i64,
+    download_url: &str,
+) -> Value {
+    let mut records = cloudkit_raw_pair_with_url(
+        asset_name,
+        master_name,
+        change_tag,
+        size_bytes,
+        asset_date_millis,
+        download_url,
+    );
+    let asset_fields = records[0]["fields"]
+        .as_object_mut()
+        .expect("asset fields should be an object");
+    asset_fields.insert(
+        "resOriginalAltRes".to_string(),
+        json!({
+            "value": {
+                "size": size_bytes,
+                "downloadURL": download_url
+            }
+        }),
+    );
+    asset_fields.insert(
+        "resOriginalAltFileType".to_string(),
+        json!({"value": "com.adobe.raw-image"}),
+    );
+
+    let master_fields = records[1]["fields"]
+        .as_object_mut()
+        .expect("master fields should be an object");
+    master_fields.insert(
+        "resOriginalRes".to_string(),
+        json!({
+            "value": {
+                "size": 1_234_567,
+                "downloadURL": "https://p140-icloud-content.icloud.com/visible-heic"
+            }
+        }),
+    );
+    master_fields.insert(
+        "resOriginalFileType".to_string(),
+        json!({"value": "public.heic"}),
+    );
+    records
+}
+
 fn cloudkit_uploaded_heic_asset(asset_name: &str, master_name: &str, change_tag: &str) -> Value {
     json!({
         "records": [{
@@ -682,6 +734,36 @@ fn cloudkit_original_asset_resolver_records_exact_raw_match() {
 }
 
 #[test]
+fn cloudkit_original_asset_resolver_records_asset_side_raw_alternative() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({
+            "records": cloudkit_asset_raw_alt_pair_with_url(
+                "CPLAsset-original-123",
+                "CPLMaster-visible-123",
+                "change-tag-1",
+                9,
+                1_800_000_000_000,
+                "https://p140-icloud-content.icloud.com/asset-side-raw-alt"
+            )
+        })],
+        vec![b"raw-bytes".to_vec()],
+    );
+
+    let proof = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_asset(&session, &original_asset_resolve_request())
+        .expect("asset-side RAW alternative should resolve by exact content hash");
+
+    assert_eq!(proof.record_name, "CPLAsset-original-123");
+    assert_eq!(proof.record_change_tag, "change-tag-1");
+    assert_eq!(
+        transport.downloaded_urls,
+        vec!["https://p140-icloud-content.icloud.com/asset-side-raw-alt"]
+    );
+}
+
+#[test]
 fn cloudkit_original_asset_batch_resolver_records_two_targets_from_one_scan() {
     let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
         .expect("session should load");
@@ -727,6 +809,43 @@ fn cloudkit_original_asset_batch_resolver_records_two_targets_from_one_scan() {
     assert_eq!(proofs["asset-2"].record_name, "CPLAsset-original-456");
     assert_eq!(proofs["asset-2"].filename, "IMG_0002.dng");
     assert_eq!(proofs["asset-2"].size_bytes, 11);
+}
+
+#[test]
+fn cloudkit_original_asset_batch_resolver_records_asset_side_raw_alternative() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({
+            "records": cloudkit_asset_raw_alt_pair_with_url(
+                "CPLAsset-original-123",
+                "CPLMaster-visible-123",
+                "change-tag-1",
+                9,
+                1_800_000_000_000,
+                "https://p140-icloud-content.icloud.com/asset-side-raw-alt"
+            )
+        })],
+        vec![b"raw-bytes".to_vec()],
+    );
+
+    let proofs = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch(
+            &session,
+            &batch_resolve_request(vec![batch_resolve_target(
+                "asset-1",
+                "IMG_0001.dng",
+                b"raw-bytes",
+            )]),
+        )
+        .expect("batch resolver should inspect asset-side RAW alternatives");
+
+    assert_eq!(proofs["asset-1"].record_name, "CPLAsset-original-123");
+    assert_eq!(proofs["asset-1"].record_change_tag, "change-tag-1");
+    assert_eq!(
+        transport.downloaded_urls,
+        vec!["https://p140-icloud-content.icloud.com/asset-side-raw-alt"]
+    );
 }
 
 #[test]

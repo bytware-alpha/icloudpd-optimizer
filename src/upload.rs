@@ -1555,6 +1555,7 @@ struct CloudKitAssetRecord {
     record_change_tag: String,
     master_record_name: String,
     asset_date_unix_seconds: u64,
+    record: Value,
 }
 
 fn parse_original_asset_query_response(
@@ -1605,13 +1606,15 @@ fn parse_original_asset_query_response(
         ) {
             continue;
         }
-        if let Some(download_url) =
-            master_matching_raw_resource_url(master, request.raw_size_bytes)?
+        let mut target_sizes = BTreeSet::new();
+        target_sizes.insert(request.raw_size_bytes);
+        for (_, download_url) in
+            record_pair_matching_raw_resource_urls(&asset.record, master, &target_sizes)?
         {
             matches.push(OriginalAssetCandidate {
                 proof: OriginalAssetProof {
-                    record_name: asset.record_name,
-                    record_change_tag: asset.record_change_tag,
+                    record_name: asset.record_name.clone(),
+                    record_change_tag: asset.record_change_tag.clone(),
                     record_type: "CPLAsset".to_string(),
                     filename: request.filename.clone(),
                     size_bytes: request.raw_size_bytes,
@@ -1687,9 +1690,11 @@ fn parse_original_asset_batch_query_response(
             .keys()
             .copied()
             .collect();
-        for (raw_size_bytes, download_url) in
-            master_matching_raw_resource_urls(master, &date_matching_target_sizes)?
-        {
+        for (raw_size_bytes, download_url) in record_pair_matching_raw_resource_urls(
+            &asset.record,
+            master,
+            &date_matching_target_sizes,
+        )? {
             let Some(target_indexes) = date_matching_target_indexes_by_size.get(&raw_size_bytes)
             else {
                 continue;
@@ -1878,62 +1883,45 @@ fn parse_cloudkit_asset_record(record: &Value) -> Result<CloudKitAssetRecord, Up
         record_change_tag: record_change_tag.to_string(),
         master_record_name: master_record_name.to_string(),
         asset_date_unix_seconds,
+        record: record.clone(),
     })
 }
 
-fn master_matching_raw_resource_url(
+struct RawResourceUrlMatches {
+    saw_resource: bool,
+    matches: Vec<(u64, Url)>,
+}
+
+fn record_pair_matching_raw_resource_urls(
+    asset: &Value,
     master: &Value,
-    raw_size_bytes: u64,
-) -> Result<Option<Url>, UploadError> {
-    let fields = record_fields(master)?;
+    target_sizes: &BTreeSet<u64>,
+) -> Result<Vec<(u64, Url)>, UploadError> {
     let mut saw_resource = false;
-    for prefix in [
-        "resOriginal",
-        "resOriginalAlt",
-        "resSidecar",
-        "resOriginalVidCompl",
-    ] {
-        let res_key = format!("{prefix}Res");
-        let Some(resource_field) = fields.get(&res_key) else {
-            continue;
-        };
-        saw_resource = true;
-        let Some(resource) = field_value_object(resource_field) else {
-            return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
-                "CPLMaster resource field is malformed",
-            ));
-        };
-        let Some(size_bytes) = resource_size_bytes(resource) else {
-            return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
-                "CPLMaster resource missing size",
-            ));
-        };
-        if size_bytes != raw_size_bytes {
-            continue;
-        }
-        let file_type_key = format!("{prefix}FileType");
-        let Some(file_type) = field_string(fields, &file_type_key) else {
-            return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
-                "CPLMaster resource missing file type",
-            ));
-        };
-        if resource_type_is_raw(file_type) {
-            return Ok(Some(resource_download_url(resource)?));
+    let mut seen = BTreeSet::new();
+    let mut matches = Vec::new();
+    for record in [asset, master] {
+        let record_matches = record_matching_raw_resource_urls(record, target_sizes)?;
+        saw_resource |= record_matches.saw_resource;
+        for (size_bytes, download_url) in record_matches.matches {
+            if seen.insert((size_bytes, download_url.as_str().to_string())) {
+                matches.push((size_bytes, download_url));
+            }
         }
     }
     if !saw_resource {
         return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
-            "CPLMaster missing original resources",
+            "CloudKit original record pair missing original resources",
         ));
     }
-    Ok(None)
+    Ok(matches)
 }
 
-fn master_matching_raw_resource_urls(
-    master: &Value,
-    target_sizes: &std::collections::BTreeSet<u64>,
-) -> Result<Vec<(u64, Url)>, UploadError> {
-    let fields = record_fields(master)?;
+fn record_matching_raw_resource_urls(
+    record: &Value,
+    target_sizes: &BTreeSet<u64>,
+) -> Result<RawResourceUrlMatches, UploadError> {
+    let fields = record_fields(record)?;
     let mut saw_resource = false;
     let mut matches = Vec::new();
     for prefix in [
@@ -1949,12 +1937,12 @@ fn master_matching_raw_resource_urls(
         saw_resource = true;
         let Some(resource) = field_value_object(resource_field) else {
             return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
-                "CPLMaster resource field is malformed",
+                "CloudKit original resource field is malformed",
             ));
         };
         let Some(size_bytes) = resource_size_bytes(resource) else {
             return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
-                "CPLMaster resource missing size",
+                "CloudKit original resource missing size",
             ));
         };
         if !target_sizes.contains(&size_bytes) {
@@ -1963,19 +1951,17 @@ fn master_matching_raw_resource_urls(
         let file_type_key = format!("{prefix}FileType");
         let Some(file_type) = field_string(fields, &file_type_key) else {
             return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
-                "CPLMaster resource missing file type",
+                "CloudKit original resource missing file type",
             ));
         };
         if resource_type_is_raw(file_type) {
             matches.push((size_bytes, resource_download_url(resource)?));
         }
     }
-    if !saw_resource {
-        return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
-            "CPLMaster missing original resources",
-        ));
-    }
-    Ok(matches)
+    Ok(RawResourceUrlMatches {
+        saw_resource,
+        matches,
+    })
 }
 
 fn master_matching_heic_resource_url(
