@@ -44,6 +44,7 @@ const MONITOR_STATS_SCHEMA_VERSION: u64 = 1;
 const DEFAULT_CAPTURE_TOLERANCE_SECONDS: u64 = 2;
 const DEFAULT_CLOUDKIT_PAGE_SIZE: u64 = 200;
 const DEFAULT_CLOUDKIT_MAX_PAGES: u64 = 2000;
+const DEFAULT_SCAN_ROOT_PREFLIGHT_TIMEOUT_SECONDS: u64 = 30;
 const MONITOR_VISUAL_RMSE_MAX: f64 = 0.02;
 const MONITOR_HEIC_STDEV_MIN: f64 = 0.005;
 const DEFAULT_LAUNCHD_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
@@ -69,6 +70,10 @@ fn default_cloudkit_page_size() -> u64 {
 
 fn default_cloudkit_max_pages() -> u64 {
     DEFAULT_CLOUDKIT_MAX_PAGES
+}
+
+fn default_scan_root_preflight_timeout_seconds() -> u64 {
+    DEFAULT_SCAN_ROOT_PREFLIGHT_TIMEOUT_SECONDS
 }
 
 fn default_scan_recursive() -> bool {
@@ -113,6 +118,8 @@ pub struct MonitorConfig {
     pub cloudkit_page_size: u64,
     #[serde(default = "default_cloudkit_max_pages")]
     pub cloudkit_max_pages: u64,
+    #[serde(default = "default_scan_root_preflight_timeout_seconds")]
+    pub scan_root_preflight_timeout_seconds: u64,
 }
 
 impl MonitorConfig {
@@ -148,6 +155,7 @@ impl MonitorConfig {
             cloudkit_start_rank: 0,
             cloudkit_page_size: default_cloudkit_page_size(),
             cloudkit_max_pages: default_cloudkit_max_pages(),
+            scan_root_preflight_timeout_seconds: default_scan_root_preflight_timeout_seconds(),
         }
     }
 
@@ -239,6 +247,11 @@ impl MonitorConfig {
         if self.cloudkit_max_pages == 0 {
             return Err(MonitorError::InvalidConfig {
                 message: "cloudkit_max_pages must be greater than 0".to_string(),
+            });
+        }
+        if self.scan_root_preflight_timeout_seconds == 0 {
+            return Err(MonitorError::InvalidConfig {
+                message: "scan_root_preflight_timeout_seconds must be greater than 0".to_string(),
             });
         }
         Ok(())
@@ -422,7 +435,7 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
                 source,
             }
         })?;
-        ensure_scan_root_access(&download_root)?;
+        ensure_scan_root_access(&download_root, config.scan_root_preflight_timeout_seconds)?;
         let now = SystemTime::now();
         let mut pending_capacity = config
             .max_conversions_per_scan
@@ -996,7 +1009,7 @@ fn should_skip_new_monitor_work(had_lifecycle_pending_at_start: bool) -> bool {
     had_lifecycle_pending_at_start
 }
 
-fn ensure_scan_root_access(path: &Path) -> Result<(), MonitorError> {
+fn ensure_scan_root_access(path: &Path, timeout_seconds: u64) -> Result<(), MonitorError> {
     #[cfg(unix)]
     {
         use std::ffi::CString;
@@ -1018,12 +1031,15 @@ fn ensure_scan_root_access(path: &Path) -> Result<(), MonitorError> {
         }
     }
     #[cfg(target_os = "macos")]
-    ensure_macos_scan_root_enumerable(path)?;
+    ensure_macos_scan_root_enumerable(path, timeout_seconds)?;
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn ensure_macos_scan_root_enumerable(path: &Path) -> Result<(), MonitorError> {
+fn ensure_macos_scan_root_enumerable(
+    path: &Path,
+    timeout_seconds: u64,
+) -> Result<(), MonitorError> {
     let mut child = Command::new("/usr/bin/perl")
         .arg("-e")
         .arg("opendir(my $dh, $ARGV[0]) or die \"$!\\n\"; readdir($dh);")
@@ -1035,7 +1051,7 @@ fn ensure_macos_scan_root_enumerable(path: &Path) -> Result<(), MonitorError> {
             program: "perl",
             source,
         })?;
-    let timeout = Duration::from_secs(5);
+    let timeout = Duration::from_secs(timeout_seconds);
     let deadline = Instant::now() + timeout;
 
     loop {
@@ -1737,7 +1753,7 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o000))
             .expect("permissions should be restricted");
 
-        let result = ensure_scan_root_access(path);
+        let result = ensure_scan_root_access(path, default_scan_root_preflight_timeout_seconds());
 
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .expect("permissions should be restored");

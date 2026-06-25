@@ -165,6 +165,8 @@ struct MonitorInitArgs {
     cloudkit_page_size: u64,
     #[arg(long, default_value_t = 2000)]
     cloudkit_max_pages: u64,
+    #[arg(long, default_value_t = 30)]
+    scan_root_preflight_timeout_seconds: u64,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     force: bool,
 }
@@ -680,6 +682,7 @@ fn monitor_init(args: MonitorInitArgs) -> Result<(), CliError> {
     config.cloudkit_start_rank = args.cloudkit_start_rank;
     config.cloudkit_page_size = args.cloudkit_page_size;
     config.cloudkit_max_pages = args.cloudkit_max_pages;
+    config.scan_root_preflight_timeout_seconds = args.scan_root_preflight_timeout_seconds;
     config.validate()?;
     config.save_atomic(args.config)?;
     Ok(())

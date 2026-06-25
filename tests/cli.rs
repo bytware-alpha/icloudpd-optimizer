@@ -1034,6 +1034,8 @@ fn monitor_init_can_enable_guarded_full_lifecycle_config() {
             "12",
             "--capture-tolerance-seconds",
             "4",
+            "--scan-root-preflight-timeout-seconds",
+            "45",
         ])
         .assert()
         .success();
@@ -1061,6 +1063,7 @@ fn monitor_init_can_enable_guarded_full_lifecycle_config() {
     assert_eq!(config["cloudkit_page_size"], 50);
     assert_eq!(config["cloudkit_max_pages"], 12);
     assert_eq!(config["capture_tolerance_seconds"], 4);
+    assert_eq!(config["scan_root_preflight_timeout_seconds"], 45);
 }
 
 #[cfg(unix)]
