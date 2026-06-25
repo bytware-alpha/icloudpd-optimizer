@@ -1370,6 +1370,8 @@ fn monitor_stats_tui_and_launchd_plist_are_simple_and_non_secret() {
             config_path.to_str().expect("config path should be utf8"),
             "--bin",
             "/usr/local/bin/icloudpd-optimizer",
+            "--associated-bundle-id",
+            "io.github.bytware-alpha.icloudpd-optimizer",
             "--stdout",
             tempdir
                 .path()
@@ -1391,6 +1393,8 @@ fn monitor_stats_tui_and_launchd_plist_are_simple_and_non_secret() {
     let plist = String::from_utf8(plist_output).expect("plist should be utf8");
     assert!(plist.contains("<string>monitor</string>"));
     assert!(plist.contains("<string>run</string>"));
+    assert!(plist.contains("<key>AssociatedBundleIdentifiers</key>"));
+    assert!(plist.contains("<string>io.github.bytware-alpha.icloudpd-optimizer</string>"));
     assert!(plist.contains("<key>StandardOutPath</key>"));
     assert!(plist.contains("monitor.stdout.log"));
     assert!(plist.contains("<key>StandardErrorPath</key>"));
@@ -1400,6 +1404,25 @@ fn monitor_stats_tui_and_launchd_plist_are_simple_and_non_secret() {
     assert!(!plist.contains("/config"));
     assert!(!plist.to_ascii_lowercase().contains("password"));
     assert!(!plist.to_ascii_lowercase().contains("token"));
+}
+
+#[test]
+fn monitor_launchd_plist_rejects_invalid_associated_bundle_id() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let config_path = tempdir.path().join("monitor.json");
+
+    binary()
+        .args([
+            "monitor",
+            "launchd-plist",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--associated-bundle-id",
+            "not a bundle id",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid bundle identifier"));
 }
 
 #[test]

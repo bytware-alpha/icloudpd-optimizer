@@ -211,6 +211,8 @@ struct MonitorLaunchdPlistArgs {
     config: PathBuf,
     #[arg(long, default_value = "com.icloudpd-optimizer.monitor")]
     label: String,
+    #[arg(long, value_name = "BUNDLE_ID")]
+    associated_bundle_id: Option<String>,
     #[arg(long, value_name = "PATH")]
     bin: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
@@ -775,6 +777,7 @@ fn monitor_launchd_plist<W: Write>(
             &stdout_path,
             &stderr_path,
             &output,
+            args.associated_bundle_id.as_deref(),
         )?;
     } else {
         writer.write_all(
@@ -784,6 +787,7 @@ fn monitor_launchd_plist<W: Write>(
                 &args.config,
                 &stdout_path,
                 &stderr_path,
+                args.associated_bundle_id.as_deref(),
             )?
             .as_bytes(),
         )?;

@@ -666,8 +666,24 @@ pub fn launchd_plist(
     config: &Path,
     stdout_path: &Path,
     stderr_path: &Path,
+    associated_bundle_id: Option<&str>,
 ) -> Result<String, MonitorError> {
     validate_launchd_label(label)?;
+    let associated_bundle_identifiers = match associated_bundle_id {
+        Some(bundle_id) => {
+            validate_bundle_identifier(bundle_id)?;
+            format!(
+                concat!(
+                    "  <key>AssociatedBundleIdentifiers</key>\n",
+                    "  <array>\n",
+                    "    <string>{bundle_id}</string>\n",
+                    "  </array>\n"
+                ),
+                bundle_id = escape_xml(bundle_id),
+            )
+        }
+        None => String::new(),
+    };
     Ok(format!(
         concat!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
@@ -685,6 +701,7 @@ pub fn launchd_plist(
             "    <string>--config</string>\n",
             "    <string>{config}</string>\n",
             "  </array>\n",
+            "{associated_bundle_identifiers}",
             "  <key>RunAtLoad</key>\n",
             "  <true/>\n",
             "  <key>KeepAlive</key>\n",
@@ -704,6 +721,7 @@ pub fn launchd_plist(
         label = escape_xml(label),
         binary = escape_xml(&binary.display().to_string()),
         config = escape_xml(&config.display().to_string()),
+        associated_bundle_identifiers = associated_bundle_identifiers,
         launchd_path = escape_xml(DEFAULT_LAUNCHD_PATH),
         stdout_path = escape_xml(&stdout_path.display().to_string()),
         stderr_path = escape_xml(&stderr_path.display().to_string()),
@@ -717,8 +735,16 @@ pub fn write_launchd_plist(
     stdout_path: &Path,
     stderr_path: &Path,
     output: &Path,
+    associated_bundle_id: Option<&str>,
 ) -> Result<(), MonitorError> {
-    let plist = launchd_plist(label, binary, config, stdout_path, stderr_path)?;
+    let plist = launchd_plist(
+        label,
+        binary,
+        config,
+        stdout_path,
+        stderr_path,
+        associated_bundle_id,
+    )?;
     write_text_atomic(output, &plist).map_err(|source| MonitorError::WriteLaunchdPlist {
         path: output.to_path_buf(),
         source,
@@ -1550,6 +1576,22 @@ fn validate_launchd_label(label: &str) -> Result<(), MonitorError> {
     Ok(())
 }
 
+fn validate_bundle_identifier(bundle_id: &str) -> Result<(), MonitorError> {
+    let has_separator = bundle_id.contains('.');
+    if bundle_id.is_empty()
+        || !has_separator
+        || !bundle_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        || bundle_id.split('.').any(str::is_empty)
+    {
+        return Err(MonitorError::InvalidBundleIdentifier {
+            bundle_id: bundle_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn escape_xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1623,6 +1665,8 @@ pub enum MonitorError {
     },
     #[error("invalid launchd label {label}")]
     InvalidLaunchdLabel { label: String },
+    #[error("invalid bundle identifier {bundle_id}")]
+    InvalidBundleIdentifier { bundle_id: String },
     #[error("failed to write launchd plist {path}: {source}")]
     WriteLaunchdPlist { path: PathBuf, source: io::Error },
 }
