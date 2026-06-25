@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(target_os = "macos")]
+use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -1040,15 +1042,20 @@ fn ensure_macos_scan_root_enumerable(
     path: &Path,
     timeout_seconds: u64,
 ) -> Result<(), MonitorError> {
-    let mut child = Command::new("/usr/bin/perl")
-        .arg("-e")
-        .arg("opendir(my $dh, $ARGV[0]) or die \"$!\\n\"; readdir($dh);")
+    let helper = env::current_exe().map_err(|source| MonitorError::CommandIo {
+        program: "icloudpd-optimizer preflight helper",
+        source,
+    })?;
+    let mut child = Command::new(helper)
+        .arg("monitor")
+        .arg("scan-root-preflight")
+        .arg("--path")
         .arg(path)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|source| MonitorError::CommandIo {
-            program: "perl",
+            program: "icloudpd-optimizer preflight helper",
             source,
         })?;
     let timeout = Duration::from_secs(timeout_seconds);
@@ -1104,6 +1111,20 @@ fn read_child_stderr(child: &mut std::process::Child) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+pub fn run_scan_root_preflight_probe(path: &Path) -> Result<(), MonitorError> {
+    let mut entries = fs::read_dir(path).map_err(|source| MonitorError::ReadDir {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if let Some(entry) = entries.next() {
+        entry.map_err(|source| MonitorError::ReadDirEntry {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(())
 }
 
 fn log_monitor_event(event: &str, scan_started_unix_seconds: u64, fields: serde_json::Value) {

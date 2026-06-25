@@ -886,6 +886,37 @@ fn monitor_init_writes_simple_config_without_overwriting() {
         .stderr(predicate::str::contains("already exists"));
 }
 
+#[test]
+fn monitor_scan_root_preflight_probe_reads_directory_or_fails_closed() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+
+    binary()
+        .args([
+            "monitor",
+            "scan-root-preflight",
+            "--path",
+            tempdir.path().to_str().expect("path should be utf8"),
+        ])
+        .assert()
+        .success()
+        .stdout("");
+
+    binary()
+        .args([
+            "monitor",
+            "scan-root-preflight",
+            "--path",
+            tempdir
+                .path()
+                .join("missing")
+                .to_str()
+                .expect("path should be utf8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to read directory"));
+}
+
 #[cfg(unix)]
 #[test]
 fn monitor_run_once_converts_matching_old_raw_and_writes_stats() {

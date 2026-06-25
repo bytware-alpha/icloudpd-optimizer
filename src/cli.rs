@@ -22,7 +22,7 @@ use crate::local_mirror::{
 use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
 use crate::monitor::{
     MonitorConfig, MonitorError, MonitorScanSummary, MonitorStats, launchd_plist, render_tui,
-    run_monitor_once, write_launchd_plist,
+    run_monitor_once, run_scan_root_preflight_probe, write_launchd_plist,
 };
 use crate::proof::NasRawProof;
 use crate::upload::{
@@ -113,6 +113,8 @@ enum MonitorCommand {
         about = "Print or write a macOS user LaunchAgent plist"
     )]
     LaunchdPlist(MonitorLaunchdPlistArgs),
+    #[command(name = "scan-root-preflight", hide = true)]
+    ScanRootPreflight(MonitorScanRootPreflightArgs),
 }
 
 #[derive(Debug, Args)]
@@ -177,6 +179,12 @@ struct MonitorRunArgs {
     config: PathBuf,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     once: bool,
+}
+
+#[derive(Debug, Args)]
+struct MonitorScanRootPreflightArgs {
+    #[arg(long, value_name = "PATH")]
+    path: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -650,7 +658,13 @@ fn run_monitor<W: Write>(args: MonitorArgs, writer: &mut W) -> Result<(), CliErr
         MonitorCommand::Stats(args) => monitor_stats(args, writer),
         MonitorCommand::Tui(args) => monitor_tui(args, writer),
         MonitorCommand::LaunchdPlist(args) => monitor_launchd_plist(args, writer),
+        MonitorCommand::ScanRootPreflight(args) => monitor_scan_root_preflight(args),
     }
+}
+
+fn monitor_scan_root_preflight(args: MonitorScanRootPreflightArgs) -> Result<(), CliError> {
+    run_scan_root_preflight_probe(&args.path)?;
+    Ok(())
 }
 
 fn monitor_init(args: MonitorInitArgs) -> Result<(), CliError> {
