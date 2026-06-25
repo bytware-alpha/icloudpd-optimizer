@@ -25,6 +25,11 @@ use crate::monitor::{
     run_monitor_once, run_scan_root_preflight_probe, write_launchd_plist,
 };
 use crate::proof::NasRawProof;
+use crate::service::{
+    DEFAULT_BUNDLE_ID, DEFAULT_SERVICE_LABEL, ServiceError, ServiceInstallRequest,
+    default_app_path, default_plist_path, install_service, service_status, start_service,
+    stop_service, tail_logs, uninstall_service,
+};
 use crate::upload::{
     CloudKitDeleteClient, CloudKitDeleteRequest, CloudKitOriginalAssetBatchResolveRequest,
     CloudKitOriginalAssetResolveRequest, CloudKitOriginalAssetResolveTarget, IcloudUploadRequest,
@@ -61,6 +66,7 @@ enum Command {
     Doctor(DoctorArgs),
     Workflow(WorkflowArgs),
     Monitor(MonitorArgs),
+    Service(ServiceArgs),
 }
 
 #[derive(Debug, Args)]
@@ -96,6 +102,28 @@ struct WorkflowArgs {
 struct MonitorArgs {
     #[command(subcommand)]
     command: MonitorCommand,
+}
+
+#[derive(Debug, Args)]
+struct ServiceArgs {
+    #[command(subcommand)]
+    command: ServiceCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    #[command(about = "Install the macOS per-user LaunchAgent service wrapper")]
+    Install(ServiceInstallArgs),
+    #[command(about = "Start the installed macOS LaunchAgent service")]
+    Start(ServiceStartArgs),
+    #[command(about = "Stop the installed macOS LaunchAgent service")]
+    Stop(ServiceLabelArgs),
+    #[command(about = "Print launchd status for the service")]
+    Status(ServiceLabelArgs),
+    #[command(about = "Print recent service stdout/stderr logs")]
+    Logs(ServiceLogsArgs),
+    #[command(about = "Remove the LaunchAgent and app-bundle service wrapper")]
+    Uninstall(ServiceUninstallArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -221,6 +249,68 @@ struct MonitorLaunchdPlistArgs {
     stderr: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ServiceInstallArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long, default_value = DEFAULT_SERVICE_LABEL)]
+    label: String,
+    #[arg(long, default_value = DEFAULT_BUNDLE_ID)]
+    bundle_id: String,
+    #[arg(long, value_name = "PATH")]
+    bin: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    app: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    plist: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    stdout: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    stderr: Option<PathBuf>,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    skip_codesign: bool,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct ServiceStartArgs {
+    #[arg(long, default_value = DEFAULT_SERVICE_LABEL)]
+    label: String,
+    #[arg(long, value_name = "PATH")]
+    plist: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ServiceLabelArgs {
+    #[arg(long, default_value = DEFAULT_SERVICE_LABEL)]
+    label: String,
+}
+
+#[derive(Debug, Args)]
+struct ServiceLogsArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    stdout: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    stderr: Option<PathBuf>,
+    #[arg(long, default_value_t = 80)]
+    lines: usize,
+}
+
+#[derive(Debug, Args)]
+struct ServiceUninstallArgs {
+    #[arg(long, default_value = DEFAULT_SERVICE_LABEL)]
+    label: String,
+    #[arg(long, value_name = "PATH")]
+    app: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    plist: Option<PathBuf>,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    keep_app: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -554,6 +644,8 @@ pub enum CliError {
     LocalMirror(#[from] LocalMirrorError),
     #[error("monitor failed: {0}")]
     Monitor(#[from] MonitorError),
+    #[error("service failed: {0}")]
+    Service(#[from] ServiceError),
     #[error("config already exists at {path}; pass --force to overwrite")]
     ConfigAlreadyExists { path: PathBuf },
     #[error("unsafe batch asset id for output filename: {asset_id}")]
@@ -574,6 +666,7 @@ fn run_with_writer<W: Write>(cli: Cli, writer: &mut W) -> Result<(), CliError> {
         Command::Doctor(args) => run_doctor(args, writer),
         Command::Workflow(args) => run_workflow(args, writer),
         Command::Monitor(args) => run_monitor(args, writer),
+        Command::Service(args) => run_service(args, writer),
     }
 }
 
@@ -662,6 +755,117 @@ fn run_monitor<W: Write>(args: MonitorArgs, writer: &mut W) -> Result<(), CliErr
         MonitorCommand::LaunchdPlist(args) => monitor_launchd_plist(args, writer),
         MonitorCommand::ScanRootPreflight(args) => monitor_scan_root_preflight(args),
     }
+}
+
+fn run_service<W: Write>(args: ServiceArgs, writer: &mut W) -> Result<(), CliError> {
+    match args.command {
+        ServiceCommand::Install(args) => service_install(args, writer),
+        ServiceCommand::Start(args) => service_start(args),
+        ServiceCommand::Stop(args) => service_stop(args),
+        ServiceCommand::Status(args) => service_status_command(args, writer),
+        ServiceCommand::Logs(args) => service_logs(args, writer),
+        ServiceCommand::Uninstall(args) => service_uninstall(args),
+    }
+}
+
+fn service_install<W: Write>(args: ServiceInstallArgs, writer: &mut W) -> Result<(), CliError> {
+    let source_binary = match args.bin {
+        Some(path) => path,
+        None => env::current_exe()?,
+    };
+    let app_path = match args.app {
+        Some(path) => path,
+        None => default_app_path()?,
+    };
+    let plist_path = match args.plist {
+        Some(path) => path,
+        None => default_plist_path(&args.label)?,
+    };
+    let stdout_path = args
+        .stdout
+        .unwrap_or_else(|| args.config.with_extension("stdout.log"));
+    let stderr_path = args
+        .stderr
+        .unwrap_or_else(|| args.config.with_extension("stderr.log"));
+    let summary = install_service(&ServiceInstallRequest {
+        config_path: args.config,
+        source_binary,
+        app_path,
+        plist_path,
+        stdout_path,
+        stderr_path,
+        label: args.label,
+        bundle_id: args.bundle_id,
+        skip_codesign: args.skip_codesign,
+        force: args.force,
+    })?;
+    writeln!(writer, "installed service {}", summary.label)?;
+    writeln!(writer, "app: {}", summary.app_path.display())?;
+    writeln!(writer, "binary: {}", summary.app_binary.display())?;
+    writeln!(writer, "launchd plist: {}", summary.plist_path.display())?;
+    writeln!(writer, "bundle id: {}", summary.bundle_id)?;
+    writeln!(
+        writer,
+        "Grant Network Volumes or Full Disk Access to the app before starting the service."
+    )?;
+    Ok(())
+}
+
+fn service_start(args: ServiceStartArgs) -> Result<(), CliError> {
+    let plist_path = match args.plist {
+        Some(path) => path,
+        None => default_plist_path(&args.label)?,
+    };
+    start_service(&args.label, &plist_path)?;
+    Ok(())
+}
+
+fn service_stop(args: ServiceLabelArgs) -> Result<(), CliError> {
+    stop_service(&args.label)?;
+    Ok(())
+}
+
+fn service_status_command<W: Write>(
+    args: ServiceLabelArgs,
+    writer: &mut W,
+) -> Result<(), CliError> {
+    let output = service_status(&args.label)?;
+    writer.write_all(output.stdout.as_bytes())?;
+    writer.write_all(output.stderr.as_bytes())?;
+    if output.status != 0 {
+        return Err(ServiceError::CommandFailed {
+            program: "launchctl print".to_string(),
+            status: output.status,
+            stderr: output.stderr,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn service_logs<W: Write>(args: ServiceLogsArgs, writer: &mut W) -> Result<(), CliError> {
+    let stdout_path = args
+        .stdout
+        .unwrap_or_else(|| args.config.with_extension("stdout.log"));
+    let stderr_path = args
+        .stderr
+        .unwrap_or_else(|| args.config.with_extension("stderr.log"));
+    writer.write_all(tail_logs(&stdout_path, &stderr_path, args.lines)?.as_bytes())?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn service_uninstall(args: ServiceUninstallArgs) -> Result<(), CliError> {
+    let app_path = match args.app {
+        Some(path) => path,
+        None => default_app_path()?,
+    };
+    let plist_path = match args.plist {
+        Some(path) => path,
+        None => default_plist_path(&args.label)?,
+    };
+    uninstall_service(&args.label, &plist_path, &app_path, args.keep_app)?;
+    Ok(())
 }
 
 fn monitor_scan_root_preflight(args: MonitorScanRootPreflightArgs) -> Result<(), CliError> {

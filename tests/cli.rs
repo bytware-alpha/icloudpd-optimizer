@@ -1426,6 +1426,130 @@ fn monitor_launchd_plist_rejects_invalid_associated_bundle_id() {
 }
 
 #[test]
+fn service_install_creates_app_bundle_and_associated_launchagent() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let config_path = tempdir.path().join("monitor.json");
+    let download_root = tempdir.path().join("download");
+    let heic_dir = tempdir.path().join("heic");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let app_path = tempdir.path().join("iCloudPD Optimizer.app");
+    let plist_path = tempdir.path().join("com.icloudpd-optimizer.monitor.plist");
+    let stdout_path = tempdir.path().join("monitor.stdout.log");
+    let stderr_path = tempdir.path().join("monitor.stderr.log");
+    let bin_path = assert_cmd::cargo::cargo_bin("icloudpd-optimizer");
+
+    binary()
+        .args([
+            "monitor",
+            "init",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--download-root",
+            download_root
+                .to_str()
+                .expect("download root should be utf8"),
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--heic-output-dir",
+            heic_dir.to_str().expect("heic dir should be utf8"),
+        ])
+        .assert()
+        .success();
+
+    let output = binary()
+        .args([
+            "service",
+            "install",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--app",
+            app_path.to_str().expect("app path should be utf8"),
+            "--plist",
+            plist_path.to_str().expect("plist path should be utf8"),
+            "--bin",
+            bin_path.to_str().expect("bin path should be utf8"),
+            "--stdout",
+            stdout_path.to_str().expect("stdout path should be utf8"),
+            "--stderr",
+            stderr_path.to_str().expect("stderr path should be utf8"),
+            "--skip-codesign",
+            "--force",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let output_text = String::from_utf8(output).expect("service output should be utf8");
+    assert!(output_text.contains("installed service com.icloudpd-optimizer.monitor"));
+    assert!(output_text.contains("Grant Network Volumes or Full Disk Access"));
+    assert!(!output_text.to_ascii_lowercase().contains("password"));
+    assert!(!output_text.to_ascii_lowercase().contains("token"));
+
+    let app_bin = app_path
+        .join("Contents")
+        .join("MacOS")
+        .join("icloudpd-optimizer-service");
+    assert!(
+        app_bin.exists(),
+        "service binary should be copied into app bundle"
+    );
+
+    let info_plist = fs::read_to_string(app_path.join("Contents").join("Info.plist"))
+        .expect("Info.plist should be readable");
+    assert!(info_plist.contains("<key>CFBundleIdentifier</key>"));
+    assert!(info_plist.contains("io.github.bytware-alpha.icloudpd-optimizer"));
+    assert!(info_plist.contains("<key>LSBackgroundOnly</key>"));
+
+    let launchd_plist = fs::read_to_string(&plist_path).expect("launchd plist should be readable");
+    assert!(launchd_plist.contains(&app_bin.to_string_lossy().to_string()));
+    assert!(launchd_plist.contains("<key>AssociatedBundleIdentifiers</key>"));
+    assert!(launchd_plist.contains("io.github.bytware-alpha.icloudpd-optimizer"));
+    assert!(launchd_plist.contains(&config_path.to_string_lossy().to_string()));
+    assert!(launchd_plist.contains(&stdout_path.to_string_lossy().to_string()));
+    assert!(launchd_plist.contains(&stderr_path.to_string_lossy().to_string()));
+}
+
+#[test]
+fn service_install_rejects_missing_config_without_writing_bundle() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let app_path = tempdir.path().join("iCloudPD Optimizer.app");
+    let plist_path = tempdir.path().join("com.icloudpd-optimizer.monitor.plist");
+    let missing_config = tempdir.path().join("missing-monitor.json");
+    let bin_path = assert_cmd::cargo::cargo_bin("icloudpd-optimizer");
+
+    binary()
+        .args([
+            "service",
+            "install",
+            "--config",
+            missing_config.to_str().expect("config path should be utf8"),
+            "--app",
+            app_path.to_str().expect("app path should be utf8"),
+            "--plist",
+            plist_path.to_str().expect("plist path should be utf8"),
+            "--bin",
+            bin_path.to_str().expect("bin path should be utf8"),
+            "--skip-codesign",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to read monitor config"));
+
+    assert!(
+        !app_path.exists(),
+        "missing config must not create an app bundle"
+    );
+    assert!(
+        !plist_path.exists(),
+        "missing config must not write a launchd plist"
+    );
+}
+
+#[test]
 fn apple_container_packaging_surface_is_documented() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let containerfile_path = repo_root.join("container/Containerfile");
@@ -1467,6 +1591,29 @@ fn apple_container_packaging_surface_is_documented() {
     ));
     assert!(readme.contains("OCI"));
     assert!(readme.contains("Linux OCI runtimes"));
+}
+
+#[test]
+fn homebrew_formula_installs_cli_and_points_to_service_wrapper() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let formula_path = repo_root
+        .join("packaging")
+        .join("homebrew")
+        .join("icloudpd-optimizer.rb");
+
+    let formula = fs::read_to_string(&formula_path).expect("Homebrew formula should be readable");
+    assert!(formula.contains("system \"cargo\", \"install\", *std_cargo_args"));
+    assert!(formula.contains("head \"https://github.com/bytware-alpha/icloudpd-optimizer.git\""));
+    assert!(formula.contains("icloudpd-optimizer service install"));
+    assert!(formula.contains("Network Volumes or Full Disk Access"));
+    for disallowed in [
+        "/Users/", "/home/", "APPLE_ID", "PASSWORD", "SECRET", "TOKEN",
+    ] {
+        assert!(
+            !formula.contains(disallowed),
+            "Homebrew formula should not include local or secret marker {disallowed}"
+        );
+    }
 }
 
 #[test]

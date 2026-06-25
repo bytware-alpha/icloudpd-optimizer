@@ -62,7 +62,20 @@ optimizer OCI image.
 
 ## Install
 
-Install from source:
+Install with Cargo:
+
+```sh
+cargo install --git https://github.com/bytware-alpha/icloudpd-optimizer --locked
+```
+
+Or install the Homebrew formula from a checkout until a tagged tap release exists:
+
+```sh
+git clone https://github.com/bytware-alpha/icloudpd-optimizer.git
+brew install --HEAD ./icloudpd-optimizer/packaging/homebrew/icloudpd-optimizer.rb
+```
+
+Install from a source checkout:
 
 ```sh
 git clone https://github.com/bytware-alpha/icloudpd-optimizer.git
@@ -284,16 +297,29 @@ icloudpd-optimizer monitor tui --config ~/.config/icloudpd-optimizer/monitor.jso
 Generate a macOS LaunchAgent plist:
 
 ```sh
-icloudpd-optimizer monitor launchd-plist \
-  --config ~/.config/icloudpd-optimizer/monitor.json \
-  --bin ~/.local/bin/icloudpd-optimizer \
-  --output ~/Library/LaunchAgents/com.icloudpd-optimizer.monitor.plist
+icloudpd-optimizer service install \
+  --config ~/.config/icloudpd-optimizer/monitor.json
+icloudpd-optimizer service start
+icloudpd-optimizer service status
+icloudpd-optimizer service logs --config ~/.config/icloudpd-optimizer/monitor.json
 ```
 
-On macOS, a LaunchAgent that scans a NAS or SMB-backed iCloudPD folder must be
-allowed to access network volumes. If macOS denies that access, the monitor logs a
-scan preflight error instead of hanging; grant the installed app or binary Network
-Volumes/Full Disk Access before enabling the agent.
+On macOS, `service install` creates a per-user `iCloudPD Optimizer.app` wrapper and a
+LaunchAgent that runs the installed CLI through that app identity. This keeps the tool
+installable through Cargo or Homebrew while giving macOS a stable app to grant privacy
+access to. Grant `iCloudPD Optimizer.app` Network Volumes or Full Disk Access before
+starting the service. If macOS denies NAS or SMB access, the monitor logs a scan
+preflight error instead of hanging.
+
+The lower-level plist generator remains available for custom service managers:
+
+```sh
+icloudpd-optimizer monitor launchd-plist \
+  --config ~/.config/icloudpd-optimizer/monitor.json \
+  --bin ~/Applications/iCloudPD\ Optimizer.app/Contents/MacOS/icloudpd-optimizer-service \
+  --associated-bundle-id io.github.bytware-alpha.icloudpd-optimizer \
+  --output ~/Library/LaunchAgents/com.icloudpd-optimizer.monitor.plist
+```
 
 ## Conversion Performance
 

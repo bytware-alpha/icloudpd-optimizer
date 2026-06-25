@@ -6,5 +6,6 @@ pub mod local_mirror;
 pub mod manifest;
 pub mod monitor;
 pub mod proof;
+pub mod service;
 pub mod upload;
 pub mod workflow;
