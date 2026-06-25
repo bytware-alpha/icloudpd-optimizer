@@ -533,18 +533,45 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
     ) -> Result<OriginalAssetProof, UploadError> {
         validate_original_asset_resolve_request(request)?;
         validate_original_asset_pagination_range(request)?;
+        let target_window = OriginalAssetDateWindow::new(
+            request.source_captured_unix_seconds,
+            request.capture_tolerance_seconds,
+        );
         let mut matches = Vec::new();
         let mut exhausted = false;
-        let mut continuation_marker = None;
-        for _ in 0..request.max_pages {
-            let payload = cloudkit_original_asset_query_payload(
-                request.start_rank,
-                request.page_size,
-                continuation_marker.as_deref(),
-            );
-            let response = self.transport.post_records_query(session, payload)?;
-            let page_result = parse_original_asset_query_response(response, request)?;
-            for candidate in page_result.matches {
+        let seek_result = seek_original_asset_query_page(
+            request.start_rank,
+            request.page_size,
+            request.max_pages,
+            &target_window,
+            |start_rank| {
+                let payload =
+                    cloudkit_original_asset_query_payload(start_rank, request.page_size, None);
+                let response = self.transport.post_records_query(session, payload)?;
+                parse_original_asset_query_response(response, request)
+            },
+        )?;
+        let mut pages_read = seek_result.pages_read;
+        let mut next_page = Some(seek_result.page);
+
+        while let Some(positioned_page) = next_page.take() {
+            match positioned_page.page.position_against(&target_window) {
+                OriginalAssetPagePosition::TooNew => {
+                    return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                        "records/query returned non-monotonic assetDate pages",
+                    ));
+                }
+                OriginalAssetPagePosition::Empty
+                    if positioned_page.page.continuation_marker.is_some() => {}
+                OriginalAssetPagePosition::TooOld | OriginalAssetPagePosition::Empty => {
+                    exhausted = true;
+                    break;
+                }
+                OriginalAssetPagePosition::Overlaps => {}
+            }
+
+            let continuation_marker = positioned_page.page.continuation_marker.clone();
+            for candidate in positioned_page.page.matches {
                 let download = self.transport.download_resource(
                     session,
                     &candidate.download_url,
@@ -565,12 +592,25 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
                     matches: matches.len(),
                 });
             }
-            if let Some(marker) = page_result.continuation_marker {
-                continuation_marker = Some(marker);
-            } else {
+
+            let Some(marker) = continuation_marker else {
                 exhausted = true;
                 break;
+            };
+            if pages_read >= request.max_pages {
+                break;
             }
+            let payload = cloudkit_original_asset_query_payload(
+                positioned_page.start_rank,
+                request.page_size,
+                Some(&marker),
+            );
+            let response = self.transport.post_records_query(session, payload)?;
+            pages_read = pages_read.saturating_add(1);
+            next_page = Some(PositionedOriginalAssetQueryPage {
+                start_rank: positioned_page.start_rank,
+                page: parse_original_asset_query_response(response, request)?,
+            });
         }
         if !exhausted {
             return Err(UploadError::OriginalAssetResolveIncomplete {
@@ -596,23 +636,43 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
             .map(|target| (target.asset_id.clone(), Vec::new()))
             .collect();
         let target_index = OriginalAssetTargetIndex::new(&request.targets);
+        let target_window = target_index.date_window();
         let mut download_cache: BTreeMap<(String, u64), CloudKitResourceDownload> = BTreeMap::new();
         let mut matched_original_record_names = BTreeSet::new();
         let mut exhausted = false;
-        let mut continuation_marker = None;
-        for _ in 0..request.max_pages {
-            let payload = cloudkit_original_asset_query_payload(
-                request.start_rank,
-                request.page_size,
-                continuation_marker.as_deref(),
-            );
-            let response = self.transport.post_records_query(session, payload)?;
-            let page_result = parse_original_asset_batch_query_response(
-                response,
-                &request.targets,
-                &target_index,
-            )?;
-            for candidate in page_result.matches {
+        let seek_result = seek_original_asset_query_page(
+            request.start_rank,
+            request.page_size,
+            request.max_pages,
+            &target_window,
+            |start_rank| {
+                let payload =
+                    cloudkit_original_asset_query_payload(start_rank, request.page_size, None);
+                let response = self.transport.post_records_query(session, payload)?;
+                parse_original_asset_batch_query_response(response, &request.targets, &target_index)
+            },
+        )?;
+        let mut pages_read = seek_result.pages_read;
+        let mut next_page = Some(seek_result.page);
+
+        while let Some(positioned_page) = next_page.take() {
+            match positioned_page.page.position_against(&target_window) {
+                OriginalAssetPagePosition::TooNew => {
+                    return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                        "records/query returned non-monotonic assetDate pages",
+                    ));
+                }
+                OriginalAssetPagePosition::Empty
+                    if positioned_page.page.continuation_marker.is_some() => {}
+                OriginalAssetPagePosition::TooOld | OriginalAssetPagePosition::Empty => {
+                    exhausted = true;
+                    break;
+                }
+                OriginalAssetPagePosition::Overlaps => {}
+            }
+
+            let continuation_marker = positioned_page.page.continuation_marker.clone();
+            for candidate in positioned_page.page.matches {
                 let cache_key = (
                     candidate.download_url.as_str().to_string(),
                     candidate.raw_size_bytes,
@@ -652,12 +712,29 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
                     });
                 }
             }
-            if let Some(marker) = page_result.continuation_marker {
-                continuation_marker = Some(marker);
-            } else {
+
+            let Some(marker) = continuation_marker else {
                 exhausted = true;
                 break;
+            };
+            if pages_read >= request.max_pages {
+                break;
             }
+            let payload = cloudkit_original_asset_query_payload(
+                positioned_page.start_rank,
+                request.page_size,
+                Some(&marker),
+            );
+            let response = self.transport.post_records_query(session, payload)?;
+            pages_read = pages_read.saturating_add(1);
+            next_page = Some(PositionedOriginalAssetQueryPage {
+                start_rank: positioned_page.start_rank,
+                page: parse_original_asset_batch_query_response(
+                    response,
+                    &request.targets,
+                    &target_index,
+                )?,
+            });
         }
         let exact_matches = matches.values().map(Vec::len).sum();
         if !exhausted {
@@ -1093,6 +1170,83 @@ fn original_asset_query_start_rank(
         ))
 }
 
+fn seek_original_asset_query_page<T>(
+    start_rank: u64,
+    page_size: u64,
+    max_pages: u64,
+    target_window: &OriginalAssetDateWindow,
+    mut query_page: impl FnMut(u64) -> Result<OriginalAssetQueryPage<T>, UploadError>,
+) -> Result<OriginalAssetSeekResult<T>, UploadError> {
+    let mut pages_read = 0;
+    let first_page = read_original_asset_rank_page(start_rank, &mut pages_read, &mut query_page)?;
+    if first_page.page.position_against(target_window) != OriginalAssetPagePosition::TooNew {
+        return Ok(OriginalAssetSeekResult {
+            page: first_page,
+            pages_read,
+        });
+    }
+
+    let mut lower_rank = start_rank;
+    let mut step = first_page
+        .page
+        .asset_count()
+        .max(1)
+        .max(page_size.saturating_div(2).max(1));
+    let mut upper_page = loop {
+        if pages_read >= max_pages {
+            return Err(UploadError::OriginalAssetResolveIncomplete { matches: 0 });
+        }
+        let probe_rank = checked_rank_add(start_rank, step)?;
+        let page = read_original_asset_rank_page(probe_rank, &mut pages_read, &mut query_page)?;
+        if page.page.position_against(target_window) == OriginalAssetPagePosition::TooNew {
+            lower_rank = probe_rank;
+            step = step
+                .checked_mul(2)
+                .ok_or(UploadError::InvalidCloudKitOriginalAssetRequest(
+                    "pagination start rank overflow",
+                ))?;
+            continue;
+        }
+        break page;
+    };
+
+    while lower_rank.saturating_add(1) < upper_page.start_rank {
+        if pages_read >= max_pages {
+            return Err(UploadError::OriginalAssetResolveIncomplete { matches: 0 });
+        }
+        let mid_rank = lower_rank + (upper_page.start_rank - lower_rank) / 2;
+        let page = read_original_asset_rank_page(mid_rank, &mut pages_read, &mut query_page)?;
+        if page.page.position_against(target_window) == OriginalAssetPagePosition::TooNew {
+            lower_rank = mid_rank;
+        } else {
+            upper_page = page;
+        }
+    }
+
+    Ok(OriginalAssetSeekResult {
+        page: upper_page,
+        pages_read,
+    })
+}
+
+fn read_original_asset_rank_page<T>(
+    start_rank: u64,
+    pages_read: &mut u64,
+    query_page: &mut impl FnMut(u64) -> Result<OriginalAssetQueryPage<T>, UploadError>,
+) -> Result<PositionedOriginalAssetQueryPage<T>, UploadError> {
+    let page = query_page(start_rank)?;
+    *pages_read = pages_read.saturating_add(1);
+    Ok(PositionedOriginalAssetQueryPage { start_rank, page })
+}
+
+fn checked_rank_add(start_rank: u64, offset: u64) -> Result<u64, UploadError> {
+    start_rank
+        .checked_add(offset)
+        .ok_or(UploadError::InvalidCloudKitOriginalAssetRequest(
+            "pagination start rank overflow",
+        ))
+}
+
 fn parse_create_upload_url_response(value: Value) -> Result<Url, UploadError> {
     let response: CreateUploadUrlResponse =
         serde_json::from_value(value).map_err(|source| UploadError::DecodeUploadResponse {
@@ -1255,9 +1409,45 @@ fn parse_cloudkit_delete_response(
     })
 }
 
-struct OriginalAssetQueryPage {
+struct OriginalAssetQueryPage<T> {
     continuation_marker: Option<String>,
-    matches: Vec<OriginalAssetCandidate>,
+    matches: Vec<T>,
+    asset_dates: Vec<u64>,
+}
+
+impl<T> OriginalAssetQueryPage<T> {
+    fn asset_count(&self) -> u64 {
+        self.asset_dates.len() as u64
+    }
+
+    fn date_bounds(&self) -> Option<(u64, u64)> {
+        let min = self.asset_dates.iter().min()?;
+        let max = self.asset_dates.iter().max()?;
+        Some((*min, *max))
+    }
+
+    fn position_against(&self, window: &OriginalAssetDateWindow) -> OriginalAssetPagePosition {
+        let Some((min_asset_date, max_asset_date)) = self.date_bounds() else {
+            return OriginalAssetPagePosition::Empty;
+        };
+        if min_asset_date > window.end_unix_seconds {
+            OriginalAssetPagePosition::TooNew
+        } else if max_asset_date < window.start_unix_seconds {
+            OriginalAssetPagePosition::TooOld
+        } else {
+            OriginalAssetPagePosition::Overlaps
+        }
+    }
+}
+
+struct PositionedOriginalAssetQueryPage<T> {
+    start_rank: u64,
+    page: OriginalAssetQueryPage<T>,
+}
+
+struct OriginalAssetSeekResult<T> {
+    page: PositionedOriginalAssetQueryPage<T>,
+    pages_read: u64,
 }
 
 struct OriginalAssetCandidate {
@@ -1277,10 +1467,35 @@ struct OriginalAssetTargetIndex {
     target_date_windows: Vec<OriginalAssetTargetDateWindow>,
 }
 
+#[derive(Clone, Copy)]
+struct OriginalAssetDateWindow {
+    start_unix_seconds: u64,
+    end_unix_seconds: u64,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OriginalAssetPagePosition {
+    TooNew,
+    Overlaps,
+    TooOld,
+    Empty,
+}
+
 struct OriginalAssetTargetDateWindow {
     start_unix_seconds: u64,
     end_unix_seconds: u64,
     target_index: usize,
+}
+
+impl OriginalAssetDateWindow {
+    fn new(source_captured_unix_seconds: u64, capture_tolerance_seconds: u64) -> Self {
+        Self {
+            start_unix_seconds: source_captured_unix_seconds
+                .saturating_sub(capture_tolerance_seconds),
+            end_unix_seconds: source_captured_unix_seconds
+                .saturating_add(capture_tolerance_seconds),
+        }
+    }
 }
 
 impl OriginalAssetTargetIndex {
@@ -1313,6 +1528,25 @@ impl OriginalAssetTargetIndex {
             .map(|window| window.target_index)
             .collect()
     }
+
+    fn date_window(&self) -> OriginalAssetDateWindow {
+        let start_unix_seconds = self
+            .target_date_windows
+            .iter()
+            .map(|window| window.start_unix_seconds)
+            .min()
+            .unwrap_or(0);
+        let end_unix_seconds = self
+            .target_date_windows
+            .iter()
+            .map(|window| window.end_unix_seconds)
+            .max()
+            .unwrap_or(0);
+        OriginalAssetDateWindow {
+            start_unix_seconds,
+            end_unix_seconds,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1326,7 +1560,7 @@ struct CloudKitAssetRecord {
 fn parse_original_asset_query_response(
     value: Value,
     request: &CloudKitOriginalAssetResolveRequest,
-) -> Result<OriginalAssetQueryPage, UploadError> {
+) -> Result<OriginalAssetQueryPage<OriginalAssetCandidate>, UploadError> {
     let records = value.get("records").and_then(Value::as_array).ok_or(
         UploadError::InvalidCloudKitOriginalAssetResponse(
             "records/query response must include records",
@@ -1353,6 +1587,10 @@ fn parse_original_asset_query_response(
         }
     }
 
+    let asset_dates = assets
+        .iter()
+        .map(|asset| asset.asset_date_unix_seconds)
+        .collect();
     let mut matches = Vec::new();
     for asset in assets {
         let master = masters.get(&asset.master_record_name).ok_or(
@@ -1387,6 +1625,7 @@ fn parse_original_asset_query_response(
     Ok(OriginalAssetQueryPage {
         continuation_marker,
         matches,
+        asset_dates,
     })
 }
 
@@ -1394,7 +1633,7 @@ fn parse_original_asset_batch_query_response(
     value: Value,
     targets: &[CloudKitOriginalAssetResolveTarget],
     target_index: &OriginalAssetTargetIndex,
-) -> Result<OriginalAssetBatchQueryPage, UploadError> {
+) -> Result<OriginalAssetQueryPage<OriginalAssetBatchCandidate>, UploadError> {
     let records = value.get("records").and_then(Value::as_array).ok_or(
         UploadError::InvalidCloudKitOriginalAssetResponse(
             "records/query response must include records",
@@ -1421,6 +1660,10 @@ fn parse_original_asset_batch_query_response(
         }
     }
 
+    let asset_dates = assets
+        .iter()
+        .map(|asset| asset.asset_date_unix_seconds)
+        .collect();
     let mut matches = Vec::new();
     for asset in assets {
         let date_matching_target_indexes =
@@ -1471,15 +1714,11 @@ fn parse_original_asset_batch_query_response(
         }
     }
 
-    Ok(OriginalAssetBatchQueryPage {
+    Ok(OriginalAssetQueryPage {
         continuation_marker,
         matches,
+        asset_dates,
     })
-}
-
-struct OriginalAssetBatchQueryPage {
-    continuation_marker: Option<String>,
-    matches: Vec<OriginalAssetBatchCandidate>,
 }
 
 struct UploadedHeicAssetLookup {

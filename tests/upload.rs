@@ -207,6 +207,18 @@ fn batch_resolve_request(
     }
 }
 
+fn start_ranks(transport: &FakeCloudKitDeleteTransport) -> Vec<u64> {
+    transport
+        .query_payloads
+        .iter()
+        .map(|payload| {
+            payload["query"]["filterBy"][1]["fieldValue"]["value"]
+                .as_u64()
+                .expect("startRank should be numeric")
+        })
+        .collect()
+}
+
 #[test]
 fn load_cloudkit_delete_session_accepts_current_ckdatabasews_origin_url() {
     let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
@@ -715,6 +727,170 @@ fn cloudkit_original_asset_batch_resolver_records_two_targets_from_one_scan() {
     assert_eq!(proofs["asset-2"].record_name, "CPLAsset-original-456");
     assert_eq!(proofs["asset-2"].filename, "IMG_0002.dng");
     assert_eq!(proofs["asset-2"].size_bytes, 11);
+}
+
+#[test]
+fn cloudkit_original_asset_batch_resolver_seeks_to_target_date_window() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let target_time = 1_718_222_196_u64;
+    let mut target = batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes");
+    target.source_captured_unix_seconds = target_time;
+    target.capture_tolerance_seconds = 2;
+    let mut request = batch_resolve_request(vec![target]);
+    request.page_size = 2;
+    request.max_pages = 10;
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![
+            json!({"records": cloudkit_raw_pair_with(
+                "CPLAsset-too-new-0",
+                "CPLMaster-too-new-0",
+                "tag-new-0",
+                9,
+                ((target_time + 40_000_000) * 1000) as i64,
+            )}),
+            json!({"records": cloudkit_raw_pair_with(
+                "CPLAsset-too-new-1",
+                "CPLMaster-too-new-1",
+                "tag-new-1",
+                9,
+                ((target_time + 20_000_000) * 1000) as i64,
+            )}),
+            json!({"records": cloudkit_raw_pair_with(
+                "CPLAsset-too-new-2",
+                "CPLMaster-too-new-2",
+                "tag-new-2",
+                9,
+                ((target_time + 10_000_000) * 1000) as i64,
+            )}),
+            json!({"records": cloudkit_raw_pair_with(
+                "CPLAsset-too-old-4",
+                "CPLMaster-too-old-4",
+                "tag-old-4",
+                9,
+                ((target_time - 10_000_000) * 1000) as i64,
+            )}),
+            json!({"records": cloudkit_raw_pair_with(
+                "CPLAsset-original-123",
+                "CPLMaster-raw-123",
+                "tag-1",
+                9,
+                (target_time * 1000) as i64,
+            )}),
+        ],
+        vec![b"raw-bytes".to_vec()],
+    );
+
+    let proofs = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch(&session, &request)
+        .expect("date seek should land on the target window");
+
+    assert_eq!(proofs["asset-1"].record_name, "CPLAsset-original-123");
+    assert_eq!(start_ranks(&transport), vec![0, 1, 2, 4, 3]);
+    assert_eq!(
+        transport.downloaded_urls,
+        vec!["https://p140-icloud-content.icloud.com/raw-original".to_string()]
+    );
+}
+
+#[test]
+fn cloudkit_original_asset_batch_resolver_counts_seek_probes_against_page_cap() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let target_time = 1_718_222_196_u64;
+    let mut target = batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes");
+    target.source_captured_unix_seconds = target_time;
+    target.capture_tolerance_seconds = 2;
+    let mut request = batch_resolve_request(vec![target]);
+    request.page_size = 2;
+    request.max_pages = 3;
+    let mut transport = FakeCloudKitDeleteTransport::query_responses(vec![
+        json!({"records": cloudkit_raw_pair_with(
+            "CPLAsset-too-new-0",
+            "CPLMaster-too-new-0",
+            "tag-new-0",
+            9,
+            ((target_time + 40_000_000) * 1000) as i64,
+        )}),
+        json!({"records": cloudkit_raw_pair_with(
+            "CPLAsset-too-new-1",
+            "CPLMaster-too-new-1",
+            "tag-new-1",
+            9,
+            ((target_time + 20_000_000) * 1000) as i64,
+        )}),
+        json!({"records": cloudkit_raw_pair_with(
+            "CPLAsset-too-new-2",
+            "CPLMaster-too-new-2",
+            "tag-new-2",
+            9,
+            ((target_time + 10_000_000) * 1000) as i64,
+        )}),
+    ]);
+
+    let error = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch(&session, &request)
+        .expect_err("unbracketed date seek should fail closed at the cap");
+
+    assert!(matches!(
+        error,
+        UploadError::OriginalAssetResolveIncomplete { matches: 0 }
+    ));
+    assert_eq!(start_ranks(&transport), vec![0, 1, 2]);
+    assert!(transport.downloaded_urls.is_empty());
+}
+
+#[test]
+fn cloudkit_original_asset_batch_resolver_scans_until_date_window_is_past() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let target_time = 1_718_222_196_u64;
+    let mut target = batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes");
+    target.source_captured_unix_seconds = target_time;
+    target.capture_tolerance_seconds = 2;
+    let mut request = batch_resolve_request(vec![target]);
+    request.page_size = 2;
+    request.max_pages = 4;
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![
+            json!({"records": cloudkit_raw_pair_with(
+                "CPLAsset-too-new-0",
+                "CPLMaster-too-new-0",
+                "tag-new-0",
+                9,
+                ((target_time + 10_000_000) * 1000) as i64,
+            )}),
+            json!({
+                "records": cloudkit_raw_pair_with(
+                    "CPLAsset-original-123",
+                    "CPLMaster-raw-123",
+                    "tag-1",
+                    9,
+                    (target_time * 1000) as i64,
+                ),
+                "continuationMarker": "next-page"
+            }),
+            json!({"records": cloudkit_raw_pair_with(
+                "CPLAsset-too-old-2",
+                "CPLMaster-too-old-2",
+                "tag-old-2",
+                9,
+                ((target_time - 10_000_000) * 1000) as i64,
+            )}),
+        ],
+        vec![b"raw-bytes".to_vec()],
+    );
+
+    let proofs = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch(&session, &request)
+        .expect("resolver should prove the capture window is exhausted");
+
+    assert_eq!(proofs["asset-1"].record_name, "CPLAsset-original-123");
+    assert_eq!(start_ranks(&transport), vec![0, 1, 1]);
+    assert_eq!(
+        transport.query_payloads[2]["continuationMarker"],
+        json!("next-page")
+    );
 }
 
 #[test]
