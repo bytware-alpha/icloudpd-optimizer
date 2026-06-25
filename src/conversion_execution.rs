@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -17,6 +18,7 @@ use crate::conversion::{
 };
 use crate::conversion_backend::{TargetPlatform, backend_report_for_target};
 use crate::manifest::{Manifest, ManifestError, State};
+use crate::proof::NasRawProof;
 use crate::workflow::{
     ConversionCommandTiming, ConversionPerformanceInput, ConversionResultProof, WorkflowError,
     record_conversion_performance, record_conversion_result,
@@ -24,6 +26,7 @@ use crate::workflow::{
 
 const DEFAULT_CHILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const CHILD_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const RAW_STAGE_HASH_BUFFER_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]
 static TEST_CHILD_COMMAND_TIMEOUT: std::sync::Mutex<Option<Duration>> = std::sync::Mutex::new(None);
@@ -179,18 +182,25 @@ fn execute_measured_conversion_for_target(
         });
     }
 
+    refuse_preexisting_output(&request.output_path)?;
+    let staged_raw = stage_raw_for_conversion(
+        &request.asset_id,
+        &raw_path,
+        record.proofs.get("nas"),
+        &request.output_path,
+    )?;
+    let staged_raw_path = staged_raw.path();
     let mut plan = plan_conversion_for_target(
         target,
-        &raw_path,
+        staged_raw_path,
         &request.output_path,
         request.heic_quality,
     )?;
-    refuse_preexisting_output(&request.output_path)?;
-    let preview_tag = select_embedded_preview_tag(&raw_path)?;
+    let preview_tag = select_embedded_preview_tag(staged_raw_path)?;
     if preview_tag != EmbeddedPreviewTag::PreviewImage {
         plan = plan_conversion_for_target_with_preview_tag(
             target,
-            &raw_path,
+            staged_raw_path,
             &request.output_path,
             request.heic_quality,
             preview_tag,
@@ -242,6 +252,195 @@ fn execute_measured_conversion_for_target(
     }
 
     conversion_result
+}
+
+fn stage_raw_for_conversion(
+    asset_id: &str,
+    raw_path: &Path,
+    nas_proof_value: Option<&Value>,
+    output_path: &Path,
+) -> Result<StagedRaw, ConversionExecutionError> {
+    let nas_proof = decode_staging_nas_proof(asset_id, raw_path, nas_proof_value)?;
+    let staged_path = staged_raw_path_for_output(output_path, raw_path);
+    let mut source =
+        File::open(raw_path).map_err(|source| ConversionExecutionError::StagedRawReadFailed {
+            path: raw_path.to_path_buf(),
+            source,
+        })?;
+    let mut staged_file = create_staged_raw_file(&staged_path)?;
+    let staged_raw = StagedRaw { path: staged_path };
+
+    let mut hasher = Sha256::new();
+    let mut copied_size = 0_u64;
+    let mut buffer = [0_u8; RAW_STAGE_HASH_BUFFER_BYTES];
+    loop {
+        let read = source.read(&mut buffer).map_err(|source| {
+            ConversionExecutionError::StagedRawReadFailed {
+                path: raw_path.to_path_buf(),
+                source,
+            }
+        })?;
+        if read == 0 {
+            break;
+        }
+        staged_file.write_all(&buffer[..read]).map_err(|source| {
+            ConversionExecutionError::StagedRawWriteFailed {
+                path: staged_raw.path.clone(),
+                source,
+            }
+        })?;
+        hasher.update(&buffer[..read]);
+        copied_size = copied_size.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+    }
+    staged_file
+        .flush()
+        .map_err(|source| ConversionExecutionError::StagedRawWriteFailed {
+            path: staged_raw.path.clone(),
+            source,
+        })?;
+    drop(staged_file);
+
+    let actual_sha256 = format!("{:x}", hasher.finalize());
+    if copied_size != nas_proof.size_bytes {
+        return Err(ConversionExecutionError::StagedRawSizeMismatch {
+            path: staged_raw.path.clone(),
+            expected: nas_proof.size_bytes,
+            actual: copied_size,
+        });
+    }
+    if actual_sha256 != nas_proof.sha256 {
+        return Err(ConversionExecutionError::StagedRawSha256Mismatch {
+            path: staged_raw.path.clone(),
+            expected: nas_proof.sha256,
+            actual: actual_sha256,
+        });
+    }
+    verify_staged_raw_file(&staged_raw.path, nas_proof.size_bytes)?;
+
+    Ok(staged_raw)
+}
+
+fn decode_staging_nas_proof(
+    asset_id: &str,
+    raw_path: &Path,
+    nas_proof_value: Option<&Value>,
+) -> Result<NasRawProof, ConversionExecutionError> {
+    let value =
+        nas_proof_value.ok_or_else(|| ConversionExecutionError::StagingNasProofMissing {
+            asset_id: asset_id.to_string(),
+        })?;
+    let proof: NasRawProof = serde_json::from_value(value.clone()).map_err(|source| {
+        ConversionExecutionError::StagingNasProofMalformed {
+            asset_id: asset_id.to_string(),
+            source,
+        }
+    })?;
+    validate_staging_nas_proof(asset_id, raw_path, &proof)?;
+    Ok(proof)
+}
+
+fn validate_staging_nas_proof(
+    asset_id: &str,
+    raw_path: &Path,
+    proof: &NasRawProof,
+) -> Result<(), ConversionExecutionError> {
+    if proof.canonical_path != raw_path {
+        return Err(ConversionExecutionError::StagingNasProofPathMismatch {
+            asset_id: asset_id.to_string(),
+            expected: raw_path.to_path_buf(),
+            actual: proof.canonical_path.clone(),
+        });
+    }
+    if proof.size_bytes == 0 {
+        return Err(ConversionExecutionError::StagingNasProofInvalid {
+            asset_id: asset_id.to_string(),
+            field: "size_bytes",
+            reason: "must be greater than zero",
+        });
+    }
+    if !is_valid_sha256_hex(&proof.sha256) {
+        return Err(ConversionExecutionError::StagingNasProofInvalid {
+            asset_id: asset_id.to_string(),
+            field: "sha256",
+            reason: "must be a 64-character hexadecimal SHA-256 digest",
+        });
+    }
+    Ok(())
+}
+
+fn is_valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn create_staged_raw_file(path: &Path) -> Result<File, ConversionExecutionError> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::AlreadyExists {
+                ConversionExecutionError::StagedRawAlreadyExists {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                ConversionExecutionError::StagedRawWriteFailed {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            }
+        })
+}
+
+fn verify_staged_raw_file(path: &Path, expected_size: u64) -> Result<(), ConversionExecutionError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| {
+        ConversionExecutionError::StagedRawReadFailed {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(ConversionExecutionError::StagedRawNotRegular {
+            path: path.to_path_buf(),
+        });
+    }
+    if metadata.len() != expected_size {
+        return Err(ConversionExecutionError::StagedRawSizeMismatch {
+            path: path.to_path_buf(),
+            expected: expected_size,
+            actual: metadata.len(),
+        });
+    }
+    Ok(())
+}
+
+fn staged_raw_path_for_output(output_path: &Path, raw_path: &Path) -> PathBuf {
+    let mut staged_path = output_path.to_path_buf();
+    let mut extension = OsString::from("staged-raw");
+    if let Some(raw_extension) = raw_path
+        .extension()
+        .filter(|extension| !extension.is_empty())
+    {
+        extension.push(".");
+        extension.push(raw_extension);
+    }
+    staged_path.set_extension(extension);
+    staged_path
+}
+
+struct StagedRaw {
+    path: PathBuf,
+}
+
+impl StagedRaw {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StagedRaw {
+    fn drop(&mut self) {
+        remove_failed_output(&self.path);
+    }
 }
 
 fn conversion_tool_name(plan: &crate::conversion::ConversionPlan) -> String {
@@ -949,6 +1148,47 @@ pub enum ConversionExecutionError {
     OutputEmpty { path: PathBuf },
     #[error("converted output changed while inspecting {path}; refusing to record a stale proof")]
     OutputChanged { path: PathBuf },
+    #[error("NAS proof is missing for {asset_id}; refusing RAW staging")]
+    StagingNasProofMissing { asset_id: String },
+    #[error("NAS proof for {asset_id} is malformed: {source}")]
+    StagingNasProofMalformed {
+        asset_id: String,
+        source: serde_json::Error,
+    },
+    #[error("NAS proof for {asset_id} has invalid {field}: {reason}")]
+    StagingNasProofInvalid {
+        asset_id: String,
+        field: &'static str,
+        reason: &'static str,
+    },
+    #[error(
+        "NAS proof canonical_path for {asset_id} does not match record RAW path: expected {expected}, got {actual}"
+    )]
+    StagingNasProofPathMismatch {
+        asset_id: String,
+        expected: PathBuf,
+        actual: PathBuf,
+    },
+    #[error("staged RAW already exists at {path}; refusing to overwrite")]
+    StagedRawAlreadyExists { path: PathBuf },
+    #[error("failed to read RAW for staging at {path}: {source}")]
+    StagedRawReadFailed { path: PathBuf, source: io::Error },
+    #[error("failed to write staged RAW at {path}: {source}")]
+    StagedRawWriteFailed { path: PathBuf, source: io::Error },
+    #[error("staged RAW at {path} is not a regular file")]
+    StagedRawNotRegular { path: PathBuf },
+    #[error("staged RAW size mismatch at {path}: expected {expected} bytes, copied {actual} bytes")]
+    StagedRawSizeMismatch {
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("staged RAW sha256 mismatch at {path}: expected {expected}, copied {actual}")]
+    StagedRawSha256Mismatch {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
     #[error("batch conversion requires at least one worker; got {jobs}")]
     InvalidBatchJobs { jobs: usize },
     #[error("batch conversion requires at least one asset")]
@@ -1063,6 +1303,223 @@ mod tests {
             fs::read_to_string(log_path).expect("command log should be readable"),
             "exiftool-preview\nexiftool-preview-orientation\nmagick-auto-orient\nheif-enc\nexiftool-metadata\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_conversion_uses_staged_raw_for_probe_and_conversion_commands() {
+        let tool_dir = fake_linux_conversion_tools_rejecting_forbidden_raw(DEFAULT_HEIF_ENC_SCRIPT);
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let nas_dir = tempdir.path().join("nas");
+        let output_dir = tempdir.path().join("out");
+        fs::create_dir_all(&nas_dir).expect("nas dir should be created");
+        fs::create_dir_all(&output_dir).expect("output dir should be created");
+        let raw_path = nas_dir.join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = output_dir.join("IMG_0001.heic");
+        let log_path = tempdir.path().join("commands.log");
+        let raw_path_log = tempdir.path().join("raw-paths.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let _raw_log_guard = EnvVarGuard::install("RAW_PATH_LOG", &raw_path_log);
+        let _forbidden_guard = EnvVarGuard::install("FORBIDDEN_RAW_PATH", &raw_path);
+        let manifest = nas_verified_manifest(&raw_path);
+
+        let updated = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect("conversion should use staged RAW bytes instead of the NAS RAW path");
+
+        let logged_paths = logged_raw_paths(&raw_path_log);
+        assert_eq!(logged_paths.len(), 4);
+        for staged_path in &logged_paths {
+            assert_ne!(staged_path, &raw_path);
+            assert!(staged_path.starts_with(&output_dir));
+            assert!(
+                !staged_path.exists(),
+                "staged RAW should be removed after successful conversion"
+            );
+        }
+        let record = updated.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::Converted);
+        assert_eq!(
+            fs::read_to_string(log_path).expect("command log should be readable"),
+            "exiftool-preview\nexiftool-preview-orientation\nmagick-auto-orient\nheif-enc\nexiftool-metadata\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_raw_staging_hash_mismatch_fails_without_output_or_proofs() {
+        let tool_dir = fake_linux_conversion_tools();
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let output_dir = tempdir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("output dir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = output_dir.join("IMG_0001.heic");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest = nas_verified_manifest(&raw_path);
+        fs::write(&raw_path, b"raw-Bytes").expect("raw should be mutated after proof");
+
+        let error = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("staging should fail when copied bytes do not match the NAS proof");
+
+        assert!(error.to_string().contains("sha256"));
+        assert!(!output_path.exists());
+        assert!(
+            !log_path.exists(),
+            "child tools must not run after staging failure"
+        );
+        assert!(
+            fs::read_dir(&output_dir)
+                .expect("output dir should remain readable")
+                .next()
+                .is_none(),
+            "failed staging must not leave a staged RAW behind"
+        );
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::NasVerified);
+        assert!(!record.proofs.contains_key("conversion"));
+        assert!(!record.proofs.contains_key("conversion_performance"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_staged_raw_is_removed_after_conversion_failure() {
+        let tool_dir = fake_linux_conversion_tools_rejecting_forbidden_raw(
+            r#"#!/bin/sh
+printf 'heif-enc\n' >> "$EXECUTION_LOG"
+out=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-o" ]; then
+    out="$arg"
+  fi
+  previous="$arg"
+done
+if [ -n "$out" ]; then
+  printf 'partial-heic' > "$out"
+fi
+exit 44
+"#,
+        );
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let nas_dir = tempdir.path().join("nas");
+        let output_dir = tempdir.path().join("out");
+        fs::create_dir_all(&nas_dir).expect("nas dir should be created");
+        fs::create_dir_all(&output_dir).expect("output dir should be created");
+        let raw_path = nas_dir.join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = output_dir.join("IMG_0001.heic");
+        let log_path = tempdir.path().join("commands.log");
+        let raw_path_log = tempdir.path().join("raw-paths.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let _raw_log_guard = EnvVarGuard::install("RAW_PATH_LOG", &raw_path_log);
+        let _forbidden_guard = EnvVarGuard::install("FORBIDDEN_RAW_PATH", &raw_path);
+        let manifest = nas_verified_manifest(&raw_path);
+
+        let error = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("conversion failure after staging should fail closed");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::CommandFailed {
+                stage: "conversion",
+                program,
+                ..
+            } if program == "heif-enc"
+        ));
+        for staged_path in logged_raw_paths(&raw_path_log) {
+            assert_ne!(staged_path, raw_path);
+            assert!(
+                !staged_path.exists(),
+                "staged RAW should be removed after conversion failure"
+            );
+        }
+        assert!(!output_path.exists());
+        assert!(!embedded_preview_path(&output_path).exists());
+        assert!(!oriented_preview_path(&output_path).exists());
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::NasVerified);
+        assert!(!record.proofs.contains_key("conversion"));
+        assert!(!record.proofs.contains_key("conversion_performance"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_refuses_preexisting_raw_stage_without_mutating_it_or_recording_proofs() {
+        let tool_dir = fake_linux_conversion_tools();
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let output_dir = tempdir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("output dir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = output_dir.join("IMG_0001.heic");
+        let staged_path = staged_raw_path_for_output(&output_path, &raw_path);
+        fs::write(&staged_path, b"existing-stage").expect("stage collision should be written");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let manifest = nas_verified_manifest(&raw_path);
+
+        let error = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("preexisting staged RAW should fail closed");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::StagedRawAlreadyExists { path } if path == staged_path
+        ));
+        assert_eq!(
+            fs::read(&staged_path).expect("existing stage should remain readable"),
+            b"existing-stage"
+        );
+        assert!(!output_path.exists());
+        assert!(
+            !log_path.exists(),
+            "child tools must not run after staging collision"
+        );
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::NasVerified);
+        assert!(!record.proofs.contains_key("conversion"));
+        assert!(!record.proofs.contains_key("conversion_performance"));
     }
 
     #[cfg(unix)]
@@ -2078,6 +2535,65 @@ exit 0
     }
 
     #[cfg(unix)]
+    fn fake_linux_conversion_tools_rejecting_forbidden_raw(
+        heif_enc_body: &str,
+    ) -> tempfile::TempDir {
+        let tempdir = tempfile::tempdir().expect("tool tempdir should be created");
+        write_executable_script(&tempdir.path().join("heif-enc"), heif_enc_body);
+        write_executable_script(
+            &tempdir.path().join("magick"),
+            r#"#!/bin/sh
+if [ "$2" = "-auto-orient" ]; then
+  printf 'magick-auto-orient\n' >> "$EXECUTION_LOG"
+  printf 'oriented-preview-jpeg'
+  exit 0
+fi
+exit 47
+"#,
+        );
+        write_executable_script(
+            &tempdir.path().join("exiftool"),
+            r#"#!/bin/sh
+log_and_check_raw() {
+  raw="$1"
+  if [ -n "${RAW_PATH_LOG:-}" ]; then
+    printf '%s\n' "$raw" >> "$RAW_PATH_LOG"
+  fi
+  if [ "$raw" = "${FORBIDDEN_RAW_PATH:-}" ]; then
+    exit 64
+  fi
+  if [ ! -f "$raw" ]; then
+    exit 65
+  fi
+}
+if [ "$1" = "-j" ]; then
+  log_and_check_raw "$4"
+  printf '[{"PreviewImage":"(Binary data 20 bytes, use -b option to extract)"}]\n'
+  exit 0
+fi
+if [ "$1" = "-b" ] && [ "$2" = "-PreviewImage" ]; then
+  log_and_check_raw "$3"
+  printf 'exiftool-preview\n' >> "$EXECUTION_LOG"
+  printf 'embedded-preview-jpeg'
+  exit 0
+fi
+if [ "$1" = "-TagsFromFile" ] && [ "$3" = "-Orientation#" ]; then
+  log_and_check_raw "$2"
+  printf 'exiftool-preview-orientation\n' >> "$EXECUTION_LOG"
+  exit 0
+fi
+if [ "$1" = "-TagsFromFile" ]; then
+  log_and_check_raw "$2"
+  printf 'exiftool-metadata\n' >> "$EXECUTION_LOG"
+  exit 0
+fi
+exit 49
+"#,
+        );
+        tempdir
+    }
+
+    #[cfg(unix)]
     fn write_executable_script(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2098,21 +2614,31 @@ exit 0
         for (index, (asset_id, raw_path)) in assets.iter().enumerate() {
             discover_raw_asset(&mut manifest, *asset_id, raw_path.to_path_buf())
                 .expect("asset should be discovered");
+            let raw = fs::read(raw_path).expect("raw should be readable");
             record_nas_proof(
                 &mut manifest,
                 asset_id,
                 NasRawProof {
                     canonical_path: raw_path.to_path_buf(),
                     relative_path: PathBuf::from(format!("IMG_{:04}.dng", index + 1)),
-                    size_bytes: 9,
+                    size_bytes: u64::try_from(raw.len()).expect("raw length should fit in u64"),
                     modified_unix_seconds: 1_700_000_000,
                     age_seconds: 40 * 24 * 60 * 60,
-                    sha256: "raw-sha256".to_string(),
+                    sha256: format!("{:x}", Sha256::digest(&raw)),
                 },
             )
             .expect("nas proof should be recorded");
         }
         manifest
+    }
+
+    #[cfg(unix)]
+    fn logged_raw_paths(path: &Path) -> Vec<PathBuf> {
+        fs::read_to_string(path)
+            .expect("raw path log should be readable")
+            .lines()
+            .map(PathBuf::from)
+            .collect()
     }
 
     #[cfg(unix)]
