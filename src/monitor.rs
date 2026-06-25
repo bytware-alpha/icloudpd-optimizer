@@ -1,17 +1,15 @@
 use std::collections::BTreeMap;
-#[cfg(target_os = "macos")]
-use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "macos")]
-use std::process::Stdio;
+use std::sync::mpsc;
 #[cfg(target_os = "macos")]
 use std::thread;
 #[cfg(target_os = "macos")]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -441,7 +439,7 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
         let now = SystemTime::now();
         let mut pending_capacity = config
             .max_conversions_per_scan
-            .saturating_sub(pending_conversion_count(&manifest));
+            .saturating_sub(pending_conversion_count(&manifest, config));
         if pending_capacity > 0 {
             log_monitor_event(
                 "discovery_started",
@@ -520,6 +518,21 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
         manifest
             .save_atomic(&config.manifest_path)
             .map_err(MonitorError::Manifest)?;
+
+        if config.full_lifecycle {
+            log_monitor_event(
+                "lifecycle_started",
+                started,
+                json!({
+                    "pending_lifecycle": pending_lifecycle_count(&manifest),
+                    "position": "before_conversions",
+                }),
+            );
+            resolve_original_assets(config, &mut manifest, &mut summary)?;
+            manifest
+                .save_atomic(&config.manifest_path)
+                .map_err(MonitorError::Manifest)?;
+        }
 
         let requests = conversion_requests(&manifest, config);
         summary.conversions_attempted = requests.len() as u64;
@@ -759,6 +772,7 @@ fn conversion_requests(
         .records()
         .values()
         .filter(|record| record.state == State::NasVerified)
+        .filter(|record| !config.full_lifecycle || record.proofs.contains_key("original_asset"))
         .take(config.max_conversions_per_scan)
         .map(|record| ConversionExecutionRequest {
             asset_id: record.asset_id.clone(),
@@ -814,9 +828,8 @@ fn resolve_original_assets(
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
 ) -> Result<(), MonitorError> {
-    let asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
-        record.state == State::ConversionVerified && !record.proofs.contains_key("original_asset")
-    });
+    let asset_ids =
+        original_asset_resolution_candidate_ids(manifest, config.max_lifecycle_per_scan);
     if asset_ids.is_empty() {
         return Ok(());
     }
@@ -1008,11 +1021,12 @@ fn delete_original_assets(
     Ok(())
 }
 
-fn pending_conversion_count(manifest: &Manifest) -> usize {
+fn pending_conversion_count(manifest: &Manifest, config: &MonitorConfig) -> usize {
     manifest
         .records()
         .values()
         .filter(|record| record.state == State::NasVerified)
+        .filter(|record| !config.full_lifecycle || record.proofs.contains_key("original_asset"))
         .count()
 }
 
@@ -1068,74 +1082,44 @@ fn ensure_macos_scan_root_enumerable(
     path: &Path,
     timeout_seconds: u64,
 ) -> Result<(), MonitorError> {
-    let helper = env::current_exe().map_err(|source| MonitorError::CommandIo {
-        program: "icloudpd-optimizer preflight helper",
-        source,
-    })?;
-    let mut child = Command::new(helper)
-        .arg("monitor")
-        .arg("scan-root-preflight")
-        .arg("--path")
-        .arg(path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| MonitorError::CommandIo {
-            program: "icloudpd-optimizer preflight helper",
-            source,
-        })?;
-    let timeout = Duration::from_secs(timeout_seconds);
-    let deadline = Instant::now() + timeout;
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if status.success() {
-                    return Ok(());
-                }
-                let stderr = read_child_stderr(&mut child);
-                return Err(MonitorError::DownloadRootPreflight {
-                    path: path.to_path_buf(),
-                    message: format!("macOS directory preflight exited with {status}: {stderr}"),
-                });
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(MonitorError::DownloadRootPreflight {
-                    path: path.to_path_buf(),
-                    message: format!(
-                        "macOS directory preflight timed out after {} seconds",
-                        timeout.as_secs()
-                    ),
-                });
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(source) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(MonitorError::DownloadRootPreflight {
-                    path: path.to_path_buf(),
-                    message: format!("macOS directory preflight failed to poll child: {source}"),
-                });
-            }
-        }
-    }
+    ensure_macos_scan_root_enumerable_with_probe(path, timeout_seconds, |path| {
+        run_scan_root_preflight_probe(&path)
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn read_child_stderr(child: &mut std::process::Child) -> String {
-    use std::io::Read;
+fn ensure_macos_scan_root_enumerable_with_probe(
+    path: &Path,
+    timeout_seconds: u64,
+    probe: impl FnOnce(PathBuf) -> Result<(), MonitorError> + Send + 'static,
+) -> Result<(), MonitorError> {
+    let path = path.to_path_buf();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn({
+        let path = path.clone();
+        move || {
+            let _ = sender.send(probe(path));
+        }
+    });
+    let timeout = Duration::from_secs(timeout_seconds);
 
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
-    let trimmed = stderr.trim();
-    if trimmed.is_empty() {
-        "no stderr".to_string()
-    } else {
-        trimmed.to_string()
+    match receiver.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(MonitorError::DownloadRootPreflight {
+            path,
+            message: format!("macOS directory preflight failed: {error}"),
+        }),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(MonitorError::DownloadRootPreflight {
+            path,
+            message: format!(
+                "macOS directory preflight timed out after {} seconds",
+                timeout.as_secs()
+            ),
+        }),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(MonitorError::DownloadRootPreflight {
+            path,
+            message: "macOS directory preflight worker exited without a result".to_string(),
+        }),
     }
 }
 
@@ -1177,6 +1161,13 @@ fn asset_ids_matching(
         .take(limit)
         .map(|record| record.asset_id.clone())
         .collect()
+}
+
+fn original_asset_resolution_candidate_ids(manifest: &Manifest, limit: usize) -> Vec<String> {
+    asset_ids_matching(manifest, limit, |record| {
+        matches!(record.state, State::NasVerified | State::ConversionVerified)
+            && !record.proofs.contains_key("original_asset")
+    })
 }
 
 fn verify_converted_heic(
@@ -1770,6 +1761,91 @@ mod tests {
     }
 
     #[test]
+    fn full_lifecycle_conversion_requests_wait_for_original_asset_proof() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        config.full_lifecycle = true;
+
+        let mut manifest = Manifest::new();
+        let mut unproven = AssetRecord::new("unproven", PathBuf::from("/raw/unproven.DNG"));
+        unproven.state = State::NasVerified;
+        manifest.upsert(unproven);
+        let mut proven = AssetRecord::new("proven", PathBuf::from("/raw/proven.DNG"));
+        proven.state = State::NasVerified;
+        proven.proofs.insert(
+            "original_asset".to_string(),
+            json!({
+                "record_name": "CPLAsset-proven",
+                "record_change_tag": "tag-proven",
+                "record_type": "CPLAsset",
+                "filename": "proven.DNG",
+                "size_bytes": 9,
+                "matched_raw_sha256": "raw-sha",
+            }),
+        );
+        manifest.upsert(proven);
+
+        let requests = conversion_requests(&manifest, &config);
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].asset_id, "proven");
+    }
+
+    #[test]
+    fn non_lifecycle_conversion_requests_do_not_require_original_asset_proof() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+
+        let mut manifest = Manifest::new();
+        let mut record = AssetRecord::new("unproven", PathBuf::from("/raw/unproven.DNG"));
+        record.state = State::NasVerified;
+        manifest.upsert(record);
+
+        let requests = conversion_requests(&manifest, &config);
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].asset_id, "unproven");
+    }
+
+    #[test]
+    fn original_asset_resolution_candidates_include_nas_verified_records() {
+        let mut manifest = Manifest::new();
+        for (asset_id, state, has_original_proof) in [
+            ("nas-unproven", State::NasVerified, false),
+            ("nas-proven", State::NasVerified, true),
+            ("verified-unproven", State::ConversionVerified, false),
+            ("converted", State::Converted, false),
+            ("failed", State::Failed, false),
+        ] {
+            let mut record =
+                AssetRecord::new(asset_id, PathBuf::from(format!("/raw/{asset_id}.DNG")));
+            record.state = state;
+            if has_original_proof {
+                record.proofs.insert(
+                    "original_asset".to_string(),
+                    json!({"record_name": "already-proven"}),
+                );
+            }
+            manifest.upsert(record);
+        }
+
+        let asset_ids = original_asset_resolution_candidate_ids(&manifest, 10);
+
+        assert_eq!(
+            asset_ids,
+            vec!["nas-unproven".to_string(), "verified-unproven".to_string()]
+        );
+    }
+
+    #[test]
     fn pending_lifecycle_count_includes_remote_mutation_states_only() {
         let mut manifest = Manifest::new();
         for (asset_id, state) in [
@@ -1825,6 +1901,23 @@ mod tests {
         assert!(matches!(
             result,
             Err(MonitorError::DownloadRootAccess { .. })
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_scan_root_preflight_timeout_fails_closed_in_process() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+
+        let result = ensure_macos_scan_root_enumerable_with_probe(tempdir.path(), 1, |_path| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            Ok(())
+        });
+
+        assert!(matches!(
+            result,
+            Err(MonitorError::DownloadRootPreflight { message, .. })
+                if message.contains("timed out after 1 seconds")
         ));
     }
 }
