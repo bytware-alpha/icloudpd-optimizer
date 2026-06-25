@@ -111,6 +111,10 @@ fi
     write_executable_with_body(
         &directory.join("exiftool"),
         r#"#!/bin/sh
+if [ "$1" = "-j" ]; then
+  printf '[{"PreviewImage":"(Binary data 20 bytes, use -b option to extract)"}]\n'
+  exit 0
+fi
 if [ "$1" = "-b" ] && [ "$2" = "-PreviewImage" ]; then
   printf 'embedded-preview-jpeg'
   exit 0

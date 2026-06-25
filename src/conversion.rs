@@ -39,6 +39,21 @@ pub struct ConversionPlan {
     pub verify_metadata: CommandPlan,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmbeddedPreviewTag {
+    PreviewImage,
+    JpgFromRaw,
+}
+
+impl EmbeddedPreviewTag {
+    pub fn exiftool_arg(self) -> &'static str {
+        match self {
+            Self::PreviewImage => "-PreviewImage",
+            Self::JpgFromRaw => "-JpgFromRaw",
+        }
+    }
+}
+
 /// Builds non-destructive command plans for RAW-to-HEIC conversion and verification.
 ///
 /// ```
@@ -65,6 +80,22 @@ pub fn plan_conversion_for_target(
     raw_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     heic_quality: u8,
+) -> Result<ConversionPlan, ConversionError> {
+    plan_conversion_for_target_with_preview_tag(
+        target,
+        raw_path,
+        output_path,
+        heic_quality,
+        EmbeddedPreviewTag::PreviewImage,
+    )
+}
+
+pub fn plan_conversion_for_target_with_preview_tag(
+    target: TargetPlatform,
+    raw_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    heic_quality: u8,
+    preview_tag: EmbeddedPreviewTag,
 ) -> Result<ConversionPlan, ConversionError> {
     let raw_path = raw_path.as_ref();
     let output_path = output_path.as_ref();
@@ -102,6 +133,7 @@ pub fn plan_conversion_for_target(
             heic_preview_arg,
             output_path,
             heic_quality,
+            preview_tag,
         ),
         _ => macos_conversion_plan(
             raw_arg,
@@ -110,6 +142,7 @@ pub fn plan_conversion_for_target(
             heic_preview_arg,
             output_path,
             heic_quality,
+            preview_tag,
         ),
     }
 }
@@ -121,6 +154,7 @@ fn macos_conversion_plan(
     heic_preview_arg: OsString,
     output_path: &Path,
     heic_quality: u8,
+    preview_tag: EmbeddedPreviewTag,
 ) -> Result<ConversionPlan, ConversionError> {
     let embedded_preview_path = intermediate_preview_path(output_path);
     let embedded_preview_arg = embedded_preview_path.as_os_str().to_os_string();
@@ -130,7 +164,7 @@ fn macos_conversion_plan(
         "exiftool",
         vec![
             OsString::from("-b"),
-            OsString::from("-PreviewImage"),
+            OsString::from(preview_tag.exiftool_arg()),
             raw_arg.clone(),
         ],
     )
@@ -258,6 +292,7 @@ fn linux_conversion_plan(
     heic_preview_arg: OsString,
     output_path: &Path,
     heic_quality: u8,
+    preview_tag: EmbeddedPreviewTag,
 ) -> Result<ConversionPlan, ConversionError> {
     let embedded_preview_path = intermediate_preview_path(output_path);
     let embedded_preview_arg = embedded_preview_path.as_os_str().to_os_string();
@@ -267,7 +302,7 @@ fn linux_conversion_plan(
         "exiftool",
         vec![
             OsString::from("-b"),
-            OsString::from("-PreviewImage"),
+            OsString::from(preview_tag.exiftool_arg()),
             raw_arg.clone(),
         ],
     )

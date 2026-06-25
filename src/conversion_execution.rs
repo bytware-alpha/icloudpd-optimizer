@@ -7,10 +7,14 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::conversion::{CommandPlan, ConversionError, plan_conversion_for_target};
+use crate::conversion::{
+    CommandPlan, ConversionError, EmbeddedPreviewTag, plan_conversion_for_target,
+    plan_conversion_for_target_with_preview_tag,
+};
 use crate::conversion_backend::{TargetPlatform, backend_report_for_target};
 use crate::manifest::{Manifest, ManifestError, State};
 use crate::workflow::{
@@ -170,13 +174,23 @@ fn execute_measured_conversion_for_target(
         });
     }
 
-    let plan = plan_conversion_for_target(
+    let mut plan = plan_conversion_for_target(
         target,
         &raw_path,
         &request.output_path,
         request.heic_quality,
     )?;
     refuse_preexisting_output(&request.output_path)?;
+    let preview_tag = select_embedded_preview_tag(&raw_path)?;
+    if preview_tag != EmbeddedPreviewTag::PreviewImage {
+        plan = plan_conversion_for_target_with_preview_tag(
+            target,
+            &raw_path,
+            &request.output_path,
+            request.heic_quality,
+            preview_tag,
+        )?;
+    }
     let conversion_result = (|| {
         let total_started = Instant::now();
         let convert_started = Instant::now();
@@ -217,8 +231,9 @@ fn execute_measured_conversion_for_target(
         Ok(updated)
     })();
 
-    if conversion_result.is_err() {
+    if let Err(error) = &conversion_result {
         remove_failed_output(&request.output_path);
+        remove_generated_intermediates_after_error(&request.output_path, error);
     }
 
     conversion_result
@@ -274,6 +289,50 @@ fn run_planned_command(
     Ok(outcome.resource_usage)
 }
 
+fn select_embedded_preview_tag(
+    raw_path: &Path,
+) -> Result<EmbeddedPreviewTag, ConversionExecutionError> {
+    let resolved_program = resolve_sanitized_path_tool("exiftool")?;
+    let output = Command::new(resolved_program)
+        .args(["-j", "-PreviewImage", "-JpgFromRaw"])
+        .arg(raw_path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(ConversionExecutionError::Io)?;
+    if !output.status.success() {
+        return Err(ConversionExecutionError::CommandFailed {
+            stage: "preview_probe",
+            program: "exiftool".to_string(),
+            status: output.status.to_string(),
+        });
+    }
+    let records: Vec<Value> = serde_json::from_slice(&output.stdout)
+        .map_err(|source| ConversionExecutionError::PreviewProbeDecode { source })?;
+    let fields = records
+        .first()
+        .and_then(Value::as_object)
+        .ok_or(ConversionExecutionError::InvalidPreviewProbeResponse)?;
+    if has_embedded_preview_field(fields, "PreviewImage") {
+        return Ok(EmbeddedPreviewTag::PreviewImage);
+    }
+    if has_embedded_preview_field(fields, "JpgFromRaw") {
+        return Ok(EmbeddedPreviewTag::JpgFromRaw);
+    }
+    Err(ConversionExecutionError::EmbeddedPreviewUnavailable {
+        path: raw_path.to_path_buf(),
+    })
+}
+
+fn has_embedded_preview_field(fields: &Map<String, Value>, key: &str) -> bool {
+    fields.get(key).is_some_and(|value| match value {
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Object(object) => !object.is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        Value::Null => false,
+        Value::Bool(_) | Value::Number(_) => true,
+    })
+}
+
 fn create_new_stdout_file(path: &Path) -> Result<File, ConversionExecutionError> {
     OpenOptions::new()
         .write(true)
@@ -300,6 +359,30 @@ fn remove_failed_output(path: &Path) {
         }
         _ => {}
     }
+}
+
+fn remove_generated_intermediates_after_error(
+    output_path: &Path,
+    error: &ConversionExecutionError,
+) {
+    let embedded_path = generated_intermediate_path(output_path, "embedded-preview.jpg");
+    let oriented_path = generated_intermediate_path(output_path, "oriented-preview.jpg");
+    match error {
+        ConversionExecutionError::OutputAlreadyExists { path } if *path == embedded_path => {}
+        ConversionExecutionError::OutputAlreadyExists { path } if *path == oriented_path => {
+            remove_failed_output(&embedded_path);
+        }
+        _ => {
+            remove_failed_output(&embedded_path);
+            remove_failed_output(&oriented_path);
+        }
+    }
+}
+
+fn generated_intermediate_path(output_path: &Path, extension: &str) -> PathBuf {
+    let mut path = output_path.to_path_buf();
+    path.set_extension(extension);
+    path
 }
 
 fn run_planned_commands(
@@ -681,6 +764,12 @@ pub enum ConversionExecutionError {
         program: String,
         status: String,
     },
+    #[error("failed to decode embedded preview probe output: {source}")]
+    PreviewProbeDecode { source: serde_json::Error },
+    #[error("embedded preview probe returned invalid output")]
+    InvalidPreviewProbeResponse,
+    #[error("RAW has neither PreviewImage nor JpgFromRaw embedded preview: {path}")]
+    EmbeddedPreviewUnavailable { path: PathBuf },
     #[error("converted output is missing or unreadable at {path}: {source}")]
     OutputUnreadable { path: PathBuf, source: io::Error },
     #[error(
@@ -804,6 +893,50 @@ mod tests {
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
             "exiftool-preview\nexiftool-preview-orientation\nmagick-auto-orient\nheif-enc\nexiftool-metadata\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_conversion_uses_jpg_from_raw_when_preview_image_is_absent() {
+        let tool_dir = fake_linux_conversion_tools_with_preview_and_heif_enc(
+            r#"printf 'exiftool-jpg-from-raw\n' >> "$EXECUTION_LOG"
+printf 'embedded-preview-jpeg'
+exit 0
+"#,
+            DEFAULT_HEIF_ENC_SCRIPT,
+        );
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let _preview_arg_guard = EnvVarGuard::install("FAKE_PREVIEW_ARG", Path::new("-JpgFromRaw"));
+        let manifest = nas_verified_manifest(&raw_path);
+
+        let updated = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: Some("linux-tools-1".to_string()),
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect("JpgFromRaw preview should be a valid embedded conversion source");
+
+        assert_eq!(
+            fs::read_to_string(log_path).expect("command log should be readable"),
+            "exiftool-jpg-from-raw\nexiftool-preview-orientation\nmagick-auto-orient\nheif-enc\nexiftool-metadata\n"
+        );
+        let record = updated.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::Converted);
+        assert_eq!(
+            record.proofs["conversion_performance"]["conversion_tool"],
+            "exiftool+exiftool+magick+heif-enc"
         );
     }
 
@@ -986,6 +1119,8 @@ exit 44
             } if program == "heif-enc"
         ));
         assert!(!output_path.exists());
+        assert!(!embedded_preview_path(&output_path).exists());
+        assert!(!oriented_preview_path(&output_path).exists());
         let record = manifest.get("asset-1").expect("asset should exist");
         assert_eq!(record.state, State::NasVerified);
         assert!(!record.proofs.contains_key("conversion"));
@@ -1035,6 +1170,8 @@ exit 41
             } if program == "exiftool"
         ));
         assert!(!output_path.exists());
+        assert!(!embedded_preview_path(&output_path).exists());
+        assert!(!oriented_preview_path(&output_path).exists());
         let record = manifest.get("asset-1").expect("asset should exist");
         assert_eq!(record.state, State::NasVerified);
         assert!(!record.proofs.contains_key("conversion"));
@@ -1419,7 +1556,16 @@ exit 47
         );
         let exiftool_body = format!(
             r#"#!/bin/sh
-if [ "$1" = "-b" ] && [ "$2" = "-PreviewImage" ]; then
+preview_arg="${{FAKE_PREVIEW_ARG:--PreviewImage}}"
+if [ "$1" = "-j" ]; then
+  if [ "$preview_arg" = "-JpgFromRaw" ]; then
+    printf '[{{"JpgFromRaw":"(Binary data 20 bytes, use -b option to extract)"}}]\n'
+  else
+    printf '[{{"PreviewImage":"(Binary data 20 bytes, use -b option to extract)"}}]\n'
+  fi
+  exit 0
+fi
+if [ "$1" = "-b" ] && [ "$2" = "$preview_arg" ]; then
 {preview_extraction_body}
 fi
 if [ "$1" = "-TagsFromFile" ] && [ "$3" = "-Orientation#" ]; then
