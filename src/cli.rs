@@ -692,8 +692,11 @@ fn monitor_run<W: Write>(args: MonitorRunArgs, writer: &mut W) -> Result<(), Cli
     let config = MonitorConfig::load(&args.config)?;
     config.validate()?;
     loop {
-        let summary = run_monitor_once(&config)?;
-        write_scan_summary(writer, &summary)?;
+        match run_monitor_once(&config) {
+            Ok(summary) => write_scan_summary(writer, &summary)?,
+            Err(error) if args.once => return Err(error.into()),
+            Err(error) => eprintln!("monitor failed: {error}"),
+        }
         if args.once {
             return Ok(());
         }
