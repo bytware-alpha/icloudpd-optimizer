@@ -45,6 +45,7 @@ const DEFAULT_CAPTURE_TOLERANCE_SECONDS: u64 = 2;
 const DEFAULT_CLOUDKIT_PAGE_SIZE: u64 = 200;
 const DEFAULT_CLOUDKIT_MAX_PAGES: u64 = 2000;
 const DEFAULT_SCAN_ROOT_PREFLIGHT_TIMEOUT_SECONDS: u64 = 30;
+const ORIGINAL_ASSET_RESOLVE_BATCH_WINDOW_SECONDS: u64 = 60 * 60;
 const MONITOR_VISUAL_RMSE_MAX: f64 = 0.02;
 const MONITOR_HEIC_STDEV_MIN: f64 = 0.005;
 const DEFAULT_LAUNCHD_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
@@ -828,58 +829,106 @@ fn resolve_original_assets(
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
 ) -> Result<(), MonitorError> {
-    let asset_ids =
-        original_asset_resolution_candidate_ids(manifest, config.max_lifecycle_per_scan);
-    if asset_ids.is_empty() {
+    let target_batches = original_asset_resolution_target_batches(manifest, config)?;
+    if target_batches.is_empty() {
         return Ok(());
     }
 
-    let targets = asset_ids
-        .iter()
-        .map(|asset_id| original_asset_resolve_target(manifest, asset_id, config))
-        .collect::<Result<Vec<_>, MonitorError>>()?;
     let session_path = required_path(&config.delete_session_path, "delete_session_path")?;
     let session = load_cloudkit_delete_session(session_path)?;
     let transport = ReqwestCloudKitDeleteTransport::new()?;
     let mut client = CloudKitDeleteClient::new(transport);
-    match client.resolve_original_assets_batch_outcome(
-        &session,
-        &CloudKitOriginalAssetBatchResolveRequest {
-            targets,
-            start_rank: config.cloudkit_start_rank,
-            page_size: config.cloudkit_page_size,
-            max_pages: config.cloudkit_max_pages,
-        },
-    ) {
-        Ok(outcome) => {
-            if record_original_asset_batch_outcome(manifest, outcome, summary)? {
-                manifest
-                    .save_atomic(&config.manifest_path)
-                    .map_err(MonitorError::Manifest)?;
+    for targets in target_batches {
+        let asset_ids = targets
+            .iter()
+            .map(|target| target.asset_id.clone())
+            .collect::<Vec<_>>();
+        let min_capture = targets
+            .iter()
+            .map(|target| target.source_captured_unix_seconds)
+            .min()
+            .unwrap_or(0);
+        let max_capture = targets
+            .iter()
+            .map(|target| target.source_captured_unix_seconds)
+            .max()
+            .unwrap_or(0);
+        let started = current_unix_seconds();
+        log_monitor_event(
+            "original_asset_resolve_batch_started",
+            summary.started_unix_seconds,
+            json!({
+                "targets": targets.len(),
+                "min_capture_unix_seconds": min_capture,
+                "max_capture_unix_seconds": max_capture,
+                "capture_span_seconds": max_capture.saturating_sub(min_capture),
+                "start_rank": config.cloudkit_start_rank,
+                "page_size": config.cloudkit_page_size,
+                "max_pages": config.cloudkit_max_pages,
+            }),
+        );
+        match client.resolve_original_assets_batch_outcome(
+            &session,
+            &CloudKitOriginalAssetBatchResolveRequest {
+                targets,
+                start_rank: config.cloudkit_start_rank,
+                page_size: config.cloudkit_page_size,
+                max_pages: config.cloudkit_max_pages,
+            },
+        ) {
+            Ok(outcome) => {
+                let resolved = outcome.proofs.len();
+                let unresolved = outcome.unresolved_asset_ids.len();
+                if record_original_asset_batch_outcome(manifest, outcome, summary)? {
+                    manifest
+                        .save_atomic(&config.manifest_path)
+                        .map_err(MonitorError::Manifest)?;
+                }
+                log_monitor_event(
+                    "original_asset_resolve_batch_finished",
+                    summary.started_unix_seconds,
+                    json!({
+                        "targets": asset_ids.len(),
+                        "resolved": resolved,
+                        "unresolved": unresolved,
+                        "wall_time_seconds": current_unix_seconds().saturating_sub(started),
+                    }),
+                );
             }
-        }
-        Err(error) => {
-            let should_fail_records = matches!(
-                &error,
-                UploadError::OriginalAssetResolveNotUnique { .. }
-                    | UploadError::OriginalAssetResolveIncomplete { .. }
-            );
-            let message = error.to_string();
-            record_monitor_failure(summary, message.clone());
-            if should_fail_records {
-                record_lifecycle_failure_for_assets(
-                    manifest,
-                    &asset_ids,
-                    "original_asset_resolve",
-                    &message,
-                )?;
-                manifest
-                    .save_atomic(&config.manifest_path)
-                    .map_err(MonitorError::Manifest)?;
+            Err(error) => {
+                let should_fail_records = original_asset_resolve_error_should_fail_records(&error);
+                let message = error.to_string();
+                record_monitor_failure(summary, message.clone());
+                if should_fail_records {
+                    record_lifecycle_failure_for_assets(
+                        manifest,
+                        &asset_ids,
+                        "original_asset_resolve",
+                        &message,
+                    )?;
+                    manifest
+                        .save_atomic(&config.manifest_path)
+                        .map_err(MonitorError::Manifest)?;
+                }
+                log_monitor_event(
+                    "original_asset_resolve_batch_finished",
+                    summary.started_unix_seconds,
+                    json!({
+                        "targets": asset_ids.len(),
+                        "resolved": 0,
+                        "unresolved": asset_ids.len(),
+                        "wall_time_seconds": current_unix_seconds().saturating_sub(started),
+                        "error": message,
+                    }),
+                );
             }
         }
     }
     Ok(())
+}
+
+fn original_asset_resolve_error_should_fail_records(error: &UploadError) -> bool {
+    matches!(error, UploadError::OriginalAssetResolveNotUnique { .. })
 }
 
 fn upload_verified_heics(
@@ -1163,11 +1212,51 @@ fn asset_ids_matching(
         .collect()
 }
 
-fn original_asset_resolution_candidate_ids(manifest: &Manifest, limit: usize) -> Vec<String> {
-    asset_ids_matching(manifest, limit, |record| {
-        matches!(record.state, State::NasVerified | State::ConversionVerified)
-            && !record.proofs.contains_key("original_asset")
-    })
+fn original_asset_resolution_target_batches(
+    manifest: &Manifest,
+    config: &MonitorConfig,
+) -> Result<Vec<Vec<CloudKitOriginalAssetResolveTarget>>, MonitorError> {
+    let mut targets = manifest
+        .records()
+        .values()
+        .filter(|record| {
+            matches!(record.state, State::NasVerified | State::ConversionVerified)
+                && !record.proofs.contains_key("original_asset")
+        })
+        .map(|record| original_asset_resolve_target(manifest, &record.asset_id, config))
+        .collect::<Result<Vec<_>, MonitorError>>()?;
+    targets.sort_by(|left, right| {
+        left.source_captured_unix_seconds
+            .cmp(&right.source_captured_unix_seconds)
+            .then_with(|| left.asset_id.cmp(&right.asset_id))
+    });
+    targets.truncate(config.max_lifecycle_per_scan);
+
+    let mut batches: Vec<Vec<CloudKitOriginalAssetResolveTarget>> = Vec::new();
+    let mut current_batch: Vec<CloudKitOriginalAssetResolveTarget> = Vec::new();
+    let mut current_batch_start = 0;
+    for target in targets {
+        if current_batch.is_empty() {
+            current_batch_start = target.source_captured_unix_seconds;
+            current_batch.push(target);
+            continue;
+        }
+        if target
+            .source_captured_unix_seconds
+            .saturating_sub(current_batch_start)
+            <= ORIGINAL_ASSET_RESOLVE_BATCH_WINDOW_SECONDS
+        {
+            current_batch.push(target);
+        } else {
+            batches.push(current_batch);
+            current_batch = vec![target];
+            current_batch_start = current_batch[0].source_captured_unix_seconds;
+        }
+    }
+    if !current_batch.is_empty() {
+        batches.push(current_batch);
+    }
+    Ok(batches)
 }
 
 fn verify_converted_heic(
@@ -1761,6 +1850,16 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_original_asset_scan_remains_retryable() {
+        assert!(!original_asset_resolve_error_should_fail_records(
+            &UploadError::OriginalAssetResolveIncomplete { matches: 0 }
+        ));
+        assert!(original_asset_resolve_error_should_fail_records(
+            &UploadError::OriginalAssetResolveNotUnique { matches: 2 }
+        ));
+    }
+
+    #[test]
     fn full_lifecycle_conversion_requests_wait_for_original_asset_proof() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let mut config = MonitorConfig::new(
@@ -1816,18 +1915,48 @@ mod tests {
     }
 
     #[test]
-    fn original_asset_resolution_candidates_include_nas_verified_records() {
+    fn original_asset_resolution_batches_include_nas_verified_records() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
         let mut manifest = Manifest::new();
-        for (asset_id, state, has_original_proof) in [
-            ("nas-unproven", State::NasVerified, false),
-            ("nas-proven", State::NasVerified, true),
-            ("verified-unproven", State::ConversionVerified, false),
-            ("converted", State::Converted, false),
-            ("failed", State::Failed, false),
+        for (asset_id, state, has_original_proof, captured_at) in [
+            ("nas-unproven", State::NasVerified, false, 1_000u64),
+            ("nas-proven", State::NasVerified, true, 1_100u64),
+            (
+                "verified-unproven",
+                State::ConversionVerified,
+                false,
+                1_200u64,
+            ),
+            ("converted", State::Converted, false, 1_300u64),
+            ("failed", State::Failed, false, 1_400u64),
         ] {
             let mut record =
                 AssetRecord::new(asset_id, PathBuf::from(format!("/raw/{asset_id}.DNG")));
             record.state = state;
+            record.proofs.insert(
+                "nas".to_string(),
+                json!({
+                    "canonical_path": format!("/raw/{asset_id}.DNG"),
+                    "relative_path": format!("{asset_id}.DNG"),
+                    "size_bytes": 9,
+                    "modified_unix_seconds": captured_at,
+                    "age_seconds": 2_592_000u64,
+                    "sha256": "raw-sha",
+                }),
+            );
+            record.proofs.insert(
+                "source_age".to_string(),
+                json!({
+                    "source_captured_unix_seconds": captured_at,
+                    "verified_at_unix_seconds": 10_000u64,
+                    "min_age_seconds": 2_592_000u64,
+                }),
+            );
             if has_original_proof {
                 record.proofs.insert(
                     "original_asset".to_string(),
@@ -1837,12 +1966,128 @@ mod tests {
             manifest.upsert(record);
         }
 
-        let asset_ids = original_asset_resolution_candidate_ids(&manifest, 10);
+        let batches = original_asset_resolution_target_batches(&manifest, &config)
+            .expect("targets should batch");
+        let asset_ids = batches
+            .iter()
+            .flat_map(|batch| batch.iter().map(|target| target.asset_id.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(asset_ids, vec!["nas-unproven", "verified-unproven"]);
+    }
+
+    #[test]
+    fn original_asset_resolution_batches_are_sorted_and_date_local() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        config.max_lifecycle_per_scan = 10;
+        let mut manifest = Manifest::new();
+        for (asset_id, captured_at) in [
+            ("late", 9_000u64),
+            ("early-b", 1_200u64),
+            ("middle-b", 4_800u64),
+            ("early-a", 1_000u64),
+            ("middle-a", 4_700u64),
+        ] {
+            let mut record =
+                AssetRecord::new(asset_id, PathBuf::from(format!("/raw/{asset_id}.DNG")));
+            record.state = State::NasVerified;
+            record.proofs.insert(
+                "nas".to_string(),
+                json!({
+                    "canonical_path": format!("/raw/{asset_id}.DNG"),
+                    "relative_path": format!("{asset_id}.DNG"),
+                    "size_bytes": 9,
+                    "modified_unix_seconds": captured_at,
+                    "age_seconds": 2_592_000u64,
+                    "sha256": "raw-sha",
+                }),
+            );
+            record.proofs.insert(
+                "source_age".to_string(),
+                json!({
+                    "source_captured_unix_seconds": captured_at,
+                    "verified_at_unix_seconds": 10_000u64,
+                    "min_age_seconds": 2_592_000u64,
+                }),
+            );
+            manifest.upsert(record);
+        }
+
+        let batches = original_asset_resolution_target_batches(&manifest, &config)
+            .expect("targets should batch");
+        let batch_asset_ids = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .map(|target| target.asset_id.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
 
         assert_eq!(
-            asset_ids,
-            vec!["nas-unproven".to_string(), "verified-unproven".to_string()]
+            batch_asset_ids,
+            vec![
+                vec!["early-a", "early-b"],
+                vec!["middle-a", "middle-b"],
+                vec!["late"],
+            ]
         );
+    }
+
+    #[test]
+    fn original_asset_resolution_batches_limit_after_capture_time_sort() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        config.max_lifecycle_per_scan = 2;
+        let mut manifest = Manifest::new();
+        for (asset_id, captured_at) in [
+            ("z-late", 9_000u64),
+            ("a-middle", 4_700u64),
+            ("m-early", 1_000u64),
+        ] {
+            let mut record =
+                AssetRecord::new(asset_id, PathBuf::from(format!("/raw/{asset_id}.DNG")));
+            record.state = State::NasVerified;
+            record.proofs.insert(
+                "nas".to_string(),
+                json!({
+                    "canonical_path": format!("/raw/{asset_id}.DNG"),
+                    "relative_path": format!("{asset_id}.DNG"),
+                    "size_bytes": 9,
+                    "modified_unix_seconds": captured_at,
+                    "age_seconds": 2_592_000u64,
+                    "sha256": "raw-sha",
+                }),
+            );
+            record.proofs.insert(
+                "source_age".to_string(),
+                json!({
+                    "source_captured_unix_seconds": captured_at,
+                    "verified_at_unix_seconds": 10_000u64,
+                    "min_age_seconds": 2_592_000u64,
+                }),
+            );
+            manifest.upsert(record);
+        }
+
+        let batches = original_asset_resolution_target_batches(&manifest, &config)
+            .expect("targets should batch");
+        let asset_ids = batches
+            .iter()
+            .flat_map(|batch| batch.iter().map(|target| target.asset_id.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(asset_ids, vec!["m-early", "a-middle"]);
     }
 
     #[test]

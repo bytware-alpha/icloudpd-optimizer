@@ -1202,11 +1202,24 @@ fn seek_original_asset_query_page<T>(
 ) -> Result<OriginalAssetSeekResult<T>, UploadError> {
     let mut pages_read = 0;
     let first_page = read_original_asset_rank_page(start_rank, &mut pages_read, &mut query_page)?;
-    if first_page.page.position_against(target_window) != OriginalAssetPagePosition::TooNew {
-        return Ok(OriginalAssetSeekResult {
-            page: first_page,
-            pages_read,
-        });
+    match first_page.page.position_against(target_window) {
+        OriginalAssetPagePosition::TooNew => {}
+        OriginalAssetPagePosition::TooOld => {
+            return seek_original_asset_query_page_toward_newer(
+                first_page,
+                page_size,
+                max_pages,
+                target_window,
+                pages_read,
+                query_page,
+            );
+        }
+        OriginalAssetPagePosition::Overlaps | OriginalAssetPagePosition::Empty => {
+            return Ok(OriginalAssetSeekResult {
+                page: first_page,
+                pages_read,
+            });
+        }
     }
 
     let mut lower_rank = start_rank;
@@ -1243,6 +1256,78 @@ fn seek_original_asset_query_page<T>(
             lower_rank = mid_rank;
         } else {
             upper_page = page;
+        }
+    }
+
+    Ok(OriginalAssetSeekResult {
+        page: upper_page,
+        pages_read,
+    })
+}
+
+fn seek_original_asset_query_page_toward_newer<T>(
+    first_page: PositionedOriginalAssetQueryPage<T>,
+    page_size: u64,
+    max_pages: u64,
+    target_window: &OriginalAssetDateWindow,
+    mut pages_read: u64,
+    mut query_page: impl FnMut(u64) -> Result<OriginalAssetQueryPage<T>, UploadError>,
+) -> Result<OriginalAssetSeekResult<T>, UploadError> {
+    if first_page.start_rank == 0 {
+        return Ok(OriginalAssetSeekResult {
+            page: first_page,
+            pages_read,
+        });
+    }
+
+    let mut upper_page = first_page;
+    let mut step = upper_page
+        .page
+        .asset_count()
+        .max(1)
+        .max(page_size.saturating_div(2).max(1));
+    let lower_page = loop {
+        if pages_read >= max_pages {
+            return Err(UploadError::OriginalAssetResolveIncomplete { matches: 0 });
+        }
+        let probe_rank = upper_page.start_rank.saturating_sub(step);
+        let page = read_original_asset_rank_page(probe_rank, &mut pages_read, &mut query_page)?;
+        match page.page.position_against(target_window) {
+            OriginalAssetPagePosition::TooOld if probe_rank > 0 => {
+                upper_page = page;
+                step =
+                    step.checked_mul(2)
+                        .ok_or(UploadError::InvalidCloudKitOriginalAssetRequest(
+                            "pagination start rank overflow",
+                        ))?;
+            }
+            OriginalAssetPagePosition::TooOld => {
+                return Ok(OriginalAssetSeekResult { page, pages_read });
+            }
+            _ => break page,
+        }
+    };
+
+    if lower_page.page.position_against(target_window) != OriginalAssetPagePosition::TooNew {
+        return Ok(OriginalAssetSeekResult {
+            page: lower_page,
+            pages_read,
+        });
+    }
+
+    let mut lower_rank = lower_page.start_rank;
+    while lower_rank.saturating_add(1) < upper_page.start_rank {
+        if pages_read >= max_pages {
+            return Err(UploadError::OriginalAssetResolveIncomplete { matches: 0 });
+        }
+        let mid_rank = lower_rank + (upper_page.start_rank - lower_rank) / 2;
+        let page = read_original_asset_rank_page(mid_rank, &mut pages_read, &mut query_page)?;
+        match page.page.position_against(target_window) {
+            OriginalAssetPagePosition::TooNew => lower_rank = mid_rank,
+            OriginalAssetPagePosition::Overlaps | OriginalAssetPagePosition::Empty => {
+                return Ok(OriginalAssetSeekResult { page, pages_read });
+            }
+            OriginalAssetPagePosition::TooOld => upper_page = page,
         }
     }
 
