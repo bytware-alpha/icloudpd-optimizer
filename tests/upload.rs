@@ -2202,6 +2202,26 @@ fn run_icloud_upload_rejects_non_utf8_filename_before_filesystem_access() {
 }
 
 #[test]
+fn run_icloud_upload_rejects_png_filename_before_upload_session_use() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let session_path = tempdir.path().join("session.json");
+    write_session(&session_path, &valid_session_json());
+    let png_path = tempdir.path().join("IMG_0001.heic-preview.png");
+    fs::write(&png_path, b"png-bytes").expect("png should be written");
+
+    let error = run_icloud_upload(&IcloudUploadRequest {
+        session_path,
+        heic_path: png_path.clone(),
+    })
+    .expect_err("PNG preview files must not be accepted as HEIC upload candidates");
+
+    assert!(matches!(
+        error,
+        UploadError::InvalidHeicExtension { path } if path == png_path
+    ));
+}
+
+#[test]
 fn build_upload_proof_rejects_when_streamed_bytes_differ_even_if_path_is_restored() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let heic_path = tempdir.path().join("IMG_0001.heic");

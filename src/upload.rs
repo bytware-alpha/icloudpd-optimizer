@@ -3101,6 +3101,15 @@ fn heic_filename(path: &Path) -> Result<String, UploadError> {
 
 fn validate_candidate_heic(path: &Path) -> Result<(), UploadError> {
     heic_filename(path)?;
+    let has_heic_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("heic"));
+    if !has_heic_extension {
+        return Err(UploadError::InvalidHeicExtension {
+            path: path.to_path_buf(),
+        });
+    }
     let metadata = std::fs::metadata(path).map_err(|source| UploadError::ReadHeic {
         path: path.to_path_buf(),
         source,
@@ -3330,6 +3339,8 @@ pub enum UploadError {
     EmptyHeic { path: PathBuf },
     #[error("verified HEIC filename is missing or is not UTF-8 at {path}")]
     InvalidFilename { path: PathBuf },
+    #[error("verified HEIC path must end in .heic: {path}")]
+    InvalidHeicExtension { path: PathBuf },
     #[error("HEIC size mismatch at {path}: expected {expected} bytes, got {actual} bytes")]
     HeicSizeMismatch {
         path: PathBuf,
