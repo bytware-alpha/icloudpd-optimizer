@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +29,7 @@ const DEFAULT_CHILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const CHILD_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RAW_STAGE_HASH_BUFFER_BYTES: usize = 64 * 1024;
 const RAW_STAGING_STAGE: &str = "raw_staging";
+static RAW_STAGE_COPY_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 static TEST_CHILD_COMMAND_TIMEOUT: std::sync::Mutex<Option<Duration>> = std::sync::Mutex::new(None);
@@ -294,17 +296,26 @@ fn run_raw_stage_copy_command(
         );
     }
 
-    let RawStageCopyCommand { program, command } =
-        raw_stage_copy_command(raw_path, staged_path, nas_proof)?;
-    let outcome = wait_for_command_with_usage(RAW_STAGING_STAGE, &program, command)?;
-    if !outcome.status.success() {
-        return Err(ConversionExecutionError::CommandFailed {
-            stage: RAW_STAGING_STAGE,
-            program,
-            status: outcome.status.to_string(),
-        });
-    }
-    Ok(())
+    with_raw_stage_copy_slot(|| {
+        let RawStageCopyCommand { program, command } =
+            raw_stage_copy_command(raw_path, staged_path, nas_proof)?;
+        let outcome = wait_for_command_with_usage(RAW_STAGING_STAGE, &program, command)?;
+        if !outcome.status.success() {
+            return Err(ConversionExecutionError::CommandFailed {
+                stage: RAW_STAGING_STAGE,
+                program,
+                status: outcome.status.to_string(),
+            });
+        }
+        Ok(())
+    })
+}
+
+fn with_raw_stage_copy_slot<T>(action: impl FnOnce() -> T) -> T {
+    let _raw_stage_slot = RAW_STAGE_COPY_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    action()
 }
 
 fn raw_stage_copy_command(
@@ -1437,6 +1448,8 @@ pub enum ConversionExecutionError {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::sync::{Mutex, MutexGuard};
 
     use crate::proof::NasRawProof;
@@ -1618,6 +1631,36 @@ mod tests {
             !staged_path.exists(),
             "child copy must remove partial output on verification failure"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_staging_commands_are_serialized_within_optimizer_process() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(4));
+        let handles = (0..4)
+            .map(|_| {
+                let active = Arc::clone(&active);
+                let max_seen = Arc::clone(&max_seen);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    with_raw_stage_copy_slot(|| {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_seen.fetch_max(current, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(25));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    });
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().expect("worker should not panic");
+        }
+
+        assert_eq!(max_seen.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(unix)]
