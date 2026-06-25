@@ -1240,8 +1240,28 @@ fn asset_ids_matching(
         .collect()
 }
 
+struct OriginalAssetResolutionCandidate {
+    asset_id: String,
+    source_captured_unix_seconds: u64,
+}
+
 fn active_lifecycle_asset_ids(manifest: &Manifest, limit: usize) -> Vec<String> {
-    asset_ids_matching(manifest, limit, is_lifecycle_candidate)
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut active_ids = asset_ids_matching(manifest, limit, is_lifecycle_continuation_candidate);
+    let remaining = limit.saturating_sub(active_ids.len());
+    if remaining == 0 {
+        return active_ids;
+    }
+
+    active_ids.extend(densest_original_asset_resolution_window(
+        manifest,
+        remaining,
+        &active_ids,
+    ));
+    active_ids
 }
 
 fn is_lifecycle_candidate(record: &AssetRecord) -> bool {
@@ -1254,6 +1274,104 @@ fn is_lifecycle_candidate(record: &AssetRecord) -> bool {
             | State::DeleteEligible
             | State::DeleteApproved
     )
+}
+
+fn is_lifecycle_continuation_candidate(record: &AssetRecord) -> bool {
+    matches!(
+        record.state,
+        State::Converted
+            | State::ConversionVerified
+            | State::UploadVerified
+            | State::DeleteEligible
+            | State::DeleteApproved
+    ) || (record.state == State::NasVerified && record.proofs.contains_key("original_asset"))
+}
+
+fn densest_original_asset_resolution_window(
+    manifest: &Manifest,
+    limit: usize,
+    already_active_ids: &[String],
+) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates = manifest
+        .records()
+        .values()
+        .filter(|record| !active_lifecycle_allows(Some(already_active_ids), &record.asset_id))
+        .filter(|record| {
+            matches!(record.state, State::NasVerified | State::ConversionVerified)
+                && !record.proofs.contains_key("original_asset")
+        })
+        .filter_map(original_asset_resolution_candidate)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.source_captured_unix_seconds
+            .cmp(&right.source_captured_unix_seconds)
+            .then_with(|| left.asset_id.cmp(&right.asset_id))
+    });
+
+    let Some(best_start) = densest_original_asset_resolution_window_start(&candidates, limit)
+    else {
+        return Vec::new();
+    };
+    let window_start = candidates[best_start].source_captured_unix_seconds;
+    candidates
+        .into_iter()
+        .skip(best_start)
+        .take_while(|candidate| {
+            candidate
+                .source_captured_unix_seconds
+                .saturating_sub(window_start)
+                <= ORIGINAL_ASSET_RESOLVE_BATCH_WINDOW_SECONDS
+        })
+        .take(limit)
+        .map(|candidate| candidate.asset_id)
+        .collect()
+}
+
+fn densest_original_asset_resolution_window_start(
+    candidates: &[OriginalAssetResolutionCandidate],
+    limit: usize,
+) -> Option<usize> {
+    if candidates.is_empty() || limit == 0 {
+        return None;
+    }
+
+    let mut best_start = 0;
+    let mut best_count = 0;
+    let mut end = 0;
+    for start in 0..candidates.len() {
+        while end < candidates.len()
+            && candidates[end]
+                .source_captured_unix_seconds
+                .saturating_sub(candidates[start].source_captured_unix_seconds)
+                <= ORIGINAL_ASSET_RESOLVE_BATCH_WINDOW_SECONDS
+        {
+            end += 1;
+        }
+        let count = end.saturating_sub(start).min(limit);
+        if count > best_count {
+            best_start = start;
+            best_count = count;
+        }
+    }
+    (best_count > 0).then_some(best_start)
+}
+
+fn original_asset_resolution_candidate(
+    record: &AssetRecord,
+) -> Option<OriginalAssetResolutionCandidate> {
+    let source_captured_unix_seconds = record
+        .proofs
+        .get("source_age")
+        .and_then(|proof| proof.get("source_captured_unix_seconds"))
+        .and_then(|captured_at| captured_at.as_u64())?;
+    Some(OriginalAssetResolutionCandidate {
+        asset_id: record.asset_id.clone(),
+        source_captured_unix_seconds,
+    })
 }
 
 fn active_lifecycle_allows(active_lifecycle_asset_ids: Option<&[String]>, asset_id: &str) -> bool {
@@ -1911,6 +2029,48 @@ mod tests {
         ));
     }
 
+    fn lifecycle_record(asset_id: &str, state: State) -> AssetRecord {
+        let mut record = AssetRecord::new(asset_id, PathBuf::from(format!("/raw/{asset_id}.DNG")));
+        record.state = state;
+        record
+    }
+
+    fn add_original_asset_proof(record: &mut AssetRecord) {
+        record.proofs.insert(
+            "original_asset".to_string(),
+            json!({
+                "record_name": format!("CPLAsset-{}", record.asset_id),
+                "record_change_tag": "tag",
+                "record_type": "CPLAsset",
+                "filename": format!("{}.DNG", record.asset_id),
+                "size_bytes": 9,
+                "matched_raw_sha256": "raw-sha",
+            }),
+        );
+    }
+
+    fn add_original_resolution_proofs(record: &mut AssetRecord, captured_at: u64) {
+        record.proofs.insert(
+            "nas".to_string(),
+            json!({
+                "canonical_path": format!("/raw/{}.DNG", record.asset_id),
+                "relative_path": format!("{}.DNG", record.asset_id),
+                "size_bytes": 9,
+                "modified_unix_seconds": captured_at,
+                "age_seconds": 2_592_000u64,
+                "sha256": "raw-sha",
+            }),
+        );
+        record.proofs.insert(
+            "source_age".to_string(),
+            json!({
+                "source_captured_unix_seconds": captured_at,
+                "verified_at_unix_seconds": 10_000u64,
+                "min_age_seconds": 2_592_000u64,
+            }),
+        );
+    }
+
     #[test]
     fn full_lifecycle_conversion_requests_wait_for_original_asset_proof() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
@@ -1922,8 +2082,8 @@ mod tests {
         config.full_lifecycle = true;
 
         let mut manifest = Manifest::new();
-        let mut unproven = AssetRecord::new("unproven", PathBuf::from("/raw/unproven.DNG"));
-        unproven.state = State::NasVerified;
+        let mut unproven = lifecycle_record("unproven", State::NasVerified);
+        add_original_resolution_proofs(&mut unproven, 1_000);
         manifest.upsert(unproven);
         let mut proven = AssetRecord::new("proven", PathBuf::from("/raw/proven.DNG"));
         proven.state = State::NasVerified;
@@ -2144,7 +2304,71 @@ mod tests {
     }
 
     #[test]
-    fn active_lifecycle_asset_ids_selects_bounded_manifest_order_candidates() {
+    fn active_lifecycle_asset_ids_prioritizes_continuation_work_before_new_resolution() {
+        let mut manifest = Manifest::new();
+        for (asset_id, captured_at) in [
+            ("a-new-raw-1", 10_000u64),
+            ("b-new-raw-2", 10_100u64),
+            ("c-new-raw-3", 10_200u64),
+        ] {
+            let mut record = lifecycle_record(asset_id, State::NasVerified);
+            add_original_resolution_proofs(&mut record, captured_at);
+            manifest.upsert(record);
+        }
+        manifest.upsert(lifecycle_record("d-converted", State::Converted));
+        let mut proven_nas = lifecycle_record("e-proven-nas", State::NasVerified);
+        add_original_asset_proof(&mut proven_nas);
+        manifest.upsert(proven_nas);
+
+        assert_eq!(
+            active_lifecycle_asset_ids(&manifest, 2),
+            vec!["d-converted", "e-proven-nas"]
+        );
+    }
+
+    #[test]
+    fn active_lifecycle_asset_ids_selects_dense_date_local_resolution_window() {
+        let mut manifest = Manifest::new();
+        for (asset_id, captured_at) in [
+            ("a-sparse-early", 1_000u64),
+            ("b-dense-1", 10_000u64),
+            ("c-dense-2", 10_100u64),
+            ("d-dense-3", 10_200u64),
+            (
+                "e-outside-window",
+                10_000u64 + ORIGINAL_ASSET_RESOLVE_BATCH_WINDOW_SECONDS + 1,
+            ),
+        ] {
+            let mut record = lifecycle_record(asset_id, State::NasVerified);
+            add_original_resolution_proofs(&mut record, captured_at);
+            manifest.upsert(record);
+        }
+
+        assert_eq!(
+            active_lifecycle_asset_ids(&manifest, 4),
+            vec!["b-dense-1", "c-dense-2", "d-dense-3"]
+        );
+    }
+
+    #[test]
+    fn active_lifecycle_asset_ids_excludes_terminal_and_undiscovered_records() {
+        let mut manifest = Manifest::new();
+        for (asset_id, state) in [
+            ("a-discovered", State::Discovered),
+            ("b-failed", State::Failed),
+            ("c-deleted", State::Deleted),
+        ] {
+            manifest.upsert(lifecycle_record(asset_id, state));
+        }
+        let mut raw = lifecycle_record("d-new-raw", State::NasVerified);
+        add_original_resolution_proofs(&mut raw, 10_000);
+        manifest.upsert(raw);
+
+        assert_eq!(active_lifecycle_asset_ids(&manifest, 10), vec!["d-new-raw"]);
+    }
+
+    #[test]
+    fn active_lifecycle_asset_ids_selects_bounded_continuation_candidates() {
         let mut manifest = Manifest::new();
         for (asset_id, state) in [
             ("a-discovered", State::Discovered),
@@ -2165,7 +2389,7 @@ mod tests {
 
         assert_eq!(
             active_lifecycle_asset_ids(&manifest, 4),
-            vec!["b-nas", "c-converted", "d-verified", "e-uploaded"]
+            vec!["c-converted", "d-verified", "e-uploaded", "f-eligible"]
         );
     }
 
@@ -2268,7 +2492,7 @@ mod tests {
             .flat_map(|batch| batch.iter().map(|target| target.asset_id.as_str()))
             .collect::<Vec<_>>();
 
-        assert_eq!(active_asset_ids, vec!["a-nas", "b-converted"]);
+        assert_eq!(active_asset_ids, vec!["b-converted", "a-nas"]);
         assert_eq!(asset_ids, vec!["a-nas"]);
     }
 
