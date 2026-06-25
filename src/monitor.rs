@@ -403,13 +403,18 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
         started_unix_seconds: started,
         ..MonitorScanSummary::default()
     };
-    let had_lifecycle_pending_at_start =
-        config.full_lifecycle && pending_lifecycle_count(&manifest) > 0;
+    let mut active_lifecycle_ids = if config.full_lifecycle {
+        active_lifecycle_asset_ids(&manifest, config.max_lifecycle_per_scan)
+    } else {
+        Vec::new()
+    };
+    let had_lifecycle_pending_at_start = config.full_lifecycle && !active_lifecycle_ids.is_empty();
     log_monitor_event(
         "scan_started",
         started,
         json!({
             "full_lifecycle": config.full_lifecycle,
+            "active_lifecycle": active_lifecycle_ids.len(),
             "had_lifecycle_pending_at_start": had_lifecycle_pending_at_start,
             "max_conversions_per_scan": config.max_conversions_per_scan,
             "max_lifecycle_per_scan": config.max_lifecycle_per_scan,
@@ -426,7 +431,7 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
                 "position": "before_discovery",
             }),
         );
-        run_lifecycle_stages(config, &mut manifest, &mut summary)?;
+        run_lifecycle_stages(config, &mut manifest, &mut summary, &active_lifecycle_ids)?;
     }
 
     if !should_skip_new_monitor_work(had_lifecycle_pending_at_start) {
@@ -519,59 +524,6 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
         manifest
             .save_atomic(&config.manifest_path)
             .map_err(MonitorError::Manifest)?;
-
-        if config.full_lifecycle {
-            log_monitor_event(
-                "lifecycle_started",
-                started,
-                json!({
-                    "pending_lifecycle": pending_lifecycle_count(&manifest),
-                    "position": "before_conversions",
-                }),
-            );
-            resolve_original_assets(config, &mut manifest, &mut summary)?;
-            manifest
-                .save_atomic(&config.manifest_path)
-                .map_err(MonitorError::Manifest)?;
-        }
-
-        let requests = conversion_requests(&manifest, config);
-        summary.conversions_attempted = requests.len() as u64;
-        if !requests.is_empty() {
-            log_monitor_event(
-                "conversions_started",
-                started,
-                json!({
-                    "requests": requests.len(),
-                    "jobs": config.jobs,
-                }),
-            );
-            match execute_measured_conversions(&manifest, requests, config.jobs) {
-                Ok(updated) => {
-                    summary.conversions_completed = summary.conversions_attempted;
-                    manifest = updated;
-                    manifest
-                        .save_atomic(&config.manifest_path)
-                        .map_err(MonitorError::Manifest)?;
-                }
-                Err(error) => {
-                    summary.failures = summary.failures.saturating_add(1);
-                    summary.last_error = Some(error.to_string());
-                }
-            }
-        }
-
-        if config.full_lifecycle {
-            log_monitor_event(
-                "lifecycle_started",
-                started,
-                json!({
-                    "pending_lifecycle": pending_lifecycle_count(&manifest),
-                    "position": "after_conversions",
-                }),
-            );
-            run_lifecycle_stages(config, &mut manifest, &mut summary)?;
-        }
     } else {
         log_monitor_event(
             "new_work_skipped",
@@ -581,6 +533,71 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
                 "pending_lifecycle_after_lifecycle": pending_lifecycle_count(&manifest),
             }),
         );
+    }
+
+    if config.full_lifecycle && active_lifecycle_ids.is_empty() {
+        active_lifecycle_ids = active_lifecycle_asset_ids(&manifest, config.max_lifecycle_per_scan);
+    }
+
+    if config.full_lifecycle {
+        log_monitor_event(
+            "lifecycle_started",
+            started,
+            json!({
+                "active_lifecycle": active_lifecycle_ids.len(),
+                "pending_lifecycle": pending_lifecycle_count(&manifest),
+                "position": "before_conversions",
+            }),
+        );
+        resolve_original_assets(config, &mut manifest, &mut summary, &active_lifecycle_ids)?;
+        manifest
+            .save_atomic(&config.manifest_path)
+            .map_err(MonitorError::Manifest)?;
+    }
+
+    let requests = conversion_requests(
+        &manifest,
+        config,
+        config
+            .full_lifecycle
+            .then_some(active_lifecycle_ids.as_slice()),
+    );
+    summary.conversions_attempted = requests.len() as u64;
+    if !requests.is_empty() {
+        log_monitor_event(
+            "conversions_started",
+            started,
+            json!({
+                "requests": requests.len(),
+                "jobs": config.jobs,
+            }),
+        );
+        match execute_measured_conversions(&manifest, requests, config.jobs) {
+            Ok(updated) => {
+                summary.conversions_completed = summary.conversions_attempted;
+                manifest = updated;
+                manifest
+                    .save_atomic(&config.manifest_path)
+                    .map_err(MonitorError::Manifest)?;
+            }
+            Err(error) => {
+                summary.failures = summary.failures.saturating_add(1);
+                summary.last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    if config.full_lifecycle {
+        log_monitor_event(
+            "lifecycle_started",
+            started,
+            json!({
+                "active_lifecycle": active_lifecycle_ids.len(),
+                "pending_lifecycle": pending_lifecycle_count(&manifest),
+                "position": "after_conversions",
+            }),
+        );
+        run_lifecycle_stages(config, &mut manifest, &mut summary, &active_lifecycle_ids)?;
     }
 
     manifest
@@ -768,11 +785,13 @@ pub fn write_launchd_plist(
 fn conversion_requests(
     manifest: &Manifest,
     config: &MonitorConfig,
+    active_lifecycle_asset_ids: Option<&[String]>,
 ) -> Vec<ConversionExecutionRequest> {
     manifest
         .records()
         .values()
         .filter(|record| record.state == State::NasVerified)
+        .filter(|record| active_lifecycle_allows(active_lifecycle_asset_ids, &record.asset_id))
         .filter(|record| !config.full_lifecycle || record.proofs.contains_key("original_asset"))
         .take(config.max_conversions_per_scan)
         .map(|record| ConversionExecutionRequest {
@@ -790,13 +809,14 @@ fn run_lifecycle_stages(
     config: &MonitorConfig,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
+    active_lifecycle_asset_ids: &[String],
 ) -> Result<(), MonitorError> {
-    verify_converted_heics(config, manifest, summary)?;
-    resolve_original_assets(config, manifest, summary)?;
-    upload_verified_heics(config, manifest, summary)?;
-    record_local_mirrors(config, manifest, summary)?;
+    verify_converted_heics(config, manifest, summary, active_lifecycle_asset_ids)?;
+    resolve_original_assets(config, manifest, summary, active_lifecycle_asset_ids)?;
+    upload_verified_heics(config, manifest, summary, active_lifecycle_asset_ids)?;
+    record_local_mirrors(config, manifest, summary, active_lifecycle_asset_ids)?;
     if config.auto_delete {
-        delete_original_assets(config, manifest, summary)?;
+        delete_original_assets(config, manifest, summary, active_lifecycle_asset_ids)?;
     }
     Ok(())
 }
@@ -805,9 +825,12 @@ fn verify_converted_heics(
     config: &MonitorConfig,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
+    active_lifecycle_asset_ids: &[String],
 ) -> Result<(), MonitorError> {
     let asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
-        record.state == State::Converted && !record.proofs.contains_key("heic")
+        active_lifecycle_allows(Some(active_lifecycle_asset_ids), &record.asset_id)
+            && record.state == State::Converted
+            && !record.proofs.contains_key("heic")
     });
     for asset_id in asset_ids {
         match verify_converted_heic(manifest, &asset_id) {
@@ -828,8 +851,13 @@ fn resolve_original_assets(
     config: &MonitorConfig,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
+    active_lifecycle_asset_ids: &[String],
 ) -> Result<(), MonitorError> {
-    let target_batches = original_asset_resolution_target_batches(manifest, config)?;
+    let target_batches = original_asset_resolution_target_batches(
+        manifest,
+        config,
+        Some(active_lifecycle_asset_ids),
+    )?;
     if target_batches.is_empty() {
         return Ok(());
     }
@@ -935,9 +963,11 @@ fn upload_verified_heics(
     config: &MonitorConfig,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
+    active_lifecycle_asset_ids: &[String],
 ) -> Result<(), MonitorError> {
     let asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
-        record.state == State::ConversionVerified
+        active_lifecycle_allows(Some(active_lifecycle_asset_ids), &record.asset_id)
+            && record.state == State::ConversionVerified
             && record.proofs.contains_key("original_asset")
             && !record.proofs.contains_key("upload")
     });
@@ -973,9 +1003,11 @@ fn record_local_mirrors(
     config: &MonitorConfig,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
+    active_lifecycle_asset_ids: &[String],
 ) -> Result<(), MonitorError> {
     let asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
-        record.state == State::UploadVerified
+        active_lifecycle_allows(Some(active_lifecycle_asset_ids), &record.asset_id)
+            && record.state == State::UploadVerified
             && !record.proofs.contains_key("icloudpd_local_mirror")
     });
     let mirror_root = config.mirror_root.as_ref().unwrap_or(&config.download_root);
@@ -1014,6 +1046,7 @@ fn delete_original_assets(
     config: &MonitorConfig,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
+    active_lifecycle_asset_ids: &[String],
 ) -> Result<(), MonitorError> {
     let session_path = required_path(&config.delete_session_path, "delete_session_path")?;
     let session = load_cloudkit_delete_session(session_path)?;
@@ -1021,14 +1054,18 @@ fn delete_original_assets(
     let mut client = CloudKitDeleteClient::new(transport);
 
     let mut asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
-        record.state == State::UploadVerified
+        active_lifecycle_allows(Some(active_lifecycle_asset_ids), &record.asset_id)
+            && record.state == State::UploadVerified
     });
     asset_ids.extend(asset_ids_matching(
         manifest,
         config
             .max_lifecycle_per_scan
             .saturating_sub(asset_ids.len()),
-        |record| matches!(record.state, State::DeleteEligible | State::DeleteApproved),
+        |record| {
+            active_lifecycle_allows(Some(active_lifecycle_asset_ids), &record.asset_id)
+                && matches!(record.state, State::DeleteEligible | State::DeleteApproved)
+        },
     ));
 
     for asset_id in asset_ids {
@@ -1083,16 +1120,7 @@ fn pending_lifecycle_count(manifest: &Manifest) -> usize {
     manifest
         .records()
         .values()
-        .filter(|record| {
-            matches!(
-                record.state,
-                State::Converted
-                    | State::ConversionVerified
-                    | State::UploadVerified
-                    | State::DeleteEligible
-                    | State::DeleteApproved
-            )
-        })
+        .filter(|record| is_lifecycle_candidate(record))
         .count()
 }
 
@@ -1212,15 +1240,39 @@ fn asset_ids_matching(
         .collect()
 }
 
+fn active_lifecycle_asset_ids(manifest: &Manifest, limit: usize) -> Vec<String> {
+    asset_ids_matching(manifest, limit, is_lifecycle_candidate)
+}
+
+fn is_lifecycle_candidate(record: &AssetRecord) -> bool {
+    matches!(
+        record.state,
+        State::NasVerified
+            | State::Converted
+            | State::ConversionVerified
+            | State::UploadVerified
+            | State::DeleteEligible
+            | State::DeleteApproved
+    )
+}
+
+fn active_lifecycle_allows(active_lifecycle_asset_ids: Option<&[String]>, asset_id: &str) -> bool {
+    active_lifecycle_asset_ids
+        .map(|asset_ids| asset_ids.iter().any(|active_id| active_id == asset_id))
+        .unwrap_or(true)
+}
+
 fn original_asset_resolution_target_batches(
     manifest: &Manifest,
     config: &MonitorConfig,
+    active_lifecycle_asset_ids: Option<&[String]>,
 ) -> Result<Vec<Vec<CloudKitOriginalAssetResolveTarget>>, MonitorError> {
     let mut targets = manifest
         .records()
         .values()
         .filter(|record| {
-            matches!(record.state, State::NasVerified | State::ConversionVerified)
+            active_lifecycle_allows(active_lifecycle_asset_ids, &record.asset_id)
+                && matches!(record.state, State::NasVerified | State::ConversionVerified)
                 && !record.proofs.contains_key("original_asset")
         })
         .map(|record| original_asset_resolve_target(manifest, &record.asset_id, config))
@@ -1888,7 +1940,8 @@ mod tests {
         );
         manifest.upsert(proven);
 
-        let requests = conversion_requests(&manifest, &config);
+        let active_asset_ids = active_lifecycle_asset_ids(&manifest, config.max_lifecycle_per_scan);
+        let requests = conversion_requests(&manifest, &config, Some(&active_asset_ids));
 
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].asset_id, "proven");
@@ -1908,7 +1961,7 @@ mod tests {
         record.state = State::NasVerified;
         manifest.upsert(record);
 
-        let requests = conversion_requests(&manifest, &config);
+        let requests = conversion_requests(&manifest, &config, None);
 
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].asset_id, "unproven");
@@ -1966,7 +2019,7 @@ mod tests {
             manifest.upsert(record);
         }
 
-        let batches = original_asset_resolution_target_batches(&manifest, &config)
+        let batches = original_asset_resolution_target_batches(&manifest, &config, None)
             .expect("targets should batch");
         let asset_ids = batches
             .iter()
@@ -2018,7 +2071,7 @@ mod tests {
             manifest.upsert(record);
         }
 
-        let batches = original_asset_resolution_target_batches(&manifest, &config)
+        let batches = original_asset_resolution_target_batches(&manifest, &config, None)
             .expect("targets should batch");
         let batch_asset_ids = batches
             .iter()
@@ -2080,7 +2133,7 @@ mod tests {
             manifest.upsert(record);
         }
 
-        let batches = original_asset_resolution_target_batches(&manifest, &config)
+        let batches = original_asset_resolution_target_batches(&manifest, &config, None)
             .expect("targets should batch");
         let asset_ids = batches
             .iter()
@@ -2091,7 +2144,136 @@ mod tests {
     }
 
     #[test]
-    fn pending_lifecycle_count_includes_remote_mutation_states_only() {
+    fn active_lifecycle_asset_ids_selects_bounded_manifest_order_candidates() {
+        let mut manifest = Manifest::new();
+        for (asset_id, state) in [
+            ("a-discovered", State::Discovered),
+            ("b-nas", State::NasVerified),
+            ("c-converted", State::Converted),
+            ("d-verified", State::ConversionVerified),
+            ("e-uploaded", State::UploadVerified),
+            ("f-eligible", State::DeleteEligible),
+            ("g-approved", State::DeleteApproved),
+            ("h-deleted", State::Deleted),
+            ("i-failed", State::Failed),
+        ] {
+            let mut record =
+                AssetRecord::new(asset_id, PathBuf::from(format!("/raw/{asset_id}.DNG")));
+            record.state = state;
+            manifest.upsert(record);
+        }
+
+        assert_eq!(
+            active_lifecycle_asset_ids(&manifest, 4),
+            vec!["b-nas", "c-converted", "d-verified", "e-uploaded"]
+        );
+    }
+
+    #[test]
+    fn full_lifecycle_conversion_requests_are_restricted_to_active_set() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        config.full_lifecycle = true;
+        config.max_lifecycle_per_scan = 2;
+
+        let mut manifest = Manifest::new();
+        for (asset_id, state, has_original_proof) in [
+            ("a-ready", State::NasVerified, true),
+            ("b-other-stage", State::Converted, false),
+            ("c-ready-outside-window", State::NasVerified, true),
+        ] {
+            let mut record =
+                AssetRecord::new(asset_id, PathBuf::from(format!("/raw/{asset_id}.DNG")));
+            record.state = state;
+            if has_original_proof {
+                record.proofs.insert(
+                    "original_asset".to_string(),
+                    json!({
+                        "record_name": format!("CPLAsset-{asset_id}"),
+                        "record_change_tag": "tag",
+                        "record_type": "CPLAsset",
+                        "filename": format!("{asset_id}.DNG"),
+                        "size_bytes": 9,
+                        "matched_raw_sha256": "raw-sha",
+                    }),
+                );
+            }
+            manifest.upsert(record);
+        }
+
+        let active_asset_ids = active_lifecycle_asset_ids(&manifest, config.max_lifecycle_per_scan);
+        let requests = conversion_requests(&manifest, &config, Some(&active_asset_ids));
+
+        assert_eq!(active_asset_ids, vec!["a-ready", "b-other-stage"]);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.asset_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-ready"]
+        );
+    }
+
+    #[test]
+    fn full_lifecycle_original_resolution_is_restricted_to_active_set() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        config.full_lifecycle = true;
+        config.max_lifecycle_per_scan = 2;
+        let mut manifest = Manifest::new();
+        for asset_id in ["a-nas", "b-converted", "c-nas-outside-window"] {
+            let mut record =
+                AssetRecord::new(asset_id, PathBuf::from(format!("/raw/{asset_id}.DNG")));
+            record.state = if asset_id == "b-converted" {
+                State::Converted
+            } else {
+                State::NasVerified
+            };
+            record.proofs.insert(
+                "nas".to_string(),
+                json!({
+                    "canonical_path": format!("/raw/{asset_id}.DNG"),
+                    "relative_path": format!("{asset_id}.DNG"),
+                    "size_bytes": 9,
+                    "modified_unix_seconds": 1_000u64,
+                    "age_seconds": 2_592_000u64,
+                    "sha256": "raw-sha",
+                }),
+            );
+            record.proofs.insert(
+                "source_age".to_string(),
+                json!({
+                    "source_captured_unix_seconds": 1_000u64,
+                    "verified_at_unix_seconds": 10_000u64,
+                    "min_age_seconds": 2_592_000u64,
+                }),
+            );
+            manifest.upsert(record);
+        }
+
+        let active_asset_ids = active_lifecycle_asset_ids(&manifest, config.max_lifecycle_per_scan);
+        let batches =
+            original_asset_resolution_target_batches(&manifest, &config, Some(&active_asset_ids))
+                .expect("targets should batch");
+        let asset_ids = batches
+            .iter()
+            .flat_map(|batch| batch.iter().map(|target| target.asset_id.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(active_asset_ids, vec!["a-nas", "b-converted"]);
+        assert_eq!(asset_ids, vec!["a-nas"]);
+    }
+
+    #[test]
+    fn pending_lifecycle_count_includes_nas_verified_work() {
         let mut manifest = Manifest::new();
         for (asset_id, state) in [
             ("discovered", State::Discovered),
@@ -2110,13 +2292,13 @@ mod tests {
             manifest.upsert(record);
         }
 
-        assert_eq!(pending_lifecycle_count(&manifest), 5);
+        assert_eq!(pending_lifecycle_count(&manifest), 6);
     }
 
     #[test]
     fn scan_start_lifecycle_work_suppresses_new_monitor_work_for_entire_scan() {
         let mut record = AssetRecord::new("asset", PathBuf::from("/raw/asset.DNG"));
-        record.state = State::ConversionVerified;
+        record.state = State::NasVerified;
         let mut manifest = Manifest::new();
         manifest.upsert(record);
 
