@@ -737,7 +737,8 @@ fn version_and_help_succeed_through_parser() {
         .success()
         .stdout(predicate::str::contains("manifest"))
         .stdout(predicate::str::contains("doctor"))
-        .stdout(predicate::str::contains("workflow"));
+        .stdout(predicate::str::contains("workflow"))
+        .stdout(predicate::str::contains("__stage-raw-copy").not());
 
     binary()
         .args(["workflow", "--help"])
@@ -745,6 +746,31 @@ fn version_and_help_succeed_through_parser() {
         .success()
         .stdout(predicate::str::contains("conversion-recorded"))
         .stdout(predicate::str::contains("heic-verified"));
+}
+
+#[test]
+fn hidden_stage_raw_copy_command_copies_and_verifies_bytes() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let raw_path = tempdir.path().join("IMG_0001.dng");
+    let staged_path = tempdir.path().join("IMG_0001.staged-raw.dng");
+    fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+    let expected_sha256 = format!("{:x}", Sha256::digest(b"raw-bytes"));
+
+    binary()
+        .args([
+            "__stage-raw-copy",
+            raw_path.to_str().expect("raw path should be utf8"),
+            staged_path.to_str().expect("staged path should be utf8"),
+            "9",
+            &expected_sha256,
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(&staged_path).expect("staged RAW should be readable"),
+        b"raw-bytes"
+    );
 }
 
 #[test]

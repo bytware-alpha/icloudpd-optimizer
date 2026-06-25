@@ -14,7 +14,7 @@ use crate::conversion_backend::{
 };
 use crate::conversion_execution::{
     ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversion,
-    execute_measured_conversions, is_executable_file,
+    execute_measured_conversions, is_executable_file, run_raw_stage_copy_child,
 };
 use crate::local_mirror::{
     IcloudpdLocalMirrorRequest, LocalMirrorError, ensure_icloudpd_local_mirror,
@@ -66,6 +66,8 @@ enum Command {
     Workflow(WorkflowArgs),
     Monitor(MonitorArgs),
     Service(ServiceArgs),
+    #[command(name = "__stage-raw-copy", hide = true)]
+    StageRawCopy(StageRawCopyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -107,6 +109,18 @@ struct MonitorArgs {
 struct ServiceArgs {
     #[command(subcommand)]
     command: ServiceCommand,
+}
+
+#[derive(Debug, Args)]
+struct StageRawCopyArgs {
+    #[arg(value_name = "SOURCE")]
+    source: PathBuf,
+    #[arg(value_name = "DEST")]
+    dest: PathBuf,
+    #[arg(value_name = "EXPECTED_SIZE")]
+    expected_size: u64,
+    #[arg(value_name = "EXPECTED_SHA256")]
+    expected_sha256: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -654,7 +668,18 @@ fn run_with_writer<W: Write>(cli: Cli, writer: &mut W) -> Result<(), CliError> {
         Command::Workflow(args) => run_workflow(args, writer),
         Command::Monitor(args) => run_monitor(args, writer),
         Command::Service(args) => run_service(args, writer),
+        Command::StageRawCopy(args) => run_stage_raw_copy(args),
     }
+}
+
+fn run_stage_raw_copy(args: StageRawCopyArgs) -> Result<(), CliError> {
+    run_raw_stage_copy_child(
+        &args.source,
+        &args.dest,
+        args.expected_size,
+        &args.expected_sha256,
+    )?;
+    Ok(())
 }
 
 fn run_manifest<W: Write>(args: ManifestArgs, writer: &mut W) -> Result<(), CliError> {

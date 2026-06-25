@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -268,7 +268,7 @@ fn stage_raw_for_conversion(
     refuse_preexisting_staged_raw(&staged_path)?;
     let staged_raw = StagedRaw { path: staged_path };
 
-    run_raw_stage_copy_command(raw_path, &staged_raw.path)?;
+    run_raw_stage_copy_command(raw_path, &staged_raw.path, &nas_proof)?;
     verify_staged_raw_file(&staged_raw.path, nas_proof.size_bytes)?;
     verify_staged_raw_hash(&staged_raw.path, &nas_proof)?;
 
@@ -278,8 +278,24 @@ fn stage_raw_for_conversion(
 fn run_raw_stage_copy_command(
     raw_path: &Path,
     staged_path: &Path,
+    nas_proof: &NasRawProof,
 ) -> Result<(), ConversionExecutionError> {
-    let RawStageCopyCommand { program, command } = raw_stage_copy_command(raw_path, staged_path);
+    #[cfg(test)]
+    if TEST_RAW_STAGE_COPY_COMMAND
+        .lock()
+        .expect("test RAW stage copy command lock should not be poisoned")
+        .is_none()
+    {
+        return copy_raw_stage_create_new(
+            raw_path,
+            staged_path,
+            nas_proof.size_bytes,
+            &nas_proof.sha256,
+        );
+    }
+
+    let RawStageCopyCommand { program, command } =
+        raw_stage_copy_command(raw_path, staged_path, nas_proof)?;
     let outcome = wait_for_command_with_usage(RAW_STAGING_STAGE, &program, command)?;
     if !outcome.status.success() {
         return Err(ConversionExecutionError::CommandFailed {
@@ -291,40 +307,200 @@ fn run_raw_stage_copy_command(
     Ok(())
 }
 
-fn raw_stage_copy_command(raw_path: &Path, staged_path: &Path) -> RawStageCopyCommand {
+fn raw_stage_copy_command(
+    raw_path: &Path,
+    staged_path: &Path,
+    nas_proof: &NasRawProof,
+) -> Result<RawStageCopyCommand, ConversionExecutionError> {
     #[cfg(test)]
     if let Some(program_path) = TEST_RAW_STAGE_COPY_COMMAND
         .lock()
         .expect("test RAW stage copy command lock should not be poisoned")
         .clone()
     {
-        let mut command = Command::new(&program_path);
-        command
-            .arg(raw_path)
-            .arg(staged_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        return RawStageCopyCommand {
-            program: program_path.display().to_string(),
-            command,
-        };
+        return Ok(raw_stage_copy_command_for_program(
+            program_path,
+            raw_path,
+            staged_path,
+            nas_proof,
+        ));
     }
 
-    let mut command = Command::new("/bin/sh");
+    let program_path = env::current_exe()?;
+    Ok(raw_stage_copy_command_for_program(
+        program_path,
+        raw_path,
+        staged_path,
+        nas_proof,
+    ))
+}
+
+fn raw_stage_copy_command_for_program(
+    program_path: PathBuf,
+    raw_path: &Path,
+    staged_path: &Path,
+    nas_proof: &NasRawProof,
+) -> RawStageCopyCommand {
+    let mut command = Command::new(&program_path);
     command
-        .arg("-c")
-        .arg("set -C\n/bin/cat \"$1\" > \"$2\"")
-        .arg("icloudpd-stage-raw")
+        .arg("__stage-raw-copy")
         .arg(raw_path)
         .arg(staged_path)
+        .arg(nas_proof.size_bytes.to_string())
+        .arg(&nas_proof.sha256)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     RawStageCopyCommand {
-        program: "/bin/sh".to_string(),
+        program: program_path.display().to_string(),
         command,
     }
+}
+
+pub fn run_raw_stage_copy_child(
+    raw_path: &Path,
+    staged_path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<(), ConversionExecutionError> {
+    let _timeout = RawStageChildSelfTimeout::install(child_command_timeout())?;
+    copy_raw_stage_create_new(raw_path, staged_path, expected_size, expected_sha256)
+}
+
+fn copy_raw_stage_create_new(
+    raw_path: &Path,
+    staged_path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<(), ConversionExecutionError> {
+    let result =
+        copy_raw_stage_create_new_inner(raw_path, staged_path, expected_size, expected_sha256);
+    if result.as_ref().is_err_and(|error| {
+        !matches!(
+            error,
+            ConversionExecutionError::StagedRawAlreadyExists { .. }
+        )
+    }) {
+        remove_failed_output(staged_path);
+    }
+    result
+}
+
+fn copy_raw_stage_create_new_inner(
+    raw_path: &Path,
+    staged_path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<(), ConversionExecutionError> {
+    let mut source =
+        File::open(raw_path).map_err(|source| ConversionExecutionError::StagedRawReadFailed {
+            path: raw_path.to_path_buf(),
+            source,
+        })?;
+    let mut destination = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staged_path)
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::AlreadyExists {
+                ConversionExecutionError::StagedRawAlreadyExists {
+                    path: staged_path.to_path_buf(),
+                }
+            } else {
+                ConversionExecutionError::StagedRawWriteFailed {
+                    path: staged_path.to_path_buf(),
+                    source,
+                }
+            }
+        })?;
+    let mut hasher = Sha256::new();
+    let mut copied_size = 0_u64;
+    let mut buffer = [0_u8; RAW_STAGE_HASH_BUFFER_BYTES];
+    loop {
+        let read = source.read(&mut buffer).map_err(|source| {
+            ConversionExecutionError::StagedRawReadFailed {
+                path: raw_path.to_path_buf(),
+                source,
+            }
+        })?;
+        if read == 0 {
+            break;
+        }
+        destination.write_all(&buffer[..read]).map_err(|source| {
+            ConversionExecutionError::StagedRawWriteFailed {
+                path: staged_path.to_path_buf(),
+                source,
+            }
+        })?;
+        hasher.update(&buffer[..read]);
+        copied_size = copied_size.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+    }
+    destination
+        .sync_all()
+        .map_err(|source| ConversionExecutionError::StagedRawWriteFailed {
+            path: staged_path.to_path_buf(),
+            source,
+        })?;
+
+    let actual_sha256 = format!("{:x}", hasher.finalize());
+    if copied_size != expected_size {
+        return Err(ConversionExecutionError::StagedRawSizeMismatch {
+            path: staged_path.to_path_buf(),
+            expected: expected_size,
+            actual: copied_size,
+        });
+    }
+    if actual_sha256 != expected_sha256 {
+        return Err(ConversionExecutionError::StagedRawSha256Mismatch {
+            path: staged_path.to_path_buf(),
+            expected: expected_sha256.to_string(),
+            actual: actual_sha256,
+        });
+    }
+    Ok(())
+}
+
+struct RawStageChildSelfTimeout;
+
+impl RawStageChildSelfTimeout {
+    fn install(timeout: Duration) -> io::Result<Self> {
+        install_raw_stage_child_self_timeout(timeout)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawStageChildSelfTimeout {
+    fn drop(&mut self) {
+        let _ = clear_raw_stage_child_self_timeout();
+    }
+}
+
+#[cfg(unix)]
+fn install_raw_stage_child_self_timeout(timeout: Duration) -> io::Result<()> {
+    let seconds = timeout.as_secs().max(1);
+    let seconds = libc::c_uint::try_from(seconds).unwrap_or(libc::c_uint::MAX);
+    unsafe {
+        libc::alarm(seconds);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn clear_raw_stage_child_self_timeout() -> io::Result<()> {
+    unsafe {
+        libc::alarm(0);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_raw_stage_child_self_timeout(_timeout: Duration) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn clear_raw_stage_child_self_timeout() -> io::Result<()> {
+    Ok(())
 }
 
 fn verify_staged_raw_hash(
@@ -1358,14 +1534,105 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn raw_staging_command_invokes_optimizer_owned_child_with_proof() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let fake_optimizer = tempdir.path().join("icloudpd-optimizer");
+        fs::write(&fake_optimizer, b"").expect("fake optimizer path should be written");
+        let _optimizer_guard = RawStageCopyCommandGuard::install(&fake_optimizer);
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        let staged_path = tempdir.path().join("IMG_0001.staged-raw.dng");
+        let expected_sha256 = format!("{:x}", Sha256::digest(b"raw-bytes"));
+        let nas_proof = NasRawProof {
+            canonical_path: raw_path.clone(),
+            relative_path: PathBuf::from("IMG_0001.dng"),
+            size_bytes: 9,
+            modified_unix_seconds: 1_700_000_000,
+            age_seconds: 40 * 24 * 60 * 60,
+            sha256: expected_sha256.clone(),
+        };
+
+        let RawStageCopyCommand { program, command } =
+            raw_stage_copy_command(&raw_path, &staged_path, &nas_proof)
+                .expect("staging command should be constructed");
+
+        assert_eq!(program, fake_optimizer.display().to_string());
+        assert_eq!(command.get_program(), fake_optimizer.as_os_str());
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec![
+                "__stage-raw-copy".to_string(),
+                raw_path.to_string_lossy().into_owned(),
+                staged_path.to_string_lossy().into_owned(),
+                "9".to_string(),
+                expected_sha256,
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_stage_child_copies_with_create_new_semantics_and_verifies_hash() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        let staged_path = tempdir.path().join("IMG_0001.staged-raw.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let expected_sha256 = format!("{:x}", Sha256::digest(b"raw-bytes"));
+
+        run_raw_stage_copy_child(&raw_path, &staged_path, 9, &expected_sha256)
+            .expect("child copy should succeed");
+
+        assert_eq!(
+            fs::read(&staged_path).expect("staged RAW should be readable"),
+            b"raw-bytes"
+        );
+        let error = run_raw_stage_copy_child(&raw_path, &staged_path, 9, &expected_sha256)
+            .expect_err("child copy must refuse a preexisting destination");
+        assert!(matches!(
+            error,
+            ConversionExecutionError::StagedRawAlreadyExists { path } if path == staged_path
+        ));
+        assert_eq!(
+            fs::read(&staged_path).expect("existing staged RAW should remain readable"),
+            b"raw-bytes"
+        );
+    }
+
+    #[test]
+    fn raw_stage_child_hash_mismatch_removes_partial_destination() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        let staged_path = tempdir.path().join("IMG_0001.staged-raw.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let wrong_sha256 = format!("{:x}", Sha256::digest(b"other-raw"));
+
+        let error = run_raw_stage_copy_child(&raw_path, &staged_path, 9, &wrong_sha256)
+            .expect_err("child copy must fail on hash mismatch");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::StagedRawSha256Mismatch { path, .. } if path == staged_path
+        ));
+        assert!(
+            !staged_path.exists(),
+            "child copy must remove partial output on verification failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn linux_conversion_uses_staged_raw_for_probe_and_conversion_commands() {
         let tool_dir = fake_linux_conversion_tools_rejecting_forbidden_raw(DEFAULT_HEIF_ENC_SCRIPT);
         let _path_guard = PathGuard::install(tool_dir.path());
         let copy_script = fake_stage_raw_copy_script(
             r#"#!/bin/sh
 set -C
-printf '%s\n%s\n' "$1" "$2" > "$STAGE_COPY_LOG"
-/bin/cat "$1" > "$2"
+if [ "$1" != "__stage-raw-copy" ]; then
+  exit 64
+fi
+printf '%s\n%s\n' "$2" "$3" > "$STAGE_COPY_LOG"
+/bin/cat "$2" > "$3"
 "#,
         );
         let _copy_guard = RawStageCopyCommandGuard::install(copy_script.path());
@@ -1429,8 +1696,11 @@ printf '%s\n%s\n' "$1" "$2" > "$STAGE_COPY_LOG"
         let copy_script = fake_stage_raw_copy_script(
             r#"#!/bin/sh
 set -C
+if [ "$1" != "__stage-raw-copy" ]; then
+  exit 64
+fi
 printf 'started\n' > "$STAGE_COPY_LOG"
-printf 'partial-stage' > "$2"
+printf 'partial-stage' > "$3"
 /bin/sleep 5
 "#,
         );
