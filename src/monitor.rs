@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "macos")]
 use std::sync::mpsc;
-#[cfg(target_os = "macos")]
 use std::thread;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
@@ -18,7 +17,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::conversion_execution::{
-    ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversions,
+    ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversion,
 };
 use crate::local_mirror::{
     IcloudpdLocalMirrorRequest, LocalMirrorError, ensure_icloudpd_local_mirror,
@@ -572,19 +571,7 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
                 "jobs": config.jobs,
             }),
         );
-        match execute_measured_conversions(&manifest, requests, config.jobs) {
-            Ok(updated) => {
-                summary.conversions_completed = summary.conversions_attempted;
-                manifest = updated;
-                manifest
-                    .save_atomic(&config.manifest_path)
-                    .map_err(MonitorError::Manifest)?;
-            }
-            Err(error) => {
-                summary.failures = summary.failures.saturating_add(1);
-                summary.last_error = Some(error.to_string());
-            }
-        }
+        execute_monitor_conversions(config, &mut manifest, &mut summary, requests)?;
     }
 
     if config.full_lifecycle {
@@ -803,6 +790,59 @@ fn conversion_requests(
             conversion_tool_version: config.conversion_tool_version.clone(),
         })
         .collect()
+}
+
+fn execute_monitor_conversions(
+    config: &MonitorConfig,
+    manifest: &mut Manifest,
+    summary: &mut MonitorScanSummary,
+    requests: Vec<ConversionExecutionRequest>,
+) -> Result<(), MonitorError> {
+    for chunk in requests.chunks(config.jobs) {
+        let mut handles = Vec::with_capacity(chunk.len());
+        for request in chunk {
+            let manifest_snapshot = manifest.clone();
+            let request = request.clone();
+            let asset_id = request.asset_id.clone();
+            handles.push((
+                asset_id.clone(),
+                thread::spawn(move || {
+                    execute_measured_conversion(&manifest_snapshot, request)
+                        .map(|updated| (asset_id, updated))
+                }),
+            ));
+        }
+
+        for (asset_id, handle) in handles {
+            match handle.join() {
+                Ok(Ok((asset_id, updated))) => {
+                    let record = updated.get(&asset_id)?.clone();
+                    manifest.upsert(record);
+                    summary.conversions_completed = summary.conversions_completed.saturating_add(1);
+                }
+                Ok(Err(error)) => {
+                    let message = error.to_string();
+                    record_stage_failure(manifest, &asset_id, "conversion", &message)?;
+                    summary.failures = summary.failures.saturating_add(1);
+                    summary.last_error =
+                        Some(format!("conversion failed for {asset_id}: {message}"));
+                }
+                Err(_) => {
+                    let message = "batch conversion worker panicked";
+                    record_stage_failure(manifest, &asset_id, "conversion", message)?;
+                    summary.failures = summary.failures.saturating_add(1);
+                    summary.last_error =
+                        Some(format!("conversion failed for {asset_id}: {message}"));
+                }
+            }
+        }
+
+        manifest
+            .save_atomic(&config.manifest_path)
+            .map_err(MonitorError::Manifest)?;
+    }
+
+    Ok(())
 }
 
 fn run_lifecycle_stages(

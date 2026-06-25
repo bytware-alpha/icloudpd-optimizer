@@ -1207,6 +1207,101 @@ fn monitor_run_once_honors_max_conversions_per_scan() {
 
 #[cfg(unix)]
 #[test]
+fn monitor_run_once_marks_failed_conversion_and_keeps_successful_peer() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
+    write_fake_conversion_tools(tool_dir.path());
+    let config_path = tempdir.path().join("monitor.json");
+    let download_root = tempdir.path().join("download");
+    let heic_dir = tempdir.path().join("heic");
+    let manifest_path = tempdir.path().join("manifest.json");
+    fs::create_dir_all(&download_root).expect("download root should be created");
+    let raw_1 = write_old_raw(&download_root, "PrimarySync/IMG_0001.DNG", b"raw-one");
+    let raw_2 = write_old_raw(&download_root, "PrimarySync/IMG_0002.DNG", b"raw-two");
+
+    binary()
+        .args([
+            "monitor",
+            "init",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--download-root",
+            download_root
+                .to_str()
+                .expect("download root should be utf8"),
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be utf8"),
+            "--heic-output-dir",
+            heic_dir.to_str().expect("heic dir should be utf8"),
+            "--jobs",
+            "2",
+            "--max-conversions-per-scan",
+            "2",
+        ])
+        .assert()
+        .success();
+
+    manifest_with_real_nas_verified_assets(
+        &manifest_path,
+        &fs::canonicalize(&download_root).expect("download root should canonicalize"),
+        &[
+            (
+                "batch-1",
+                fs::canonicalize(&raw_1).expect("raw should canonicalize"),
+            ),
+            (
+                "batch-2",
+                fs::canonicalize(&raw_2).expect("raw should canonicalize"),
+            ),
+        ],
+    );
+    fs::create_dir_all(&heic_dir).expect("heic dir should be created");
+    fs::write(heic_dir.join("batch-2.heic"), b"preexisting")
+        .expect("preexisting output should be written");
+
+    binary()
+        .args([
+            "monitor",
+            "run",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+            "--once",
+        ])
+        .env("PATH", tool_dir.path())
+        .assert()
+        .success();
+
+    let manifest = Manifest::load(&manifest_path).expect("manifest should load");
+    let converted = manifest
+        .get("batch-1")
+        .expect("converted asset should exist");
+    assert_eq!(converted.state, State::Converted);
+    assert!(converted.proofs.contains_key("conversion"));
+    let failed = manifest.get("batch-2").expect("failed asset should exist");
+    assert_eq!(failed.state, State::Failed);
+    assert_eq!(failed.failures[0].stage, "conversion");
+    assert!(
+        failed.failures[0]
+            .message
+            .contains("converted output already exists")
+    );
+
+    let stats: Value = serde_json::from_str(
+        &fs::read_to_string(config_path.with_file_name("manifest.monitor-stats.json"))
+            .expect("stats should be readable"),
+    )
+    .expect("stats should be json");
+    assert_eq!(stats["conversions_attempted"], 2);
+    assert_eq!(stats["conversions_completed"], 1);
+    assert_eq!(stats["failures"], 1);
+    assert_eq!(stats["state_counts"]["converted"], 1);
+    assert_eq!(stats["state_counts"]["failed"], 1);
+}
+
+#[cfg(unix)]
+#[test]
 fn monitor_run_once_can_scan_download_root_non_recursively() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
