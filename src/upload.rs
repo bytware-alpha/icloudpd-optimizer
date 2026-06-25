@@ -159,6 +159,12 @@ pub struct CloudKitOriginalAssetBatchResolveRequest {
     pub max_pages: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudKitOriginalAssetBatchResolveOutcome {
+    pub proofs: BTreeMap<String, OriginalAssetProof>,
+    pub unresolved_asset_ids: Vec<String>,
+}
+
 pub fn load_upload_session(path: &Path) -> Result<UploadSession, UploadError> {
     let json = std::fs::read_to_string(path).map_err(|source| UploadError::ReadSession {
         path: path.to_path_buf(),
@@ -628,6 +634,18 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
         session: &CloudKitDeleteSession,
         request: &CloudKitOriginalAssetBatchResolveRequest,
     ) -> Result<BTreeMap<String, OriginalAssetProof>, UploadError> {
+        let outcome = self.resolve_original_assets_batch_outcome(session, request)?;
+        if !outcome.unresolved_asset_ids.is_empty() {
+            return Err(UploadError::OriginalAssetResolveNotUnique { matches: 0 });
+        }
+        Ok(outcome.proofs)
+    }
+
+    pub fn resolve_original_assets_batch_outcome(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        request: &CloudKitOriginalAssetBatchResolveRequest,
+    ) -> Result<CloudKitOriginalAssetBatchResolveOutcome, UploadError> {
         validate_original_asset_batch_resolve_request(request)?;
         validate_original_asset_batch_pagination_range(request)?;
         let mut matches: BTreeMap<String, Vec<OriginalAssetProof>> = request
@@ -743,6 +761,7 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
             });
         }
         let mut proofs = BTreeMap::new();
+        let mut unresolved_asset_ids = Vec::new();
         for target in &request.targets {
             let mut target_matches = matches.remove(&target.asset_id).ok_or(
                 UploadError::InvalidCloudKitOriginalAssetResponse(
@@ -753,10 +772,14 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
                 1 => {
                     proofs.insert(target.asset_id.clone(), target_matches.remove(0));
                 }
+                0 => unresolved_asset_ids.push(target.asset_id.clone()),
                 count => return Err(UploadError::OriginalAssetResolveNotUnique { matches: count }),
             }
         }
-        Ok(proofs)
+        Ok(CloudKitOriginalAssetBatchResolveOutcome {
+            proofs,
+            unresolved_asset_ids,
+        })
     }
 }
 

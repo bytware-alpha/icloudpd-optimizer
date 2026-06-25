@@ -1045,6 +1045,39 @@ fn cloudkit_original_asset_batch_resolver_fails_when_any_target_unresolved() {
 }
 
 #[test]
+fn cloudkit_original_asset_batch_outcome_isolates_unresolved_targets() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let records = cloudkit_raw_pair_with(
+        "CPLAsset-original-123",
+        "CPLMaster-raw-123",
+        "tag-1",
+        9,
+        1_800_000_000_000,
+    );
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": records})],
+        vec![b"raw-bytes".to_vec()],
+    );
+
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(
+            &session,
+            &batch_resolve_request(vec![
+                batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes"),
+                batch_resolve_target("asset-2", "IMG_0002.dng", b"missing"),
+            ]),
+        )
+        .expect("monitor-facing outcome should preserve partial resolution");
+
+    assert_eq!(
+        outcome.proofs["asset-1"].record_name,
+        "CPLAsset-original-123"
+    );
+    assert_eq!(outcome.unresolved_asset_ids, vec!["asset-2".to_string()]);
+}
+
+#[test]
 fn cloudkit_original_asset_batch_resolver_forwards_continuation_once() {
     let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
         .expect("session should load");

@@ -26,9 +26,10 @@ use crate::local_mirror::{
 use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
 use crate::proof::{MIN_RAW_AGE_DAYS, NasRawProof, ProofError};
 use crate::upload::{
-    CloudKitDeleteClient, CloudKitOriginalAssetBatchResolveRequest,
-    CloudKitOriginalAssetResolveTarget, ReqwestCloudKitDeleteTransport, UploadError,
-    build_upload_proof, load_cloudkit_delete_session, run_icloud_upload, verify_local_heic,
+    CloudKitDeleteClient, CloudKitOriginalAssetBatchResolveOutcome,
+    CloudKitOriginalAssetBatchResolveRequest, CloudKitOriginalAssetResolveTarget,
+    ReqwestCloudKitDeleteTransport, UploadError, build_upload_proof, load_cloudkit_delete_session,
+    run_icloud_upload, verify_local_heic,
 };
 use crate::workflow::{
     ConversionResultProof, HeicVerificationProof, SourceAgeProof, WorkflowError, approve_delete,
@@ -787,7 +788,7 @@ fn resolve_original_assets(
     let session = load_cloudkit_delete_session(session_path)?;
     let transport = ReqwestCloudKitDeleteTransport::new()?;
     let mut client = CloudKitDeleteClient::new(transport);
-    match client.resolve_original_assets_batch(
+    match client.resolve_original_assets_batch_outcome(
         &session,
         &CloudKitOriginalAssetBatchResolveRequest {
             targets,
@@ -796,13 +797,12 @@ fn resolve_original_assets(
             max_pages: config.cloudkit_max_pages,
         },
     ) {
-        Ok(proofs) => {
-            let resolved = proofs.len() as u64;
-            record_original_asset_batch_proofs(manifest, &asset_ids, proofs)?;
-            manifest
-                .save_atomic(&config.manifest_path)
-                .map_err(MonitorError::Manifest)?;
-            summary.originals_resolved = summary.originals_resolved.saturating_add(resolved);
+        Ok(outcome) => {
+            if record_original_asset_batch_outcome(manifest, outcome, summary)? {
+                manifest
+                    .save_atomic(&config.manifest_path)
+                    .map_err(MonitorError::Manifest)?;
+            }
         }
         Err(error) => {
             let should_fail_records = matches!(
@@ -1316,6 +1316,32 @@ fn record_monitor_failure(summary: &mut MonitorScanSummary, error: impl ToString
     summary.last_error = Some(error.to_string());
 }
 
+fn record_original_asset_batch_outcome(
+    manifest: &mut Manifest,
+    outcome: CloudKitOriginalAssetBatchResolveOutcome,
+    summary: &mut MonitorScanSummary,
+) -> Result<bool, MonitorError> {
+    let resolved = outcome.proofs.len() as u64;
+    let unresolved_asset_ids = outcome.unresolved_asset_ids;
+    let has_manifest_changes = resolved > 0 || !unresolved_asset_ids.is_empty();
+    if resolved > 0 {
+        let resolved_asset_ids = outcome.proofs.keys().cloned().collect::<Vec<_>>();
+        record_original_asset_batch_proofs(manifest, &resolved_asset_ids, outcome.proofs)?;
+        summary.originals_resolved = summary.originals_resolved.saturating_add(resolved);
+    }
+    if !unresolved_asset_ids.is_empty() {
+        let message = "CloudKit original asset resolver found no exact RAW resource for this asset; delete remains blocked";
+        record_monitor_failure(summary, message);
+        record_lifecycle_failure_for_assets(
+            manifest,
+            &unresolved_asset_ids,
+            "original_asset_resolve",
+            message,
+        )?;
+    }
+    Ok(has_manifest_changes)
+}
+
 fn record_lifecycle_failure_for_assets(
     manifest: &mut Manifest,
     asset_ids: &[String],
@@ -1599,6 +1625,67 @@ mod tests {
             assert_eq!(record.failures[0].stage, "original_asset_resolve");
             assert!(record.failures[0].message.contains("0 matching candidates"));
         }
+    }
+
+    #[test]
+    fn original_asset_batch_outcome_records_proofs_and_only_fails_unresolved_assets() {
+        let mut manifest = Manifest::new();
+        for asset_id in ["asset-a", "asset-b"] {
+            let mut record =
+                AssetRecord::new(asset_id, PathBuf::from(format!("/raw/{asset_id}.DNG")));
+            record.state = State::ConversionVerified;
+            record.proofs.insert(
+                "nas".to_string(),
+                json!({
+                    "canonical_path": format!("/raw/{asset_id}.DNG"),
+                    "relative_path": format!("{asset_id}.DNG"),
+                    "size_bytes": 9,
+                    "modified_unix_seconds": 1_800_000_000u64,
+                    "age_seconds": 2_592_000u64,
+                    "sha256": "raw-sha",
+                }),
+            );
+            manifest.upsert(record);
+        }
+        let mut proofs = std::collections::BTreeMap::new();
+        proofs.insert(
+            "asset-a".to_string(),
+            crate::workflow::OriginalAssetProof {
+                record_name: "CPLAsset-original-a".to_string(),
+                record_change_tag: "tag-a".to_string(),
+                record_type: "CPLAsset".to_string(),
+                filename: "asset-a.DNG".to_string(),
+                size_bytes: 9,
+                matched_raw_sha256: "raw-sha".to_string(),
+            },
+        );
+        let outcome = CloudKitOriginalAssetBatchResolveOutcome {
+            proofs,
+            unresolved_asset_ids: vec!["asset-b".to_string()],
+        };
+        let mut summary = MonitorScanSummary::default();
+
+        let changed = record_original_asset_batch_outcome(&mut manifest, outcome, &mut summary)
+            .expect("partial outcome should be recorded");
+
+        assert!(changed);
+        let resolved = manifest
+            .get("asset-a")
+            .expect("resolved asset should exist");
+        assert_eq!(resolved.state, State::ConversionVerified);
+        assert_eq!(
+            resolved.proofs["original_asset"]["record_name"],
+            "CPLAsset-original-a"
+        );
+        assert!(resolved.failures.is_empty());
+        let unresolved = manifest
+            .get("asset-b")
+            .expect("unresolved asset should exist");
+        assert_eq!(unresolved.state, State::Failed);
+        assert!(!unresolved.proofs.contains_key("original_asset"));
+        assert_eq!(unresolved.failures[0].stage, "original_asset_resolve");
+        assert_eq!(summary.originals_resolved, 1);
+        assert_eq!(summary.failures, 1);
     }
 
     #[test]
