@@ -26,9 +26,8 @@ use crate::monitor::{
 };
 use crate::proof::NasRawProof;
 use crate::service::{
-    DEFAULT_BUNDLE_ID, DEFAULT_SERVICE_LABEL, ServiceError, ServiceInstallRequest,
-    default_app_path, default_plist_path, install_service, service_status, start_service,
-    stop_service, tail_logs, uninstall_service,
+    DEFAULT_SERVICE_LABEL, ServiceError, ServiceInstallRequest, default_plist_path,
+    install_service, service_status, start_service, stop_service, tail_logs, uninstall_service,
 };
 use crate::upload::{
     CloudKitDeleteClient, CloudKitDeleteRequest, CloudKitOriginalAssetBatchResolveRequest,
@@ -112,7 +111,7 @@ struct ServiceArgs {
 
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
-    #[command(about = "Install the macOS per-user LaunchAgent service wrapper")]
+    #[command(about = "Install the macOS per-user LaunchAgent service")]
     Install(ServiceInstallArgs),
     #[command(about = "Start the installed macOS LaunchAgent service")]
     Start(ServiceStartArgs),
@@ -122,7 +121,7 @@ enum ServiceCommand {
     Status(ServiceLabelArgs),
     #[command(about = "Print recent service stdout/stderr logs")]
     Logs(ServiceLogsArgs),
-    #[command(about = "Remove the LaunchAgent and app-bundle service wrapper")]
+    #[command(about = "Remove the LaunchAgent service")]
     Uninstall(ServiceUninstallArgs),
 }
 
@@ -257,22 +256,14 @@ struct ServiceInstallArgs {
     config: PathBuf,
     #[arg(long, default_value = DEFAULT_SERVICE_LABEL)]
     label: String,
-    #[arg(long, default_value = DEFAULT_BUNDLE_ID)]
-    bundle_id: String,
     #[arg(long, value_name = "PATH")]
     bin: Option<PathBuf>,
-    #[arg(long, value_name = "PATH")]
-    app: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     plist: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     stdout: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     stderr: Option<PathBuf>,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
-    skip_codesign: bool,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
-    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -306,11 +297,7 @@ struct ServiceUninstallArgs {
     #[arg(long, default_value = DEFAULT_SERVICE_LABEL)]
     label: String,
     #[arg(long, value_name = "PATH")]
-    app: Option<PathBuf>,
-    #[arg(long, value_name = "PATH")]
     plist: Option<PathBuf>,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
-    keep_app: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -769,13 +756,9 @@ fn run_service<W: Write>(args: ServiceArgs, writer: &mut W) -> Result<(), CliErr
 }
 
 fn service_install<W: Write>(args: ServiceInstallArgs, writer: &mut W) -> Result<(), CliError> {
-    let source_binary = match args.bin {
+    let binary_path = match args.bin {
         Some(path) => path,
         None => env::current_exe()?,
-    };
-    let app_path = match args.app {
-        Some(path) => path,
-        None => default_app_path()?,
     };
     let plist_path = match args.plist {
         Some(path) => path,
@@ -789,24 +772,18 @@ fn service_install<W: Write>(args: ServiceInstallArgs, writer: &mut W) -> Result
         .unwrap_or_else(|| args.config.with_extension("stderr.log"));
     let summary = install_service(&ServiceInstallRequest {
         config_path: args.config,
-        source_binary,
-        app_path,
+        binary_path,
         plist_path,
         stdout_path,
         stderr_path,
         label: args.label,
-        bundle_id: args.bundle_id,
-        skip_codesign: args.skip_codesign,
-        force: args.force,
     })?;
     writeln!(writer, "installed service {}", summary.label)?;
-    writeln!(writer, "app: {}", summary.app_path.display())?;
-    writeln!(writer, "binary: {}", summary.app_binary.display())?;
+    writeln!(writer, "binary: {}", summary.binary_path.display())?;
     writeln!(writer, "launchd plist: {}", summary.plist_path.display())?;
-    writeln!(writer, "bundle id: {}", summary.bundle_id)?;
     writeln!(
         writer,
-        "Grant Network Volumes or Full Disk Access to the app before starting the service."
+        "If macOS denies NAS access, grant Network Volumes or Full Disk Access to the service binary."
     )?;
     Ok(())
 }
@@ -856,15 +833,11 @@ fn service_logs<W: Write>(args: ServiceLogsArgs, writer: &mut W) -> Result<(), C
 }
 
 fn service_uninstall(args: ServiceUninstallArgs) -> Result<(), CliError> {
-    let app_path = match args.app {
-        Some(path) => path,
-        None => default_app_path()?,
-    };
     let plist_path = match args.plist {
         Some(path) => path,
         None => default_plist_path(&args.label)?,
     };
-    uninstall_service(&args.label, &plist_path, &app_path, args.keep_app)?;
+    uninstall_service(&args.label, &plist_path)?;
     Ok(())
 }
 

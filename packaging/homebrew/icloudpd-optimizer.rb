@@ -11,17 +11,38 @@ class IcloudpdOptimizer < Formula
 
   def install
     system "cargo", "install", *std_cargo_args
+    (etc/"icloudpd-optimizer").mkpath
+    (var/"log/icloudpd-optimizer").mkpath
+  end
+
+  service do
+    run [
+      opt_bin/"icloudpd-optimizer",
+      "monitor",
+      "run",
+      "--config",
+      etc/"icloudpd-optimizer/monitor.json",
+    ]
+    keep_alive true
+    log_path var/"log/icloudpd-optimizer/stdout.log"
+    error_log_path var/"log/icloudpd-optimizer/stderr.log"
+    environment_variables PATH: std_service_path_env
   end
 
   def caveats
     <<~EOS
-      Create a monitor config, then install the macOS service wrapper:
+      Create a monitor config, then start the Homebrew service:
 
-        icloudpd-optimizer monitor init --config ~/.config/icloudpd-optimizer/monitor.json ...
+        icloudpd-optimizer monitor init --config #{etc}/icloudpd-optimizer/monitor.json ...
+        brew services start icloudpd-optimizer
+
+      For a custom config path, use:
+
         icloudpd-optimizer service install --config ~/.config/icloudpd-optimizer/monitor.json
+        icloudpd-optimizer service start
 
-      On macOS, grant iCloudPD Optimizer.app Network Volumes or Full Disk Access
-      before starting the service.
+      On macOS, grant Network Volumes or Full Disk Access to the service binary
+      if launchd cannot read your NAS mount.
     EOS
   end
 

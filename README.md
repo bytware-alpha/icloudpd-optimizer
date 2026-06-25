@@ -304,20 +304,30 @@ icloudpd-optimizer service status
 icloudpd-optimizer service logs --config ~/.config/icloudpd-optimizer/monitor.json
 ```
 
-On macOS, `service install` creates a per-user `iCloudPD Optimizer.app` wrapper and a
-LaunchAgent that runs the installed CLI through that app identity. This keeps the tool
-installable through Cargo or Homebrew while giving macOS a stable app to grant privacy
-access to. Grant `iCloudPD Optimizer.app` Network Volumes or Full Disk Access before
-starting the service. If macOS denies NAS or SMB access, the monitor logs a scan
-preflight error instead of hanging.
+On macOS, `service install` writes a per-user LaunchAgent that runs the installed
+`icloudpd-optimizer` binary directly. This is the normal shape for CLI services. If
+macOS denies NAS or SMB access, grant Network Volumes or Full Disk Access to the
+service binary and rerun `service start`; the monitor logs a scan preflight error
+instead of hanging.
+
+If you installed through Homebrew and use the default config path, Homebrew can own
+the service lifecycle:
+
+```sh
+icloudpd-optimizer monitor init \
+  --config "$(brew --prefix)/etc/icloudpd-optimizer/monitor.json" \
+  --download-root /path/to/icloudpd/downloads \
+  --manifest /path/to/optimizer/manifest.json \
+  --heic-output-dir /path/to/optimizer/heic
+brew services start icloudpd-optimizer
+```
 
 The lower-level plist generator remains available for custom service managers:
 
 ```sh
 icloudpd-optimizer monitor launchd-plist \
   --config ~/.config/icloudpd-optimizer/monitor.json \
-  --bin ~/Applications/iCloudPD\ Optimizer.app/Contents/MacOS/icloudpd-optimizer-service \
-  --associated-bundle-id io.github.bytware-alpha.icloudpd-optimizer \
+  --bin "$(command -v icloudpd-optimizer)" \
   --output ~/Library/LaunchAgents/com.icloudpd-optimizer.monitor.plist
 ```
 
