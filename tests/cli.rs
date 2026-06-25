@@ -1481,6 +1481,7 @@ fn service_install_creates_plain_launchagent_for_installed_binary() {
     let output_text = String::from_utf8(output).expect("service output should be utf8");
     assert!(output_text.contains("installed service com.icloudpd-optimizer.monitor"));
     assert!(output_text.contains(&bin_path.to_string_lossy().to_string()));
+    assert!(output_text.contains("after installing or updating"));
     assert!(!output_text.contains(".app"));
     assert!(!output_text.to_ascii_lowercase().contains("password"));
     assert!(!output_text.to_ascii_lowercase().contains("token"));

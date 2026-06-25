@@ -307,8 +307,9 @@ icloudpd-optimizer service logs --config ~/.config/icloudpd-optimizer/monitor.js
 On macOS, `service install` writes a per-user LaunchAgent that runs the installed
 `icloudpd-optimizer` binary directly. This is the normal shape for CLI services. If
 macOS denies NAS or SMB access, grant Network Volumes or Full Disk Access to the
-service binary and rerun `service start`; the monitor logs a scan preflight error
-instead of hanging.
+service binary after installing or updating it, then rerun `service start`; the
+monitor logs a scan preflight error instead of hanging. Replacing or re-signing the
+binary after granting access can invalidate the macOS privacy grant.
 
 If you installed through Homebrew and use the default config path, Homebrew can own
 the service lifecycle:

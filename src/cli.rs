@@ -783,7 +783,7 @@ fn service_install<W: Write>(args: ServiceInstallArgs, writer: &mut W) -> Result
     writeln!(writer, "launchd plist: {}", summary.plist_path.display())?;
     writeln!(
         writer,
-        "If macOS denies NAS access, grant Network Volumes or Full Disk Access to the service binary."
+        "If macOS denies NAS access, grant Network Volumes or Full Disk Access to the service binary after installing or updating it."
     )?;
     Ok(())
 }

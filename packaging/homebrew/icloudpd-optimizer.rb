@@ -42,7 +42,9 @@ class IcloudpdOptimizer < Formula
         icloudpd-optimizer service start
 
       On macOS, grant Network Volumes or Full Disk Access to the service binary
-      if launchd cannot read your NAS mount.
+      after installing or updating it if launchd cannot read your NAS mount.
+      Replacing or re-signing the binary after granting access can invalidate the
+      macOS privacy grant.
     EOS
   end
 
