@@ -3134,7 +3134,7 @@ fn rolling_asset_terminal_state(
 ) -> Result<bool, MonitorError> {
     let manifest = lock_shared(manifest, "rolling lifecycle manifest")?;
     let state = manifest.get(asset_id)?.state;
-    Ok(matches!(state, State::Deleted | State::Failed))
+    Ok(state.is_terminal() || state == State::Failed)
 }
 
 fn remove_stale_monitor_conversion_artifacts(
@@ -6881,25 +6881,21 @@ fn record_original_asset_batch_outcome(
     observed_at_unix_seconds: u64,
     summary: &mut MonitorScanSummary,
 ) -> Result<OriginalAssetResolutionMonitorSummary, MonitorError> {
-    let incomplete_transient = outcome
-        .resolutions
-        .values()
-        .filter(|resolution| {
-            matches!(
-                resolution.disposition,
-                crate::upload::CloudKitOriginalAssetResolveDisposition::IncompleteTransient
-            )
-        })
-        .count() as u64;
+    let has_incomplete_transient = outcome.resolutions.values().any(|resolution| {
+        matches!(
+            resolution.disposition,
+            crate::upload::CloudKitOriginalAssetResolveDisposition::IncompleteTransient
+        )
+    });
     let Some(inventory) = outcome.inventory else {
         return Ok(OriginalAssetResolutionMonitorSummary {
-            deferred: outcome.resolutions.len() as u64,
+            deferred: targets.len() as u64,
             ..Default::default()
         });
     };
-    if incomplete_transient > 0 {
+    if has_incomplete_transient {
         return Ok(OriginalAssetResolutionMonitorSummary {
-            deferred: incomplete_transient,
+            deferred: targets.len() as u64,
             ..Default::default()
         });
     }
@@ -7223,6 +7219,11 @@ pub enum MonitorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upload::{
+        CLOUDKIT_ORIGINAL_ASSET_RESOLVER_VERSION, CloudKitDatabaseScope,
+        CloudKitOriginalAssetInventoryFingerprint, CloudKitOriginalAssetResolution,
+        CloudKitOriginalAssetResolveDisposition, CloudKitOriginalAssetResolveObservations,
+    };
     use filetime::{FileTime, set_file_mtime};
     use serde_json::Value;
     use serde_json::json;
@@ -8247,6 +8248,33 @@ mod tests {
             ),
             vec!["c-converted"]
         );
+    }
+
+    #[test]
+    fn terminal_reconciliation_states_stop_workers_and_are_not_progressable() {
+        let config = MonitorConfig::new("/download", "/manifest.json", "/heic");
+        let mut manifest = Manifest::new();
+        for (asset_id, state) in [
+            ("no-action", State::NoAction),
+            ("needs-review", State::NeedsReview),
+        ] {
+            manifest.upsert(lifecycle_record(asset_id, state));
+        }
+        let shared_manifest = Arc::new(Mutex::new(manifest.clone()));
+
+        for asset_id in ["no-action", "needs-review"] {
+            let record = manifest
+                .get(asset_id)
+                .expect("terminal record should exist");
+            assert!(
+                rolling_asset_terminal_state(&shared_manifest, asset_id)
+                    .expect("terminal state check should succeed")
+            );
+            assert!(!rolling_lifecycle_record_can_run_worker_stage(
+                record, &config, true,
+            ));
+            assert!(rolling_lifecycle_next_worker_step(record, &config, true).is_none());
+        }
     }
 
     #[test]
@@ -10362,6 +10390,96 @@ mod tests {
     }
 
     #[test]
+    fn original_asset_batch_outcome_records_fresh_exact_original_proof_and_summary() {
+        let asset_id = "asset-exact";
+        let mut manifest = Manifest::new();
+        manifest.upsert(fresh_original_asset_resolution_record(asset_id));
+        let target = fresh_original_asset_resolution_target(asset_id);
+        let destination = test_delete_session().zone;
+        let outcome = CloudKitOriginalAssetBatchResolveOutcome {
+            resolutions: BTreeMap::from([(
+                asset_id.to_string(),
+                exact_original_asset_resolution(asset_id),
+            )]),
+            inventory: Some(complete_original_asset_resolution_inventory()),
+        };
+        let mut summary = MonitorScanSummary::default();
+
+        let resolution = record_original_asset_batch_outcome(
+            &mut manifest,
+            &[target],
+            &destination,
+            outcome,
+            1_800_000_000,
+            &mut summary,
+        )
+        .expect("complete exact outcome should be recorded");
+
+        let record = manifest.get(asset_id).expect("exact asset should exist");
+        assert!(resolution.manifest_changed());
+        assert_eq!(record.state, State::NasVerified);
+        assert_eq!(
+            record.proofs["original_asset"]["record_name"],
+            "CPLAsset-asset-exact"
+        );
+        assert!(record.proofs.contains_key("original_asset_resolution"));
+        assert_eq!(summary.originals_resolved, 1);
+        assert_eq!(summary.no_action_records, 0);
+        assert_eq!(summary.needs_review_records, 0);
+        assert_eq!(summary.failures, 0);
+    }
+
+    #[test]
+    fn original_asset_batch_outcome_defers_entire_mixed_batch_without_mutation() {
+        let exact_id = "asset-exact";
+        let transient_id = "asset-transient";
+        let mut manifest = Manifest::new();
+        manifest.upsert(fresh_original_asset_resolution_record(exact_id));
+        manifest.upsert(fresh_original_asset_resolution_record(transient_id));
+        let before = manifest.clone();
+        let targets = [
+            fresh_original_asset_resolution_target(exact_id),
+            fresh_original_asset_resolution_target(transient_id),
+        ];
+        let destination = test_delete_session().zone;
+        let outcome = CloudKitOriginalAssetBatchResolveOutcome {
+            resolutions: BTreeMap::from([
+                (
+                    exact_id.to_string(),
+                    exact_original_asset_resolution(exact_id),
+                ),
+                (
+                    transient_id.to_string(),
+                    CloudKitOriginalAssetResolution {
+                        observations: Default::default(),
+                        disposition: CloudKitOriginalAssetResolveDisposition::IncompleteTransient,
+                    },
+                ),
+            ]),
+            inventory: Some(complete_original_asset_resolution_inventory()),
+        };
+        let mut summary = MonitorScanSummary::default();
+
+        let resolution = record_original_asset_batch_outcome(
+            &mut manifest,
+            &targets,
+            &destination,
+            outcome,
+            1_800_000_000,
+            &mut summary,
+        )
+        .expect("mixed batch should defer without an error");
+
+        assert_eq!(manifest, before);
+        assert!(!resolution.manifest_changed());
+        assert_eq!(resolution.deferred, 2);
+        assert_eq!(summary.originals_resolved, 0);
+        assert_eq!(summary.no_action_records, 0);
+        assert_eq!(summary.needs_review_records, 0);
+        assert_eq!(summary.failures, 0);
+    }
+
+    #[test]
     fn original_asset_resolve_batch_event_separates_terminal_outcomes_from_failures() {
         let failed_ids = vec!["asset-b".to_string(), "asset-c".to_string()];
         let reconciliation = OriginalAssetResolutionMonitorSummary {
@@ -10728,6 +10846,61 @@ mod tests {
                 "min_age_seconds": 2_592_000u64,
             }),
         );
+    }
+
+    fn fresh_original_asset_resolution_record(asset_id: &str) -> AssetRecord {
+        let mut record = lifecycle_record(asset_id, State::NasVerified);
+        add_original_resolution_proofs(&mut record, 1_700_000_000);
+        record.proofs.get_mut("nas").unwrap()["sha256"] = json!("ab".repeat(32));
+        record.proofs.get_mut("source_age").unwrap()["verified_at_unix_seconds"] =
+            json!(1_702_592_000u64);
+        record
+    }
+
+    fn fresh_original_asset_resolution_target(
+        asset_id: &str,
+    ) -> CloudKitOriginalAssetResolveTarget {
+        CloudKitOriginalAssetResolveTarget {
+            asset_id: asset_id.to_string(),
+            raw_size_bytes: 9,
+            source_captured_unix_seconds: 1_700_000_000,
+            capture_tolerance_seconds: 2,
+            filename: format!("{asset_id}.DNG"),
+            matched_raw_sha256: "ab".repeat(32),
+            replacement_candidate: None,
+        }
+    }
+
+    fn exact_original_asset_resolution(asset_id: &str) -> CloudKitOriginalAssetResolution {
+        CloudKitOriginalAssetResolution {
+            observations: CloudKitOriginalAssetResolveObservations {
+                date_candidates: 1,
+                raw_resources: 1,
+                raw_size_matches: 1,
+                raw_hash_matches: 1,
+                ..Default::default()
+            },
+            disposition: CloudKitOriginalAssetResolveDisposition::ExactOriginal {
+                proof: OriginalAssetProof {
+                    record_name: format!("CPLAsset-{asset_id}"),
+                    record_change_tag: format!("tag-{asset_id}"),
+                    record_type: "CPLAsset".to_string(),
+                    database_scope: CloudKitDatabaseScope::Private,
+                    zone_name: "PrimarySync".to_string(),
+                    filename: format!("{asset_id}.DNG"),
+                    size_bytes: 9,
+                    matched_raw_sha256: "ab".repeat(32),
+                },
+            },
+        }
+    }
+
+    fn complete_original_asset_resolution_inventory() -> CloudKitOriginalAssetInventoryFingerprint {
+        CloudKitOriginalAssetInventoryFingerprint {
+            resolver_version: CLOUDKIT_ORIGINAL_ASSET_RESOLVER_VERSION.to_string(),
+            sha256: "cd".repeat(32),
+            records_scanned: 1,
+        }
     }
 
     fn retryable_failed_conversion_record(asset_id: &str, message: &str) -> AssetRecord {
