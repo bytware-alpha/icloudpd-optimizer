@@ -21,6 +21,14 @@ const SCHEMA_VERSION: i32 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WRITER_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_WRITER_OWNER_ID_BYTES: usize = 128;
+const CANONICAL_V1_ASSETS_SQL: &str = "CREATE TABLE assets (
+    asset_id TEXT PRIMARY KEY NOT NULL,
+    state TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    record_json TEXT NOT NULL
+)";
+const CANONICAL_V1_ASSETS_STATE_INDEX_SQL: &str =
+    "CREATE INDEX assets_state_index ON assets(state)";
 
 #[cfg(test)]
 std::thread_local! {
@@ -192,6 +200,9 @@ impl AssetStateStore {
         let mut connection = store.connect_existing_writer()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let asset_count = validate_exact_v1_schema(&transaction)?;
+        if asset_count == 0 {
+            return Err(AssetStateStoreError::MigrationSchemaEmpty);
+        }
         let asset_count = u64::try_from(asset_count).map_err(|_| {
             AssetStateStoreError::MigrationSchemaInvalid {
                 reason: "assets count must not be negative".to_string(),
@@ -818,51 +829,170 @@ fn validate_exact_v1_schema(transaction: &Transaction<'_>) -> Result<i64, AssetS
     }
 
     let mut statement = transaction.prepare(
-        "SELECT type, name FROM sqlite_master
+        "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master
          WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
     )?;
     let objects = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                normalize_schema_sql(&row.get::<_, String>(3)?),
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let expected_objects = vec![
-        ("index".to_string(), "assets_state_index".to_string()),
-        ("table".to_string(), "assets".to_string()),
+        (
+            "index".to_string(),
+            "assets_state_index".to_string(),
+            "assets".to_string(),
+            normalize_schema_sql(CANONICAL_V1_ASSETS_STATE_INDEX_SQL),
+        ),
+        (
+            "table".to_string(),
+            "assets".to_string(),
+            "assets".to_string(),
+            normalize_schema_sql(CANONICAL_V1_ASSETS_SQL),
+        ),
     ];
     if objects != expected_objects {
         return Err(AssetStateStoreError::MigrationSchemaInvalid {
-            reason: "expected only the canonical v1 assets table and assets_state_index"
-                .to_string(),
+            reason: "schema objects do not match the canonical v1 DDL".to_string(),
         });
     }
 
-    let mut columns = transaction.prepare("PRAGMA table_info(assets)")?;
+    let mut columns = transaction.prepare("PRAGMA table_xinfo(assets)")?;
     let columns = columns
         .query_map([], |row| {
             Ok((
+                row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let expected_columns = vec![
-        ("asset_id".to_string(), "TEXT".to_string(), 1, 1),
-        ("state".to_string(), "TEXT".to_string(), 1, 0),
-        ("updated_at".to_string(), "TEXT".to_string(), 1, 0),
-        ("record_json".to_string(), "TEXT".to_string(), 1, 0),
+        (0, "asset_id".to_string(), "TEXT".to_string(), 1, None, 1, 0),
+        (1, "state".to_string(), "TEXT".to_string(), 1, None, 0, 0),
+        (
+            2,
+            "updated_at".to_string(),
+            "TEXT".to_string(),
+            1,
+            None,
+            0,
+            0,
+        ),
+        (
+            3,
+            "record_json".to_string(),
+            "TEXT".to_string(),
+            1,
+            None,
+            0,
+            0,
+        ),
     ];
     if columns != expected_columns {
         return Err(AssetStateStoreError::MigrationSchemaInvalid {
-            reason: "assets table does not match the canonical v1 columns".to_string(),
+            reason: "assets columns do not match the canonical v1 definition".to_string(),
+        });
+    }
+
+    let mut tables = transaction.prepare("PRAGMA table_list")?;
+    let tables = tables
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let assets_tables = tables
+        .into_iter()
+        .filter(|(schema, name, _, _, _, _)| schema == "main" && name == "assets")
+        .collect::<Vec<_>>();
+    if assets_tables
+        != vec![(
+            "main".to_string(),
+            "assets".to_string(),
+            "table".to_string(),
+            4,
+            0,
+            0,
+        )]
+    {
+        return Err(AssetStateStoreError::MigrationSchemaInvalid {
+            reason: "assets table must not be STRICT or WITHOUT ROWID".to_string(),
+        });
+    }
+
+    let mut indexes = transaction.prepare("PRAGMA index_list(assets)")?;
+    let indexes = indexes
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .filter_map(|row| match row {
+            Ok((_, name, _, _, _)) if name.starts_with("sqlite_autoindex_") => None,
+            other => Some(other),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if indexes != vec![(0, "assets_state_index".to_string(), 0, "c".to_string(), 0)] {
+        return Err(AssetStateStoreError::MigrationSchemaInvalid {
+            reason: "assets_state_index must be the canonical non-unique non-partial index"
+                .to_string(),
+        });
+    }
+
+    let mut index_columns = transaction.prepare("PRAGMA index_xinfo(assets_state_index)")?;
+    let index_columns = index_columns
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .filter_map(|row| match row {
+            Ok((_, _, _, _, _, 0)) => None,
+            other => Some(other),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if index_columns != vec![(0, 1, Some("state".to_string()), 0, "BINARY".to_string(), 1)] {
+        return Err(AssetStateStoreError::MigrationSchemaInvalid {
+            reason: "assets_state_index must index only state with the canonical ordering"
+                .to_string(),
         });
     }
 
     transaction
         .query_row("SELECT count(*) FROM assets", [], |row| row.get(0))
         .map_err(AssetStateStoreError::from)
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_whitespace())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
 }
 
 fn ensure_wal_in_transaction(transaction: &Transaction<'_>) -> Result<(), AssetStateStoreError> {
@@ -877,6 +1007,12 @@ fn ensure_wal_in_transaction(transaction: &Transaction<'_>) -> Result<(), AssetS
 fn quick_check_in_transaction(
     transaction: &Transaction<'_>,
 ) -> Result<String, AssetStateStoreError> {
+    #[cfg(test)]
+    if FAIL_NEXT_INTEGRITY_CHECK.with(|fail| fail.replace(false)) {
+        return Err(AssetStateStoreError::IntegrityCheck {
+            result: "forced test failure".to_string(),
+        });
+    }
     let result: String = transaction.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
     if result == "ok" {
         return Ok(result);
@@ -1191,6 +1327,8 @@ pub enum AssetStateStoreError {
     MigrationDatabaseMetadata { path: PathBuf, source: io::Error },
     #[error("schema migration expected schema version {expected}, found {actual}")]
     MigrationSchemaVersion { expected: i32, actual: i32 },
+    #[error("schema migration v1 assets table contains no asset rows")]
+    MigrationSchemaEmpty,
     #[error("schema migration rejected noncanonical v1 schema: {reason}")]
     MigrationSchemaInvalid { reason: String },
     #[error("state database error: {0}")]
@@ -1322,5 +1460,84 @@ mod tests {
 
         AssetStateStore::open_writer(&manifest_path, "writer-b", Duration::from_secs(1))
             .expect("failed post-acquisition integrity must not leave a held lease");
+    }
+
+    #[test]
+    fn schema_only_migration_integrity_failure_after_ddl_rolls_back_every_change() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
+        let record = AssetRecord::new("asset-1", "/photos/asset-1.dng");
+        let record_json = serde_json::to_string(&record).expect("encode asset record");
+        let asset_digest_before = format!("{:x}", Sha256::digest(record_json.as_bytes()));
+        let connection = Connection::open(&db_path).expect("open v1 state db");
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 BEGIN IMMEDIATE;
+                 CREATE TABLE assets (
+                   asset_id TEXT PRIMARY KEY NOT NULL,
+                   state TEXT NOT NULL,
+                   updated_at TEXT NOT NULL,
+                   record_json TEXT NOT NULL
+                 );
+                 CREATE INDEX assets_state_index ON assets(state);
+                 PRAGMA user_version = 1;
+                 COMMIT;",
+            )
+            .expect("create v1 schema");
+        connection
+            .execute(
+                "INSERT INTO assets (asset_id, state, updated_at, record_json) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    record.asset_id,
+                    record.state.as_str(),
+                    record.updated_at,
+                    record_json
+                ],
+            )
+            .expect("insert v1 asset");
+
+        fail_next_integrity_check_for_current_thread();
+        let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+            .expect_err("post-DDL integrity failure must roll back the migration");
+        assert!(matches!(error, AssetStateStoreError::IntegrityCheck { .. }));
+
+        let connection = Connection::open(db_path).expect("reopen rolled-back state db");
+        let version: i32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read rolled-back schema version");
+        assert_eq!(version, 1);
+        let objects = connection
+            .prepare(
+                "SELECT type, name FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+            )
+            .expect("prepare schema object query")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query schema objects")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read schema objects");
+        assert_eq!(
+            objects,
+            vec![
+                ("index".to_string(), "assets_state_index".to_string()),
+                ("table".to_string(), "assets".to_string()),
+            ]
+        );
+        let durable_json: String = connection
+            .query_row(
+                "SELECT record_json FROM assets WHERE asset_id = 'asset-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read rolled-back asset record");
+        assert_eq!(durable_json, record_json);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(durable_json.as_bytes())),
+            asset_digest_before
+        );
     }
 }

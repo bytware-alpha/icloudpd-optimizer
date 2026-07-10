@@ -1115,6 +1115,18 @@ fn manifest_migrate_rejects_missing_wrong_and_already_migrated_databases_without
              COMMIT;",
         )
         .expect("v1 schema should be created");
+    let record = AssetRecord::new("asset-1", "/photos/raw/asset-1.dng");
+    connection
+        .execute(
+            "INSERT INTO assets (asset_id, state, updated_at, record_json) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                record.asset_id,
+                record.state.as_str(),
+                record.updated_at,
+                serde_json::to_string(&record).expect("record should encode")
+            ],
+        )
+        .expect("v1 asset should be inserted");
 
     binary()
         .args(["manifest", "migrate", "--manifest"])

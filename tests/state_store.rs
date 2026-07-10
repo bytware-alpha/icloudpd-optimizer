@@ -96,6 +96,76 @@ fn asset_row_digest(manifest_path: &std::path::Path) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn create_custom_v1_database(
+    manifest_path: &std::path::Path,
+    assets_sql: &str,
+    index_sql: &str,
+    extra_sql: &str,
+    records: &[AssetRecord],
+) {
+    let db_path = AssetStateStore::db_path_for_manifest(manifest_path);
+    let connection = rusqlite::Connection::open(db_path).expect("open custom v1 state db");
+    connection
+        .execute_batch(&format!(
+            "PRAGMA journal_mode=WAL;
+             BEGIN IMMEDIATE;
+             {assets_sql};
+             {index_sql};
+             {extra_sql}
+             PRAGMA user_version = 1;
+             COMMIT;"
+        ))
+        .expect("create custom v1 schema");
+    for record in records {
+        connection
+            .execute(
+                "INSERT INTO assets (asset_id, state, updated_at, record_json) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    record.asset_id,
+                    record.state.as_str(),
+                    record.updated_at,
+                    serde_json::to_string(record).expect("encode record")
+                ],
+            )
+            .expect("insert custom v1 asset record");
+    }
+}
+
+fn migration_schema_digest(manifest_path: &std::path::Path) -> String {
+    let connection =
+        rusqlite::Connection::open(AssetStateStore::db_path_for_manifest(manifest_path))
+            .expect("open state db for schema digest");
+    let version: i32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("read schema version for digest");
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )
+        .expect("prepare schema digest query");
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .expect("query schema digest rows");
+    let mut hasher = Sha256::new();
+    hasher.update(version.to_le_bytes());
+    for row in rows {
+        let (object_type, name, table, sql) = row.expect("read schema digest row");
+        for value in [&object_type, &name, &table, &sql] {
+            hasher.update(value.as_bytes());
+            hasher.update([0]);
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 #[test]
 fn imports_json_once_and_reopens_durable_record_updates() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -721,6 +791,209 @@ fn schema_only_migration_preserves_v1_assets_and_never_reads_or_writes_manifest_
         )
         .expect("read schema-only import metadata");
     assert_eq!(import_metadata, (1, None));
+}
+
+#[test]
+fn schema_only_migration_rejects_every_semantically_altered_v1_schema_without_mutation() {
+    const CANONICAL_TABLE: &str = "CREATE TABLE assets (
+        asset_id TEXT PRIMARY KEY NOT NULL,
+        state TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        record_json TEXT NOT NULL
+    )";
+    const CANONICAL_INDEX: &str = "CREATE INDEX assets_state_index ON assets(state)";
+
+    let cases = [
+        (
+            "wrong-index-column",
+            CANONICAL_TABLE,
+            "CREATE INDEX assets_state_index ON assets(asset_id)",
+            "",
+        ),
+        (
+            "unique-index",
+            CANONICAL_TABLE,
+            "CREATE UNIQUE INDEX assets_state_index ON assets(state)",
+            "",
+        ),
+        (
+            "partial-index",
+            CANONICAL_TABLE,
+            "CREATE INDEX assets_state_index ON assets(state) WHERE state <> ''",
+            "",
+        ),
+        (
+            "descending-index",
+            CANONICAL_TABLE,
+            "CREATE INDEX assets_state_index ON assets(state DESC)",
+            "",
+        ),
+        (
+            "column-default",
+            "CREATE TABLE assets (
+                asset_id TEXT PRIMARY KEY NOT NULL,
+                state TEXT NOT NULL DEFAULT 'discovered',
+                updated_at TEXT NOT NULL,
+                record_json TEXT NOT NULL
+            )",
+            CANONICAL_INDEX,
+            "",
+        ),
+        (
+            "generated-column",
+            "CREATE TABLE assets (
+                asset_id TEXT PRIMARY KEY NOT NULL,
+                state TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                state_copy TEXT GENERATED ALWAYS AS (state) STORED
+            )",
+            CANONICAL_INDEX,
+            "",
+        ),
+        (
+            "strict-table",
+            "CREATE TABLE assets (
+                asset_id TEXT PRIMARY KEY NOT NULL,
+                state TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                record_json TEXT NOT NULL
+            ) STRICT",
+            CANONICAL_INDEX,
+            "",
+        ),
+        (
+            "without-rowid",
+            "CREATE TABLE assets (
+                asset_id TEXT PRIMARY KEY NOT NULL,
+                state TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                record_json TEXT NOT NULL
+            ) WITHOUT ROWID",
+            CANONICAL_INDEX,
+            "",
+        ),
+        (
+            "table-check-constraint",
+            "CREATE TABLE assets (
+                asset_id TEXT PRIMARY KEY NOT NULL,
+                state TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                CHECK (length(state) > 0)
+            )",
+            CANONICAL_INDEX,
+            "",
+        ),
+        (
+            "trigger",
+            CANONICAL_TABLE,
+            CANONICAL_INDEX,
+            "CREATE TRIGGER assets_reject_insert BEFORE INSERT ON assets WHEN 0 BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        ),
+        (
+            "view",
+            CANONICAL_TABLE,
+            CANONICAL_INDEX,
+            "CREATE VIEW extra_assets_view AS SELECT asset_id FROM assets;",
+        ),
+        (
+            "extra-table",
+            CANONICAL_TABLE,
+            CANONICAL_INDEX,
+            "CREATE TABLE extra_state (key TEXT PRIMARY KEY NOT NULL);",
+        ),
+    ];
+
+    for (case, assets_sql, index_sql, extra_sql) in cases {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join(format!("{case}.json"));
+        let record = AssetRecord::new("asset-1", "/photos/asset-1.dng");
+        create_custom_v1_database(
+            &manifest_path,
+            assets_sql,
+            index_sql,
+            extra_sql,
+            std::slice::from_ref(&record),
+        );
+        let assets_before = asset_row_digest(&manifest_path);
+        let schema_before = migration_schema_digest(&manifest_path);
+
+        let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+            .expect_err("semantically altered v1 schema must fail closed");
+
+        assert!(matches!(
+            error,
+            AssetStateStoreError::MigrationSchemaInvalid { .. }
+        ));
+        assert_eq!(asset_row_digest(&manifest_path), assets_before, "{case}");
+        assert_eq!(
+            migration_schema_digest(&manifest_path),
+            schema_before,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn schema_only_migration_rejects_zero_row_v1_without_touching_json_or_schema() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("manifest.json");
+    create_v1_database(&manifest_path, &[]);
+    fs::write(&manifest_path, b"{legacy JSON sentinel must not be read")
+        .expect("write manifest sentinel");
+    let manifest_before = fs::read(&manifest_path).expect("read manifest sentinel");
+    let schema_before = migration_schema_digest(&manifest_path);
+
+    let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+        .expect_err("zero-row v1 database is ambiguous and must not migrate");
+
+    assert!(error.to_string().contains("contains no asset rows"));
+    assert_eq!(
+        fs::read(&manifest_path).expect("manifest sentinel should remain untouched"),
+        manifest_before
+    );
+    assert_eq!(migration_schema_digest(&manifest_path), schema_before);
+}
+
+#[test]
+fn schema_only_migration_waits_for_an_existing_immediate_writer_before_committing() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("manifest.json");
+    create_v1_database(
+        &manifest_path,
+        &[AssetRecord::new("asset-1", "/photos/asset-1.dng")],
+    );
+    let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
+    let lock_connection = rusqlite::Connection::open(db_path).expect("open writer lock database");
+    lock_connection
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("acquire existing immediate writer");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let migration_path = manifest_path.clone();
+    let migration = std::thread::spawn(move || {
+        started_tx.send(()).expect("signal migration start");
+        result_tx.send(AssetStateStore::migrate_schema_only(&migration_path, 1, 2))
+    });
+    started_rx.recv().expect("wait for migration thread start");
+    assert!(
+        result_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "migration must not overlap an existing IMMEDIATE writer"
+    );
+
+    lock_connection
+        .execute_batch("COMMIT;")
+        .expect("release existing immediate writer");
+    let summary = result_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("migration should complete after writer release")
+        .expect("migration should succeed after writer release");
+    migration
+        .join()
+        .expect("migration thread should not panic")
+        .expect("migration result should be sent");
+    assert_eq!(summary.asset_count, 1);
 }
 
 #[test]
