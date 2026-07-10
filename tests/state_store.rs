@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -1116,6 +1118,71 @@ fn schema_only_migration_rejects_symlinked_database_and_lock_files() {
 
 #[cfg(unix)]
 #[test]
+fn schema_only_migration_rejects_hard_linked_lock_without_mutating_the_other_name() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("manifest.json");
+    create_v1_database(
+        &manifest_path,
+        &[AssetRecord::new("asset-1", "/photos/asset-1.dng")],
+    );
+    let unrelated_path = tempdir.path().join("unrelated-lock-target");
+    let unrelated_bytes = b"unrelated bytes must remain unchanged";
+    fs::write(&unrelated_path, unrelated_bytes).expect("write unrelated file");
+    fs::hard_link(
+        &unrelated_path,
+        manifest_path.with_extension("monitor.lock"),
+    )
+    .expect("hard-link monitor lock");
+    let schema_before = migration_schema_digest(&manifest_path);
+
+    let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+        .expect_err("hard-linked monitor lock must fail closed");
+
+    assert!(matches!(
+        error,
+        AssetStateStoreError::MigrationMonitorLockHardLink { .. }
+    ));
+    assert_eq!(
+        fs::read(&unrelated_path).expect("read unrelated hard-link target"),
+        unrelated_bytes
+    );
+    assert_eq!(migration_schema_digest(&manifest_path), schema_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn schema_only_migration_rejects_database_hard_link_aliases_before_the_other_manifest_lock() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_a = tempdir.path().join("manifest-a.json");
+    let manifest_b = tempdir.path().join("manifest-b.json");
+    create_v1_database(
+        &manifest_a,
+        &[AssetRecord::new("asset-1", "/photos/asset-1.dng")],
+    );
+    let database_a = AssetStateStore::db_path_for_manifest(&manifest_a);
+    let database_b = AssetStateStore::db_path_for_manifest(&manifest_b);
+    fs::hard_link(&database_a, &database_b).expect("hard-link state database");
+    let config_a = MonitorConfig::new(
+        tempdir.path().join("download-a"),
+        manifest_a.clone(),
+        tempdir.path().join("heic-a"),
+    );
+    let guard_a = acquire_monitor_run_guard(&config_a).expect("first manifest lock should hold");
+    let schema_before = migration_schema_digest(&manifest_a);
+
+    let error = AssetStateStore::migrate_schema_only(&manifest_b, 1, 2)
+        .expect_err("database hard-link alias must not bypass manifest-a lock");
+
+    assert!(matches!(
+        error,
+        AssetStateStoreError::MigrationDatabaseHardLink { .. }
+    ));
+    assert_eq!(migration_schema_digest(&manifest_a), schema_before);
+    drop(guard_a);
+}
+
+#[cfg(unix)]
+#[test]
 fn schema_only_migration_hashes_the_canonical_database_identity() {
     use std::os::unix::fs::symlink;
 
@@ -1134,10 +1201,13 @@ fn schema_only_migration_hashes_the_canonical_database_identity() {
         &backing_manifest_path,
     ))
     .expect("canonicalize verified database");
-    let expected_id = format!(
-        "sha256:{:x}",
-        Sha256::digest(canonical_db_path.to_string_lossy().as_bytes())
-    );
+    let metadata = fs::metadata(&canonical_db_path).expect("inspect canonical database");
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_db_path.to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(metadata.dev().to_le_bytes());
+    hasher.update(metadata.ino().to_le_bytes());
+    let expected_id = format!("sha256:{:x}", hasher.finalize());
 
     let summary = AssetStateStore::migrate_schema_only(&alias_manifest_path, 1, 2)
         .expect("migration through a parent alias should succeed");

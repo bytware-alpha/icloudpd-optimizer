@@ -188,7 +188,9 @@ monitor refuse v1 state with an actionable migration-required error; they never 
 implicitly. Stop the local monitor before running this command: it holds the same
 `manifest.monitor.lock` during validation and migration. That flock is local to one shared
 filesystem, so stop any cross-VM or Docker writers whose lock domain is not shared before
-migrating.
+migrating. Schema migration is supported only on Unix hosts with OS file fencing, and it
+refuses symbolic-link or hard-link state databases and lock files rather than risking an
+alias write.
 
 Verify that a RAW file is safely present under your storage root:
 

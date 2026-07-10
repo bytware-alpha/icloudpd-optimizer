@@ -984,10 +984,23 @@ impl Drop for MonitorRunGuard {
 
 fn monitor_lock_error(error: ManifestLockError) -> MonitorError {
     match error {
+        ManifestLockError::UnsupportedPlatform => MonitorError::MonitorLockUnsupported,
         ManifestLockError::Held { lock_path } => MonitorError::MonitorAlreadyRunning { lock_path },
         ManifestLockError::Symlink { path } => MonitorError::MonitorLockIo {
             path,
             source: io::Error::other("monitor lock must not be a symbolic link"),
+        },
+        ManifestLockError::NotRegular { path } => MonitorError::MonitorLockIo {
+            path,
+            source: io::Error::other("monitor lock must be a regular file"),
+        },
+        ManifestLockError::HardLink { path, .. } => MonitorError::MonitorLockIo {
+            path,
+            source: io::Error::other("monitor lock must not be hard-linked"),
+        },
+        ManifestLockError::IdentityChanged { path } => MonitorError::MonitorLockIo {
+            path,
+            source: io::Error::other("monitor lock changed after open"),
         },
         ManifestLockError::Io { path, source } => MonitorError::MonitorLockIo { path, source },
     }
@@ -7046,6 +7059,8 @@ pub enum MonitorError {
         "another icloudpd-optimizer monitor is already running for this manifest; lock held at {lock_path}"
     )]
     MonitorAlreadyRunning { lock_path: PathBuf },
+    #[error("monitor locking is unsupported on this platform")]
+    MonitorLockUnsupported,
     #[error("failed to use monitor lock {path}: {source}")]
     MonitorLockIo { path: PathBuf, source: io::Error },
     #[error("failed to read directory {path}: {source}")]
