@@ -665,7 +665,13 @@ pub fn run_monitor_once(
                 "position": "before_discovery",
             }),
         );
-        run_lifecycle_stages(config, &mut manifest, &mut summary, &active_lifecycle_ids)?;
+        run_lifecycle_stages(
+            config,
+            &state_store,
+            &mut manifest,
+            &mut summary,
+            &active_lifecycle_ids,
+        )?;
     }
 
     let new_work_skip_reason = new_monitor_work_skip_reason(
@@ -789,8 +795,14 @@ pub fn run_monitor_once(
                 &active_lifecycle_ids,
             )?;
         } else {
-            resolve_original_assets(config, &mut manifest, &mut summary, &active_lifecycle_ids)?;
-            checkpoint_manifest_for_config(config, &manifest)?;
+            resolve_original_assets(
+                config,
+                &state_store,
+                &mut manifest,
+                &mut summary,
+                &active_lifecycle_ids,
+            )?;
+            checkpoint_manifest_state(&state_store, &manifest)?;
         }
     }
 
@@ -812,7 +824,13 @@ pub fn run_monitor_once(
                     "jobs": config.jobs,
                 }),
             );
-            execute_monitor_conversions(config, &mut manifest, &mut summary, requests)?;
+            execute_monitor_conversions(
+                config,
+                &state_store,
+                &mut manifest,
+                &mut summary,
+                requests,
+            )?;
         }
 
         if config.full_lifecycle {
@@ -825,7 +843,13 @@ pub fn run_monitor_once(
                     "position": "after_conversions",
                 }),
             );
-            run_lifecycle_stages(config, &mut manifest, &mut summary, &active_lifecycle_ids)?;
+            run_lifecycle_stages(
+                config,
+                &state_store,
+                &mut manifest,
+                &mut summary,
+                &active_lifecycle_ids,
+            )?;
         }
     }
 
@@ -903,7 +927,7 @@ pub fn acquire_monitor_run_guard(config: &MonitorConfig) -> Result<MonitorRunGua
         }
     }
 
-    let owner_id = format!("pid-{}-{}", std::process::id(), Uuid::new_v4());
+    let owner_id = Uuid::new_v4().to_string();
     file.set_len(0)
         .and_then(|()| {
             write!(
@@ -1167,6 +1191,7 @@ fn raw_size_bytes_from_record(record: &AssetRecord) -> u64 {
 
 fn execute_monitor_conversions(
     config: &MonitorConfig,
+    state_store: &AssetStateStore,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     requests: Vec<ConversionExecutionRequest>,
@@ -1242,7 +1267,7 @@ fn execute_monitor_conversions(
             }
         }
 
-        checkpoint_manifest_for_config(config, manifest)?;
+        checkpoint_manifest_state(state_store, manifest)?;
     }
 
     Ok(())
@@ -1291,18 +1316,27 @@ where
 
 fn run_lifecycle_stages(
     config: &MonitorConfig,
+    state_store: &AssetStateStore,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     active_lifecycle_asset_ids: &[String],
 ) -> Result<(), MonitorError> {
     for stage in lifecycle_stage_sequence(config.auto_delete) {
-        run_lifecycle_stage(config, manifest, summary, active_lifecycle_asset_ids, stage)?;
+        run_lifecycle_stage(
+            config,
+            state_store,
+            manifest,
+            summary,
+            active_lifecycle_asset_ids,
+            stage,
+        )?;
     }
     Ok(())
 }
 
 fn run_lifecycle_stage(
     config: &MonitorConfig,
+    state_store: &AssetStateStore,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     active_lifecycle_asset_ids: &[String],
@@ -1319,19 +1353,49 @@ fn run_lifecycle_stage(
     );
     match stage {
         LifecycleStage::DeleteOriginalAssets => {
-            delete_original_assets(config, manifest, summary, active_lifecycle_asset_ids)?;
+            delete_original_assets(
+                config,
+                state_store,
+                manifest,
+                summary,
+                active_lifecycle_asset_ids,
+            )?;
         }
         LifecycleStage::RecordLocalMirrors => {
-            record_local_mirrors(config, manifest, summary, active_lifecycle_asset_ids)?;
+            record_local_mirrors(
+                config,
+                state_store,
+                manifest,
+                summary,
+                active_lifecycle_asset_ids,
+            )?;
         }
         LifecycleStage::UploadVerifiedHeics => {
-            upload_verified_heics(config, manifest, summary, active_lifecycle_asset_ids)?;
+            upload_verified_heics(
+                config,
+                state_store,
+                manifest,
+                summary,
+                active_lifecycle_asset_ids,
+            )?;
         }
         LifecycleStage::VerifyConvertedHeics => {
-            verify_converted_heics(config, manifest, summary, active_lifecycle_asset_ids)?;
+            verify_converted_heics(
+                config,
+                state_store,
+                manifest,
+                summary,
+                active_lifecycle_asset_ids,
+            )?;
         }
         LifecycleStage::ResolveOriginalAssets => {
-            resolve_original_assets(config, manifest, summary, active_lifecycle_asset_ids)?;
+            resolve_original_assets(
+                config,
+                state_store,
+                manifest,
+                summary,
+                active_lifecycle_asset_ids,
+            )?;
         }
     }
     log_monitor_event(
@@ -1468,7 +1532,13 @@ fn run_rolling_lifecycle_pass(
         return Ok(());
     }
 
-    run_rolling_lifecycle_delete_batch(config, manifest, summary, active_lifecycle_asset_ids)?;
+    run_rolling_lifecycle_delete_batch(
+        config,
+        state_store,
+        manifest,
+        summary,
+        active_lifecycle_asset_ids,
+    )?;
 
     let mut worker_asset_ids = rolling_lifecycle_worker_asset_ids(
         manifest,
@@ -1496,6 +1566,7 @@ fn run_rolling_lifecycle_pass(
         );
         resolve_rolling_lifecycle_original_assets(
             config,
+            state_store,
             manifest,
             summary,
             active_lifecycle_asset_ids,
@@ -1546,10 +1617,17 @@ fn run_rolling_lifecycle_pass(
         )?;
     }
 
-    run_rolling_lifecycle_delete_batch(config, manifest, summary, active_lifecycle_asset_ids)?;
+    run_rolling_lifecycle_delete_batch(
+        config,
+        state_store,
+        manifest,
+        summary,
+        active_lifecycle_asset_ids,
+    )?;
 
     resolve_rolling_lifecycle_original_assets(
         config,
+        state_store,
         manifest,
         summary,
         active_lifecycle_asset_ids,
@@ -1560,6 +1638,7 @@ fn run_rolling_lifecycle_pass(
 
 fn resolve_rolling_lifecycle_original_assets(
     config: &MonitorConfig,
+    state_store: &Arc<AssetStateStore>,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     active_lifecycle_asset_ids: &[String],
@@ -1585,6 +1664,7 @@ fn resolve_rolling_lifecycle_original_assets(
 
     resolve_original_asset_batches(
         config,
+        state_store,
         manifest,
         summary,
         &resolver_asset_ids,
@@ -1598,6 +1678,7 @@ fn resolve_rolling_lifecycle_original_assets(
 
 fn run_rolling_lifecycle_delete_batch(
     config: &MonitorConfig,
+    state_store: &Arc<AssetStateStore>,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     active_lifecycle_asset_ids: &[String],
@@ -1605,7 +1686,13 @@ fn run_rolling_lifecycle_delete_batch(
     if !config.auto_delete {
         return Ok(());
     }
-    delete_original_assets(config, manifest, summary, active_lifecycle_asset_ids)
+    delete_original_assets(
+        config,
+        state_store,
+        manifest,
+        summary,
+        active_lifecycle_asset_ids,
+    )
 }
 
 fn run_rolling_lifecycle_worker_pool(
@@ -3099,14 +3186,6 @@ fn checkpoint_manifest_state(
     Ok(())
 }
 
-fn checkpoint_manifest_for_config(
-    config: &MonitorConfig,
-    manifest: &Manifest,
-) -> Result<(), MonitorError> {
-    let state_store = AssetStateStore::open(&config.manifest_path)?;
-    checkpoint_manifest_state(&state_store, manifest)
-}
-
 fn shared_asset_state_name(
     manifest: &Arc<Mutex<Manifest>>,
     asset_id: &str,
@@ -3214,6 +3293,7 @@ fn lifecycle_stage_finished_fields(
 
 fn verify_converted_heics(
     config: &MonitorConfig,
+    state_store: &AssetStateStore,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     active_lifecycle_asset_ids: &[String],
@@ -3279,7 +3359,7 @@ fn verify_converted_heics(
             }
         }
         if !verified_asset_ids.is_empty() {
-            checkpoint_manifest_for_config(config, manifest)?;
+            checkpoint_manifest_state(state_store, manifest)?;
             for asset_id in verified_asset_ids {
                 log_monitor_event(
                     "heic_verify_finished",
@@ -3324,15 +3404,24 @@ fn record_heic_verification_or_failure(
 
 fn resolve_original_assets(
     config: &MonitorConfig,
+    state_store: &AssetStateStore,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     active_lifecycle_asset_ids: &[String],
 ) -> Result<(), MonitorError> {
-    resolve_original_asset_batches(config, manifest, summary, active_lifecycle_asset_ids, None)
+    resolve_original_asset_batches(
+        config,
+        state_store,
+        manifest,
+        summary,
+        active_lifecycle_asset_ids,
+        None,
+    )
 }
 
 fn resolve_original_asset_batches(
     config: &MonitorConfig,
+    state_store: &AssetStateStore,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     active_lifecycle_asset_ids: &[String],
@@ -3354,6 +3443,7 @@ fn resolve_original_asset_batches(
     if run_parallel {
         return resolve_original_asset_batches_parallel(
             config,
+            state_store,
             manifest,
             summary,
             session,
@@ -3408,7 +3498,7 @@ fn resolve_original_asset_batches(
                 let unresolved = outcome.unresolved_asset_ids.len();
                 let unresolved_asset_ids = outcome.unresolved_asset_ids.clone();
                 if record_original_asset_batch_outcome(manifest, outcome, summary)? {
-                    checkpoint_manifest_for_config(config, manifest)?;
+                    checkpoint_manifest_state(state_store, manifest)?;
                 }
                 log_monitor_event(
                     "original_asset_resolve_batch_finished",
@@ -3440,7 +3530,7 @@ fn resolve_original_asset_batches(
                         "original_asset_resolve",
                         &message,
                     )?;
-                    checkpoint_manifest_for_config(config, manifest)?;
+                    checkpoint_manifest_state(state_store, manifest)?;
                 }
                 log_monitor_event(
                     "original_asset_resolve_batch_finished",
@@ -3477,6 +3567,7 @@ struct OriginalAssetResolveBatchJobResult {
 
 fn resolve_original_asset_batches_parallel(
     config: &MonitorConfig,
+    state_store: &AssetStateStore,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     session: CloudKitDeleteSession,
@@ -3561,13 +3652,19 @@ fn resolve_original_asset_batches_parallel(
             program: "icloudpd-optimizer",
             message: "parallel original asset resolver panicked".to_string(),
         })?;
-        record_original_asset_batch_job_result(config, manifest, summary, job_result, max_batches)?;
+        record_original_asset_batch_job_result(
+            state_store,
+            manifest,
+            summary,
+            job_result,
+            max_batches,
+        )?;
     }
     Ok(())
 }
 
 fn record_original_asset_batch_job_result(
-    config: &MonitorConfig,
+    state_store: &AssetStateStore,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     job_result: OriginalAssetResolveBatchJobResult,
@@ -3580,7 +3677,7 @@ fn record_original_asset_batch_job_result(
             let unresolved = outcome.unresolved_asset_ids.len();
             let unresolved_asset_ids = outcome.unresolved_asset_ids.clone();
             if record_original_asset_batch_outcome(manifest, outcome, summary)? {
-                checkpoint_manifest_for_config(config, manifest)?;
+                checkpoint_manifest_state(state_store, manifest)?;
             }
             let mut fields = original_asset_resolve_batch_finished_fields(
                 job.asset_ids.len(),
@@ -3615,7 +3712,7 @@ fn record_original_asset_batch_job_result(
                     "original_asset_resolve",
                     &message,
                 )?;
-                checkpoint_manifest_for_config(config, manifest)?;
+                checkpoint_manifest_state(state_store, manifest)?;
             }
             let mut fields = original_asset_resolve_batch_finished_fields(
                 job.asset_ids.len(),
@@ -3681,6 +3778,7 @@ fn original_asset_resolve_batch_finished_fields(
 
 fn upload_verified_heics(
     config: &MonitorConfig,
+    state_store: &AssetStateStore,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     active_lifecycle_asset_ids: &[String],
@@ -3791,7 +3889,7 @@ fn upload_verified_heics(
             }
         }
         if !uploaded_assets.is_empty() || manifest_changed {
-            checkpoint_manifest_for_config(config, manifest)?;
+            checkpoint_manifest_state(state_store, manifest)?;
         }
         if !uploaded_assets.is_empty() {
             for (asset_id, heic_size, timings) in uploaded_assets {
@@ -4030,6 +4128,7 @@ fn run_upload_child_with_timeout(
 
 fn record_local_mirrors(
     config: &MonitorConfig,
+    state_store: &AssetStateStore,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     active_lifecycle_asset_ids: &[String],
@@ -4069,7 +4168,7 @@ fn record_local_mirrors(
             }
         }
         if !mirrored_asset_ids.is_empty() {
-            checkpoint_manifest_for_config(config, manifest)?;
+            checkpoint_manifest_state(state_store, manifest)?;
         }
         if should_stop {
             break;
@@ -4288,6 +4387,7 @@ fn command_output_message(output: &Output) -> String {
 
 fn delete_original_assets(
     config: &MonitorConfig,
+    state_store: &AssetStateStore,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     active_lifecycle_asset_ids: &[String],
@@ -4298,6 +4398,7 @@ fn delete_original_assets(
     let mut client = CloudKitDeleteClient::new(transport);
     delete_original_assets_with_client(
         config,
+        state_store,
         manifest,
         summary,
         active_lifecycle_asset_ids,
@@ -4396,6 +4497,7 @@ struct DeletePreparationOutcome {
 
 fn delete_original_assets_with_client<T: CloudKitDeleteTransport>(
     config: &MonitorConfig,
+    state_store: &AssetStateStore,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     active_lifecycle_asset_ids: &[String],
@@ -4403,7 +4505,6 @@ fn delete_original_assets_with_client<T: CloudKitDeleteTransport>(
     client: &mut CloudKitDeleteClient<T>,
 ) -> Result<(), MonitorError> {
     let total_started = Instant::now();
-    let state_store = AssetStateStore::open(&config.manifest_path)?;
     let asset_ids = delete_lifecycle_asset_ids(manifest, config, active_lifecycle_asset_ids);
     if asset_ids.is_empty() {
         return Ok(());
@@ -4426,7 +4527,7 @@ fn delete_original_assets_with_client<T: CloudKitDeleteTransport>(
 
     for (window_index, window_asset_ids) in asset_ids.chunks(window_size).enumerate() {
         let reconciliation = reconcile_delete_window(
-            &state_store,
+            state_store,
             manifest,
             summary,
             window_asset_ids,
@@ -4446,7 +4547,7 @@ fn delete_original_assets_with_client<T: CloudKitDeleteTransport>(
 
         let preparation = process_delete_preparation_window(
             config,
-            &state_store,
+            state_store,
             manifest,
             summary,
             &reconciliation.remaining_asset_ids,
@@ -4490,7 +4591,7 @@ fn delete_original_assets_with_client<T: CloudKitDeleteTransport>(
                 continue;
             }
             let commit = match stage_and_commit_confirmed_deletes(
-                &state_store,
+                state_store,
                 manifest,
                 summary.started_unix_seconds,
                 submission.confirmed,
@@ -8266,9 +8367,12 @@ mod tests {
             started_unix_seconds: 1,
             ..MonitorScanSummary::default()
         };
+        let state_store =
+            Arc::new(AssetStateStore::open_read_only(&config.manifest_path).expect("state store"));
 
         run_rolling_lifecycle_delete_batch(
             &config,
+            &state_store,
             &mut manifest,
             &mut summary,
             &["asset-a".to_string()],
@@ -8319,7 +8423,12 @@ mod tests {
             started_unix_seconds: 1,
             ..MonitorScanSummary::default()
         };
-        let store = AssetStateStore::open(&config.manifest_path).expect("state store should open");
+        let store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
 
         let uploaded = record_rolling_asset_upload_proof(
             &store,
@@ -8345,7 +8454,9 @@ mod tests {
     fn rolling_state_commit_failure_restores_the_previous_in_memory_record() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let manifest_path = tempdir.path().join("manifest.json");
-        let store = AssetStateStore::open(&manifest_path).expect("state store should open");
+        let store =
+            AssetStateStore::open_writer(&manifest_path, "test-writer", Duration::from_secs(60))
+                .expect("state store should open");
         let mut manifest = Manifest::new();
         manifest.upsert(AssetRecord::new("asset-a", "/photos/asset-a.dng"));
         store
@@ -8456,7 +8567,12 @@ mod tests {
             icloudpd_download_path: mirror_root.join("asset-a.HEIC"),
         })
         .expect("local mirror proof should be produced");
-        let store = AssetStateStore::open(&config.manifest_path).expect("state store should open");
+        let store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
 
         record_rolling_asset_local_mirror_proof(
             &store,
@@ -8786,7 +8902,12 @@ mod tests {
         manifest
             .save_atomic(&config.manifest_path)
             .expect("manifest should save");
-        let state_store = AssetStateStore::open(&config.manifest_path).expect("state store");
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store");
         state_store.load_or_import().expect("import initial state");
         let session = test_delete_session();
         let mut transport = FakeDeleteTransport {
@@ -8816,6 +8937,7 @@ mod tests {
 
         delete_original_assets_with_client(
             &config,
+            &state_store,
             &mut manifest,
             &mut summary,
             &active,
@@ -8868,7 +8990,12 @@ mod tests {
         manifest
             .save_atomic(&config.manifest_path)
             .expect("manifest should save");
-        let state_store = AssetStateStore::open(&config.manifest_path).expect("state store");
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store");
         state_store.load_or_import().expect("import initial state");
         let mut transport = RemoveRawBeforeDeleteResponseTransport {
             raw_path: raw_path.clone(),
@@ -8891,6 +9018,7 @@ mod tests {
 
         delete_original_assets_with_client(
             &config,
+            &state_store,
             &mut manifest,
             &mut summary,
             &active,
@@ -8949,7 +9077,12 @@ mod tests {
         let _ = prepare_delete_item("batch-test", &mut manifest, "asset-a")
             .expect("approval should succeed");
         manifest.save_atomic(&config.manifest_path).unwrap();
-        let state_store = AssetStateStore::open(&config.manifest_path).unwrap();
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .unwrap();
         state_store.load_or_import().unwrap();
         fs::remove_file(&raw_path).expect("crash recovery must not require RAW access");
         let mut transport = LookupThenModifyTransport {
@@ -8971,6 +9104,7 @@ mod tests {
 
         delete_original_assets_with_client(
             &config,
+            &state_store,
             &mut manifest,
             &mut summary,
             &["asset-a".to_string()],
@@ -9003,7 +9137,12 @@ mod tests {
         let _ = prepare_delete_item("batch-test", &mut manifest, "asset-a")
             .expect("approval should succeed");
         manifest.save_atomic(&config.manifest_path).unwrap();
-        let state_store = AssetStateStore::open(&config.manifest_path).unwrap();
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .unwrap();
         state_store.load_or_import().unwrap();
         let mut transport = LookupThenModifyTransport {
             modify_payloads: Vec::new(),
@@ -9028,6 +9167,7 @@ mod tests {
 
         delete_original_assets_with_client(
             &config,
+            &state_store,
             &mut manifest,
             &mut summary,
             &["asset-a".to_string()],
@@ -9058,7 +9198,12 @@ mod tests {
         ));
         let _ = prepare_delete_item("batch-test", &mut manifest, "asset-a").unwrap();
         manifest.save_atomic(&config.manifest_path).unwrap();
-        let state_store = AssetStateStore::open(&config.manifest_path).unwrap();
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .unwrap();
         state_store.load_or_import().unwrap();
         let mut transport = LookupThenModifyTransport {
             modify_payloads: Vec::new(),
@@ -9078,6 +9223,7 @@ mod tests {
 
         delete_original_assets_with_client(
             &config,
+            &state_store,
             &mut manifest,
             &mut summary,
             &["asset-a".to_string()],
@@ -9111,7 +9257,12 @@ mod tests {
             &config.download_root,
         ));
         manifest.save_atomic(&config.manifest_path).unwrap();
-        let state_store = AssetStateStore::open(&config.manifest_path).unwrap();
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .unwrap();
         state_store.load_or_import().unwrap();
         let mut newer_unrelated = manifest.get("asset-b").unwrap().clone();
         newer_unrelated.updated_at = "9999999999.000000000Z".to_string();
@@ -9266,7 +9417,12 @@ mod tests {
         ));
         let (prepared, _) = prepare_delete_item("batch-test", &mut manifest, "asset-a").unwrap();
         let unrelated_before = manifest.get("asset-b").unwrap().clone();
-        let state_store = AssetStateStore::open(tempdir.path().join("manifest.json")).unwrap();
+        let state_store = AssetStateStore::open_writer(
+            tempdir.path().join("manifest.json"),
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .unwrap();
         state_store.persist_manifest_records(&manifest).unwrap();
 
         let totals = stage_and_commit_confirmed_deletes(
@@ -9404,7 +9560,12 @@ mod tests {
         manifest
             .save_atomic(&config.manifest_path)
             .expect("manifest should save");
-        let state_store = AssetStateStore::open(&config.manifest_path).expect("state store");
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store");
         state_store.load_or_import().expect("import initial state");
         let mut transport = AmbiguousDeleteTransport {
             payloads: Vec::new(),
@@ -9428,6 +9589,7 @@ mod tests {
 
         delete_original_assets_with_client(
             &config,
+            &state_store,
             &mut manifest,
             &mut summary,
             &active,
@@ -9480,7 +9642,12 @@ mod tests {
             manifest
                 .save_atomic(&config.manifest_path)
                 .expect("manifest should save");
-            let state_store = AssetStateStore::open(&config.manifest_path).expect("state store");
+            let state_store = AssetStateStore::open_writer(
+                &config.manifest_path,
+                "test-writer",
+                Duration::from_secs(60),
+            )
+            .expect("state store");
             state_store.load_or_import().expect("import initial state");
             let mut transport = AmbiguousDeleteTransport {
                 payloads: Vec::new(),
@@ -9497,6 +9664,7 @@ mod tests {
 
             delete_original_assets_with_client(
                 &config,
+                &state_store,
                 &mut manifest,
                 &mut summary,
                 &active,
@@ -9541,7 +9709,12 @@ mod tests {
         manifest
             .save_atomic(&config.manifest_path)
             .expect("manifest should save");
-        let state_store = AssetStateStore::open(&config.manifest_path).expect("state store");
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store");
         state_store.load_or_import().expect("import initial state");
         let mut transport = PersistConflictAfterModifyTransport {
             state_store: state_store.clone(),
@@ -9572,6 +9745,7 @@ mod tests {
 
         let error = delete_original_assets_with_client(
             &config,
+            &state_store,
             &mut manifest,
             &mut summary,
             &active,
@@ -9788,6 +9962,13 @@ mod tests {
         manifest
             .save_atomic(&config.manifest_path)
             .expect("manifest should save");
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store");
+        state_store.load_or_import().expect("import initial state");
         let responses = active
             .chunks(200)
             .map(|chunk| {
@@ -9817,6 +9998,7 @@ mod tests {
 
         delete_original_assets_with_client(
             &config,
+            &state_store,
             &mut manifest,
             &mut summary,
             &active,
@@ -9869,6 +10051,13 @@ mod tests {
         manifest
             .save_atomic(&config.manifest_path)
             .expect("manifest should save");
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store");
+        state_store.load_or_import().expect("import initial state");
         let session = test_delete_session();
         let mut transport = FakeDeleteTransport {
             payloads: Vec::new(),
@@ -9899,6 +10088,7 @@ mod tests {
 
         delete_original_assets_with_client(
             &config,
+            &state_store,
             &mut manifest,
             &mut summary,
             &active,
@@ -9941,6 +10131,13 @@ mod tests {
         manifest
             .save_atomic(&config.manifest_path)
             .expect("manifest should save");
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store");
+        state_store.load_or_import().expect("import initial state");
         let session = test_delete_session();
         let mut transport = AmbiguousDeleteTransport {
             payloads: Vec::new(),
@@ -9956,6 +10153,7 @@ mod tests {
 
         delete_original_assets_with_client(
             &config,
+            &state_store,
             &mut manifest,
             &mut summary,
             &active,
@@ -11042,7 +11240,9 @@ mod tests {
     fn original_asset_resolver_retry_persists_through_strict_store() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let manifest_path = tempdir.path().join("manifest.json");
-        let store = AssetStateStore::open(&manifest_path).expect("state store should open");
+        let store =
+            AssetStateStore::open_writer(&manifest_path, "test-writer", Duration::from_secs(60))
+                .expect("state store should open");
         let mut manifest = Manifest::new();
         manifest.upsert(failed_original_asset_resolve_record(
             "resolver-retry",
@@ -11204,7 +11404,9 @@ mod tests {
     fn retryable_failed_asset_recovery_commits_newer_state_to_strict_store() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let manifest_path = tempdir.path().join("manifest.json");
-        let store = AssetStateStore::open(&manifest_path).expect("state store should open");
+        let store =
+            AssetStateStore::open_writer(&manifest_path, "test-writer", Duration::from_secs(60))
+                .expect("state store should open");
         let mut manifest = Manifest::new();
         let mut failed = retryable_failed_conversion_record(
             "conversion-timeout",
@@ -11924,7 +12126,9 @@ mod tests {
     fn retryable_upload_conflict_recovery_commits_newer_state_to_strict_store() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let manifest_path = tempdir.path().join("manifest.json");
-        let store = AssetStateStore::open(&manifest_path).expect("state store should open");
+        let store =
+            AssetStateStore::open_writer(&manifest_path, "test-writer", Duration::from_secs(60))
+                .expect("state store should open");
         let mut manifest = Manifest::new();
         let mut recoverable = lifecycle_record("recoverable", State::Failed);
         recoverable.updated_at = "100.000000000Z".to_string();
@@ -12483,6 +12687,27 @@ mod tests {
         drop(first);
 
         acquire_monitor_run_guard(&config).expect("lock should release when owner drops");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn monitor_run_guard_drop_releases_state_writer_lease() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("state/manifest.json"),
+            tempdir.path().join("heic"),
+        );
+
+        {
+            let mut guard = acquire_monitor_run_guard(&config).expect("first guard should lock");
+            guard
+                .state_store(&config.manifest_path)
+                .expect("guard should own state writer");
+        }
+
+        AssetStateStore::open_writer(&config.manifest_path, "writer-b", Duration::from_secs(1))
+            .expect("dropping the guard should release the sqlite writer lease");
     }
 
     #[cfg(unix)]

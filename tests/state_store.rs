@@ -21,6 +21,19 @@ fn open_writer(manifest_path: &std::path::Path, owner: &str) -> AssetStateStore 
         .expect("open writer store")
 }
 
+fn lease_row(manifest_path: &std::path::Path) -> (String, i64, i64) {
+    let connection =
+        rusqlite::Connection::open(AssetStateStore::db_path_for_manifest(manifest_path))
+            .expect("open state db");
+    connection
+        .query_row(
+            "SELECT owner_id, epoch, expires_at_unix_ms FROM writer_lease WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("load lease row")
+}
+
 #[test]
 fn imports_json_once_and_reopens_durable_record_updates() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -40,9 +53,9 @@ fn imports_json_once_and_reopens_durable_record_updates() {
         .release_writer_lease()
         .expect("release first writer before reopening");
 
-    let reopened = AssetStateStore::open(&manifest_path)
+    let reopened = AssetStateStore::open_read_only(&manifest_path)
         .expect("reopen store")
-        .load_or_import()
+        .load()
         .expect("reload store");
     assert_eq!(
         reopened.get("asset-1").expect("asset").state,
@@ -141,6 +154,43 @@ fn read_only_loads_work_while_writer_lease_is_held() {
 }
 
 #[test]
+fn read_only_store_rejects_every_mutator() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("manifest.json");
+    manifest_with_record("asset-1")
+        .save_atomic(&manifest_path)
+        .expect("save json");
+    open_writer(&manifest_path, "writer-a")
+        .load_or_import()
+        .expect("initial import");
+
+    let reader = AssetStateStore::open_read_only(&manifest_path).expect("open reader");
+    let mut manifest = Manifest::new();
+    manifest.upsert(AssetRecord::new("asset-2", "/photos/asset-2.dng"));
+    let record = AssetRecord::new("asset-3", "/photos/asset-3.dng");
+
+    for error in [
+        reader
+            .load_or_import()
+            .expect_err("import must require writer"),
+        reader
+            .persist_record(&record)
+            .expect_err("single-record persist must require writer"),
+        reader
+            .persist_records_atomic([&record])
+            .expect_err("batch persist must require writer"),
+        reader
+            .persist_manifest_records(&manifest)
+            .expect_err("manifest persist must require writer"),
+        reader
+            .export_json()
+            .expect_err("export must require writer"),
+    ] {
+        assert!(matches!(error, AssetStateStoreError::WriterLeaseRequired));
+    }
+}
+
+#[test]
 fn live_foreign_writer_is_rejected_and_release_allows_reacquire() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let manifest_path = tempdir.path().join("manifest.json");
@@ -158,6 +208,48 @@ fn live_foreign_writer_is_rejected_and_release_allows_reacquire() {
         .expect("writer should release cleanly");
     AssetStateStore::open_writer(&manifest_path, "writer-b", Duration::from_secs(5))
         .expect("new owner should acquire after release");
+}
+
+#[test]
+fn same_owner_renewal_never_shortens_existing_expiry() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let first = AssetStateStore::open_writer(&manifest_path, "writer-a", Duration::from_secs(5))
+        .expect("first writer");
+    let (_, first_epoch, first_expiry) = lease_row(&manifest_path);
+
+    let renewal =
+        AssetStateStore::open_writer(&manifest_path, "writer-a", Duration::from_millis(1))
+            .expect("same owner renewal should succeed");
+    let (_, second_epoch, second_expiry) = lease_row(&manifest_path);
+    assert_eq!(second_epoch, first_epoch);
+    assert!(
+        second_expiry >= first_expiry,
+        "same-owner reopen must not shorten the lease"
+    );
+
+    renewal.renew_writer_lease().expect("renew same owner");
+    let (_, renewed_epoch, renewed_expiry) = lease_row(&manifest_path);
+    assert_eq!(renewed_epoch, first_epoch);
+    assert!(
+        renewed_expiry >= second_expiry,
+        "same-owner renew must not shorten the lease"
+    );
+
+    first.release_writer_lease().expect("release lease");
+}
+
+#[test]
+fn writer_drop_releases_sqlite_lease() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("manifest.json");
+    {
+        let writer = open_writer(&manifest_path, "writer-a");
+        writer.load_or_import().expect("import");
+    }
+
+    AssetStateStore::open_writer(&manifest_path, "writer-b", Duration::from_secs(1))
+        .expect("writer drop should release the sqlite lease");
 }
 
 #[test]
@@ -185,6 +277,59 @@ fn expired_takeover_increments_epoch_and_fences_stale_writer() {
         AssetStateStoreError::WriterLeaseFenced { owner_id, epoch, .. }
             if owner_id == "writer-a" && epoch == first_epoch
     ));
+}
+
+#[test]
+fn failed_v1_to_v2_migration_rolls_back_without_partial_v2_tables() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             BEGIN IMMEDIATE;
+             CREATE TABLE assets (
+               asset_id TEXT PRIMARY KEY NOT NULL,
+               state TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               record_json TEXT NOT NULL
+             );
+             CREATE INDEX assets_state_index ON assets(state);
+             CREATE VIEW json_import_metadata AS SELECT 1 AS singleton;
+             PRAGMA user_version = 1;
+             COMMIT;",
+        )
+        .expect("create v1 schema plus conflicting view");
+
+    let error = AssetStateStore::open_read_only(&manifest_path)
+        .expect_err("migration conflict should fail closed");
+    assert!(matches!(error, AssetStateStoreError::Database(_)));
+
+    let connection = rusqlite::Connection::open(&db_path).expect("reopen sqlite");
+    let version: i32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("read schema version");
+    assert_eq!(version, 1);
+
+    let writer_lease_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'writer_lease'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count writer_lease tables");
+    assert_eq!(writer_lease_count, 0);
+
+    let json_import_view_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'view' AND name = 'json_import_metadata'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count json_import_metadata views");
+    assert_eq!(json_import_view_count, 1);
 }
 
 #[test]
@@ -257,7 +402,7 @@ fn corrupt_database_and_record_payload_fail_closed() {
     assert!(AssetStateStore::open(&manifest_path).is_err());
 
     fs::remove_file(&db_path).expect("remove corrupt db");
-    let store = AssetStateStore::open(&manifest_path).expect("open clean db");
+    let store = open_writer(&manifest_path, "writer-a");
     store
         .persist_record(&AssetRecord::new("asset-1", "/photos/asset-1.dng"))
         .expect("persist record");
@@ -275,7 +420,7 @@ fn corrupt_database_and_record_payload_fail_closed() {
 fn stale_record_updates_and_unknown_schema_fail_closed() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let manifest_path = tempdir.path().join("manifest.json");
-    let store = AssetStateStore::open(&manifest_path).expect("open store");
+    let store = open_writer(&manifest_path, "writer-a");
     let mut current = AssetRecord::new("asset-1", "/photos/asset-1.dng");
     current.updated_at = "200.000000000Z".to_string();
     store
@@ -307,7 +452,7 @@ fn stale_record_updates_and_unknown_schema_fail_closed() {
 fn authoritative_manifest_save_rejects_stale_records_but_allows_idempotent_records() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let manifest_path = tempdir.path().join("manifest.json");
-    let store = AssetStateStore::open(&manifest_path).expect("open store");
+    let store = open_writer(&manifest_path, "writer-a");
     let mut current = AssetRecord::new("asset-1", "/photos/asset-1.dng");
     current.state = State::NasVerified;
     current.updated_at = "200.000000000Z".to_string();
@@ -333,7 +478,7 @@ fn authoritative_manifest_save_rejects_stale_records_but_allows_idempotent_recor
 fn direct_database_load_does_not_reimport_json_checkpoint() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let manifest_path = tempdir.path().join("manifest.json");
-    let store = AssetStateStore::open(&manifest_path).expect("open store");
+    let store = open_writer(&manifest_path, "writer-a");
     let mut durable = AssetRecord::new("asset-1", "/photos/asset-1.dng");
     durable.state = State::NasVerified;
     durable.updated_at = "200.000000000Z".to_string();
@@ -386,7 +531,7 @@ fn single_record_snapshot_contains_only_the_requested_asset() {
 fn atomic_record_batch_persists_every_record() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let manifest_path = tempdir.path().join("manifest.json");
-    let store = AssetStateStore::open(&manifest_path).expect("open store");
+    let store = open_writer(&manifest_path, "writer-a");
     let mut first = AssetRecord::new("asset-1", "/photos/asset-1.dng");
     first.state = State::NasVerified;
     first.updated_at = "200.000000000Z".to_string();
@@ -416,7 +561,7 @@ fn stale_or_conflicting_batch_member_rolls_back_every_update() {
     ] {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let manifest_path = tempdir.path().join(format!("manifest-{case}.json"));
-        let store = AssetStateStore::open(&manifest_path).expect("open store");
+        let store = open_writer(&manifest_path, "writer-a");
         let mut durable_first = AssetRecord::new("asset-1", "/photos/asset-1.dng");
         durable_first.updated_at = "100.000000000Z".to_string();
         let mut durable_second = AssetRecord::new("asset-2", "/photos/asset-2.dng");
@@ -471,7 +616,7 @@ fn stale_or_conflicting_batch_member_rolls_back_every_update() {
 fn atomic_record_batch_validates_only_requested_asset_ids() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let manifest_path = tempdir.path().join("manifest.json");
-    let store = AssetStateStore::open(&manifest_path).expect("open store");
+    let store = open_writer(&manifest_path, "writer-a");
     let mut requested = AssetRecord::new("requested", "/photos/requested.dng");
     requested.updated_at = "100.000000000Z".to_string();
     let unrelated = AssetRecord::new("unrelated", "/photos/unrelated.dng");
@@ -518,7 +663,7 @@ fn atomic_record_batch_validates_only_requested_asset_ids() {
 fn atomic_record_batch_rejects_duplicate_asset_ids_without_writes() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let manifest_path = tempdir.path().join("manifest.json");
-    let store = AssetStateStore::open(&manifest_path).expect("open store");
+    let store = open_writer(&manifest_path, "writer-a");
     let first = AssetRecord::new("asset-1", "/photos/asset-1.dng");
     let mut duplicate = first.clone();
     duplicate.state = State::Failed;
@@ -539,7 +684,7 @@ fn atomic_record_batch_rejects_duplicate_asset_ids_without_writes() {
 fn atomic_record_batch_accepts_idempotent_records() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let manifest_path = tempdir.path().join("manifest.json");
-    let store = AssetStateStore::open(&manifest_path).expect("open store");
+    let store = open_writer(&manifest_path, "writer-a");
     let mut first = AssetRecord::new("asset-1", "/photos/asset-1.dng");
     first.state = State::NasVerified;
     first.updated_at = "200.000000000Z".to_string();

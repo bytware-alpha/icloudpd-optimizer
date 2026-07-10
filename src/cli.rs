@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::conversion_backend::{
     TargetPlatform, current_backend_report, required_tools_for_target,
@@ -2222,7 +2223,7 @@ fn workflow_delete_execute(args: WorkflowDeleteExecuteArgs) -> Result<(), CliErr
 
 fn load_manifest_for_write(path: &Path) -> Result<Manifest, CliError> {
     if AssetStateStore::db_path_for_manifest(path).exists() {
-        return Ok(AssetStateStore::open(path)?.load()?);
+        return Ok(AssetStateStore::open_read_only(path)?.load()?);
     }
     match Manifest::load(path) {
         Ok(manifest) => Ok(manifest),
@@ -2236,7 +2237,7 @@ fn load_manifest_for_write(path: &Path) -> Result<Manifest, CliError> {
 
 fn load_existing_manifest(path: &Path) -> Result<Manifest, CliError> {
     if AssetStateStore::db_path_for_manifest(path).exists() {
-        return Ok(AssetStateStore::open(path)?.load()?);
+        return Ok(AssetStateStore::open_read_only(path)?.load()?);
     }
     Manifest::load(path).map_err(|source| CliError::LoadManifest {
         path: path.to_path_buf(),
@@ -2323,7 +2324,11 @@ fn decode_workflow_proof<T: serde::de::DeserializeOwned>(
 
 fn save_manifest(manifest: &Manifest, path: &Path) -> Result<(), CliError> {
     if AssetStateStore::db_path_for_manifest(path).exists() {
-        let store = AssetStateStore::open(path)?;
+        let store = AssetStateStore::open_writer(
+            path,
+            Uuid::new_v4().to_string(),
+            Duration::from_secs(60),
+        )?;
         store.persist_manifest_records(manifest)?;
         store.export_json()?;
         return Ok(());
