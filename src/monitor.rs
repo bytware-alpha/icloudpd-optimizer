@@ -711,7 +711,9 @@ pub fn run_monitor_once(
                     | Some(State::DeleteEligible)
                     | Some(State::DeleteApproved)
                     | Some(State::Deleted)
-                    | Some(State::Failed) => {
+                    | Some(State::Failed)
+                    | Some(State::NoAction)
+                    | Some(State::NeedsReview) => {
                         summary.skipped_known = summary.skipped_known.saturating_add(1);
                         return Ok(VisitDecision::Continue);
                     }

@@ -1996,10 +1996,11 @@ fn require_proof<'a>(
 }
 
 fn source_age_proof_is_frozen(state: State) -> bool {
-    matches!(
-        state,
-        State::DeleteEligible | State::DeleteApproved | State::Deleted | State::Failed
-    )
+    state.is_terminal()
+        || matches!(
+            state,
+            State::DeleteEligible | State::DeleteApproved | State::Failed
+        )
 }
 
 fn stored_proof<T: DeserializeOwned>(

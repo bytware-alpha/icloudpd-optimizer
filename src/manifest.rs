@@ -21,6 +21,8 @@ pub enum State {
     DeleteApproved,
     Deleted,
     Failed,
+    NoAction,
+    NeedsReview,
 }
 
 impl State {
@@ -48,7 +50,13 @@ impl State {
             Self::DeleteApproved => "delete_approved",
             Self::Deleted => "deleted",
             Self::Failed => "failed",
+            Self::NoAction => "no_action",
+            Self::NeedsReview => "needs_review",
         }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Deleted | Self::NoAction | Self::NeedsReview)
     }
 }
 
@@ -165,6 +173,14 @@ impl Manifest {
         stage: impl Into<String>,
         message: impl Into<String>,
     ) -> Result<&AssetRecord, ManifestError> {
+        let current_state = self.get(asset_id)?.state;
+        if current_state.is_terminal() {
+            return Err(ManifestError::InvalidTransition {
+                asset_id: asset_id.to_string(),
+                from: current_state,
+                to: State::Failed,
+            });
+        }
         let recorded_at = current_timestamp();
         let record = self
             .records
@@ -210,6 +226,31 @@ impl Manifest {
                 asset_id: asset_id.to_string(),
             })?;
         record.state = retry_state;
+        record.updated_at = updated_at;
+        Ok(record)
+    }
+
+    pub(crate) fn apply_original_asset_resolution_update(
+        &mut self,
+        asset_id: &str,
+        new_state: State,
+        original_asset_proof: Option<Value>,
+        resolution_proof: Value,
+    ) -> Result<&AssetRecord, ManifestError> {
+        let updated_at = current_timestamp();
+        let record = self
+            .records
+            .get_mut(asset_id)
+            .ok_or_else(|| ManifestError::UnknownAsset {
+                asset_id: asset_id.to_string(),
+            })?;
+        record.state = new_state;
+        if let Some(proof) = original_asset_proof {
+            record.proofs.insert("original_asset".to_string(), proof);
+        }
+        record
+            .proofs
+            .insert("original_asset_resolution".to_string(), resolution_proof);
         record.updated_at = updated_at;
         Ok(record)
     }
@@ -373,6 +414,36 @@ fn timestamp_nanos() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconciliation_terminal_states_are_serialized_and_cannot_enter_lifecycle() {
+        let mut manifest = Manifest::new();
+        for (asset_id, state, serialized) in [
+            ("no-action", State::NoAction, "no_action"),
+            ("needs-review", State::NeedsReview, "needs_review"),
+        ] {
+            assert_eq!(state.as_str(), serialized);
+            assert!(state.is_terminal());
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{serialized}\"")
+            );
+
+            let mut record = AssetRecord::new(asset_id, format!("/raw/{asset_id}.dng"));
+            record.state = state;
+            manifest.upsert(record);
+            assert!(matches!(
+                manifest.transition(asset_id, State::NasVerified, "test", serde_json::json!({})),
+                Err(ManifestError::InvalidTransition { .. })
+            ));
+            let before = manifest.get(asset_id).unwrap().clone();
+            assert!(matches!(
+                manifest.record_failure(asset_id, "test", "terminal records are immutable"),
+                Err(ManifestError::InvalidTransition { .. })
+            ));
+            assert_eq!(manifest.get(asset_id).unwrap(), &before);
+        }
+    }
 
     #[test]
     fn recover_failed_for_retry_only_allows_failed_assets_to_retry_states() {

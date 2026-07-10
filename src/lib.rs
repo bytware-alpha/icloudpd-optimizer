@@ -8,6 +8,7 @@ pub mod manifest_lock;
 pub mod metrics;
 pub mod monitor;
 pub mod proof;
+pub mod reconciliation;
 pub mod service;
 pub mod state_store;
 pub mod upload;

@@ -1193,7 +1193,7 @@ impl<T: CloudKitOriginalAssetReadTransport> CloudKitDeleteClient<T> {
     }
 }
 
-const CLOUDKIT_ORIGINAL_ASSET_RESOLVER_VERSION: &str = "cloudkit-original-asset-reconcile-v1";
+pub const CLOUDKIT_ORIGINAL_ASSET_RESOLVER_VERSION: &str = "cloudkit-original-asset-reconcile-v1";
 
 fn build_batch_resolve_outcome(
     request: &CloudKitOriginalAssetBatchResolveRequest,
