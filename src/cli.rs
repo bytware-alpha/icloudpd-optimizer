@@ -1483,18 +1483,21 @@ fn original_assets_audit_replacement_candidate(
     if !canonical_candidate.starts_with(canonical_library_root) || !canonical_candidate.is_file() {
         return None;
     }
-    let size_bytes = canonical_candidate.metadata().ok()?.len();
-    if size_bytes == 0 {
-        return None;
-    }
-    Some(CloudKitLocalReplacementCandidate {
-        sha256: sha256_file(&canonical_candidate).ok()?,
-        size_bytes,
-    })
+    let candidate = hash_stable_file(&canonical_candidate).ok()?;
+    (candidate.size_bytes > 0).then_some(candidate)
 }
 
-fn sha256_file(path: &Path) -> io::Result<String> {
+fn hash_stable_file(path: &Path) -> io::Result<CloudKitLocalReplacementCandidate> {
+    hash_stable_file_with_before_hash(path, || {})
+}
+
+fn hash_stable_file_with_before_hash(
+    path: &Path,
+    before_hash: impl FnOnce(),
+) -> io::Result<CloudKitLocalReplacementCandidate> {
     let mut file = File::open(path)?;
+    let before = file.metadata()?;
+    before_hash();
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
@@ -1504,7 +1507,17 @@ fn sha256_file(path: &Path) -> io::Result<String> {
         }
         hasher.update(&buffer[..bytes_read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    let after = file.metadata()?;
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "local replacement changed while hashing",
+        ));
+    }
+    Ok(CloudKitLocalReplacementCandidate {
+        sha256: format!("{:x}", hasher.finalize()),
+        size_bytes: after.len(),
+    })
 }
 
 fn redact_audit_resolutions(
@@ -2964,5 +2977,20 @@ mod original_assets_audit_tests {
         assert!(summary.contains("no_raw_resource=1"));
         assert!(summary.contains("private:PrimarySync=7ms"));
         assert!(summary.contains("elapsed_ms=11"));
+    }
+
+    #[test]
+    fn replacement_candidate_hash_rejects_a_file_changed_after_handle_open() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let replacement = tempdir.path().join("asset.HEIC");
+        fs::write(&replacement, b"replacement").expect("replacement should save");
+
+        let error = hash_stable_file_with_before_hash(&replacement, || {
+            fs::write(&replacement, b"replacement changed")
+                .expect("replacement mutation should succeed");
+        })
+        .expect_err("changed replacement bytes must not produce an exact local candidate");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }

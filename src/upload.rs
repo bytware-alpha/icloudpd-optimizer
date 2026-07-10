@@ -309,6 +309,7 @@ pub struct CloudKitOriginalAssetResolution {
 pub struct CloudKitOriginalAssetInventoryFingerprint {
     pub resolver_version: String,
     pub sha256: String,
+    /// Unique normalized CPLAsset inventory identities scanned in the proven date window.
     pub records_scanned: u64,
 }
 
@@ -943,17 +944,9 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
     ) -> Result<CloudKitOriginalAssetBatchResolveOutcome, UploadError> {
         validate_original_asset_batch_resolve_request(request)?;
         validate_original_asset_batch_pagination_range(request)?;
-        let mut resolutions: BTreeMap<String, OriginalAssetResolutionWork> = request
-            .targets
-            .iter()
-            .map(|target| {
-                (
-                    target.asset_id.clone(),
-                    OriginalAssetResolutionWork::default(),
-                )
-            })
-            .collect();
         let target_index = OriginalAssetTargetIndex::new(&request.targets);
+        let mut cohort_work =
+            vec![OriginalAssetCohortResolutionWork::default(); target_index.cohort_count()];
         let target_window = target_index.date_window();
         let mut download_cache: BTreeMap<(String, u64), CachedCloudKitResourceDownload> =
             BTreeMap::new();
@@ -972,24 +965,22 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
                     &session.zone,
                 );
                 let response = self.transport.post_records_query(session, payload)?;
-                parse_original_asset_batch_query_response(
-                    response,
-                    &request.targets,
-                    &target_index,
-                    &session.zone,
-                )
+                parse_original_asset_batch_query_response(response, &target_index, &session.zone)
             },
         ) {
             Ok(result) => result,
             Err(UploadError::OriginalAssetResolveIncomplete { .. }) => {
                 return Ok(build_batch_resolve_outcome(
                     request,
-                    resolutions,
+                    &target_index,
                     &target_window,
                     &session.zone,
-                    inventory_records,
-                    false,
-                    true,
+                    OriginalAssetBatchResolveScanEvidence {
+                        cohort_work,
+                        inventory_records,
+                        complete: false,
+                        force_transient: true,
+                    },
                 ));
             }
             Err(error) => return Err(error),
@@ -1016,27 +1007,42 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
             let continuation_marker = positioned_page.page.continuation_marker.clone();
             inventory_records.extend(positioned_page.page.inventory_records.iter().cloned());
             for increment in &positioned_page.page.observation_increments {
-                let resolution = resolutions.get_mut(&increment.asset_id).ok_or(
+                let work = cohort_work.get_mut(increment.cohort_index).ok_or(
                     UploadError::InvalidCloudKitOriginalAssetResponse(
-                        "records/query observed an unknown batch target",
+                        "records/query observed an unknown target cohort",
                     ),
                 )?;
-                resolution.observations.add(increment);
+                work.observations.date_candidates = work
+                    .observations
+                    .date_candidates
+                    .saturating_add(increment.date_candidates);
+                work.observations.raw_resources = work
+                    .observations
+                    .raw_resources
+                    .saturating_add(increment.raw_resources);
+                for (size_bytes, matches) in &increment.raw_size_matches {
+                    *work.raw_size_matches.entry(*size_bytes).or_default() = work
+                        .raw_size_matches
+                        .get(size_bytes)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(*matches);
+                }
             }
             for candidate in positioned_page.page.matches {
                 let cache_key = (
-                    candidate.download_url.as_str().to_string(),
-                    candidate.resource_size_bytes,
+                    candidate.resource.download_url.as_str().to_string(),
+                    candidate.resource.size_bytes,
                 );
                 let download = if let Some(download) = download_cache.get(&cache_key) {
                     download.clone()
                 } else {
                     let download = match self.transport.download_resource(
                         session,
-                        &candidate.download_url,
-                        candidate.resource_size_bytes,
+                        &candidate.resource.download_url,
+                        candidate.resource.size_bytes,
                     ) {
-                        Ok(download) if download.size_bytes == candidate.resource_size_bytes => {
+                        Ok(download) if download.size_bytes == candidate.resource.size_bytes => {
                             CachedCloudKitResourceDownload::Downloaded(download)
                         }
                         Ok(_)
@@ -1048,50 +1054,63 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
                     download_cache.insert(cache_key, download.clone());
                     download
                 };
-                let resolution = resolutions.get_mut(&candidate.asset_id).ok_or(
-                    UploadError::InvalidCloudKitOriginalAssetResponse(
-                        "records/query matched an unknown batch target",
-                    ),
-                )?;
                 let CachedCloudKitResourceDownload::Downloaded(download) = download else {
-                    if candidate.kind == CloudKitOriginalAssetCandidateKind::Raw {
-                        resolution.raw_download_size_mismatch = true;
+                    for cohort_index in &candidate.cohort_indexes {
+                        let cohort = &target_index.cohorts[*cohort_index];
+                        let work = &mut cohort_work[*cohort_index];
+                        match candidate.resource.kind {
+                            CloudKitOriginalAssetCandidateKind::Raw
+                                if cohort
+                                    .raw_target_sizes
+                                    .contains(&candidate.resource.size_bytes) =>
+                            {
+                                work.incomplete_raw_sizes
+                                    .insert(candidate.resource.size_bytes);
+                            }
+                            CloudKitOriginalAssetCandidateKind::Replacement
+                                if cohort
+                                    .replacement_target_sizes
+                                    .contains(&candidate.resource.size_bytes) =>
+                            {
+                                work.incomplete_replacement_sizes
+                                    .insert(candidate.resource.size_bytes);
+                            }
+                            _ => {}
+                        }
                     }
                     continue;
                 };
-                if download.sha256 != candidate.expected_sha256 {
-                    continue;
-                }
-                match candidate.kind {
-                    CloudKitOriginalAssetCandidateKind::Raw => {
-                        resolution.observations.raw_hash_matches =
-                            resolution.observations.raw_hash_matches.saturating_add(1);
-                        resolution
-                            .exact_matches
-                            .push(MatchedOriginalAssetCandidate {
-                                proof: candidate.original_proof.ok_or(
-                                    UploadError::InvalidCloudKitOriginalAssetResponse(
-                                        "RAW candidate omitted original proof",
-                                    ),
-                                )?,
-                                remote_identity: candidate.remote_identity,
-                            });
-                    }
-                    CloudKitOriginalAssetCandidateKind::Replacement => {
-                        resolution.observations.replacement_resource_matches = resolution
-                            .observations
-                            .replacement_resource_matches
-                            .saturating_add(1);
-                        resolution
-                            .replacement_matches
-                            .push(MatchedReplacementAssetCandidate {
-                                proof: candidate.replacement_proof.ok_or(
-                                    UploadError::InvalidCloudKitOriginalAssetResponse(
-                                        "replacement candidate omitted replacement proof",
-                                    ),
-                                )?,
-                                remote_identity: candidate.remote_identity,
-                            });
+                let key = OriginalAssetMatchKey {
+                    size_bytes: candidate.resource.size_bytes,
+                    sha256: download.sha256,
+                };
+                let remote_identity =
+                    remote_resource_identity(&candidate.asset.record_name, &candidate.resource);
+                let remote_match = OriginalAssetRemoteMatch {
+                    asset: candidate.asset,
+                    resource_field: candidate.resource.field.clone(),
+                };
+                for cohort_index in candidate.cohort_indexes {
+                    let cohort = &target_index.cohorts[cohort_index];
+                    let work = &mut cohort_work[cohort_index];
+                    match candidate.resource.kind {
+                        CloudKitOriginalAssetCandidateKind::Raw
+                            if cohort.raw_target_counts.contains_key(&key) =>
+                        {
+                            work.raw_matches
+                                .entry(key.clone())
+                                .or_default()
+                                .insert(remote_identity.clone(), remote_match.clone());
+                        }
+                        CloudKitOriginalAssetCandidateKind::Replacement
+                            if cohort.replacement_target_counts.contains_key(&key) =>
+                        {
+                            work.replacement_matches
+                                .entry(key.clone())
+                                .or_default()
+                                .insert(remote_identity.clone(), remote_match.clone());
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1115,7 +1134,6 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
                 start_rank: positioned_page.start_rank,
                 page: parse_original_asset_batch_query_response(
                     response,
-                    &request.targets,
                     &target_index,
                     &session.zone,
                 )?,
@@ -1124,22 +1142,28 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
         if !exhausted {
             return Ok(build_batch_resolve_outcome(
                 request,
-                resolutions,
+                &target_index,
                 &target_window,
                 &session.zone,
-                inventory_records,
-                false,
-                true,
+                OriginalAssetBatchResolveScanEvidence {
+                    cohort_work,
+                    inventory_records,
+                    complete: false,
+                    force_transient: true,
+                },
             ));
         }
         Ok(build_batch_resolve_outcome(
             request,
-            resolutions,
+            &target_index,
             &target_window,
             &session.zone,
-            inventory_records,
-            true,
-            false,
+            OriginalAssetBatchResolveScanEvidence {
+                cohort_work,
+                inventory_records,
+                complete: true,
+                force_transient: false,
+            },
         ))
     }
 }
@@ -1148,69 +1172,161 @@ const CLOUDKIT_ORIGINAL_ASSET_RESOLVER_VERSION: &str = "cloudkit-original-asset-
 
 fn build_batch_resolve_outcome(
     request: &CloudKitOriginalAssetBatchResolveRequest,
-    mut work: BTreeMap<String, OriginalAssetResolutionWork>,
+    target_index: &OriginalAssetTargetIndex,
     target_window: &OriginalAssetDateWindow,
     destination: &CloudKitLibraryDestination,
-    inventory_records: BTreeSet<String>,
-    complete: bool,
-    force_transient: bool,
+    evidence: OriginalAssetBatchResolveScanEvidence,
 ) -> CloudKitOriginalAssetBatchResolveOutcome {
-    let mut claims = BTreeMap::<String, BTreeSet<String>>::new();
-    for (asset_id, resolution) in &work {
-        for remote_identity in resolution
-            .exact_matches
-            .iter()
-            .map(|candidate| &candidate.remote_identity)
-            .chain(
-                resolution
-                    .replacement_matches
-                    .iter()
-                    .map(|candidate| &candidate.remote_identity),
-            )
-        {
-            claims
-                .entry(remote_identity.clone())
-                .or_default()
-                .insert(asset_id.clone());
+    let OriginalAssetBatchResolveScanEvidence {
+        cohort_work,
+        inventory_records,
+        complete,
+        force_transient,
+    } = evidence;
+    let mut claims = BTreeMap::<String, BTreeSet<OriginalAssetCohortMatchGroupKey>>::new();
+    let mut ambiguous_groups = BTreeSet::new();
+    for (cohort_index, work) in cohort_work.iter().enumerate() {
+        let cohort = &target_index.cohorts[cohort_index];
+        for (kind, matches, target_counts) in [
+            (
+                CloudKitOriginalAssetCandidateKind::Raw,
+                &work.raw_matches,
+                &cohort.raw_target_counts,
+            ),
+            (
+                CloudKitOriginalAssetCandidateKind::Replacement,
+                &work.replacement_matches,
+                &cohort.replacement_target_counts,
+            ),
+        ] {
+            for (key, candidates) in matches {
+                let group = OriginalAssetCohortMatchGroupKey {
+                    cohort_index,
+                    kind,
+                    key: key.clone(),
+                };
+                if candidates.len() > 1 || target_counts.get(key).copied().unwrap_or(0) > 1 {
+                    ambiguous_groups.insert(group.clone());
+                }
+                for remote_identity in candidates.keys() {
+                    claims
+                        .entry(remote_identity.clone())
+                        .or_default()
+                        .insert(group.clone());
+                }
+            }
         }
     }
-    let ambiguous_asset_ids = claims
-        .values()
-        .filter(|asset_ids| asset_ids.len() > 1)
-        .flat_map(|asset_ids| asset_ids.iter().cloned())
-        .collect::<BTreeSet<_>>();
+    for groups in claims.values().filter(|groups| groups.len() > 1) {
+        ambiguous_groups.extend(groups.iter().cloned());
+    }
 
     let resolutions = request
         .targets
         .iter()
-        .map(|target| {
-            let resolution = work
-                .remove(&target.asset_id)
-                .expect("all validated batch targets have resolver work state");
-            let disposition = if force_transient {
+        .enumerate()
+        .map(|(target_position, target)| {
+            let cohort_index = target_index.target_cohort_indexes[target_position];
+            let work = &cohort_work[cohort_index];
+            let raw_key = OriginalAssetMatchKey {
+                size_bytes: target.raw_size_bytes,
+                sha256: target.matched_raw_sha256.clone(),
+            };
+            let replacement_key =
+                target
+                    .replacement_candidate
+                    .as_ref()
+                    .map(|replacement| OriginalAssetMatchKey {
+                        size_bytes: replacement.size_bytes,
+                        sha256: replacement.sha256.clone(),
+                    });
+            let raw_matches = work.raw_matches.get(&raw_key);
+            let replacement_matches = replacement_key
+                .as_ref()
+                .and_then(|key| work.replacement_matches.get(key));
+            let raw_group = OriginalAssetCohortMatchGroupKey {
+                cohort_index,
+                kind: CloudKitOriginalAssetCandidateKind::Raw,
+                key: raw_key.clone(),
+            };
+            let replacement_group =
+                replacement_key
+                    .as_ref()
+                    .map(|key| OriginalAssetCohortMatchGroupKey {
+                        cohort_index,
+                        kind: CloudKitOriginalAssetCandidateKind::Replacement,
+                        key: key.clone(),
+                    });
+            let mut observations = work.observations.clone();
+            observations.raw_size_matches = *work
+                .raw_size_matches
+                .get(&target.raw_size_bytes)
+                .unwrap_or(&0);
+            observations.raw_hash_matches = raw_matches.map_or(0, |matches| matches.len() as u64);
+            observations.replacement_resource_matches =
+                replacement_matches.map_or(0, |matches| matches.len() as u64);
+            let incomplete_candidate_evidence =
+                work.incomplete_raw_sizes.contains(&target.raw_size_bytes)
+                    || target
+                        .replacement_candidate
+                        .as_ref()
+                        .is_some_and(|replacement| {
+                            work.incomplete_replacement_sizes
+                                .contains(&replacement.size_bytes)
+                        });
+            let disposition = if force_transient || incomplete_candidate_evidence {
                 CloudKitOriginalAssetResolveDisposition::IncompleteTransient
-            } else if ambiguous_asset_ids.contains(&target.asset_id)
-                || resolution.exact_matches.len() > 1
-                || resolution.replacement_matches.len() > 1
-                || (!resolution.exact_matches.is_empty()
-                    && !resolution.replacement_matches.is_empty())
+            } else if ambiguous_groups.contains(&raw_group)
+                || replacement_group
+                    .as_ref()
+                    .is_some_and(|group| ambiguous_groups.contains(group))
+                || (raw_matches.is_some_and(|matches| !matches.is_empty())
+                    && replacement_matches.is_some_and(|matches| !matches.is_empty()))
             {
                 CloudKitOriginalAssetResolveDisposition::Ambiguous
-            } else if let Some(candidate) = resolution.exact_matches.into_iter().next() {
-                CloudKitOriginalAssetResolveDisposition::ExactOriginal {
-                    proof: candidate.proof,
-                }
-            } else if let Some(candidate) = resolution.replacement_matches.into_iter().next() {
-                CloudKitOriginalAssetResolveDisposition::ReplacementPresent {
-                    proof: candidate.proof,
-                }
-            } else if resolution.observations.date_candidates == 0 {
-                CloudKitOriginalAssetResolveDisposition::NoDateCandidate
-            } else if resolution.observations.raw_resources == 0 {
-                CloudKitOriginalAssetResolveDisposition::NoRawResource
-            } else if resolution.observations.raw_size_matches == 0
-                || resolution.raw_download_size_mismatch
+            } else if let Some(candidate) = raw_matches.and_then(|matches| matches.values().next())
             {
+                CloudKitOriginalAssetResolveDisposition::ExactOriginal {
+                    proof: OriginalAssetProof {
+                        record_name: candidate.asset.record_name.clone(),
+                        record_change_tag: candidate.asset.record_change_tag.clone(),
+                        record_type: "CPLAsset".to_string(),
+                        database_scope: destination.database_scope,
+                        zone_name: destination.zone_name.clone(),
+                        filename: target.filename.clone(),
+                        size_bytes: target.raw_size_bytes,
+                        matched_raw_sha256: target.matched_raw_sha256.clone(),
+                    },
+                }
+            } else if let Some(candidate) =
+                replacement_matches.and_then(|matches| matches.values().next())
+            {
+                CloudKitOriginalAssetResolveDisposition::ReplacementPresent {
+                    proof: CloudKitReplacementResourceProof {
+                        record_name: candidate.asset.record_name.clone(),
+                        record_change_tag: candidate.asset.record_change_tag.clone(),
+                        record_type: "CPLAsset".to_string(),
+                        database_scope: destination.database_scope,
+                        zone_name: destination.zone_name.clone(),
+                        resource_field: candidate.resource_field.clone(),
+                        size_bytes: target
+                            .replacement_candidate
+                            .as_ref()
+                            .expect("replacement match requires a local candidate")
+                            .size_bytes,
+                        matched_heic_sha256: target
+                            .replacement_candidate
+                            .as_ref()
+                            .expect("replacement match requires a local candidate")
+                            .sha256
+                            .clone(),
+                    },
+                }
+            } else if observations.date_candidates == 0 {
+                CloudKitOriginalAssetResolveDisposition::NoDateCandidate
+            } else if observations.raw_resources == 0 {
+                CloudKitOriginalAssetResolveDisposition::NoRawResource
+            } else if observations.raw_size_matches == 0 {
                 CloudKitOriginalAssetResolveDisposition::RawSizeMismatch
             } else {
                 CloudKitOriginalAssetResolveDisposition::RawHashMismatch
@@ -1218,7 +1334,7 @@ fn build_batch_resolve_outcome(
             (
                 target.asset_id.clone(),
                 CloudKitOriginalAssetResolution {
-                    observations: resolution.observations,
+                    observations,
                     disposition,
                 },
             )
@@ -1235,6 +1351,13 @@ fn build_batch_resolve_outcome(
             )
         }),
     }
+}
+
+struct OriginalAssetBatchResolveScanEvidence {
+    cohort_work: Vec<OriginalAssetCohortResolutionWork>,
+    inventory_records: BTreeSet<String>,
+    complete: bool,
+    force_transient: bool,
 }
 
 fn cloudkit_original_asset_inventory_fingerprint(
@@ -2266,7 +2389,7 @@ struct OriginalAssetQueryPage<T> {
     continuation_marker: Option<String>,
     matches: Vec<T>,
     asset_dates: Vec<u64>,
-    observation_increments: Vec<OriginalAssetTargetObservationIncrement>,
+    observation_increments: Vec<OriginalAssetCohortObservationIncrement>,
     inventory_records: Vec<String>,
 }
 
@@ -2311,17 +2434,24 @@ struct OriginalAssetCandidate {
 }
 
 struct OriginalAssetBatchCandidate {
-    asset_id: String,
-    kind: CloudKitOriginalAssetCandidateKind,
-    resource_size_bytes: u64,
-    expected_sha256: String,
-    original_proof: Option<OriginalAssetProof>,
-    replacement_proof: Option<CloudKitReplacementResourceProof>,
-    download_url: Url,
-    remote_identity: String,
+    asset: OriginalAssetRemoteAsset,
+    resource: OriginalAssetRemoteResource,
+    cohort_indexes: Vec<usize>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone)]
+struct OriginalAssetRemoteAsset {
+    record_name: String,
+    record_change_tag: String,
+}
+
+#[derive(Clone)]
+struct OriginalAssetRemoteMatch {
+    asset: OriginalAssetRemoteAsset,
+    resource_field: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum CloudKitOriginalAssetCandidateKind {
     Raw,
     Replacement,
@@ -2333,46 +2463,41 @@ enum CachedCloudKitResourceDownload {
     SizeMismatch,
 }
 
-#[derive(Default)]
-struct OriginalAssetResolutionWork {
+#[derive(Clone, Default)]
+struct OriginalAssetCohortResolutionWork {
     observations: CloudKitOriginalAssetResolveObservations,
-    exact_matches: Vec<MatchedOriginalAssetCandidate>,
-    replacement_matches: Vec<MatchedReplacementAssetCandidate>,
-    raw_download_size_mismatch: bool,
+    raw_size_matches: BTreeMap<u64, u64>,
+    incomplete_raw_sizes: BTreeSet<u64>,
+    incomplete_replacement_sizes: BTreeSet<u64>,
+    raw_matches: BTreeMap<OriginalAssetMatchKey, BTreeMap<String, OriginalAssetRemoteMatch>>,
+    replacement_matches:
+        BTreeMap<OriginalAssetMatchKey, BTreeMap<String, OriginalAssetRemoteMatch>>,
 }
 
-struct MatchedOriginalAssetCandidate {
-    proof: OriginalAssetProof,
-    remote_identity: String,
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct OriginalAssetMatchKey {
+    size_bytes: u64,
+    sha256: String,
 }
 
-struct MatchedReplacementAssetCandidate {
-    proof: CloudKitReplacementResourceProof,
-    remote_identity: String,
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct OriginalAssetCohortMatchGroupKey {
+    cohort_index: usize,
+    kind: CloudKitOriginalAssetCandidateKind,
+    key: OriginalAssetMatchKey,
 }
 
 #[derive(Default)]
-struct OriginalAssetTargetObservationIncrement {
-    asset_id: String,
+struct OriginalAssetCohortObservationIncrement {
+    cohort_index: usize,
     date_candidates: u64,
     raw_resources: u64,
-    raw_size_matches: u64,
-}
-
-impl CloudKitOriginalAssetResolveObservations {
-    fn add(&mut self, increment: &OriginalAssetTargetObservationIncrement) {
-        self.date_candidates = self
-            .date_candidates
-            .saturating_add(increment.date_candidates);
-        self.raw_resources = self.raw_resources.saturating_add(increment.raw_resources);
-        self.raw_size_matches = self
-            .raw_size_matches
-            .saturating_add(increment.raw_size_matches);
-    }
+    raw_size_matches: BTreeMap<u64, u64>,
 }
 
 struct OriginalAssetTargetIndex {
-    target_date_windows: Vec<OriginalAssetTargetDateWindow>,
+    cohorts: Vec<OriginalAssetTargetCohort>,
+    target_cohort_indexes: Vec<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -2389,10 +2514,13 @@ enum OriginalAssetPagePosition {
     Empty,
 }
 
-struct OriginalAssetTargetDateWindow {
+struct OriginalAssetTargetCohort {
     start_unix_seconds: u64,
     end_unix_seconds: u64,
-    target_index: usize,
+    raw_target_counts: BTreeMap<OriginalAssetMatchKey, usize>,
+    replacement_target_counts: BTreeMap<OriginalAssetMatchKey, usize>,
+    raw_target_sizes: BTreeSet<u64>,
+    replacement_target_sizes: BTreeSet<u64>,
 }
 
 impl OriginalAssetDateWindow {
@@ -2408,46 +2536,94 @@ impl OriginalAssetDateWindow {
 
 impl OriginalAssetTargetIndex {
     fn new(targets: &[CloudKitOriginalAssetResolveTarget]) -> Self {
-        let mut target_date_windows = Vec::with_capacity(targets.len());
+        let mut target_date_windows = BTreeMap::<(u64, u64), Vec<usize>>::new();
         for (index, target) in targets.iter().enumerate() {
-            target_date_windows.push(OriginalAssetTargetDateWindow {
-                start_unix_seconds: target
-                    .source_captured_unix_seconds
-                    .saturating_sub(target.capture_tolerance_seconds),
-                end_unix_seconds: target
-                    .source_captured_unix_seconds
-                    .saturating_add(target.capture_tolerance_seconds),
-                target_index: index,
-            });
+            target_date_windows
+                .entry((
+                    target
+                        .source_captured_unix_seconds
+                        .saturating_sub(target.capture_tolerance_seconds),
+                    target
+                        .source_captured_unix_seconds
+                        .saturating_add(target.capture_tolerance_seconds),
+                ))
+                .or_default()
+                .push(index);
         }
-        target_date_windows.sort_by_key(|window| window.start_unix_seconds);
+        let mut target_cohort_indexes = vec![0; targets.len()];
+        let cohorts = target_date_windows
+            .into_iter()
+            .enumerate()
+            .map(
+                |(cohort_index, ((start_unix_seconds, end_unix_seconds), target_indexes))| {
+                    let mut raw_target_counts = BTreeMap::new();
+                    let mut replacement_target_counts = BTreeMap::new();
+                    let mut raw_target_sizes = BTreeSet::new();
+                    let mut replacement_target_sizes = BTreeSet::new();
+                    for target_index in &target_indexes {
+                        target_cohort_indexes[*target_index] = cohort_index;
+                        let target = &targets[*target_index];
+                        let raw_key = OriginalAssetMatchKey {
+                            size_bytes: target.raw_size_bytes,
+                            sha256: target.matched_raw_sha256.clone(),
+                        };
+                        raw_target_sizes.insert(raw_key.size_bytes);
+                        *raw_target_counts.entry(raw_key).or_default() += 1;
+                        if let Some(replacement) = &target.replacement_candidate {
+                            let replacement_key = OriginalAssetMatchKey {
+                                size_bytes: replacement.size_bytes,
+                                sha256: replacement.sha256.clone(),
+                            };
+                            replacement_target_sizes.insert(replacement_key.size_bytes);
+                            *replacement_target_counts
+                                .entry(replacement_key)
+                                .or_default() += 1;
+                        }
+                    }
+                    OriginalAssetTargetCohort {
+                        start_unix_seconds,
+                        end_unix_seconds,
+                        raw_target_counts,
+                        replacement_target_counts,
+                        raw_target_sizes,
+                        replacement_target_sizes,
+                    }
+                },
+            )
+            .collect();
         Self {
-            target_date_windows,
+            cohorts,
+            target_cohort_indexes,
         }
     }
 
-    fn indexes_for_asset_date(&self, asset_date_unix_seconds: u64) -> Vec<usize> {
+    fn cohort_indexes_for_asset_date(&self, asset_date_unix_seconds: u64) -> Vec<usize> {
         let upper_bound = self
-            .target_date_windows
-            .partition_point(|window| window.start_unix_seconds <= asset_date_unix_seconds);
-        self.target_date_windows[..upper_bound]
+            .cohorts
+            .partition_point(|cohort| cohort.start_unix_seconds <= asset_date_unix_seconds);
+        self.cohorts[..upper_bound]
             .iter()
-            .filter(|window| asset_date_unix_seconds <= window.end_unix_seconds)
-            .map(|window| window.target_index)
+            .enumerate()
+            .filter(|(_, cohort)| asset_date_unix_seconds <= cohort.end_unix_seconds)
+            .map(|(cohort_index, _)| cohort_index)
             .collect()
+    }
+
+    fn cohort_count(&self) -> usize {
+        self.cohorts.len()
     }
 
     fn date_window(&self) -> OriginalAssetDateWindow {
         let start_unix_seconds = self
-            .target_date_windows
+            .cohorts
             .iter()
-            .map(|window| window.start_unix_seconds)
+            .map(|cohort| cohort.start_unix_seconds)
             .min()
             .unwrap_or(0);
         let end_unix_seconds = self
-            .target_date_windows
+            .cohorts
             .iter()
-            .map(|window| window.end_unix_seconds)
+            .map(|cohort| cohort.end_unix_seconds)
             .max()
             .unwrap_or(0);
         OriginalAssetDateWindow {
@@ -2491,7 +2667,11 @@ fn parse_original_asset_query_response(
             "CPLAsset" => assets.push(parse_cloudkit_asset_record(record)?),
             "CPLMaster" => {
                 let record_name = required_record_string(record, "recordName")?.to_string();
-                masters.insert(record_name, record);
+                if masters.insert(record_name, record).is_some() {
+                    return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                        "records/query returned duplicate CPLMaster recordName",
+                    ));
+                }
             }
             _ => {}
         }
@@ -2547,9 +2727,8 @@ fn parse_original_asset_query_response(
 
 fn parse_original_asset_batch_query_response(
     value: Value,
-    targets: &[CloudKitOriginalAssetResolveTarget],
     target_index: &OriginalAssetTargetIndex,
-    destination: &CloudKitLibraryDestination,
+    _destination: &CloudKitLibraryDestination,
 ) -> Result<OriginalAssetQueryPage<OriginalAssetBatchCandidate>, UploadError> {
     let records = value.get("records").and_then(Value::as_array).ok_or(
         UploadError::InvalidCloudKitOriginalAssetResponse(
@@ -2571,7 +2750,11 @@ fn parse_original_asset_batch_query_response(
             "CPLAsset" => assets.push(parse_cloudkit_asset_record(record)?),
             "CPLMaster" => {
                 let record_name = required_record_string(record, "recordName")?.to_string();
-                masters.insert(record_name, record);
+                if masters.insert(record_name, record).is_some() {
+                    return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                        "records/query returned duplicate CPLMaster recordName",
+                    ));
+                }
             }
             _ => {}
         }
@@ -2586,12 +2769,12 @@ fn parse_original_asset_batch_query_response(
     let mut inventory_records = BTreeSet::new();
     let inventory_window = target_index.date_window();
     for asset in assets {
-        let date_matching_target_indexes =
-            target_index.indexes_for_asset_date(asset.asset_date_unix_seconds);
+        let matching_cohort_indexes =
+            target_index.cohort_indexes_for_asset_date(asset.asset_date_unix_seconds);
         let in_inventory_window = asset.asset_date_unix_seconds
             >= inventory_window.start_unix_seconds
             && asset.asset_date_unix_seconds <= inventory_window.end_unix_seconds;
-        if date_matching_target_indexes.is_empty() && !in_inventory_window {
+        if matching_cohort_indexes.is_empty() && !in_inventory_window {
             continue;
         }
         let master = masters.get(&asset.master_record_name).ok_or(
@@ -2599,76 +2782,59 @@ fn parse_original_asset_batch_query_response(
                 "records/query returned an asset without its master",
             ),
         )?;
-        inventory_records.insert(canonical_json(&asset.record));
-        inventory_records.insert(canonical_json(master));
         let resources = record_pair_original_asset_resources(&asset.record, master)?;
-        if date_matching_target_indexes.is_empty() {
+        inventory_records.insert(normalized_inventory_asset_identity(&asset, master)?);
+        if matching_cohort_indexes.is_empty() {
             continue;
         }
-        for target_index in date_matching_target_indexes {
-            let target = &targets[target_index];
-            let mut increment = OriginalAssetTargetObservationIncrement {
-                asset_id: target.asset_id.clone(),
+        for cohort_index in &matching_cohort_indexes {
+            let mut increment = OriginalAssetCohortObservationIncrement {
+                cohort_index: *cohort_index,
                 date_candidates: 1,
-                ..OriginalAssetTargetObservationIncrement::default()
+                ..OriginalAssetCohortObservationIncrement::default()
             };
             for resource in &resources {
                 if resource.kind == CloudKitOriginalAssetCandidateKind::Raw {
                     increment.raw_resources = increment.raw_resources.saturating_add(1);
-                    if resource.size_bytes != target.raw_size_bytes {
-                        continue;
-                    }
-                    increment.raw_size_matches = increment.raw_size_matches.saturating_add(1);
-                    matches.push(OriginalAssetBatchCandidate {
-                        asset_id: target.asset_id.clone(),
-                        kind: CloudKitOriginalAssetCandidateKind::Raw,
-                        resource_size_bytes: resource.size_bytes,
-                        expected_sha256: target.matched_raw_sha256.clone(),
-                        original_proof: Some(OriginalAssetProof {
-                            record_name: asset.record_name.clone(),
-                            record_change_tag: asset.record_change_tag.clone(),
-                            record_type: "CPLAsset".to_string(),
-                            database_scope: destination.database_scope,
-                            zone_name: destination.zone_name.clone(),
-                            filename: target.filename.clone(),
-                            size_bytes: target.raw_size_bytes,
-                            matched_raw_sha256: target.matched_raw_sha256.clone(),
-                        }),
-                        replacement_proof: None,
-                        download_url: resource.download_url.clone(),
-                        remote_identity: remote_resource_identity(&asset.record_name, resource),
-                    });
+                    *increment
+                        .raw_size_matches
+                        .entry(resource.size_bytes)
+                        .or_default() = increment
+                        .raw_size_matches
+                        .get(&resource.size_bytes)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(1);
                 }
-                let Some(replacement) = &target.replacement_candidate else {
-                    continue;
-                };
-                if resource.kind != CloudKitOriginalAssetCandidateKind::Replacement
-                    || resource.size_bytes != replacement.size_bytes
-                {
-                    continue;
-                }
-                matches.push(OriginalAssetBatchCandidate {
-                    asset_id: target.asset_id.clone(),
-                    kind: CloudKitOriginalAssetCandidateKind::Replacement,
-                    resource_size_bytes: resource.size_bytes,
-                    expected_sha256: replacement.sha256.clone(),
-                    original_proof: None,
-                    replacement_proof: Some(CloudKitReplacementResourceProof {
-                        record_name: asset.record_name.clone(),
-                        record_change_tag: asset.record_change_tag.clone(),
-                        record_type: "CPLAsset".to_string(),
-                        database_scope: destination.database_scope,
-                        zone_name: destination.zone_name.clone(),
-                        resource_field: resource.field.clone(),
-                        size_bytes: resource.size_bytes,
-                        matched_heic_sha256: replacement.sha256.clone(),
-                    }),
-                    download_url: resource.download_url.clone(),
-                    remote_identity: remote_resource_identity(&asset.record_name, resource),
-                });
             }
             observation_increments.push(increment);
         }
+        let asset = OriginalAssetRemoteAsset {
+            record_name: asset.record_name,
+            record_change_tag: asset.record_change_tag,
+        };
+        matches.extend(resources.into_iter().filter_map(|resource| {
+            let relevant = matching_cohort_indexes.iter().any(|cohort_index| {
+                let cohort = &target_index.cohorts[*cohort_index];
+                match resource.kind {
+                    CloudKitOriginalAssetCandidateKind::Raw => {
+                        cohort.raw_target_sizes.contains(&resource.size_bytes)
+                    }
+                    CloudKitOriginalAssetCandidateKind::Replacement => cohort
+                        .replacement_target_sizes
+                        .contains(&resource.size_bytes),
+                }
+            });
+            if relevant {
+                Some(OriginalAssetBatchCandidate {
+                    asset: asset.clone(),
+                    resource,
+                    cohort_indexes: matching_cohort_indexes.clone(),
+                })
+            } else {
+                None
+            }
+        }));
     }
 
     Ok(OriginalAssetQueryPage {
@@ -2931,26 +3097,61 @@ fn remote_resource_identity(
     resource: &OriginalAssetRemoteResource,
 ) -> String {
     format!(
-        "{asset_record_name}\u{1f}{}\u{1f}{}",
-        resource.size_bytes, resource.download_url
+        "{asset_record_name}\u{1f}{}\u{1f}{}\u{1f}{}",
+        resource.field, resource.kind as u8, resource.size_bytes
     )
 }
 
-fn canonical_json(value: &Value) -> String {
-    match value {
-        Value::Object(object) => {
-            let mut canonical = BTreeMap::new();
-            for (key, value) in object {
-                canonical.insert(key, canonical_json(value));
-            }
-            serde_json::to_string(&canonical).expect("canonical JSON strings serialize")
+fn normalized_inventory_asset_identity(
+    asset: &CloudKitAssetRecord,
+    master: &Value,
+) -> Result<String, UploadError> {
+    // Keep this limited to stable record relationships and resource metadata;
+    // download URLs and record change tags rotate independently of inventory.
+    let master_record_name = required_record_string(master, "recordName")?;
+    let mut resources = BTreeSet::new();
+    for (record_role, record) in [("asset", &asset.record), ("master", master)] {
+        let fields = record_fields(record)?;
+        for prefix in [
+            "resOriginal",
+            "resOriginalAlt",
+            "resSidecar",
+            "resOriginalVidCompl",
+        ] {
+            let resource_field = format!("{prefix}Res");
+            let Some(resource_field_value) = fields.get(&resource_field) else {
+                continue;
+            };
+            let resource = field_value_object(resource_field_value).ok_or(
+                UploadError::InvalidCloudKitOriginalAssetResponse(
+                    "CloudKit original resource field is malformed",
+                ),
+            )?;
+            let size_bytes = resource_size_bytes(resource).ok_or(
+                UploadError::InvalidCloudKitOriginalAssetResponse(
+                    "CloudKit original resource missing size",
+                ),
+            )?;
+            let file_type_key = format!("{prefix}FileType");
+            let file_type = field_string(fields, &file_type_key).ok_or(
+                UploadError::InvalidCloudKitOriginalAssetResponse(
+                    "CloudKit original resource missing file type",
+                ),
+            )?;
+            resources.insert(format!(
+                "{record_role}\u{1f}{resource_field}\u{1f}{}\u{1f}{size_bytes}",
+                file_type.to_ascii_lowercase(),
+            ));
         }
-        Value::Array(values) => {
-            let values = values.iter().map(canonical_json).collect::<Vec<_>>();
-            serde_json::to_string(&values).expect("canonical JSON arrays serialize")
-        }
-        _ => serde_json::to_string(value).expect("canonical JSON values serialize"),
     }
+    Ok(format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        asset.record_name,
+        asset.master_record_name,
+        asset.asset_date_unix_seconds,
+        master_record_name,
+        resources.into_iter().collect::<Vec<_>>().join("\u{1e}"),
+    ))
 }
 
 fn record_pair_matching_raw_resource_urls(
@@ -4504,4 +4705,80 @@ pub enum UploadError {
     StreamedHeicSizeMismatch { expected: u64, actual: u64 },
     #[error("streamed HEIC SHA-256 mismatch")]
     StreamedHeicHashMismatch { expected: String, actual: String },
+}
+
+#[cfg(test)]
+mod batch_reconciliation_performance_tests {
+    use super::*;
+
+    #[test]
+    fn dense_timestamp_cohort_indexes_thousands_of_targets_and_records_once() {
+        const COUNT: usize = 4_096;
+        let targets = (0..COUNT)
+            .map(|index| CloudKitOriginalAssetResolveTarget {
+                asset_id: format!("asset-{index}"),
+                raw_size_bytes: 9,
+                source_captured_unix_seconds: 1_800_000_000,
+                capture_tolerance_seconds: 2,
+                filename: format!("IMG_{index:04}.DNG"),
+                matched_raw_sha256: format!("raw-{index}"),
+                replacement_candidate: None,
+            })
+            .collect::<Vec<_>>();
+        let index = OriginalAssetTargetIndex::new(&targets);
+
+        assert_eq!(index.cohort_count(), 1);
+        assert!((0..COUNT).all(|_| index.cohort_indexes_for_asset_date(1_800_000_000) == [0]));
+    }
+
+    #[test]
+    fn dense_timestamp_parser_emits_one_resource_candidate_per_remote_record() {
+        const COUNT: usize = 2_048;
+        let targets = (0..COUNT)
+            .map(|index| CloudKitOriginalAssetResolveTarget {
+                asset_id: format!("asset-{index}"),
+                raw_size_bytes: 9,
+                source_captured_unix_seconds: 1_800_000_000,
+                capture_tolerance_seconds: 2,
+                filename: format!("IMG_{index:04}.DNG"),
+                matched_raw_sha256: format!("raw-{index}"),
+                replacement_candidate: None,
+            })
+            .collect::<Vec<_>>();
+        let target_index = OriginalAssetTargetIndex::new(&targets);
+        let mut records = Vec::with_capacity(COUNT * 2);
+        for index in 0..COUNT {
+            let master = format!("CPLMaster-{index}");
+            records.push(serde_json::json!({
+                "recordName": format!("CPLAsset-{index}"),
+                "recordType": "CPLAsset",
+                "recordChangeTag": format!("tag-{index}"),
+                "fields": {
+                    "masterRef": {"value": {"recordName": master}},
+                    "assetDate": {"value": 1_800_000_000_000_i64}
+                }
+            }));
+            records.push(serde_json::json!({
+                "recordName": format!("CPLMaster-{index}"),
+                "recordType": "CPLMaster",
+                "fields": {
+                    "resOriginalRes": {"value": {
+                        "size": 9,
+                        "downloadURL": format!("https://p140-icloud-content.icloud.com/raw-{index}")
+                    }},
+                    "resOriginalFileType": {"value": "com.adobe.raw-image"}
+                }
+            }));
+        }
+
+        let page = parse_original_asset_batch_query_response(
+            serde_json::json!({"records": records}),
+            &target_index,
+            &CloudKitLibraryDestination::primary_sync(),
+        )
+        .expect("dense inventory page should parse");
+
+        assert_eq!(page.matches.len(), COUNT);
+        assert_eq!(page.observation_increments.len(), COUNT);
+    }
 }

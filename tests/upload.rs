@@ -1805,6 +1805,141 @@ fn cloudkit_original_asset_batch_reconciliation_keeps_exact_and_absent_targets_t
 }
 
 #[test]
+fn cloudkit_original_asset_batch_reconciliation_marks_raw_download_incompleteness_transient() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut records = cloudkit_raw_pair_with(
+        "CPLAsset-original",
+        "CPLMaster-original",
+        "tag-original",
+        9,
+        1_800_000_000_000,
+    );
+    records[1]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+        json!("https://p140-icloud-content.icloud.com/raw-truncated");
+    records[1]["fields"]["resOriginalAltRes"] = json!({"value": {
+        "size": 9,
+        "downloadURL": "https://p140-icloud-content.icloud.com/raw-exact"
+    }});
+    records[1]["fields"]["resOriginalAltFileType"] = json!({"value": "com.adobe.raw-image"});
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": records})],
+        vec![b"short".to_vec(), b"raw-bytes".to_vec()],
+    );
+
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(
+            &session,
+            &batch_resolve_request(vec![batch_resolve_target(
+                "asset-1",
+                "IMG_0001.DNG",
+                b"raw-bytes",
+            )]),
+        )
+        .expect("a complete scan should return a typed per-target outcome");
+
+    assert!(matches!(
+        outcome.resolutions["asset-1"].disposition,
+        CloudKitOriginalAssetResolveDisposition::IncompleteTransient
+    ));
+    assert!(outcome.exact_original_proofs().is_empty());
+}
+
+#[test]
+fn cloudkit_original_asset_batch_reconciliation_marks_replacement_download_incompleteness_transient()
+ {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let replacement = b"replacement-heic";
+    let mut records = cloudkit_raw_pair_with(
+        "CPLAsset-replacement",
+        "CPLMaster-replacement",
+        "tag-replacement",
+        9,
+        1_800_000_000_000,
+    );
+    records[1]["fields"]["resOriginalAltRes"] = json!({"value": {
+        "size": replacement.len(),
+        "downloadURL": "https://p140-icloud-content.icloud.com/replacement-truncated"
+    }});
+    records[1]["fields"]["resOriginalAltFileType"] = json!({"value": "public.heic"});
+    records[1]["fields"]["resSidecarRes"] = json!({"value": {
+        "size": replacement.len(),
+        "downloadURL": "https://p140-icloud-content.icloud.com/replacement-exact"
+    }});
+    records[1]["fields"]["resSidecarFileType"] = json!({"value": "public.heic"});
+    let mut target = batch_resolve_target("asset-1", "IMG_0001.DNG", b"other-raw");
+    target.replacement_candidate = Some(CloudKitLocalReplacementCandidate {
+        sha256: sha256_hex(replacement),
+        size_bytes: replacement.len() as u64,
+    });
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": records})],
+        vec![
+            b"raw-bytes".to_vec(),
+            b"short".to_vec(),
+            replacement.to_vec(),
+        ],
+    );
+
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(&session, &batch_resolve_request(vec![target]))
+        .expect("a complete scan should return a typed per-target outcome");
+
+    assert!(matches!(
+        outcome.resolutions["asset-1"].disposition,
+        CloudKitOriginalAssetResolveDisposition::IncompleteTransient
+    ));
+    assert!(outcome.exact_original_proofs().is_empty());
+}
+
+#[test]
+fn cloudkit_original_asset_batch_reconciliation_rejects_duplicate_master_identities_in_any_order() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let records = cloudkit_raw_pair_with(
+        "CPLAsset-original",
+        "CPLMaster-duplicate",
+        "tag-original",
+        9,
+        1_800_000_000_000,
+    );
+    let mut first_master_then_second = records.clone();
+    let mut second_master = first_master_then_second[1].clone();
+    second_master["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+        json!("https://p140-icloud-content.icloud.com/conflicting-master");
+    first_master_then_second
+        .as_array_mut()
+        .expect("records should be an array")
+        .push(second_master.clone());
+    let mut second_master_then_first = records;
+    second_master_then_first[1] = second_master;
+    second_master_then_first
+        .as_array_mut()
+        .expect("records should be an array")
+        .push(first_master_then_second[1].clone());
+
+    for records in [first_master_then_second, second_master_then_first] {
+        let mut transport =
+            FakeCloudKitDeleteTransport::query_responses(vec![json!({"records": records})]);
+        let error = CloudKitDeleteClient::new(&mut transport)
+            .resolve_original_assets_batch_outcome(
+                &session,
+                &batch_resolve_request(vec![batch_resolve_target(
+                    "asset-1",
+                    "IMG_0001.DNG",
+                    b"raw-bytes",
+                )]),
+            )
+            .expect_err("duplicate CPLMaster identities must fail closed");
+        assert!(matches!(
+            error,
+            UploadError::InvalidCloudKitOriginalAssetResponse(_)
+        ));
+    }
+}
+
+#[test]
 fn cloudkit_original_asset_batch_reconciliation_classifies_each_terminal_absence() {
     let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
         .expect("session should load");
@@ -2110,7 +2245,7 @@ fn cloudkit_original_asset_batch_inventory_fingerprint_includes_scanned_window_r
                 .clone(),
         );
     let mut changed_records = records.clone();
-    changed_records[2]["recordChangeTag"] = json!("tag-gap-changed");
+    changed_records[3]["fields"]["resOriginalRes"]["value"]["size"] = json!(10);
     let mut first_transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
         vec![json!({"records": records})],
         vec![b"raw-bytes".to_vec()],
@@ -2135,8 +2270,105 @@ fn cloudkit_original_asset_batch_inventory_fingerprint_includes_scanned_window_r
         .inventory
         .as_ref()
         .expect("inventory should be complete");
-    assert_eq!(first_inventory.records_scanned, 4);
+    assert_eq!(first_inventory.records_scanned, 2);
     assert_ne!(first_inventory.sha256, second_inventory.sha256);
+}
+
+#[test]
+fn cloudkit_original_asset_batch_inventory_fingerprint_ignores_rotating_download_urls() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let request = batch_resolve_request(vec![batch_resolve_target(
+        "asset-1",
+        "IMG_0001.DNG",
+        b"raw-bytes",
+    )]);
+    let first_records = cloudkit_raw_pair_with_url(
+        "CPLAsset-original",
+        "CPLMaster-original",
+        "tag-original",
+        9,
+        1_800_000_000_000,
+        "https://p140-icloud-content.icloud.com/raw?signature=first",
+    );
+    let second_records = cloudkit_raw_pair_with_url(
+        "CPLAsset-original",
+        "CPLMaster-original",
+        "tag-original",
+        9,
+        1_800_000_000_000,
+        "https://p140-icloud-content.icloud.com/raw?signature=rotated",
+    );
+    let mut changed_metadata_records = second_records.clone();
+    changed_metadata_records[1]["fields"]["resOriginalRes"]["value"]["size"] = json!(10);
+    let mut changed_change_tag_records = second_records.clone();
+    changed_change_tag_records[0]["recordChangeTag"] = json!("tag-rotated");
+    let mut first_transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": first_records})],
+        vec![b"raw-bytes".to_vec()],
+    );
+    let mut second_transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": second_records})],
+        vec![b"raw-bytes".to_vec()],
+    );
+    let mut changed_metadata_transport = FakeCloudKitDeleteTransport::query_responses(vec![
+        json!({"records": changed_metadata_records}),
+    ]);
+    let mut changed_change_tag_transport =
+        FakeCloudKitDeleteTransport::query_responses_with_downloads(
+            vec![json!({"records": changed_change_tag_records})],
+            vec![b"raw-bytes".to_vec()],
+        );
+
+    let first = CloudKitDeleteClient::new(&mut first_transport)
+        .resolve_original_assets_batch_outcome(&session, &request)
+        .expect("first inventory should resolve");
+    let second = CloudKitDeleteClient::new(&mut second_transport)
+        .resolve_original_assets_batch_outcome(&session, &request)
+        .expect("rotated URL inventory should resolve");
+    let changed_metadata = CloudKitDeleteClient::new(&mut changed_metadata_transport)
+        .resolve_original_assets_batch_outcome(&session, &request)
+        .expect("changed resource metadata inventory should resolve");
+    let changed_change_tag = CloudKitDeleteClient::new(&mut changed_change_tag_transport)
+        .resolve_original_assets_batch_outcome(&session, &request)
+        .expect("rotated change tag inventory should resolve");
+
+    assert_eq!(
+        first
+            .inventory
+            .as_ref()
+            .expect("first inventory should be complete")
+            .sha256,
+        second
+            .inventory
+            .as_ref()
+            .expect("second inventory should be complete")
+            .sha256
+    );
+    assert_ne!(
+        first
+            .inventory
+            .as_ref()
+            .expect("first inventory should be complete")
+            .sha256,
+        changed_metadata
+            .inventory
+            .as_ref()
+            .expect("changed metadata inventory should be complete")
+            .sha256
+    );
+    assert_eq!(
+        first
+            .inventory
+            .as_ref()
+            .expect("first inventory should be complete")
+            .sha256,
+        changed_change_tag
+            .inventory
+            .as_ref()
+            .expect("change tag rotation should not change inventory")
+            .sha256
+    );
 }
 
 #[test]
