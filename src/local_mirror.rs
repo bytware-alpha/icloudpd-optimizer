@@ -33,15 +33,6 @@ pub fn ensure_icloudpd_local_mirror(
     require_non_empty_path("uploaded_heic_path", &request.uploaded_heic_path)?;
     require_non_empty_path("icloudpd_download_path", &request.icloudpd_download_path)?;
 
-    let source_identity = inspect_regular_file("uploaded_heic_path", &request.uploaded_heic_path)?;
-    require_identity(
-        "uploaded_heic_sha256",
-        "size_bytes",
-        &request.uploaded_heic_sha256,
-        request.size_bytes,
-        &source_identity,
-    )?;
-
     match fs::symlink_metadata(&request.icloudpd_download_path) {
         Ok(metadata) => {
             let destination_identity = inspect_existing_metadata(
@@ -58,6 +49,15 @@ pub fn ensure_icloudpd_local_mirror(
             )?;
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let source_identity =
+                inspect_regular_file("uploaded_heic_path", &request.uploaded_heic_path)?;
+            require_identity(
+                "uploaded_heic_sha256",
+                "size_bytes",
+                &request.uploaded_heic_sha256,
+                request.size_bytes,
+                &source_identity,
+            )?;
             copy_missing_destination(&request)?;
             let destination_identity =
                 inspect_regular_file("icloudpd_download_path", &request.icloudpd_download_path)?;
@@ -443,6 +443,52 @@ mod tests {
     }
 
     #[test]
+    fn existing_verified_destination_succeeds_when_staging_file_is_missing() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let uploaded_heic_path = tempdir.path().join("staging.HEIC");
+        let destination_path = tempdir.path().join("downloaded.HEIC");
+        let bytes = b"verified-heic-bytes";
+        fs::write(&destination_path, bytes).expect("destination should be written");
+        let request = IcloudpdLocalMirrorRequest {
+            uploaded_heic_asset_id: "uploaded-heic-asset".to_string(),
+            uploaded_heic_sha256: format!("{:x}", Sha256::digest(bytes)),
+            uploaded_heic_path: uploaded_heic_path.clone(),
+            size_bytes: bytes.len() as u64,
+            icloudpd_download_path: destination_path.clone(),
+        };
+
+        let proof = ensure_icloudpd_local_mirror(request)
+            .expect("existing verified destination should be accepted");
+
+        assert_eq!(proof.uploaded_heic_path, uploaded_heic_path);
+        assert_eq!(proof.icloudpd_download_path, destination_path);
+    }
+
+    #[test]
+    fn existing_verified_destination_succeeds_when_staging_file_mismatches() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let uploaded_heic_path = tempdir.path().join("staging.HEIC");
+        let destination_path = tempdir.path().join("downloaded.HEIC");
+        let bytes = b"verified-heic-bytes";
+        fs::write(&uploaded_heic_path, b"stale staging bytes")
+            .expect("staging file should be written");
+        fs::write(&destination_path, bytes).expect("destination should be written");
+        let request = IcloudpdLocalMirrorRequest {
+            uploaded_heic_asset_id: "uploaded-heic-asset".to_string(),
+            uploaded_heic_sha256: format!("{:x}", Sha256::digest(bytes)),
+            uploaded_heic_path: uploaded_heic_path.clone(),
+            size_bytes: bytes.len() as u64,
+            icloudpd_download_path: destination_path.clone(),
+        };
+
+        let proof = ensure_icloudpd_local_mirror(request)
+            .expect("existing verified destination should be accepted");
+
+        assert_eq!(proof.uploaded_heic_path, uploaded_heic_path);
+        assert_eq!(proof.icloudpd_download_path, destination_path);
+    }
+
+    #[test]
     fn mirror_install_falls_back_to_create_new_copy_when_rename_is_unsupported() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let temp_path = tempdir.path().join(".asset.tmp");
@@ -511,6 +557,86 @@ mod tests {
         assert!(
             !destination_path.exists(),
             "failed fallback copy should not leave a destination file"
+        );
+    }
+
+    #[test]
+    fn existing_mismatched_destination_is_not_overwritten() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let source_path = tempdir.path().join("staging.HEIC");
+        let destination_path = tempdir.path().join("downloaded.HEIC");
+        let source_bytes = b"verified-heic-bytes";
+        let existing_bytes = b"mismatched-download";
+        fs::write(&source_path, source_bytes).expect("source should be written");
+        fs::write(&destination_path, existing_bytes).expect("destination should be written");
+        let request = mirror_request(source_path, destination_path.clone(), source_bytes);
+
+        let error = ensure_icloudpd_local_mirror(request)
+            .expect_err("mismatched destination must fail closed");
+
+        assert!(matches!(
+            error,
+            LocalMirrorError::Mismatch {
+                field: "uploaded_heic_sha256",
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read(&destination_path).expect("destination should remain readable"),
+            existing_bytes
+        );
+    }
+
+    #[test]
+    fn existing_destination_directory_fails_closed() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let source_path = tempdir.path().join("staging.HEIC");
+        let destination_path = tempdir.path().join("downloaded.HEIC");
+        let bytes = b"verified-heic-bytes";
+        fs::write(&source_path, bytes).expect("source should be written");
+        fs::create_dir(&destination_path).expect("destination directory should be created");
+        let request = mirror_request(source_path, destination_path.clone(), bytes);
+
+        let error = ensure_icloudpd_local_mirror(request)
+            .expect_err("destination directory must fail closed");
+
+        assert!(matches!(
+            error,
+            LocalMirrorError::Directory {
+                field: "icloudpd_download_path",
+                ..
+            }
+        ));
+        assert!(destination_path.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_destination_symlink_fails_closed() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let source_path = tempdir.path().join("staging.HEIC");
+        let target_path = tempdir.path().join("target.HEIC");
+        let destination_path = tempdir.path().join("downloaded.HEIC");
+        let bytes = b"verified-heic-bytes";
+        fs::write(&source_path, bytes).expect("source should be written");
+        fs::write(&target_path, b"target bytes").expect("target should be written");
+        std::os::unix::fs::symlink(&target_path, &destination_path)
+            .expect("destination symlink should be created");
+        let request = mirror_request(source_path, destination_path.clone(), bytes);
+
+        let error = ensure_icloudpd_local_mirror(request)
+            .expect_err("destination symlink must fail closed");
+
+        assert!(matches!(
+            error,
+            LocalMirrorError::Symlink {
+                field: "icloudpd_download_path",
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read(&target_path).expect("target should remain readable"),
+            b"target bytes"
         );
     }
 }

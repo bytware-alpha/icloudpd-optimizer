@@ -3032,6 +3032,7 @@ fn icloudpd_local_mirror_request(
     manifest: &Manifest,
     asset_id: &str,
 ) -> Result<IcloudpdLocalMirrorRequest, MonitorError> {
+    let record = manifest.get(asset_id)?;
     let (upload, heic) = icloudpd_local_mirror_ready_proofs(manifest, asset_id)?;
     let uploaded_heic_path =
         upload
@@ -3040,8 +3041,12 @@ fn icloudpd_local_mirror_request(
             .ok_or(WorkflowError::EmptyProofField {
                 field: "uploaded_heic_path",
             })?;
-    let icloudpd_download_path =
-        icloudpd_local_mirror_destination(mirror_root, asset_id, &upload.uploaded_heic_sha256)?;
+    let icloudpd_download_path = icloudpd_local_mirror_download_path(
+        record,
+        mirror_root,
+        asset_id,
+        &upload.uploaded_heic_sha256,
+    )?;
     Ok(IcloudpdLocalMirrorRequest {
         uploaded_heic_asset_id: upload.uploaded_heic_asset_id,
         uploaded_heic_sha256: upload.uploaded_heic_sha256,
@@ -3049,6 +3054,34 @@ fn icloudpd_local_mirror_request(
         size_bytes: heic.size_bytes,
         icloudpd_download_path,
     })
+}
+
+fn icloudpd_local_mirror_download_path(
+    record: &AssetRecord,
+    mirror_root: &Path,
+    asset_id: &str,
+    uploaded_heic_sha256: &str,
+) -> Result<PathBuf, MonitorError> {
+    let raw_parent = record
+        .raw_path
+        .parent()
+        .ok_or_else(|| MonitorError::InvalidConfig {
+            message: format!(
+                "RAW path {} has no parent directory",
+                record.raw_path.display()
+            ),
+        })?;
+    let candidate = raw_parent.join(format!("{asset_id}.HEIC"));
+    match fs::symlink_metadata(&candidate) {
+        Ok(_) => Ok(candidate),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(
+            icloudpd_local_mirror_destination(mirror_root, asset_id, uploaded_heic_sha256)?,
+        ),
+        Err(source) => Err(MonitorError::ReadMetadata {
+            path: candidate,
+            source,
+        }),
+    }
 }
 
 fn icloudpd_local_mirror_destination(
@@ -10636,18 +10669,78 @@ mod tests {
     }
 
     #[test]
-    fn rolling_and_non_rolling_mirror_requests_use_content_addressed_destination() {
+    fn rolling_and_batch_mirror_requests_prefer_existing_per_record_download_candidates() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let private_raw_root = tempdir.path().join("private-library");
+        let shared_raw_root = tempdir.path().join("shared-library");
+        fs::create_dir_all(&private_raw_root).expect("private raw root should be created");
+        fs::create_dir_all(&shared_raw_root).expect("shared raw root should be created");
         let mut config = MonitorConfig::new(
-            tempdir.path().join("download"),
+            &private_raw_root,
             tempdir.path().join("manifest.json"),
             tempdir.path().join("heic"),
         );
-        fs::create_dir_all(&config.download_root).expect("download root should be created");
         let mirror_root = tempdir.path().join("mirror");
         config.mirror_root = Some(mirror_root.clone());
         let uploaded_hash = "cd".repeat(32);
-        let mut record = upload_verified_delete_ready_record("asset-a", &config.download_root);
+        let mut private_record =
+            upload_verified_delete_ready_record("private-asset", &private_raw_root);
+        let mut shared_record =
+            upload_verified_delete_ready_record("shared-asset", &shared_raw_root);
+        for record in [&mut private_record, &mut shared_record] {
+            record.proofs.remove("icloudpd_local_mirror");
+            for proof_key in ["conversion", "heic"] {
+                record.proofs.get_mut(proof_key).unwrap()["heic_sha256"] = json!(uploaded_hash);
+            }
+            record.proofs.get_mut("upload").unwrap()["uploaded_heic_sha256"] = json!(uploaded_hash);
+        }
+        let private_candidate = private_record
+            .raw_path
+            .parent()
+            .expect("private RAW should have a parent")
+            .join("private-asset.HEIC");
+        let shared_candidate = shared_record
+            .raw_path
+            .parent()
+            .expect("shared RAW should have a parent")
+            .join("shared-asset.HEIC");
+        fs::write(&private_candidate, b"private candidate")
+            .expect("private candidate should be written");
+        fs::write(&shared_candidate, b"shared candidate")
+            .expect("shared candidate should be written");
+        let mut manifest = Manifest::new();
+        manifest.upsert(private_record);
+        manifest.upsert(shared_record);
+
+        for (asset_id, expected) in [
+            ("private-asset", private_candidate),
+            ("shared-asset", shared_candidate),
+        ] {
+            let rolling = rolling_asset_local_mirror_request(&config, &manifest, asset_id)
+                .expect("rolling request should be prepared")
+                .expect("rolling asset should need a mirror");
+            let batch = icloudpd_local_mirror_request(&mirror_root, &manifest, asset_id)
+                .expect("batch request should be prepared");
+
+            assert_eq!(rolling.icloudpd_download_path, expected);
+            assert_eq!(batch.icloudpd_download_path, expected);
+        }
+    }
+
+    #[test]
+    fn rolling_and_batch_mirror_requests_use_controlled_destination_when_candidate_is_absent() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_root = tempdir.path().join("library");
+        fs::create_dir_all(&raw_root).expect("raw root should be created");
+        let mut config = MonitorConfig::new(
+            &raw_root,
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        let mirror_root = tempdir.path().join("mirror");
+        config.mirror_root = Some(mirror_root.clone());
+        let uploaded_hash = "cd".repeat(32);
+        let mut record = upload_verified_delete_ready_record("asset-a", &raw_root);
         record.proofs.remove("icloudpd_local_mirror");
         for proof_key in ["conversion", "heic"] {
             record.proofs.get_mut(proof_key).unwrap()["heic_sha256"] = json!(uploaded_hash);
@@ -10660,11 +10753,11 @@ mod tests {
         let rolling = rolling_asset_local_mirror_request(&config, &manifest, "asset-a")
             .expect("rolling request should be prepared")
             .expect("rolling asset should need a mirror");
-        let non_rolling = icloudpd_local_mirror_request(&mirror_root, &manifest, "asset-a")
-            .expect("non-rolling request should be prepared");
+        let batch = icloudpd_local_mirror_request(&mirror_root, &manifest, "asset-a")
+            .expect("batch request should be prepared");
 
         assert_eq!(rolling.icloudpd_download_path, expected);
-        assert_eq!(non_rolling.icloudpd_download_path, expected);
+        assert_eq!(batch.icloudpd_download_path, expected);
     }
 
     fn lifecycle_record(asset_id: &str, state: State) -> AssetRecord {
