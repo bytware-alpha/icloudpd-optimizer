@@ -2,10 +2,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +22,9 @@ use crate::conversion_execution::{
 };
 use crate::local_mirror::{IcloudpdLocalMirrorRequest, LocalMirrorError};
 use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
+use crate::manifest_lock::{
+    ManifestLockError, ManifestLockGuard, acquire_manifest_lock, manifest_lock_path,
+};
 use crate::proof::{MIN_RAW_AGE_DAYS, NasRawProof, ProofError};
 use crate::state_store::{AssetStateStore, AssetStateStoreError};
 use crate::upload::{
@@ -882,7 +883,7 @@ pub fn run_monitor_once(
 
 #[derive(Debug)]
 pub struct MonitorRunGuard {
-    file: File,
+    _lock: ManifestLockGuard,
     owner_id: String,
     state_store: Option<AssetStateStore>,
     heartbeat: Option<MonitorLeaseHeartbeat>,
@@ -936,67 +937,16 @@ impl Drop for MonitorLeaseHeartbeat {
 }
 
 pub fn monitor_run_lock_path(config: &MonitorConfig) -> PathBuf {
-    config.manifest_path.with_extension("monitor.lock")
+    manifest_lock_path(&config.manifest_path)
 }
 
 pub fn acquire_monitor_run_guard(config: &MonitorConfig) -> Result<MonitorRunGuard, MonitorError> {
-    let lock_path = monitor_run_lock_path(config);
-    let parent = lock_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|source| MonitorError::MonitorLockIo {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|source| MonitorError::MonitorLockIo {
-            path: lock_path.clone(),
-            source,
-        })?;
-
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result != 0 {
-            let source = io::Error::last_os_error();
-            if matches!(
-                source.raw_os_error(),
-                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
-            ) {
-                return Err(MonitorError::MonitorAlreadyRunning { lock_path });
-            }
-            return Err(MonitorError::MonitorLockIo {
-                path: lock_path,
-                source,
-            });
-        }
-    }
-
     let owner_id = Uuid::new_v4().to_string();
-    file.set_len(0)
-        .and_then(|()| {
-            write!(
-                file,
-                "pid={}\nowner={}\nmanifest={}\n",
-                std::process::id(),
-                owner_id,
-                config.manifest_path.display()
-            )
-        })
-        .and_then(|()| file.sync_data())
-        .map_err(|source| MonitorError::MonitorLockIo {
-            path: lock_path.clone(),
-            source,
-        })?;
+    let lock = acquire_manifest_lock(&config.manifest_path, &owner_id, true)
+        .map_err(monitor_lock_error)?;
 
     Ok(MonitorRunGuard {
-        file,
+        _lock: lock,
         owner_id,
         state_store: None,
         heartbeat: None,
@@ -1029,10 +979,17 @@ impl Drop for MonitorRunGuard {
         if let Some(state_store) = self.state_store.as_ref() {
             let _ = state_store.release_writer_lease();
         }
-        #[cfg(unix)]
-        {
-            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-        }
+    }
+}
+
+fn monitor_lock_error(error: ManifestLockError) -> MonitorError {
+    match error {
+        ManifestLockError::Held { lock_path } => MonitorError::MonitorAlreadyRunning { lock_path },
+        ManifestLockError::Symlink { path } => MonitorError::MonitorLockIo {
+            path,
+            source: io::Error::other("monitor lock must not be a symbolic link"),
+        },
+        ManifestLockError::Io { path, source } => MonitorError::MonitorLockIo { path, source },
     }
 }
 

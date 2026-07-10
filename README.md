@@ -183,7 +183,12 @@ icloudpd-optimizer manifest migrate --manifest manifest.json --from 1 --to 2
 
 This command requires the exact v1 `manifest.state.sqlite3` schema and returns a JSON
 summary with a safe database identifier. It rejects missing, empty, unknown, or already
-v2 databases without bootstrapping or changing the manifest JSON.
+v2 databases without bootstrapping or changing the manifest JSON. Normal writers and the
+monitor refuse v1 state with an actionable migration-required error; they never migrate it
+implicitly. Stop the local monitor before running this command: it holds the same
+`manifest.monitor.lock` during validation and migration. That flock is local to one shared
+filesystem, so stop any cross-VM or Docker writers whose lock domain is not shared before
+migrating.
 
 Verify that a RAW file is safely present under your storage root:
 

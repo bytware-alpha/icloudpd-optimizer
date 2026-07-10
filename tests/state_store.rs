@@ -4,6 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use icloudpd_optimizer::manifest::{AssetRecord, Manifest, State};
+use icloudpd_optimizer::monitor::{MonitorConfig, acquire_monitor_run_guard};
 use icloudpd_optimizer::state_store::{AssetStateStore, AssetStateStoreError};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -18,7 +19,7 @@ fn manifest_with_record(asset_id: &str) -> Manifest {
 }
 
 fn open_writer(manifest_path: &std::path::Path, owner: &str) -> AssetStateStore {
-    AssetStateStore::open_writer(manifest_path, owner, Duration::from_millis(200))
+    AssetStateStore::open_writer(manifest_path, owner, Duration::from_secs(1))
         .expect("open writer store")
 }
 
@@ -394,42 +395,25 @@ fn concurrent_fresh_openers_observe_writer_lease_held() {
 }
 
 #[test]
-fn concurrent_v1_openers_observe_writer_lease_held() {
+fn normal_v1_openers_require_explicit_schema_only_migration_without_mutation() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let manifest_path = tempdir.path().join("manifest.json");
-    let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
-    let connection = rusqlite::Connection::open(&db_path).expect("open v1 database");
-    connection
-        .execute_batch(
-            "CREATE TABLE assets (
-               asset_id TEXT PRIMARY KEY NOT NULL,
-               state TEXT NOT NULL,
-               updated_at TEXT NOT NULL,
-               record_json TEXT NOT NULL
-             );
-             CREATE INDEX assets_state_index ON assets(state);
-             PRAGMA user_version = 1;",
-        )
-        .expect("create v1 schema");
+    create_v1_database(
+        &manifest_path,
+        &[AssetRecord::new("asset-1", "/photos/asset-1.dng")],
+    );
+    let schema_before = migration_schema_digest(&manifest_path);
 
-    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let first_path = manifest_path.clone();
-    let first = thread::spawn(move || {
-        let writer = AssetStateStore::open_writer(&first_path, "writer-a", Duration::from_secs(1))
-            .expect("first v1 writer should migrate and acquire");
-        acquired_tx.send(()).expect("signal acquired writer");
-        release_rx.recv().expect("wait for release");
-        drop(writer);
-    });
-    acquired_rx.recv().expect("wait for v1 migration");
-
-    assert!(matches!(
-        AssetStateStore::open_writer(&manifest_path, "writer-b", Duration::from_secs(1)),
-        Err(AssetStateStoreError::WriterLeaseHeld { .. })
-    ));
-    release_tx.send(()).expect("release first writer");
-    first.join().expect("join first writer");
+    for owner in ["writer-a", "writer-b"] {
+        let error = AssetStateStore::open_writer(&manifest_path, owner, Duration::from_secs(1))
+            .expect_err("normal writers must not migrate v1 databases");
+        assert!(
+            error
+                .to_string()
+                .contains("requires explicit schema-only migration")
+        );
+        assert_eq!(migration_schema_digest(&manifest_path), schema_before);
+    }
 }
 
 #[test]
@@ -644,11 +628,11 @@ fn failed_v1_to_v2_migration_rolls_back_without_partial_v2_tables() {
         )
         .expect("create v1 schema plus conflicting view");
 
-    let error = AssetStateStore::open_writer(&manifest_path, "writer-a", Duration::from_secs(1))
+    let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
         .expect_err("migration conflict should fail closed");
     assert!(
-        matches!(error, AssetStateStoreError::Database(_)),
-        "expected writer-side migration error, got {error:?}"
+        matches!(error, AssetStateStoreError::MigrationSchemaInvalid { .. }),
+        "expected exact-schema migration error, got {error:?}"
     );
 
     let connection = rusqlite::Connection::open(&db_path).expect("reopen sqlite");
@@ -723,6 +707,16 @@ fn migrates_v1_database_without_reimporting_json_checkpoint() {
         .save_atomic(&manifest_path)
         .expect("replace json checkpoint");
 
+    let error = AssetStateStore::open_writer(&manifest_path, "writer-a", Duration::from_secs(1))
+        .expect_err("normal writer must not migrate v1 state");
+    assert!(
+        error
+            .to_string()
+            .contains("requires explicit schema-only migration")
+    );
+
+    AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+        .expect("explicit schema-only migration should succeed");
     let writer = open_writer(&manifest_path, "writer-a");
     let manifest = writer.load_or_import().expect("load migrated store");
     assert_eq!(
@@ -994,6 +988,161 @@ fn schema_only_migration_waits_for_an_existing_immediate_writer_before_committin
         .expect("migration thread should not panic")
         .expect("migration result should be sent");
     assert_eq!(summary.asset_count, 1);
+}
+
+#[test]
+fn schema_only_migration_rejects_held_monitor_lock_without_database_mutation() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("state/manifest.json");
+    fs::create_dir_all(manifest_path.parent().expect("state parent")).expect("create state parent");
+    create_v1_database(
+        &manifest_path,
+        &[AssetRecord::new("asset-1", "/photos/asset-1.dng")],
+    );
+    let schema_before = migration_schema_digest(&manifest_path);
+    let assets_before = asset_row_digest(&manifest_path);
+    let config = MonitorConfig::new(
+        tempdir.path().join("download"),
+        manifest_path.clone(),
+        tempdir.path().join("heic"),
+    );
+    let guard = acquire_monitor_run_guard(&config).expect("monitor should hold manifest lock");
+
+    let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+        .expect_err("migration must not overlap the monitor lock owner");
+
+    assert!(error.to_string().contains("monitor lock"));
+    assert_eq!(migration_schema_digest(&manifest_path), schema_before);
+    assert_eq!(asset_row_digest(&manifest_path), assets_before);
+    drop(guard);
+    AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+        .expect("migration should succeed once the monitor lock is released");
+}
+
+#[test]
+fn schema_only_migration_validates_every_asset_record_before_ddl() {
+    for (case, mutation, expected_error) in [
+        (
+            "malformed-record-json",
+            "UPDATE assets SET record_json = '{}' WHERE asset_id = 'asset-1'",
+            "failed to decode asset",
+        ),
+        (
+            "mismatched-state-column",
+            "UPDATE assets SET state = 'failed' WHERE asset_id = 'asset-1'",
+            "columns do not match",
+        ),
+    ] {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join(format!("{case}.json"));
+        create_v1_database(
+            &manifest_path,
+            &[AssetRecord::new("asset-1", "/photos/asset-1.dng")],
+        );
+        let connection =
+            rusqlite::Connection::open(AssetStateStore::db_path_for_manifest(&manifest_path))
+                .expect("open v1 state db");
+        connection
+            .execute(mutation, [])
+            .expect("corrupt v1 asset row");
+        let schema_before = migration_schema_digest(&manifest_path);
+        let assets_before = asset_row_digest(&manifest_path);
+
+        let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+            .expect_err("invalid durable asset row must fail closed");
+
+        assert!(
+            error.to_string().contains(expected_error),
+            "{case}: {error}"
+        );
+        assert_eq!(
+            migration_schema_digest(&manifest_path),
+            schema_before,
+            "{case}"
+        );
+        assert_eq!(asset_row_digest(&manifest_path), assets_before, "{case}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn schema_only_migration_rejects_symlinked_database_and_lock_files() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let backing_manifest_path = tempdir.path().join("backing/manifest.json");
+    fs::create_dir_all(backing_manifest_path.parent().expect("backing parent"))
+        .expect("create backing parent");
+    create_v1_database(
+        &backing_manifest_path,
+        &[AssetRecord::new("asset-1", "/photos/asset-1.dng")],
+    );
+    let alias_manifest_path = tempdir.path().join("alias/manifest.json");
+    fs::create_dir_all(alias_manifest_path.parent().expect("alias parent"))
+        .expect("create alias parent");
+    let alias_db_path = AssetStateStore::db_path_for_manifest(&alias_manifest_path);
+    symlink(
+        AssetStateStore::db_path_for_manifest(&backing_manifest_path),
+        &alias_db_path,
+    )
+    .expect("symlink state database");
+    let schema_before = migration_schema_digest(&backing_manifest_path);
+
+    let db_error = AssetStateStore::migrate_schema_only(&alias_manifest_path, 1, 2)
+        .expect_err("symlinked state database must fail closed");
+    assert!(db_error.to_string().contains("symbolic link"));
+    assert_eq!(
+        migration_schema_digest(&backing_manifest_path),
+        schema_before
+    );
+
+    let manifest_path = tempdir.path().join("lock/manifest.json");
+    fs::create_dir_all(manifest_path.parent().expect("lock parent")).expect("create lock parent");
+    create_v1_database(
+        &manifest_path,
+        &[AssetRecord::new("asset-2", "/photos/asset-2.dng")],
+    );
+    let lock_path = manifest_path.with_extension("monitor.lock");
+    let lock_target = tempdir.path().join("lock-target");
+    fs::write(&lock_target, b"not a lock").expect("write lock target");
+    symlink(&lock_target, &lock_path).expect("symlink monitor lock");
+    let schema_before = migration_schema_digest(&manifest_path);
+
+    let lock_error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+        .expect_err("symlinked monitor lock must fail closed");
+    assert!(lock_error.to_string().contains("symbolic link"));
+    assert_eq!(migration_schema_digest(&manifest_path), schema_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn schema_only_migration_hashes_the_canonical_database_identity() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let backing_dir = tempdir.path().join("backing");
+    fs::create_dir_all(&backing_dir).expect("create backing directory");
+    let backing_manifest_path = backing_dir.join("manifest.json");
+    create_v1_database(
+        &backing_manifest_path,
+        &[AssetRecord::new("asset-1", "/photos/asset-1.dng")],
+    );
+    let alias_dir = tempdir.path().join("alias");
+    symlink(&backing_dir, &alias_dir).expect("symlink parent directory");
+    let alias_manifest_path = alias_dir.join("manifest.json");
+    let canonical_db_path = fs::canonicalize(AssetStateStore::db_path_for_manifest(
+        &backing_manifest_path,
+    ))
+    .expect("canonicalize verified database");
+    let expected_id = format!(
+        "sha256:{:x}",
+        Sha256::digest(canonical_db_path.to_string_lossy().as_bytes())
+    );
+
+    let summary = AssetStateStore::migrate_schema_only(&alias_manifest_path, 1, 2)
+        .expect("migration through a parent alias should succeed");
+
+    assert_eq!(summary.database_id, expected_id);
 }
 
 #[test]

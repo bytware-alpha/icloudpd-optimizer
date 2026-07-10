@@ -16,6 +16,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::manifest::{AssetRecord, Manifest, ManifestError};
+use crate::manifest_lock::{ManifestLockError, acquire_manifest_lock};
 
 const SCHEMA_VERSION: i32 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -107,6 +108,10 @@ pub struct SchemaMigrationSummary {
     pub quick_check: String,
 }
 
+struct VerifiedDatabasePath {
+    canonical_path: PathBuf,
+}
+
 impl AssetStateStore {
     pub fn db_path_for_manifest(manifest_path: impl AsRef<Path>) -> PathBuf {
         manifest_path.as_ref().with_extension("state.sqlite3")
@@ -154,6 +159,13 @@ impl AssetStateStore {
             writer: None,
         };
         let mut connection = store.connect_writer()?;
+        let schema_version: i32 =
+            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if schema_version == 1 {
+            return Err(AssetStateStoreError::MigrationRequired {
+                path: store.db_path.clone(),
+            });
+        }
         ensure_wal(&connection, true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         store.initialize_writer(&transaction)?;
@@ -178,23 +190,15 @@ impl AssetStateStore {
         }
 
         let manifest_path = manifest_path.as_ref().to_path_buf();
-        let db_path = Self::db_path_for_manifest(&manifest_path);
-        match fs::metadata(&db_path) {
-            Ok(_) => {}
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                return Err(AssetStateStoreError::MigrationDatabaseMissing { path: db_path });
-            }
-            Err(source) => {
-                return Err(AssetStateStoreError::MigrationDatabaseMetadata {
-                    path: db_path,
-                    source,
-                });
-            }
-        }
+        let requested_db_path = Self::db_path_for_manifest(&manifest_path);
+        let verified_database = verify_existing_database_path(&requested_db_path)?;
+        let owner_id = format!("schema-migrate-{}", Uuid::new_v4());
+        let _manifest_lock = acquire_manifest_lock(&manifest_path, &owner_id, false)
+            .map_err(migration_lock_error)?;
 
         let store = Self {
             manifest_path,
-            db_path,
+            db_path: verified_database.canonical_path,
             writer: None,
         };
         let mut connection = store.connect_existing_writer()?;
@@ -213,7 +217,6 @@ impl AssetStateStore {
         // The IMMEDIATE transaction serializes legacy v1 writers until the v2 lease exists.
         // Once created, the lease token is acquired and cleared in this same transaction.
         migrate_v1_to_v2_with_import_metadata(&transaction, JsonImportMetadataSeed::schema_only())?;
-        let owner_id = format!("schema-migrate-{}", Uuid::new_v4());
         let token = store.acquire_writer_lease_in_transaction(
             &transaction,
             &owner_id,
@@ -348,13 +351,14 @@ impl AssetStateStore {
     }
 
     fn connect_existing_writer(&self) -> Result<Connection, AssetStateStoreError> {
-        let connection =
-            Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(
-                |source| AssetStateStoreError::OpenDatabase {
-                    path: self.db_path.clone(),
-                    source,
-                },
-            )?;
+        let connection = Connection::open_with_flags(
+            &self.db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|source| AssetStateStoreError::OpenDatabase {
+            path: self.db_path.clone(),
+            source,
+        })?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -415,7 +419,11 @@ impl AssetStateStore {
 
         match (schema_version, user_table_count) {
             (0, 0) => create_v2_schema(transaction)?,
-            (1, _) => self.migrate_v1_to_v2(transaction)?,
+            (1, _) => {
+                return Err(AssetStateStoreError::MigrationRequired {
+                    path: self.db_path.clone(),
+                });
+            }
             (SCHEMA_VERSION, 0) => return Err(AssetStateStoreError::MissingSchema),
             (SCHEMA_VERSION, _) => {}
             (_, 0) => return Err(AssetStateStoreError::MissingSchema),
@@ -427,25 +435,6 @@ impl AssetStateStore {
             }
         }
         Ok(())
-    }
-
-    fn migrate_v1_to_v2(&self, transaction: &Transaction<'_>) -> Result<(), AssetStateStoreError> {
-        let asset_count: i64 =
-            transaction.query_row("SELECT count(*) FROM assets", [], |row| row.get(0))?;
-        let (source_size_bytes, source_mtime_unix_nanos) =
-            manifest_file_metadata(&self.manifest_path)?;
-        let imported_once = asset_count > 0;
-        migrate_v1_to_v2_with_import_metadata(
-            transaction,
-            JsonImportMetadataSeed {
-                imported_once,
-                source_path: imported_once.then(|| self.manifest_path.display().to_string()),
-                source_size_bytes,
-                source_mtime_unix_nanos,
-                imported_at_unix_ms: imported_once.then_some(current_unix_millis()),
-                import_note: imported_once.then_some("legacy_v1_migration"),
-            },
-        )
     }
 
     fn verify_integrity(&self, connection: &Connection) -> Result<(), AssetStateStoreError> {
@@ -983,9 +972,34 @@ fn validate_exact_v1_schema(transaction: &Transaction<'_>) -> Result<i64, AssetS
         });
     }
 
-    transaction
-        .query_row("SELECT count(*) FROM assets", [], |row| row.get(0))
-        .map_err(AssetStateStoreError::from)
+    validate_v1_asset_rows(transaction)
+}
+
+fn validate_v1_asset_rows(transaction: &Transaction<'_>) -> Result<i64, AssetStateStoreError> {
+    let mut statement = transaction
+        .prepare("SELECT asset_id, state, updated_at, record_json FROM assets ORDER BY asset_id")?;
+    let mut rows = statement.query([])?;
+    let mut asset_count = 0_i64;
+    while let Some(row) = rows.next()? {
+        let asset_id: String = row.get(0)?;
+        let state: String = row.get(1)?;
+        let updated_at: String = row.get(2)?;
+        let record_json: String = row.get(3)?;
+        let record: AssetRecord = serde_json::from_str(&record_json).map_err(|source| {
+            AssetStateStoreError::DecodeRecord {
+                asset_id: asset_id.clone(),
+                source,
+            }
+        })?;
+        if record.asset_id != asset_id
+            || record.state.as_str() != state
+            || record.updated_at != updated_at
+        {
+            return Err(AssetStateStoreError::RecordColumnMismatch { asset_id });
+        }
+        asset_count = asset_count.saturating_add(1);
+    }
+    Ok(asset_count)
 }
 
 fn normalize_schema_sql(sql: &str) -> String {
@@ -1051,6 +1065,67 @@ fn database_id(path: &Path) -> String {
         "sha256:{:x}",
         Sha256::digest(path.to_string_lossy().as_bytes())
     )
+}
+
+fn verify_existing_database_path(
+    path: &Path,
+) -> Result<VerifiedDatabasePath, AssetStateStoreError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Err(AssetStateStoreError::MigrationDatabaseMissing {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(source) => {
+            return Err(AssetStateStoreError::MigrationDatabaseMetadata {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(AssetStateStoreError::MigrationDatabaseSymlink {
+            path: path.to_path_buf(),
+        });
+    }
+    if !metadata.file_type().is_file() {
+        return Err(AssetStateStoreError::MigrationDatabaseNotFile {
+            path: path.to_path_buf(),
+        });
+    }
+    let canonical_path = fs::canonicalize(path).map_err(|source| {
+        AssetStateStoreError::MigrationDatabaseMetadata {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    let canonical_metadata = fs::symlink_metadata(&canonical_path).map_err(|source| {
+        AssetStateStoreError::MigrationDatabaseMetadata {
+            path: canonical_path.clone(),
+            source,
+        }
+    })?;
+    if canonical_metadata.file_type().is_symlink() || !canonical_metadata.file_type().is_file() {
+        return Err(AssetStateStoreError::MigrationDatabaseNotFile {
+            path: canonical_path,
+        });
+    }
+    Ok(VerifiedDatabasePath { canonical_path })
+}
+
+fn migration_lock_error(error: ManifestLockError) -> AssetStateStoreError {
+    match error {
+        ManifestLockError::Held { lock_path } => {
+            AssetStateStoreError::MigrationMonitorLockHeld { lock_path }
+        }
+        ManifestLockError::Symlink { path } => {
+            AssetStateStoreError::MigrationMonitorLockSymlink { path }
+        }
+        ManifestLockError::Io { path, source } => {
+            AssetStateStoreError::MigrationMonitorLockIo { path, source }
+        }
+    }
 }
 
 fn validate_writer_owner_id(owner_id: &str) -> Result<(), AssetStateStoreError> {
@@ -1319,12 +1394,28 @@ pub enum AssetStateStoreError {
         path: PathBuf,
         source: rusqlite::Error,
     },
+    #[error(
+        "state database at {path} requires explicit schema-only migration; stop all writers and run `icloudpd-optimizer manifest migrate --manifest <PATH> --from 1 --to 2`"
+    )]
+    MigrationRequired { path: PathBuf },
     #[error("schema migration only supports from=1 to=2; received from={from} to={to}")]
     InvalidSchemaMigration { from: i32, to: i32 },
     #[error("state database for schema migration does not exist at {path}")]
     MigrationDatabaseMissing { path: PathBuf },
+    #[error("state database for schema migration must not be a symbolic link: {path}")]
+    MigrationDatabaseSymlink { path: PathBuf },
+    #[error("state database for schema migration must be a regular file: {path}")]
+    MigrationDatabaseNotFile { path: PathBuf },
     #[error("failed to inspect state database for schema migration at {path}: {source}")]
     MigrationDatabaseMetadata { path: PathBuf, source: io::Error },
+    #[error(
+        "schema-only migration cannot acquire manifest monitor lock at {lock_path}; stop the monitor before migrating"
+    )]
+    MigrationMonitorLockHeld { lock_path: PathBuf },
+    #[error("schema-only migration monitor lock must not be a symbolic link: {path}")]
+    MigrationMonitorLockSymlink { path: PathBuf },
+    #[error("failed to use schema-only migration monitor lock {path}: {source}")]
+    MigrationMonitorLockIo { path: PathBuf, source: io::Error },
     #[error("schema migration expected schema version {expected}, found {actual}")]
     MigrationSchemaVersion { expected: i32, actual: i32 },
     #[error("schema migration v1 assets table contains no asset rows")]
