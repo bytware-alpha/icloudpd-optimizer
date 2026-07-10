@@ -187,6 +187,10 @@ fn cloudkit_asset_raw_alt_pair_with_url(
         "resOriginalAltFileType".to_string(),
         json!({"value": "com.adobe.raw-image"}),
     );
+    asset_fields.insert(
+        "resOriginalAltFingerprint".to_string(),
+        json!({"value": "asset-alt-fingerprint"}),
+    );
 
     let master_fields = records[1]["fields"]
         .as_object_mut()
@@ -1822,6 +1826,7 @@ fn cloudkit_original_asset_batch_reconciliation_marks_raw_download_incompletenes
         "downloadURL": "https://p140-icloud-content.icloud.com/raw-exact"
     }});
     records[1]["fields"]["resOriginalAltFileType"] = json!({"value": "com.adobe.raw-image"});
+    records[1]["fields"]["resOriginalAltFingerprint"] = json!({"value": "raw-alt-fingerprint"});
     let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
         vec![json!({"records": records})],
         vec![b"short".to_vec(), b"raw-bytes".to_vec()],
@@ -1863,11 +1868,15 @@ fn cloudkit_original_asset_batch_reconciliation_marks_replacement_download_incom
         "downloadURL": "https://p140-icloud-content.icloud.com/replacement-truncated"
     }});
     records[1]["fields"]["resOriginalAltFileType"] = json!({"value": "public.heic"});
+    records[1]["fields"]["resOriginalAltFingerprint"] =
+        json!({"value": "replacement-truncated-fingerprint"});
     records[1]["fields"]["resSidecarRes"] = json!({"value": {
         "size": replacement.len(),
         "downloadURL": "https://p140-icloud-content.icloud.com/replacement-exact"
     }});
     records[1]["fields"]["resSidecarFileType"] = json!({"value": "public.heic"});
+    records[1]["fields"]["resSidecarFingerprint"] =
+        json!({"value": "replacement-exact-fingerprint"});
     let mut target = batch_resolve_target("asset-1", "IMG_0001.DNG", b"other-raw");
     target.replacement_candidate = Some(CloudKitLocalReplacementCandidate {
         sha256: sha256_hex(replacement),
@@ -2086,6 +2095,7 @@ fn cloudkit_original_asset_batch_reconciliation_reports_remote_replacement_witho
         "downloadURL": "https://p140-icloud-content.icloud.com/replacement"
     }});
     records[1]["fields"]["resOriginalAltFileType"] = json!({"value": "public.heic"});
+    records[1]["fields"]["resOriginalAltFingerprint"] = json!({"value": "replacement-fingerprint"});
     let mut target = batch_resolve_target("asset-1", "IMG_0001.dng", b"other-raw");
     target.replacement_candidate = Some(CloudKitLocalReplacementCandidate {
         sha256: sha256_hex(replacement),
@@ -2133,6 +2143,8 @@ fn cloudkit_original_asset_batch_reconciliation_marks_exact_and_replacement_ambi
         "downloadURL": "https://p140-icloud-content.icloud.com/both-replacement"
     }});
     records[1]["fields"]["resOriginalAltFileType"] = json!({"value": "public.heif"});
+    records[1]["fields"]["resOriginalAltFingerprint"] =
+        json!({"value": "both-replacement-fingerprint"});
     let mut target = batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes");
     target.replacement_candidate = Some(CloudKitLocalReplacementCandidate {
         sha256: sha256_hex(replacement),
@@ -2301,6 +2313,9 @@ fn cloudkit_original_asset_batch_inventory_fingerprint_ignores_rotating_download
     );
     let mut changed_metadata_records = second_records.clone();
     changed_metadata_records[1]["fields"]["resOriginalRes"]["value"]["size"] = json!(10);
+    let mut changed_resource_fingerprint_records = second_records.clone();
+    changed_resource_fingerprint_records[1]["fields"]["resOriginalFingerprint"]["value"] =
+        json!("fingerprint-updated");
     let mut changed_change_tag_records = second_records.clone();
     changed_change_tag_records[0]["recordChangeTag"] = json!("tag-rotated");
     let mut first_transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
@@ -2314,6 +2329,11 @@ fn cloudkit_original_asset_batch_inventory_fingerprint_ignores_rotating_download
     let mut changed_metadata_transport = FakeCloudKitDeleteTransport::query_responses(vec![
         json!({"records": changed_metadata_records}),
     ]);
+    let mut changed_resource_fingerprint_transport =
+        FakeCloudKitDeleteTransport::query_responses_with_downloads(
+            vec![json!({"records": changed_resource_fingerprint_records})],
+            vec![b"raw-bytes".to_vec()],
+        );
     let mut changed_change_tag_transport =
         FakeCloudKitDeleteTransport::query_responses_with_downloads(
             vec![json!({"records": changed_change_tag_records})],
@@ -2329,6 +2349,10 @@ fn cloudkit_original_asset_batch_inventory_fingerprint_ignores_rotating_download
     let changed_metadata = CloudKitDeleteClient::new(&mut changed_metadata_transport)
         .resolve_original_assets_batch_outcome(&session, &request)
         .expect("changed resource metadata inventory should resolve");
+    let changed_resource_fingerprint =
+        CloudKitDeleteClient::new(&mut changed_resource_fingerprint_transport)
+            .resolve_original_assets_batch_outcome(&session, &request)
+            .expect("changed resource fingerprint inventory should resolve");
     let changed_change_tag = CloudKitDeleteClient::new(&mut changed_change_tag_transport)
         .resolve_original_assets_batch_outcome(&session, &request)
         .expect("rotated change tag inventory should resolve");
@@ -2357,6 +2381,18 @@ fn cloudkit_original_asset_batch_inventory_fingerprint_ignores_rotating_download
             .expect("changed metadata inventory should be complete")
             .sha256
     );
+    assert_ne!(
+        first
+            .inventory
+            .as_ref()
+            .expect("first inventory should be complete")
+            .sha256,
+        changed_resource_fingerprint
+            .inventory
+            .as_ref()
+            .expect("changed resource fingerprint inventory should be complete")
+            .sha256
+    );
     assert_eq!(
         first
             .inventory
@@ -2369,6 +2405,46 @@ fn cloudkit_original_asset_batch_inventory_fingerprint_ignores_rotating_download
             .expect("change tag rotation should not change inventory")
             .sha256
     );
+}
+
+#[test]
+fn cloudkit_original_asset_batch_inventory_rejects_missing_or_conflicting_resource_fingerprints() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let request = batch_resolve_request(vec![batch_resolve_target(
+        "asset-1",
+        "IMG_0001.DNG",
+        b"raw-bytes",
+    )]);
+    let mut missing_fingerprint_records = cloudkit_raw_pair_with(
+        "CPLAsset-original",
+        "CPLMaster-original",
+        "tag-original",
+        9,
+        1_800_000_000_000,
+    );
+    missing_fingerprint_records[1]["fields"]
+        .as_object_mut()
+        .expect("master fields should be an object")
+        .remove("resOriginalFingerprint");
+    let mut conflicting_fingerprint_records = missing_fingerprint_records.clone();
+    conflicting_fingerprint_records[1]["fields"]["resOriginalFingerprint"] = json!({
+        "value": ["fingerprint-a", "fingerprint-b"]
+    });
+
+    for records in [missing_fingerprint_records, conflicting_fingerprint_records] {
+        let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+            vec![json!({"records": records})],
+            vec![b"raw-bytes".to_vec()],
+        );
+        let error = CloudKitDeleteClient::new(&mut transport)
+            .resolve_original_assets_batch_outcome(&session, &request)
+            .expect_err("incomplete or conflicting resource fingerprint metadata must fail closed");
+        assert!(matches!(
+            error,
+            UploadError::InvalidCloudKitOriginalAssetResponse(_)
+        ));
+    }
 }
 
 #[test]

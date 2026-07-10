@@ -3118,30 +3118,12 @@ fn normalized_inventory_asset_identity(
             "resSidecar",
             "resOriginalVidCompl",
         ] {
-            let resource_field = format!("{prefix}Res");
-            let Some(resource_field_value) = fields.get(&resource_field) else {
+            let Some(resource) =
+                normalized_inventory_resource_identity(record_role, fields, prefix)?
+            else {
                 continue;
             };
-            let resource = field_value_object(resource_field_value).ok_or(
-                UploadError::InvalidCloudKitOriginalAssetResponse(
-                    "CloudKit original resource field is malformed",
-                ),
-            )?;
-            let size_bytes = resource_size_bytes(resource).ok_or(
-                UploadError::InvalidCloudKitOriginalAssetResponse(
-                    "CloudKit original resource missing size",
-                ),
-            )?;
-            let file_type_key = format!("{prefix}FileType");
-            let file_type = field_string(fields, &file_type_key).ok_or(
-                UploadError::InvalidCloudKitOriginalAssetResponse(
-                    "CloudKit original resource missing file type",
-                ),
-            )?;
-            resources.insert(format!(
-                "{record_role}\u{1f}{resource_field}\u{1f}{}\u{1f}{size_bytes}",
-                file_type.to_ascii_lowercase(),
-            ));
+            resources.insert(resource);
         }
     }
     Ok(format!(
@@ -3152,6 +3134,53 @@ fn normalized_inventory_asset_identity(
         master_record_name,
         resources.into_iter().collect::<Vec<_>>().join("\u{1e}"),
     ))
+}
+
+fn normalized_inventory_resource_identity(
+    record_role: &str,
+    fields: &serde_json::Map<String, Value>,
+    prefix: &str,
+) -> Result<Option<String>, UploadError> {
+    let resource_field = format!("{prefix}Res");
+    let fingerprint_field = format!("{prefix}Fingerprint");
+    let resource_field_value = match (fields.get(&resource_field), fields.get(&fingerprint_field)) {
+        (None, None) => return Ok(None),
+        (Some(resource), Some(_)) => resource,
+        (Some(_), None) => {
+            return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                "CloudKit original resource missing fingerprint",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+                "CloudKit original fingerprint has no resource",
+            ));
+        }
+    };
+    let resource = field_value_object(resource_field_value).ok_or(
+        UploadError::InvalidCloudKitOriginalAssetResponse(
+            "CloudKit original resource field is malformed",
+        ),
+    )?;
+    let size_bytes =
+        resource_size_bytes(resource).ok_or(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "CloudKit original resource missing size",
+        ))?;
+    let file_type_key = format!("{prefix}FileType");
+    let file_type = field_string(fields, &file_type_key).ok_or(
+        UploadError::InvalidCloudKitOriginalAssetResponse(
+            "CloudKit original resource missing file type",
+        ),
+    )?;
+    let fingerprint = field_string(fields, &fingerprint_field)
+        .filter(|fingerprint| !fingerprint.trim().is_empty())
+        .ok_or(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "CloudKit original resource fingerprint is malformed or conflicting",
+        ))?;
+    Ok(Some(format!(
+        "{record_role}\u{1f}{resource_field}\u{1f}{}\u{1f}{size_bytes}\u{1f}{fingerprint}",
+        file_type.to_ascii_lowercase(),
+    )))
 }
 
 fn record_pair_matching_raw_resource_urls(
@@ -4766,7 +4795,8 @@ mod batch_reconciliation_performance_tests {
                         "size": 9,
                         "downloadURL": format!("https://p140-icloud-content.icloud.com/raw-{index}")
                     }},
-                    "resOriginalFileType": {"value": "com.adobe.raw-image"}
+                    "resOriginalFileType": {"value": "com.adobe.raw-image"},
+                    "resOriginalFingerprint": {"value": format!("fingerprint-{index}")}
                 }
             }));
         }
