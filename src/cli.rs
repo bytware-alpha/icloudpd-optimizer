@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::ErrorKind;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::thread;
@@ -1508,7 +1510,9 @@ fn hash_stable_file_with_before_hash(
         hasher.update(&buffer[..bytes_read]);
     }
     let after = file.metadata()?;
-    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+    if !same_file_handle_metadata(&before, &after)
+        || !canonical_path_still_points_to_open_file(path, &after)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "local replacement changed while hashing",
@@ -1518,6 +1522,43 @@ fn hash_stable_file_with_before_hash(
         sha256: format!("{:x}", hasher.finalize()),
         size_bytes: after.len(),
     })
+}
+
+fn same_file_handle_metadata(before: &Metadata, after: &Metadata) -> bool {
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn canonical_path_still_points_to_open_file(path: &Path, open_file: &Metadata) -> bool {
+    let Ok(final_path) = fs::canonicalize(path) else {
+        return false;
+    };
+    if final_path != path {
+        return false;
+    }
+    let Ok(final_metadata) = fs::metadata(final_path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        open_file.dev() == final_metadata.dev() && open_file.ino() == final_metadata.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        same_file_handle_metadata(open_file, &final_metadata)
+    }
 }
 
 fn redact_audit_resolutions(
@@ -2990,6 +3031,51 @@ mod original_assets_audit_tests {
                 .expect("replacement mutation should succeed");
         })
         .expect_err("changed replacement bytes must not produce an exact local candidate");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_candidate_hash_rejects_same_size_rewrite_with_restored_mtime() {
+        use filetime::{FileTime, set_file_mtime};
+        use std::os::unix::fs::MetadataExt;
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let replacement = tempdir.path().join("asset.HEIC");
+        fs::write(&replacement, b"before").expect("replacement should save");
+        let before = fs::metadata(&replacement).expect("replacement metadata should load");
+        let original_mtime = FileTime::from_last_modification_time(&before);
+
+        let error = hash_stable_file_with_before_hash(&replacement, || {
+            fs::write(&replacement, b"after!").expect("replacement mutation should succeed");
+            set_file_mtime(&replacement, original_mtime)
+                .expect("replacement mtime should be restored");
+        })
+        .expect_err("same-size rewrite must not produce an exact local candidate");
+
+        let after = fs::metadata(&replacement).expect("replacement metadata should reload");
+        assert_ne!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec())
+        );
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_candidate_hash_rejects_a_path_replaced_after_handle_open() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let replacement = tempdir.path().join("asset.HEIC");
+        let replacement_swap = tempdir.path().join("asset.HEIC.swap");
+        fs::write(&replacement, b"before").expect("replacement should save");
+        fs::write(&replacement_swap, b"after!").expect("replacement swap should save");
+
+        let error = hash_stable_file_with_before_hash(&replacement, || {
+            fs::rename(&replacement_swap, &replacement)
+                .expect("replacement path should be replaced atomically");
+        })
+        .expect_err("replaced path must not produce an exact local candidate");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
