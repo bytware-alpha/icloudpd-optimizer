@@ -1252,6 +1252,7 @@ fn monitor_scan_root_preflight(args: MonitorScanRootPreflightArgs) -> Result<(),
 struct OriginalAssetsAuditReport {
     targets: usize,
     skipped_targets: usize,
+    skip_reason_counts: BTreeMap<String, u64>,
     destinations: Vec<OriginalAssetsAuditDestinationReport>,
     disposition_counts: BTreeMap<String, u64>,
     elapsed_millis: u128,
@@ -1281,6 +1282,29 @@ struct OriginalAssetsAuditTarget {
     target: CloudKitOriginalAssetResolveTarget,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum OriginalAssetsAuditSkipReason {
+    InvalidOrMissingNasProof,
+    InvalidOrMissingSourceAgeProof,
+    RawPathUnavailable,
+    OutsideDownloadRoot,
+    UnsupportedLibraryLayout,
+    InvalidFilename,
+}
+
+impl OriginalAssetsAuditSkipReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidOrMissingNasProof => "invalid_or_missing_nas_proof",
+            Self::InvalidOrMissingSourceAgeProof => "invalid_or_missing_source_age_proof",
+            Self::RawPathUnavailable => "raw_path_unavailable",
+            Self::OutsideDownloadRoot => "outside_download_root",
+            Self::UnsupportedLibraryLayout => "unsupported_library_layout",
+            Self::InvalidFilename => "invalid_filename",
+        }
+    }
+}
+
 fn monitor_original_assets_audit<W: Write>(
     args: MonitorOriginalAssetsAuditArgs,
     writer: &mut W,
@@ -1297,7 +1321,7 @@ fn monitor_original_assets_audit<W: Write>(
     run_scan_root_preflight_probe(&canonical_library_root)?;
     let state_store = AssetStateStore::open_read_only(&config.manifest_path)?;
     let manifest = state_store.load()?;
-    let (destination_targets, skipped_targets) = original_assets_audit_targets(
+    let (destination_targets, skipped_targets, skip_reason_counts) = original_assets_audit_targets(
         &manifest,
         &canonical_library_root,
         config.capture_tolerance_seconds,
@@ -1334,6 +1358,7 @@ fn monitor_original_assets_audit<W: Write>(
     let mut report = OriginalAssetsAuditReport {
         targets: target_count,
         skipped_targets,
+        skip_reason_counts,
         destinations: destination_reports,
         disposition_counts: BTreeMap::new(),
         elapsed_millis: started.elapsed().as_millis(),
@@ -1346,6 +1371,7 @@ fn monitor_original_assets_audit<W: Write>(
         original_assets_audit_human_summary(
             report.targets,
             report.skipped_targets,
+            &report.skip_reason_counts,
             &report.destinations,
             report.elapsed_millis,
         )
@@ -1461,25 +1487,35 @@ fn original_assets_audit_targets(
 ) -> (
     BTreeMap<CloudKitLibraryDestination, Vec<CloudKitOriginalAssetResolveTarget>>,
     usize,
+    BTreeMap<String, u64>,
 ) {
     let mut targets = BTreeMap::new();
     let mut skipped = 0_usize;
+    let mut skip_reason_counts = BTreeMap::new();
     for record in manifest.records().values() {
         if !original_assets_audit_eligible(record) {
             continue;
         }
-        let Some(target) =
-            original_assets_audit_target(record, canonical_library_root, capture_tolerance_seconds)
-        else {
-            skipped = skipped.saturating_add(1);
-            continue;
+        let target = match original_assets_audit_target(
+            record,
+            canonical_library_root,
+            capture_tolerance_seconds,
+        ) {
+            Ok(target) => target,
+            Err(reason) => {
+                skipped = skipped.saturating_add(1);
+                *skip_reason_counts
+                    .entry(reason.as_str().to_string())
+                    .or_default() += 1;
+                continue;
+            }
         };
         targets
             .entry(target.destination)
             .or_insert_with(Vec::new)
             .push(target.target);
     }
-    (targets, skipped)
+    (targets, skipped, skip_reason_counts)
 }
 
 fn original_assets_audit_eligible(record: &AssetRecord) -> bool {
@@ -1499,17 +1535,18 @@ fn original_assets_audit_target(
     record: &AssetRecord,
     canonical_library_root: &Path,
     capture_tolerance_seconds: u64,
-) -> Option<OriginalAssetsAuditTarget> {
-    let nas = serde_json::from_value::<NasRawProof>(record.proofs.get("nas")?.clone()).ok()?;
-    let source_age =
-        serde_json::from_value::<SourceAgeProof>(record.proofs.get("source_age")?.clone()).ok()?;
-    let canonical_raw_path = fs::canonicalize(&record.raw_path).ok()?;
+) -> Result<OriginalAssetsAuditTarget, OriginalAssetsAuditSkipReason> {
+    let nas = original_assets_audit_nas_proof(record)?;
+    let source_age = original_assets_audit_source_age_proof(record)?;
+    let canonical_raw_path = fs::canonicalize(&record.raw_path)
+        .map_err(|_| OriginalAssetsAuditSkipReason::RawPathUnavailable)?;
     let relative_raw_path = canonical_raw_path
         .strip_prefix(canonical_library_root)
-        .ok()?;
-    let destination = original_assets_audit_destination(relative_raw_path)?;
-    let filename = canonical_raw_path.file_name()?.to_str()?.to_string();
-    Some(OriginalAssetsAuditTarget {
+        .map_err(|_| OriginalAssetsAuditSkipReason::OutsideDownloadRoot)?;
+    let destination = original_assets_audit_destination(canonical_library_root, relative_raw_path)
+        .ok_or(OriginalAssetsAuditSkipReason::UnsupportedLibraryLayout)?;
+    let filename = original_assets_audit_filename(&canonical_raw_path)?;
+    Ok(OriginalAssetsAuditTarget {
         destination,
         target: CloudKitOriginalAssetResolveTarget {
             asset_id: record.asset_id.clone(),
@@ -1527,13 +1564,86 @@ fn original_assets_audit_target(
     })
 }
 
+fn original_assets_audit_nas_proof(
+    record: &AssetRecord,
+) -> Result<NasRawProof, OriginalAssetsAuditSkipReason> {
+    let nas = record
+        .proofs
+        .get("nas")
+        .cloned()
+        .and_then(|proof| serde_json::from_value::<NasRawProof>(proof).ok())
+        .ok_or(OriginalAssetsAuditSkipReason::InvalidOrMissingNasProof)?;
+    (!nas.canonical_path.as_os_str().is_empty()
+        && !nas.relative_path.as_os_str().is_empty()
+        && nas.size_bytes > 0
+        && !nas.sha256.trim().is_empty())
+    .then_some(nas)
+    .ok_or(OriginalAssetsAuditSkipReason::InvalidOrMissingNasProof)
+}
+
+fn original_assets_audit_source_age_proof(
+    record: &AssetRecord,
+) -> Result<SourceAgeProof, OriginalAssetsAuditSkipReason> {
+    let source_age = record
+        .proofs
+        .get("source_age")
+        .cloned()
+        .and_then(|proof| serde_json::from_value::<SourceAgeProof>(proof).ok())
+        .ok_or(OriginalAssetsAuditSkipReason::InvalidOrMissingSourceAgeProof)?;
+    (source_age.source_captured_unix_seconds > 0
+        && source_age.verified_at_unix_seconds >= source_age.source_captured_unix_seconds
+        && source_age.min_age_seconds > 0)
+        .then_some(source_age)
+        .ok_or(OriginalAssetsAuditSkipReason::InvalidOrMissingSourceAgeProof)
+}
+
+fn original_assets_audit_filename(
+    canonical_raw_path: &Path,
+) -> Result<String, OriginalAssetsAuditSkipReason> {
+    if !canonical_raw_path.is_file() {
+        return Err(OriginalAssetsAuditSkipReason::InvalidFilename);
+    }
+    canonical_raw_path
+        .file_name()
+        .and_then(|filename| filename.to_str())
+        .filter(|filename| {
+            !filename.trim().is_empty()
+                && *filename != "."
+                && *filename != ".."
+                && !filename.contains(['/', '\\'])
+        })
+        .map(ToOwned::to_owned)
+        .ok_or(OriginalAssetsAuditSkipReason::InvalidFilename)
+}
+
 fn original_assets_audit_destination(
+    canonical_library_root: &Path,
     relative_raw_path: &Path,
 ) -> Option<CloudKitLibraryDestination> {
-    let Component::Normal(component) = relative_raw_path.components().next()? else {
+    if !relative_raw_path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
+    {
         return None;
-    };
-    let library = component.to_str()?;
+    }
+    let library = canonical_library_root
+        .file_name()
+        .and_then(|component| component.to_str())
+        .and_then(original_assets_audit_library_destination)
+        .or_else(|| {
+            relative_raw_path
+                .components()
+                .next()
+                .and_then(|component| match component {
+                    Component::Normal(component) => component.to_str(),
+                    _ => None,
+                })
+                .and_then(original_assets_audit_library_destination)
+        })?;
+    Some(library)
+}
+
+fn original_assets_audit_library_destination(library: &str) -> Option<CloudKitLibraryDestination> {
     if library == "PrimarySync" {
         return Some(CloudKitLibraryDestination::primary_sync());
     }
@@ -1700,6 +1810,7 @@ fn original_assets_audit_disposition_counts(
 fn original_assets_audit_human_summary(
     targets: usize,
     skipped_targets: usize,
+    skip_reason_counts: &BTreeMap<String, u64>,
     reports: &[OriginalAssetsAuditDestinationReport],
     elapsed_millis: u128,
 ) -> String {
@@ -1710,6 +1821,15 @@ fn original_assets_audit_human_summary(
         counts
             .into_iter()
             .map(|(disposition, count)| format!("{disposition}={count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let skip_reasons = if skip_reason_counts.is_empty() {
+        "none".to_string()
+    } else {
+        skip_reason_counts
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
             .collect::<Vec<_>>()
             .join(",")
     };
@@ -1730,7 +1850,7 @@ fn original_assets_audit_human_summary(
             .join(",")
     };
     format!(
-        "original-assets-audit: targets={targets} skipped={skipped_targets} dispositions={dispositions} destination_timings={destination_timings} elapsed_ms={elapsed_millis}"
+        "original-assets-audit: targets={targets} skipped={skipped_targets} skip_reasons={skip_reasons} dispositions={dispositions} destination_timings={destination_timings} elapsed_ms={elapsed_millis}"
     )
 }
 
@@ -3186,13 +3306,14 @@ mod original_assets_audit_tests {
         manifest.upsert(audit_record("asset-primary", primary_raw, &root));
         manifest.upsert(audit_record("asset-shared", shared_raw, &root));
 
-        let (groups, skipped) = original_assets_audit_targets(
+        let (groups, skipped, skip_reasons) = original_assets_audit_targets(
             &manifest,
             &fs::canonicalize(&root).expect("root should canonicalize"),
             2,
         );
 
         assert_eq!(skipped, 0);
+        assert!(skip_reasons.is_empty());
         assert_eq!(groups.len(), 2);
         let primary = groups
             .get(&CloudKitLibraryDestination::primary_sync())
@@ -3210,13 +3331,170 @@ mod original_assets_audit_tests {
             database_scope: CloudKitDatabaseScope::Shared,
             zone_name: "SharedSync-family".to_string(),
         };
+        let shared = groups
+            .get(&shared_destination)
+            .expect("shared target should be grouped");
+        assert_eq!(shared.len(), 1);
+        assert!(
+            shared[0].replacement_candidate.is_none(),
+            "an unavailable stable replacement candidate must not skip the target"
+        );
+    }
+
+    #[test]
+    fn audit_groups_assets_when_download_root_is_primary_sync() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let root = tempdir.path().join("PrimarySync");
+        let raw = root.join("IMG_0001.DNG");
+        fs::create_dir_all(&root).expect("library directory should be created");
+        fs::write(&raw, b"primary-raw").expect("primary raw should save");
+        let mut manifest = Manifest::new();
+        manifest.upsert(audit_record("asset-primary", raw, &root));
+
+        let (groups, skipped, skip_reasons) = original_assets_audit_targets(
+            &manifest,
+            &fs::canonicalize(&root).expect("root should canonicalize"),
+            2,
+        );
+
+        assert_eq!(skipped, 0);
+        assert!(skip_reasons.is_empty());
         assert_eq!(
             groups
-                .get(&shared_destination)
+                .get(&CloudKitLibraryDestination::primary_sync())
+                .expect("primary target should be grouped")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn audit_groups_assets_when_download_root_is_shared_sync() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let root = tempdir.path().join("SharedSync-family");
+        let raw = root.join("IMG_0002.DNG");
+        fs::create_dir_all(&root).expect("library directory should be created");
+        fs::write(&raw, b"shared-raw").expect("shared raw should save");
+        let mut manifest = Manifest::new();
+        manifest.upsert(audit_record("asset-shared", raw, &root));
+
+        let (groups, skipped, skip_reasons) = original_assets_audit_targets(
+            &manifest,
+            &fs::canonicalize(&root).expect("root should canonicalize"),
+            2,
+        );
+
+        assert_eq!(skipped, 0);
+        assert!(skip_reasons.is_empty());
+        let destination = CloudKitLibraryDestination {
+            database_scope: CloudKitDatabaseScope::Shared,
+            zone_name: "SharedSync-family".to_string(),
+        };
+        assert_eq!(
+            groups
+                .get(&destination)
                 .expect("shared target should be grouped")
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn audit_report_aggregates_redacted_skip_reasons() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let root = tempdir.path().join("library");
+        let primary = root.join("PrimarySync");
+        fs::create_dir_all(&primary).expect("primary directory should be created");
+        let raw = primary.join("IMG_0001.DNG");
+        fs::write(&raw, b"raw").expect("raw should save");
+
+        let mut manifest = Manifest::new();
+        let mut invalid_nas = audit_record("asset-invalid-nas", raw.clone(), &root);
+        invalid_nas
+            .proofs
+            .insert("nas".to_string(), serde_json::json!({"size_bytes": 3}));
+        manifest.upsert(invalid_nas);
+
+        let mut invalid_source_age = audit_record("asset-invalid-source-age", raw.clone(), &root);
+        invalid_source_age.proofs.insert(
+            "source_age".to_string(),
+            serde_json::json!({"source_captured_unix_seconds": 1}),
+        );
+        manifest.upsert(invalid_source_age);
+
+        let mut missing_raw = audit_record("asset-missing-raw", raw.clone(), &root);
+        missing_raw.raw_path = primary.join("not-present.DNG");
+        manifest.upsert(missing_raw);
+
+        let outside = tempdir.path().join("outside/secret.DNG");
+        fs::create_dir_all(outside.parent().expect("outside raw should have a parent"))
+            .expect("outside directory should be created");
+        fs::write(&outside, b"outside").expect("outside raw should save");
+        manifest.upsert(audit_record("asset-outside-root", outside, tempdir.path()));
+
+        let unsupported = root.join("UnknownLibrary/secret.DNG");
+        fs::create_dir_all(
+            unsupported
+                .parent()
+                .expect("unsupported raw should have a parent"),
+        )
+        .expect("unsupported directory should be created");
+        fs::write(&unsupported, b"unsupported").expect("unsupported raw should save");
+        manifest.upsert(audit_record("asset-unsupported-layout", unsupported, &root));
+
+        let mut invalid_filename = audit_record("asset-invalid-filename", raw, &root);
+        invalid_filename.raw_path = primary.clone();
+        manifest.upsert(invalid_filename);
+
+        let manifest_path = tempdir.path().join("manifest.json");
+        manifest
+            .save_atomic(&manifest_path)
+            .expect("manifest should save");
+        AssetStateStore::open_writer(
+            &manifest_path,
+            "audit-skip-reasons-test",
+            Duration::from_secs(1),
+        )
+        .expect("state store should open")
+        .load_or_import()
+        .expect("manifest should import into the state store");
+        let session_path = tempdir.path().join("session.json");
+        fs::write(&session_path, "{}".as_bytes()).expect("session fixture should save");
+        let config_path = tempdir.path().join("monitor.json");
+        let mut config = MonitorConfig::new(&root, &manifest_path, tempdir.path().join("heic"));
+        config.delete_session_path = Some(session_path);
+        config
+            .save_atomic(&config_path)
+            .expect("config should save");
+
+        let mut output = Vec::new();
+        monitor_original_assets_audit(
+            MonitorOriginalAssetsAuditArgs {
+                config: config_path,
+            },
+            &mut output,
+        )
+        .expect("audit should report skipped records without contacting CloudKit");
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&output).expect("audit output should be JSON");
+        assert_eq!(report["targets"], 0);
+        assert_eq!(report["skipped_targets"], 6);
+        assert_eq!(
+            report["skip_reason_counts"],
+            serde_json::json!({
+                "invalid_or_missing_nas_proof": 1,
+                "invalid_or_missing_source_age_proof": 1,
+                "raw_path_unavailable": 1,
+                "outside_download_root": 1,
+                "unsupported_library_layout": 1,
+                "invalid_filename": 1,
+            })
+        );
+        let rendered = String::from_utf8(output).expect("audit output should be UTF-8");
+        assert!(!rendered.contains("secret.DNG"));
+        assert!(!rendered.contains("asset-outside-root"));
+        assert!(!rendered.contains(&root.display().to_string()));
     }
 
     #[test]
@@ -3266,6 +3544,16 @@ mod original_assets_audit_tests {
             "resolver interrupted",
         ));
         assert!(original_assets_audit_eligible(&failed));
+
+        let mut unrelated_failure = AssetRecord::new("unrelated", "/raw/unrelated.DNG");
+        unrelated_failure.state = State::Failed;
+        unrelated_failure
+            .failures
+            .push(crate::manifest::FailureRecord::new(
+                "conversion",
+                "converter interrupted",
+            ));
+        assert!(!original_assets_audit_eligible(&unrelated_failure));
     }
 
     #[test]
@@ -3305,10 +3593,17 @@ mod original_assets_audit_tests {
             elapsed_millis: 7,
         }];
 
-        let summary = original_assets_audit_human_summary(2, 0, &reports, 11);
+        let summary = original_assets_audit_human_summary(
+            2,
+            0,
+            &BTreeMap::from([("invalid_filename".to_string(), 1)]),
+            &reports,
+            11,
+        );
 
         assert!(summary.contains("exact_original=1"));
         assert!(summary.contains("no_raw_resource=1"));
+        assert!(summary.contains("skip_reasons=invalid_filename=1"));
         assert!(summary.contains("private:PrimarySync=7ms"));
         assert!(summary.contains("elapsed_ms=11"));
     }
