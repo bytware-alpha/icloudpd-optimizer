@@ -986,6 +986,165 @@ fn manifest_show_bad_manifest_fails_without_mutating_it() {
     assert_eq!(after, before);
 }
 
+#[test]
+fn manifest_migrate_upgrades_only_the_existing_v1_database_and_returns_json_summary() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let db_path = manifest_path.with_extension("state.sqlite3");
+    let mut record = AssetRecord::new("asset-1", "/photos/raw/asset-1.dng");
+    record.state = State::NasVerified;
+    record.updated_at = "200.000000000Z".to_string();
+    let record_json = serde_json::to_string(&record).expect("record should encode");
+    let connection = rusqlite::Connection::open(&db_path).expect("v1 database should open");
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             BEGIN IMMEDIATE;
+             CREATE TABLE assets (
+               asset_id TEXT PRIMARY KEY NOT NULL,
+               state TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               record_json TEXT NOT NULL
+             );
+             CREATE INDEX assets_state_index ON assets(state);
+             PRAGMA user_version = 1;
+             COMMIT;",
+        )
+        .expect("v1 schema should be created");
+    connection
+        .execute(
+            "INSERT INTO assets (asset_id, state, updated_at, record_json) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                record.asset_id,
+                record.state.as_str(),
+                record.updated_at,
+                record_json
+            ],
+        )
+        .expect("v1 asset should be inserted");
+    fs::write(
+        &manifest_path,
+        b"{malformed manifest JSON must remain untouched",
+    )
+    .expect("manifest sentinel should be written");
+    let manifest_before = fs::read(&manifest_path).expect("manifest sentinel should be readable");
+
+    let output = binary()
+        .args(["manifest", "migrate", "--manifest"])
+        .arg(&manifest_path)
+        .args(["--from", "1", "--to", "2"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let summary: Value = serde_json::from_slice(&output).expect("migration stdout should be JSON");
+    assert_eq!(summary["from"], 1);
+    assert_eq!(summary["to"], 2);
+    assert_eq!(summary["asset_count"], 1);
+    assert_eq!(summary["quick_check"], "ok");
+    assert!(
+        summary["database_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    assert!(
+        !String::from_utf8(output)
+            .expect("migration output should be utf8")
+            .contains(manifest_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        fs::read(&manifest_path).expect("manifest sentinel should remain readable"),
+        manifest_before
+    );
+
+    let connection = rusqlite::Connection::open(db_path).expect("migrated database should open");
+    let row: (String, String, String, String) = connection
+        .query_row(
+            "SELECT asset_id, state, updated_at, record_json FROM assets WHERE asset_id = 'asset-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("asset row should remain present");
+    assert_eq!(row.0, record.asset_id);
+    assert_eq!(row.1, record.state.as_str());
+    assert_eq!(row.2, record.updated_at);
+    assert_eq!(row.3, record_json);
+    let lease_owner: String = connection
+        .query_row(
+            "SELECT owner_id FROM writer_lease WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("migration lease should be readable");
+    assert!(lease_owner.is_empty());
+}
+
+#[test]
+fn manifest_migrate_rejects_missing_wrong_and_already_migrated_databases_without_bootstrap() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let missing_manifest_path = tempdir.path().join("missing/manifest.json");
+    let missing_db_path = missing_manifest_path.with_extension("state.sqlite3");
+
+    binary()
+        .args(["manifest", "migrate", "--manifest"])
+        .arg(&missing_manifest_path)
+        .args(["--from", "1", "--to", "2"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not exist"));
+    assert!(!missing_db_path.exists());
+    assert!(!missing_db_path.parent().expect("missing parent").exists());
+
+    let manifest_path = tempdir.path().join("manifest.json");
+    let db_path = manifest_path.with_extension("state.sqlite3");
+    let connection = rusqlite::Connection::open(&db_path).expect("v1 database should open");
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             BEGIN IMMEDIATE;
+             CREATE TABLE assets (
+               asset_id TEXT PRIMARY KEY NOT NULL,
+               state TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               record_json TEXT NOT NULL
+             );
+             CREATE INDEX assets_state_index ON assets(state);
+             PRAGMA user_version = 1;
+             COMMIT;",
+        )
+        .expect("v1 schema should be created");
+
+    binary()
+        .args(["manifest", "migrate", "--manifest"])
+        .arg(&manifest_path)
+        .args(["--from", "2", "--to", "1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("only supports from=1 to=2"));
+    let version: i32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("wrong request should not change version");
+    assert_eq!(version, 1);
+
+    binary()
+        .args(["manifest", "migrate", "--manifest"])
+        .arg(&manifest_path)
+        .args(["--from", "1", "--to", "2"])
+        .assert()
+        .success();
+    binary()
+        .args(["manifest", "migrate", "--manifest"])
+        .arg(&manifest_path)
+        .args(["--from", "1", "--to", "2"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "expected schema version 1, found 2",
+        ));
+}
+
 #[cfg(unix)]
 #[test]
 fn monitor_init_writes_simple_config_without_overwriting() {

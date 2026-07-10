@@ -10,7 +10,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Statement, Transaction, TransactionBehavior, params,
 };
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::manifest::{AssetRecord, Manifest, ManifestError};
 
@@ -63,6 +66,37 @@ struct JsonImportSnapshot {
     source_size_bytes: Option<i64>,
     source_mtime_unix_nanos: Option<i64>,
     import_note: &'static str,
+}
+
+struct JsonImportMetadataSeed {
+    imported_once: bool,
+    source_path: Option<String>,
+    source_size_bytes: Option<i64>,
+    source_mtime_unix_nanos: Option<i64>,
+    imported_at_unix_ms: Option<i64>,
+    import_note: Option<&'static str>,
+}
+
+impl JsonImportMetadataSeed {
+    fn schema_only() -> Self {
+        Self {
+            imported_once: true,
+            source_path: None,
+            source_size_bytes: None,
+            source_mtime_unix_nanos: None,
+            imported_at_unix_ms: Some(current_unix_millis()),
+            import_note: Some("schema_only_v1_migration"),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct SchemaMigrationSummary {
+    pub from: i32,
+    pub to: i32,
+    pub asset_count: u64,
+    pub database_id: String,
+    pub quick_check: String,
 }
 
 impl AssetStateStore {
@@ -124,6 +158,67 @@ impl AssetStateStore {
         }
         store.writer = Some(Arc::new(token));
         Ok(store)
+    }
+
+    pub fn migrate_schema_only(
+        manifest_path: impl AsRef<Path>,
+        from: i32,
+        to: i32,
+    ) -> Result<SchemaMigrationSummary, AssetStateStoreError> {
+        if from != 1 || to != SCHEMA_VERSION {
+            return Err(AssetStateStoreError::InvalidSchemaMigration { from, to });
+        }
+
+        let manifest_path = manifest_path.as_ref().to_path_buf();
+        let db_path = Self::db_path_for_manifest(&manifest_path);
+        match fs::metadata(&db_path) {
+            Ok(_) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Err(AssetStateStoreError::MigrationDatabaseMissing { path: db_path });
+            }
+            Err(source) => {
+                return Err(AssetStateStoreError::MigrationDatabaseMetadata {
+                    path: db_path,
+                    source,
+                });
+            }
+        }
+
+        let store = Self {
+            manifest_path,
+            db_path,
+            writer: None,
+        };
+        let mut connection = store.connect_existing_writer()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let asset_count = validate_exact_v1_schema(&transaction)?;
+        let asset_count = u64::try_from(asset_count).map_err(|_| {
+            AssetStateStoreError::MigrationSchemaInvalid {
+                reason: "assets count must not be negative".to_string(),
+            }
+        })?;
+        ensure_wal_in_transaction(&transaction)?;
+
+        // The IMMEDIATE transaction serializes legacy v1 writers until the v2 lease exists.
+        // Once created, the lease token is acquired and cleared in this same transaction.
+        migrate_v1_to_v2_with_import_metadata(&transaction, JsonImportMetadataSeed::schema_only())?;
+        let owner_id = format!("schema-migrate-{}", Uuid::new_v4());
+        let token = store.acquire_writer_lease_in_transaction(
+            &transaction,
+            &owner_id,
+            Duration::from_secs(30),
+        )?;
+        release_writer_lease_in_transaction(&transaction, &token)?;
+        let quick_check = quick_check_in_transaction(&transaction)?;
+        transaction.commit()?;
+
+        Ok(SchemaMigrationSummary {
+            from,
+            to,
+            asset_count,
+            database_id: database_id(&store.db_path),
+            quick_check,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -241,6 +336,20 @@ impl AssetStateStore {
         Ok(connection)
     }
 
+    fn connect_existing_writer(&self) -> Result<Connection, AssetStateStoreError> {
+        let connection =
+            Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(
+                |source| AssetStateStoreError::OpenDatabase {
+                    path: self.db_path.clone(),
+                    source,
+                },
+            )?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(connection)
+    }
+
     fn connect_read_only(&self) -> Result<Connection, AssetStateStoreError> {
         let connection =
             Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
@@ -315,48 +424,17 @@ impl AssetStateStore {
         let (source_size_bytes, source_mtime_unix_nanos) =
             manifest_file_metadata(&self.manifest_path)?;
         let imported_once = asset_count > 0;
-        let imported_at_unix_ms = imported_once.then_some(current_unix_millis());
-        let import_note = imported_once.then_some("legacy_v1_migration");
-
-        transaction.execute_batch(
-            "CREATE TABLE writer_lease (
-                   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                   owner_id TEXT NOT NULL,
-                   epoch INTEGER NOT NULL,
-                   expires_at_unix_ms INTEGER NOT NULL,
-                   acquired_at_unix_ms INTEGER NOT NULL,
-                   renewed_at_unix_ms INTEGER NOT NULL
-                 );
-                 INSERT INTO writer_lease (
-                   singleton, owner_id, epoch, expires_at_unix_ms, acquired_at_unix_ms, renewed_at_unix_ms
-                 ) VALUES (1, '', 0, 0, 0, 0);
-                 CREATE TABLE json_import_metadata (
-                   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                   imported_once INTEGER NOT NULL,
-                   source_path TEXT,
-                   source_size_bytes INTEGER,
-                   source_mtime_unix_nanos INTEGER,
-                   imported_at_unix_ms INTEGER,
-                   import_note TEXT
-                 );",
-        )?;
-        transaction.execute(
-            "INSERT INTO json_import_metadata (
-                   singleton, imported_once, source_path, source_size_bytes,
-                   source_mtime_unix_nanos, imported_at_unix_ms, import_note
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                1_i64,
-                if imported_once { 1_i64 } else { 0_i64 },
-                imported_once.then(|| self.manifest_path.display().to_string()),
+        migrate_v1_to_v2_with_import_metadata(
+            transaction,
+            JsonImportMetadataSeed {
+                imported_once,
+                source_path: imported_once.then(|| self.manifest_path.display().to_string()),
                 source_size_bytes,
                 source_mtime_unix_nanos,
-                imported_at_unix_ms,
-                import_note
-            ],
-        )?;
-        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        Ok(())
+                imported_at_unix_ms: imported_once.then_some(current_unix_millis()),
+                import_note: imported_once.then_some("legacy_v1_migration"),
+            },
+        )
     }
 
     fn verify_integrity(&self, connection: &Connection) -> Result<(), AssetStateStoreError> {
@@ -685,6 +763,160 @@ fn create_v2_schema(transaction: &Transaction<'_>) -> Result<(), AssetStateStore
     Ok(())
 }
 
+fn migrate_v1_to_v2_with_import_metadata(
+    transaction: &Transaction<'_>,
+    metadata: JsonImportMetadataSeed,
+) -> Result<(), AssetStateStoreError> {
+    transaction.execute_batch(
+        "CREATE TABLE writer_lease (
+               singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+               owner_id TEXT NOT NULL,
+               epoch INTEGER NOT NULL,
+               expires_at_unix_ms INTEGER NOT NULL,
+               acquired_at_unix_ms INTEGER NOT NULL,
+               renewed_at_unix_ms INTEGER NOT NULL
+             );
+             INSERT INTO writer_lease (
+               singleton, owner_id, epoch, expires_at_unix_ms, acquired_at_unix_ms, renewed_at_unix_ms
+             ) VALUES (1, '', 0, 0, 0, 0);
+             CREATE TABLE json_import_metadata (
+               singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+               imported_once INTEGER NOT NULL,
+               source_path TEXT,
+               source_size_bytes INTEGER,
+               source_mtime_unix_nanos INTEGER,
+               imported_at_unix_ms INTEGER,
+               import_note TEXT
+             );",
+    )?;
+    transaction.execute(
+        "INSERT INTO json_import_metadata (
+               singleton, imported_once, source_path, source_size_bytes,
+               source_mtime_unix_nanos, imported_at_unix_ms, import_note
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            1_i64,
+            if metadata.imported_once { 1_i64 } else { 0_i64 },
+            metadata.source_path,
+            metadata.source_size_bytes,
+            metadata.source_mtime_unix_nanos,
+            metadata.imported_at_unix_ms,
+            metadata.import_note,
+        ],
+    )?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+fn validate_exact_v1_schema(transaction: &Transaction<'_>) -> Result<i64, AssetStateStoreError> {
+    let actual: i32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if actual != 1 {
+        return Err(AssetStateStoreError::MigrationSchemaVersion {
+            expected: 1,
+            actual,
+        });
+    }
+
+    let mut statement = transaction.prepare(
+        "SELECT type, name FROM sqlite_master
+         WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+    )?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_objects = vec![
+        ("index".to_string(), "assets_state_index".to_string()),
+        ("table".to_string(), "assets".to_string()),
+    ];
+    if objects != expected_objects {
+        return Err(AssetStateStoreError::MigrationSchemaInvalid {
+            reason: "expected only the canonical v1 assets table and assets_state_index"
+                .to_string(),
+        });
+    }
+
+    let mut columns = transaction.prepare("PRAGMA table_info(assets)")?;
+    let columns = columns
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_columns = vec![
+        ("asset_id".to_string(), "TEXT".to_string(), 1, 1),
+        ("state".to_string(), "TEXT".to_string(), 1, 0),
+        ("updated_at".to_string(), "TEXT".to_string(), 1, 0),
+        ("record_json".to_string(), "TEXT".to_string(), 1, 0),
+    ];
+    if columns != expected_columns {
+        return Err(AssetStateStoreError::MigrationSchemaInvalid {
+            reason: "assets table does not match the canonical v1 columns".to_string(),
+        });
+    }
+
+    transaction
+        .query_row("SELECT count(*) FROM assets", [], |row| row.get(0))
+        .map_err(AssetStateStoreError::from)
+}
+
+fn ensure_wal_in_transaction(transaction: &Transaction<'_>) -> Result<(), AssetStateStoreError> {
+    let journal_mode: String =
+        transaction.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if journal_mode.eq_ignore_ascii_case("wal") {
+        return Ok(());
+    }
+    Err(AssetStateStoreError::WalUnavailable { mode: journal_mode })
+}
+
+fn quick_check_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<String, AssetStateStoreError> {
+    let result: String = transaction.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    if result == "ok" {
+        return Ok(result);
+    }
+    Err(AssetStateStoreError::IntegrityCheck { result })
+}
+
+fn release_writer_lease_in_transaction(
+    transaction: &Transaction<'_>,
+    token: &WriterLeaseToken,
+) -> Result<(), AssetStateStoreError> {
+    let changed = transaction.execute(
+        "UPDATE writer_lease
+         SET owner_id = '', expires_at_unix_ms = 0, renewed_at_unix_ms = ?1
+         WHERE singleton = 1 AND owner_id = ?2 AND epoch = ?3",
+        params![
+            current_unix_millis(),
+            token.owner_id,
+            i64::try_from(token.epoch).unwrap_or(i64::MAX),
+        ],
+    )?;
+    if changed == 1 {
+        return Ok(());
+    }
+    let current = load_writer_lease(transaction)?;
+    Err(AssetStateStoreError::WriterLeaseFenced {
+        owner_id: token.owner_id.clone(),
+        epoch: token.epoch,
+        current_owner_id: current.owner_id,
+        current_epoch: current.epoch,
+    })
+}
+
+fn database_id(path: &Path) -> String {
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(path.to_string_lossy().as_bytes())
+    )
+}
+
 fn validate_writer_owner_id(owner_id: &str) -> Result<(), AssetStateStoreError> {
     if owner_id.trim().is_empty() || owner_id.len() > MAX_WRITER_OWNER_ID_BYTES {
         return Err(AssetStateStoreError::InvalidWriterOwnerId {
@@ -951,6 +1183,16 @@ pub enum AssetStateStoreError {
         path: PathBuf,
         source: rusqlite::Error,
     },
+    #[error("schema migration only supports from=1 to=2; received from={from} to={to}")]
+    InvalidSchemaMigration { from: i32, to: i32 },
+    #[error("state database for schema migration does not exist at {path}")]
+    MigrationDatabaseMissing { path: PathBuf },
+    #[error("failed to inspect state database for schema migration at {path}: {source}")]
+    MigrationDatabaseMetadata { path: PathBuf, source: io::Error },
+    #[error("schema migration expected schema version {expected}, found {actual}")]
+    MigrationSchemaVersion { expected: i32, actual: i32 },
+    #[error("schema migration rejected noncanonical v1 schema: {reason}")]
+    MigrationSchemaInvalid { reason: String },
     #[error("state database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("manifest error: {0}")]

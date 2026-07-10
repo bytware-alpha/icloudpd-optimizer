@@ -6,6 +6,7 @@ use std::time::Duration;
 use icloudpd_optimizer::manifest::{AssetRecord, Manifest, State};
 use icloudpd_optimizer::state_store::{AssetStateStore, AssetStateStoreError};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 fn manifest_with_record(asset_id: &str) -> Manifest {
     let mut manifest = Manifest::new();
@@ -32,6 +33,67 @@ fn lease_row(manifest_path: &std::path::Path) -> (String, i64, i64) {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("load lease row")
+}
+
+fn create_v1_database(manifest_path: &std::path::Path, records: &[AssetRecord]) {
+    let db_path = AssetStateStore::db_path_for_manifest(manifest_path);
+    let connection = rusqlite::Connection::open(db_path).expect("open v1 state db");
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             BEGIN IMMEDIATE;
+             CREATE TABLE assets (
+               asset_id TEXT PRIMARY KEY NOT NULL,
+               state TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               record_json TEXT NOT NULL
+             );
+             CREATE INDEX assets_state_index ON assets(state);
+             PRAGMA user_version = 1;
+             COMMIT;",
+        )
+        .expect("create v1 schema");
+    for record in records {
+        connection
+            .execute(
+                "INSERT INTO assets (asset_id, state, updated_at, record_json) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    record.asset_id,
+                    record.state.as_str(),
+                    record.updated_at,
+                    serde_json::to_string(record).expect("encode record")
+                ],
+            )
+            .expect("insert v1 asset record");
+    }
+}
+
+fn asset_row_digest(manifest_path: &std::path::Path) -> String {
+    let connection =
+        rusqlite::Connection::open(AssetStateStore::db_path_for_manifest(manifest_path))
+            .expect("open state db for asset digest");
+    let mut statement = connection
+        .prepare("SELECT asset_id, state, updated_at, record_json FROM assets ORDER BY asset_id")
+        .expect("prepare asset digest query");
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .expect("query asset digest rows");
+    let mut hasher = Sha256::new();
+    for row in rows {
+        let (asset_id, state, updated_at, record_json) = row.expect("read asset digest row");
+        for value in [&asset_id, &state, &updated_at, &record_json] {
+            hasher.update(value.as_bytes());
+            hasher.update([0]);
+        }
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 #[test]
@@ -603,6 +665,179 @@ fn migrates_v1_database_without_reimporting_json_checkpoint() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("read schema version");
     assert_eq!(version, 2);
+}
+
+#[test]
+fn schema_only_migration_preserves_v1_assets_and_never_reads_or_writes_manifest_json() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
+    let mut first = AssetRecord::new("asset-1", "/photos/asset-1.dng");
+    first.state = State::NasVerified;
+    first.updated_at = "200.000000000Z".to_string();
+    let mut second = AssetRecord::new("asset-2", "/photos/asset-2.dng");
+    second.state = State::Failed;
+    second.updated_at = "300.000000000Z".to_string();
+    create_v1_database(&manifest_path, &[first, second]);
+    fs::write(&manifest_path, b"{deliberately malformed legacy json")
+        .expect("write malformed manifest sentinel");
+    let manifest_before = fs::read(&manifest_path).expect("read manifest sentinel");
+    let assets_before = asset_row_digest(&manifest_path);
+
+    let summary = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+        .expect("schema-only migration should succeed");
+
+    assert_eq!(summary.from, 1);
+    assert_eq!(summary.to, 2);
+    assert_eq!(summary.asset_count, 2);
+    assert_eq!(summary.quick_check, "ok");
+    assert!(!summary.database_id.is_empty());
+    assert_eq!(
+        fs::read(&manifest_path).expect("manifest sentinel should remain untouched"),
+        manifest_before
+    );
+    assert_eq!(asset_row_digest(&manifest_path), assets_before);
+
+    let connection = rusqlite::Connection::open(db_path).expect("open migrated state db");
+    let version: i32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("read migrated schema version");
+    assert_eq!(version, 2);
+    let lease: (String, i64, i64) = connection
+        .query_row(
+            "SELECT owner_id, epoch, expires_at_unix_ms FROM writer_lease WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read released migration lease");
+    assert_eq!(lease.0, "");
+    assert!(lease.1 > 0);
+    assert_eq!(lease.2, 0);
+    let import_metadata: (i64, Option<String>) = connection
+        .query_row(
+            "SELECT imported_once, source_path FROM json_import_metadata WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read schema-only import metadata");
+    assert_eq!(import_metadata, (1, None));
+}
+
+#[test]
+fn schema_only_migration_rejects_missing_wrong_or_already_migrated_databases_without_mutation() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let missing_manifest_path = tempdir.path().join("missing/manifest.json");
+    let missing_db_path = AssetStateStore::db_path_for_manifest(&missing_manifest_path);
+    let missing = AssetStateStore::migrate_schema_only(&missing_manifest_path, 1, 2)
+        .expect_err("missing state database must fail closed");
+    assert!(matches!(
+        missing,
+        AssetStateStoreError::MigrationDatabaseMissing { path } if path == missing_db_path
+    ));
+    assert!(!missing_db_path.exists());
+    assert!(!missing_db_path.parent().expect("missing parent").exists());
+
+    let manifest_path = tempdir.path().join("manifest.json");
+    create_v1_database(
+        &manifest_path,
+        &[AssetRecord::new("asset-1", "/photos/asset-1.dng")],
+    );
+    let assets_before = asset_row_digest(&manifest_path);
+    let wrong_request = AssetStateStore::migrate_schema_only(&manifest_path, 2, 1)
+        .expect_err("only v1 to v2 should be accepted");
+    assert!(matches!(
+        wrong_request,
+        AssetStateStoreError::InvalidSchemaMigration { from: 2, to: 1 }
+    ));
+    assert_eq!(asset_row_digest(&manifest_path), assets_before);
+
+    AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+        .expect("initial migration should succeed");
+    let already_migrated = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+        .expect_err("v2 must not be accepted as an idempotent migration");
+    assert!(matches!(
+        already_migrated,
+        AssetStateStoreError::MigrationSchemaVersion {
+            expected: 1,
+            actual: 2
+        }
+    ));
+    assert_eq!(asset_row_digest(&manifest_path), assets_before);
+
+    let empty_manifest_path = tempdir.path().join("empty.json");
+    let empty_db_path = AssetStateStore::db_path_for_manifest(&empty_manifest_path);
+    let empty_connection = rusqlite::Connection::open(&empty_db_path).expect("open empty state db");
+    let journal_before: String = empty_connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .expect("read empty journal mode");
+    let empty = AssetStateStore::migrate_schema_only(&empty_manifest_path, 1, 2)
+        .expect_err("empty database must fail closed");
+    assert!(matches!(
+        empty,
+        AssetStateStoreError::MigrationSchemaVersion {
+            expected: 1,
+            actual: 0
+        }
+    ));
+    let journal_after: String = empty_connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .expect("read unchanged empty journal mode");
+    assert_eq!(journal_after, journal_before);
+
+    let unknown_manifest_path = tempdir.path().join("unknown.json");
+    create_v1_database(
+        &unknown_manifest_path,
+        &[AssetRecord::new(
+            "asset-unknown",
+            "/photos/asset-unknown.dng",
+        )],
+    );
+    let unknown_db_path = AssetStateStore::db_path_for_manifest(&unknown_manifest_path);
+    let unknown_connection =
+        rusqlite::Connection::open(&unknown_db_path).expect("open unknown-version state db");
+    unknown_connection
+        .pragma_update(None, "user_version", 3)
+        .expect("set unknown schema version");
+    let unknown = AssetStateStore::migrate_schema_only(&unknown_manifest_path, 1, 2)
+        .expect_err("unknown schema version must fail closed");
+    assert!(matches!(
+        unknown,
+        AssetStateStoreError::MigrationSchemaVersion {
+            expected: 1,
+            actual: 3
+        }
+    ));
+}
+
+#[test]
+fn schema_only_migration_rolls_back_the_entire_transaction_on_schema_conflict() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
+    let record = AssetRecord::new("asset-1", "/photos/asset-1.dng");
+    create_v1_database(&manifest_path, std::slice::from_ref(&record));
+    let connection = rusqlite::Connection::open(&db_path).expect("open v1 state db");
+    connection
+        .execute_batch("CREATE VIEW json_import_metadata AS SELECT 1 AS singleton;")
+        .expect("install migration conflict");
+    let assets_before = asset_row_digest(&manifest_path);
+
+    assert!(AssetStateStore::migrate_schema_only(&manifest_path, 1, 2).is_err());
+
+    assert_eq!(asset_row_digest(&manifest_path), assets_before);
+    let connection = rusqlite::Connection::open(db_path).expect("reopen rolled-back state db");
+    let version: i32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("read rolled-back schema version");
+    assert_eq!(version, 1);
+    let writer_lease_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'writer_lease'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count rolled-back writer lease tables");
+    assert_eq!(writer_lease_count, 0);
 }
 
 #[test]

@@ -92,12 +92,23 @@ struct ManifestArgs {
 #[derive(Debug, Subcommand)]
 enum ManifestCommand {
     Show(ManifestShowArgs),
+    Migrate(ManifestMigrateArgs),
 }
 
 #[derive(Debug, Args)]
 struct ManifestShowArgs {
     #[arg(long, value_name = "PATH")]
     manifest: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ManifestMigrateArgs {
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+    #[arg(long)]
+    from: i32,
+    #[arg(long)]
+    to: i32,
 }
 
 #[derive(Debug, Args)]
@@ -836,6 +847,7 @@ fn run_stage_raw_copy(args: StageRawCopyArgs) -> Result<(), CliError> {
 fn run_manifest<W: Write>(args: ManifestArgs, writer: &mut W) -> Result<(), CliError> {
     match args.command {
         ManifestCommand::Show(args) => show_manifest(args, writer),
+        ManifestCommand::Migrate(args) => migrate_manifest(args, writer),
     }
 }
 
@@ -845,6 +857,13 @@ fn show_manifest<W: Write>(args: ManifestShowArgs, writer: &mut W) -> Result<(),
         records: manifest.records().values().collect(),
     };
     serde_json::to_writer_pretty(&mut *writer, &output)?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn migrate_manifest<W: Write>(args: ManifestMigrateArgs, writer: &mut W) -> Result<(), CliError> {
+    let summary = AssetStateStore::migrate_schema_only(&args.manifest, args.from, args.to)?;
+    serde_json::to_writer_pretty(&mut *writer, &summary)?;
     writeln!(writer)?;
     Ok(())
 }

@@ -174,6 +174,17 @@ Inspect an existing manifest:
 icloudpd-optimizer manifest show --manifest manifest.json
 ```
 
+Upgrade an existing v1 SQLite sidecar to the fenced v2 schema without importing or
+exporting the manifest JSON:
+
+```sh
+icloudpd-optimizer manifest migrate --manifest manifest.json --from 1 --to 2
+```
+
+This command requires the exact v1 `manifest.state.sqlite3` schema and returns a JSON
+summary with a safe database identifier. It rejects missing, empty, unknown, or already
+v2 databases without bootstrapping or changing the manifest JSON.
+
 Verify that a RAW file is safely present under your storage root:
 
 ```sh
