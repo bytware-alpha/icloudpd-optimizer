@@ -63,6 +63,11 @@ struct MonitorStatsPayload: Decodable {
     let failures: Int
     let lastError: String?
     let stateCounts: [String: Int]
+    var terminalRecords: Int? = nil
+    var noActionRecords: Int? = nil
+    var needsReviewRecords: Int? = nil
+    var failedRecords: Int? = nil
+    var pendingRecords: Int? = nil
 
     enum CodingKeys: String, CodingKey {
         case scansStarted = "scans_started"
@@ -79,6 +84,11 @@ struct MonitorStatsPayload: Decodable {
         case failures
         case lastError = "last_error"
         case stateCounts = "state_counts"
+        case terminalRecords = "terminal_records"
+        case noActionRecords = "no_action_records"
+        case needsReviewRecords = "needs_review_records"
+        case failedRecords = "failed_records"
+        case pendingRecords = "pending_records"
     }
 }
 
@@ -104,6 +114,11 @@ struct VerifiedMetricsPayload: Decodable {
     let verifiedBytesSaved: Int64
     let deletedSizeMetricsComplete: Bool
     let deletedRecordsMissingSizeProofs: Int
+    var terminalRecords: Int? = nil
+    var noActionRecords: Int? = nil
+    var needsReviewRecords: Int? = nil
+    var failedRecords: Int? = nil
+    var pendingRecords: Int? = nil
 
     enum CodingKeys: String, CodingKey {
         case totalRecords = "total_records"
@@ -117,6 +132,11 @@ struct VerifiedMetricsPayload: Decodable {
         case verifiedBytesSaved = "verified_bytes_saved"
         case deletedSizeMetricsComplete = "deleted_size_metrics_complete"
         case deletedRecordsMissingSizeProofs = "deleted_records_missing_size_proofs"
+        case terminalRecords = "terminal_records"
+        case noActionRecords = "no_action_records"
+        case needsReviewRecords = "needs_review_records"
+        case failedRecords = "failed_records"
+        case pendingRecords = "pending_records"
     }
 }
 
@@ -1822,6 +1842,16 @@ private func operatorSummaryMetrics(
     let manifestBacklog = queuePayload?.stateCounts["failed"]
         ?? statsPayload?.stateCounts["failed"]
         ?? 0
+    let noActionRecords = queuePayload?.verifiedMetrics.noActionRecords
+        ?? queuePayload?.verifiedMetrics.stateCounts["no_action"]
+        ?? statsPayload?.noActionRecords
+        ?? statsPayload?.stateCounts["no_action"]
+        ?? 0
+    let needsReviewRecords = queuePayload?.verifiedMetrics.needsReviewRecords
+        ?? queuePayload?.verifiedMetrics.stateCounts["needs_review"]
+        ?? statsPayload?.needsReviewRecords
+        ?? statsPayload?.stateCounts["needs_review"]
+        ?? 0
     let verified = queuePayload?.verifiedMetrics
     let displayedWorkers = max(workerCount, workerCounts.total)
     let occupiedWorkers = workerCounts.busy + workerCounts.waiting
@@ -1835,6 +1865,8 @@ private func operatorSummaryMetrics(
         DashboardMetric(title: "Converted (15m)", value: "\(live.conversions15m)", detail: "\(live.hourlyRate(live.conversions15m)) current pace", tone: .active),
         DashboardMetric(title: "Uploaded total", value: verified.map { "\($0.uploadedReplacements)" } ?? "--", detail: "\(live.uploads15m) uploaded in the last 15m", tone: .active),
         DashboardMetric(title: "Deleted total", value: verified.map { "\($0.deletedOriginals)" } ?? "--", detail: "\(live.deletes15m) deleted in the last 15m", tone: .success),
+        DashboardMetric(title: "No action total", value: "\(noActionRecords)", detail: "terminal reconciliation outcomes; not queued", tone: .neutral),
+        DashboardMetric(title: "Needs review total", value: "\(needsReviewRecords)", detail: "terminal reconciliation outcomes; not failed or queued", tone: .warning),
         spaceSaved,
         DashboardMetric(title: "Blocked assets (15m)", value: "\(live.blockedAssets15m)", detail: blockedDetail, tone: live.failureAttempts15m > 0 || manifestBacklog > 0 ? .warning : .success),
     ]
@@ -3374,12 +3406,17 @@ private func runDashboardMetricsSelfTestAndExit() -> Never {
       "convert_stage_slots":1,
       "max_lifecycle_per_scan":100,
       "max_conversions_per_scan":100,
-      "state_counts":{"deleted":2301,"failed":3997},
+      "state_counts":{"deleted":2301,"no_action":52,"needs_review":49,"failed":3997,"nas_verified":1},
       "queue_counts":{"active_lifecycle":2},
       "failure_counts":{"blocked_original_asset_resolve":3991,"blocked_visual_content":4,"failed_other":2},
       "verified_metrics":{
         "total_records":6400,
-        "state_counts":{"deleted":2301,"failed":3997},
+        "state_counts":{"deleted":2301,"no_action":52,"needs_review":49,"failed":3997,"nas_verified":1},
+        "terminal_records":2402,
+        "no_action_records":52,
+        "needs_review_records":49,
+        "failed_records":3997,
+        "pending_records":1,
         "uploaded_replacements":2400,
         "uploaded_heic_bytes":15482906008,
         "uploaded_size_metrics_complete":true,
@@ -3507,6 +3544,8 @@ private func runDashboardMetricsSelfTestAndExit() -> Never {
         ("summaryPanelSeparatesTimeRanges", operatorSummaryPanelTitle == "Lifetime totals and recent activity"),
         ("summaryUsesDurableUploads", summaryByTitle["Uploaded total"]?.value == "2400"),
         ("summaryUsesDurableDeletes", summaryByTitle["Deleted total"]?.value == "2301"),
+        ("summarySeparatesNoActionTerminals", summaryByTitle["No action total"]?.value == "52"),
+        ("summarySeparatesNeedsReviewTerminals", summaryByTitle["Needs review total"]?.value == "49"),
         ("summaryUsesDurableBytesSaved", summaryByTitle["Space saved total"]?.value == DashboardFormat.bytes(63_662_048_584)),
         ("summaryLabelsRecentBlockedAssets", summaryByTitle["Blocked assets (15m)"]?.value == "3"),
         ("summaryReportsAttemptsSeparately", summaryByTitle["Blocked assets (15m)"]?.detail == "6 retry/failure attempts; 1 without asset ID"),

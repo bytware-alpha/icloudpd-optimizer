@@ -25,7 +25,11 @@ use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
 use crate::manifest_lock::{
     ManifestLockError, ManifestLockGuard, acquire_manifest_lock, manifest_lock_path,
 };
+use crate::metrics::VerifiedMetrics;
 use crate::proof::{MIN_RAW_AGE_DAYS, NasRawProof, ProofError};
+use crate::reconciliation::{
+    OriginalAssetResolutionBatch, OriginalAssetResolutionBatchSummary, OriginalAssetResolutionError,
+};
 use crate::state_store::{AssetStateStore, AssetStateStoreError};
 use crate::upload::{
     CLOUDKIT_RECORDS_MODIFY_MAX_OPERATIONS, CloudKitDeleteBatchRequest,
@@ -41,9 +45,8 @@ use crate::workflow::{
     approve_delete, icloudpd_local_mirror_ready_proofs, mark_delete_eligible,
     prepare_delete_reconciliation, prevalidate_approved_original_delete, prove_and_record_nas,
     record_heic_verification, record_icloudpd_local_mirror_proof,
-    record_original_asset_batch_proofs, record_prevalidated_delete_execution,
-    record_reconciled_delete_execution, record_source_age_proof, record_stage_failure,
-    record_upload_proof, upload_ready_heic_proof,
+    record_prevalidated_delete_execution, record_reconciled_delete_execution,
+    record_source_age_proof, record_stage_failure, record_upload_proof, upload_ready_heic_proof,
 };
 
 static MONITOR_FAILURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -53,7 +56,7 @@ thread_local! {
 }
 
 const MONITOR_CONFIG_SCHEMA_VERSION: u64 = 1;
-const MONITOR_STATS_SCHEMA_VERSION: u64 = 1;
+const MONITOR_STATS_SCHEMA_VERSION: u64 = 2;
 const DEFAULT_CAPTURE_TOLERANCE_SECONDS: u64 = 2;
 const DEFAULT_CLOUDKIT_PAGE_SIZE: u64 = 200;
 const DEFAULT_CLOUDKIT_MAX_PAGES: u64 = 2000;
@@ -453,6 +456,16 @@ pub struct MonitorStats {
     pub last_scan_finished_unix_seconds: Option<u64>,
     pub last_error: Option<String>,
     pub state_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub terminal_records: u64,
+    #[serde(default)]
+    pub no_action_records: u64,
+    #[serde(default)]
+    pub needs_review_records: u64,
+    #[serde(default)]
+    pub failed_records: u64,
+    #[serde(default)]
+    pub pending_records: u64,
 }
 
 impl MonitorStats {
@@ -528,6 +541,11 @@ impl MonitorStats {
         self.last_scan_finished_unix_seconds = Some(summary.finished_unix_seconds);
         self.last_error = summary.last_error.clone();
         self.state_counts = summary.state_counts.clone();
+        self.terminal_records = summary.terminal_records;
+        self.no_action_records = summary.no_action_records;
+        self.needs_review_records = summary.needs_review_records;
+        self.failed_records = summary.failed_records;
+        self.pending_records = summary.pending_records;
     }
 }
 
@@ -553,6 +571,11 @@ pub struct MonitorScanSummary {
     pub finished_unix_seconds: u64,
     pub last_error: Option<String>,
     pub state_counts: BTreeMap<String, u64>,
+    pub terminal_records: u64,
+    pub no_action_records: u64,
+    pub needs_review_records: u64,
+    pub failed_records: u64,
+    pub pending_records: u64,
 }
 
 pub fn run_monitor_once(
@@ -862,7 +885,13 @@ pub fn run_monitor_once(
     checkpoint_manifest_state(&state_store, &manifest)?;
 
     summary.finished_unix_seconds = current_unix_seconds();
-    summary.state_counts = state_counts(&manifest);
+    let metrics = VerifiedMetrics::from_manifest(&manifest);
+    summary.state_counts = metrics.state_counts;
+    summary.terminal_records = metrics.terminal_records;
+    summary.no_action_records = metrics.no_action_records;
+    summary.needs_review_records = metrics.needs_review_records;
+    summary.failed_records = metrics.failed_records;
+    summary.pending_records = metrics.pending_records;
     stats.apply_scan(&summary);
     stats.save_atomic(&config.stats_path)?;
     log_monitor_event(
@@ -1044,6 +1073,9 @@ pub fn render_tui(config: &MonitorConfig, stats: &MonitorStats) -> String {
             "saved: {saved_gib} GiB\n",
             "skipped known: {skipped_known}  skipped not ready: {skipped_not_ready}  ",
             "failures: {failures}\n",
+            "terminal: {terminal_records}  no action: {no_action_records}  ",
+            "needs review: {needs_review_records}  pending: {pending_records}  ",
+            "failed: {failed_records}\n",
             "last scan: {last_scan}  interval: {interval}s  jobs: {jobs}\n",
             "states: {state_counts}\n",
             "last error: {last_error}\n",
@@ -1070,6 +1102,11 @@ pub fn render_tui(config: &MonitorConfig, stats: &MonitorStats) -> String {
         skipped_known = stats.skipped_known,
         skipped_not_ready = stats.skipped_not_ready,
         failures = stats.failures,
+        terminal_records = stats.terminal_records,
+        no_action_records = stats.no_action_records,
+        needs_review_records = stats.needs_review_records,
+        pending_records = stats.pending_records,
+        failed_records = stats.failed_records,
         last_scan = stats
             .last_scan_finished_unix_seconds
             .map(|value| value.to_string())
@@ -3524,17 +3561,22 @@ fn resolve_original_asset_batches(
         match client.resolve_original_assets_batch_outcome(
             &session,
             &CloudKitOriginalAssetBatchResolveRequest {
-                targets,
+                targets: targets.clone(),
                 start_rank: config.cloudkit_start_rank,
                 page_size: config.cloudkit_page_size,
                 max_pages: config.cloudkit_max_pages,
             },
         ) {
             Ok(outcome) => {
-                let resolved = outcome.exact_original_proofs().len();
-                let unresolved_asset_ids = outcome.non_exact_asset_ids();
-                let unresolved = unresolved_asset_ids.len();
-                if record_original_asset_batch_outcome(manifest, outcome, summary)? {
+                let resolution = record_original_asset_batch_outcome(
+                    manifest,
+                    &targets,
+                    &session.zone,
+                    outcome,
+                    current_unix_seconds(),
+                    summary,
+                )?;
+                if resolution.manifest_changed() {
                     checkpoint_manifest_state(state_store, manifest)?;
                 }
                 log_monitor_event(
@@ -3542,9 +3584,9 @@ fn resolve_original_asset_batches(
                     summary.started_unix_seconds,
                     original_asset_resolve_batch_finished_fields(
                         asset_ids.len(),
-                        resolved,
-                        unresolved,
-                        &unresolved_asset_ids,
+                        &resolution,
+                        0,
+                        &[],
                         current_unix_seconds().saturating_sub(started),
                         max_batches,
                         None,
@@ -3574,7 +3616,7 @@ fn resolve_original_asset_batches(
                     summary.started_unix_seconds,
                     original_asset_resolve_batch_finished_fields(
                         asset_ids.len(),
-                        0,
+                        &OriginalAssetResolutionMonitorSummary::default(),
                         asset_ids.len(),
                         &unresolved_asset_ids,
                         current_unix_seconds().saturating_sub(started),
@@ -3693,6 +3735,7 @@ fn resolve_original_asset_batches_parallel(
             state_store,
             manifest,
             summary,
+            &session.zone,
             job_result,
             max_batches,
         )?;
@@ -3704,23 +3747,29 @@ fn record_original_asset_batch_job_result(
     state_store: &AssetStateStore,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
+    destination: &CloudKitLibraryDestination,
     job_result: OriginalAssetResolveBatchJobResult,
     max_batches: Option<usize>,
 ) -> Result<(), MonitorError> {
     let OriginalAssetResolveBatchJobResult { job, result } = job_result;
     match result {
         Ok(outcome) => {
-            let resolved = outcome.exact_original_proofs().len();
-            let unresolved_asset_ids = outcome.non_exact_asset_ids();
-            let unresolved = unresolved_asset_ids.len();
-            if record_original_asset_batch_outcome(manifest, outcome, summary)? {
+            let resolution = record_original_asset_batch_outcome(
+                manifest,
+                &job.targets,
+                destination,
+                outcome,
+                current_unix_seconds(),
+                summary,
+            )?;
+            if resolution.manifest_changed() {
                 checkpoint_manifest_state(state_store, manifest)?;
             }
             let mut fields = original_asset_resolve_batch_finished_fields(
                 job.asset_ids.len(),
-                resolved,
-                unresolved,
-                &unresolved_asset_ids,
+                &resolution,
+                0,
+                &[],
                 current_unix_seconds().saturating_sub(job.started_unix_seconds),
                 max_batches,
                 None,
@@ -3753,7 +3802,7 @@ fn record_original_asset_batch_job_result(
             }
             let mut fields = original_asset_resolve_batch_finished_fields(
                 job.asset_ids.len(),
-                0,
+                &OriginalAssetResolutionMonitorSummary::default(),
                 job.asset_ids.len(),
                 &unresolved_asset_ids,
                 current_unix_seconds().saturating_sub(job.started_unix_seconds),
@@ -3792,7 +3841,7 @@ fn original_asset_resolve_error_should_fail_records(error: &UploadError) -> bool
 
 fn original_asset_resolve_batch_finished_fields(
     targets: usize,
-    resolved: usize,
+    reconciliation: &OriginalAssetResolutionMonitorSummary,
     unresolved: usize,
     unresolved_asset_ids: &[String],
     wall_time_seconds: u64,
@@ -3801,7 +3850,10 @@ fn original_asset_resolve_batch_finished_fields(
 ) -> serde_json::Value {
     let mut fields = json!({
         "targets": targets,
-        "resolved": resolved,
+        "resolved": reconciliation.applied.exact_original,
+        "no_action": reconciliation.applied.no_action,
+        "needs_review": reconciliation.applied.needs_review,
+        "deferred": reconciliation.deferred,
         "unresolved": unresolved,
         "unresolved_asset_ids": unresolved_asset_ids,
         "wall_time_seconds": wall_time_seconds,
@@ -6807,42 +6859,70 @@ fn record_monitor_failure(summary: &mut MonitorScanSummary, error: impl ToString
     summary.last_error = Some(error.to_string());
 }
 
+#[derive(Default)]
+struct OriginalAssetResolutionMonitorSummary {
+    applied: OriginalAssetResolutionBatchSummary,
+    deferred: u64,
+}
+
+impl OriginalAssetResolutionMonitorSummary {
+    fn manifest_changed(&self) -> bool {
+        self.applied.exact_original > 0
+            || self.applied.no_action > 0
+            || self.applied.needs_review > 0
+    }
+}
+
 fn record_original_asset_batch_outcome(
     manifest: &mut Manifest,
+    targets: &[CloudKitOriginalAssetResolveTarget],
+    destination: &CloudKitLibraryDestination,
     outcome: CloudKitOriginalAssetBatchResolveOutcome,
+    observed_at_unix_seconds: u64,
     summary: &mut MonitorScanSummary,
-) -> Result<bool, MonitorError> {
-    let proofs = outcome.exact_original_proofs();
-    let resolved = proofs.len() as u64;
-    let unresolved_asset_ids = outcome
+) -> Result<OriginalAssetResolutionMonitorSummary, MonitorError> {
+    let incomplete_transient = outcome
         .resolutions
-        .iter()
-        .filter(|(_, resolution)| {
-            !matches!(
+        .values()
+        .filter(|resolution| {
+            matches!(
                 resolution.disposition,
-                crate::upload::CloudKitOriginalAssetResolveDisposition::ExactOriginal { .. }
-                    | crate::upload::CloudKitOriginalAssetResolveDisposition::IncompleteTransient
+                crate::upload::CloudKitOriginalAssetResolveDisposition::IncompleteTransient
             )
         })
-        .map(|(asset_id, _)| asset_id.clone())
-        .collect::<Vec<_>>();
-    let has_manifest_changes = resolved > 0 || !unresolved_asset_ids.is_empty();
-    if resolved > 0 {
-        let resolved_asset_ids = proofs.keys().cloned().collect::<Vec<_>>();
-        record_original_asset_batch_proofs(manifest, &resolved_asset_ids, proofs)?;
-        summary.originals_resolved = summary.originals_resolved.saturating_add(resolved);
+        .count() as u64;
+    let Some(inventory) = outcome.inventory else {
+        return Ok(OriginalAssetResolutionMonitorSummary {
+            deferred: outcome.resolutions.len() as u64,
+            ..Default::default()
+        });
+    };
+    if incomplete_transient > 0 {
+        return Ok(OriginalAssetResolutionMonitorSummary {
+            deferred: incomplete_transient,
+            ..Default::default()
+        });
     }
-    if !unresolved_asset_ids.is_empty() {
-        let message = "CloudKit original asset resolver found no exact RAW resource for this asset; delete remains blocked";
-        record_monitor_failure(summary, message);
-        record_lifecycle_failure_for_assets(
-            manifest,
-            &unresolved_asset_ids,
-            "original_asset_resolve",
-            message,
-        )?;
-    }
-    Ok(has_manifest_changes)
+    let applied = manifest.apply_original_asset_resolution_batch(OriginalAssetResolutionBatch {
+        targets: targets.to_vec(),
+        destination: destination.clone(),
+        inventory,
+        observed_at_unix_seconds,
+        resolutions: outcome.resolutions,
+    })?;
+    summary.originals_resolved = summary
+        .originals_resolved
+        .saturating_add(applied.summary.exact_original);
+    summary.no_action_records = summary
+        .no_action_records
+        .saturating_add(applied.summary.no_action);
+    summary.needs_review_records = summary
+        .needs_review_records
+        .saturating_add(applied.summary.needs_review);
+    Ok(OriginalAssetResolutionMonitorSummary {
+        applied: applied.summary,
+        deferred: 0,
+    })
 }
 
 fn record_lifecycle_failure_for_assets(
@@ -6944,14 +7024,6 @@ fn workflow_error_is_not_ready(error: &WorkflowError) -> bool {
         WorkflowError::Proof(ProofError::RawTooNew { .. })
             | WorkflowError::Proof(ProofError::UnsupportedRawExtension { .. })
     )
-}
-
-fn state_counts(manifest: &Manifest) -> BTreeMap<String, u64> {
-    let mut counts = BTreeMap::new();
-    for record in manifest.records().values() {
-        *counts.entry(record.state.as_str().to_string()).or_insert(0) += 1;
-    }
-    counts
 }
 
 fn current_unix_seconds() -> u64 {
@@ -7087,6 +7159,8 @@ pub enum MonitorError {
     StateStore(#[from] AssetStateStoreError),
     #[error("workflow error: {0}")]
     Workflow(#[from] WorkflowError),
+    #[error("original asset reconciliation error: {0}")]
+    OriginalAssetResolution(#[from] OriginalAssetResolutionError),
     #[error("conversion error: {0}")]
     Conversion(#[from] ConversionExecutionError),
     #[error("upload error: {0}")]
@@ -10201,102 +10275,121 @@ mod tests {
     }
 
     #[test]
-    fn original_asset_batch_outcome_records_proofs_and_only_fails_unresolved_assets() {
+    fn original_asset_batch_outcome_keeps_non_exact_reconciliation_outcomes_terminal() {
         let mut manifest = Manifest::new();
-        for asset_id in ["asset-a", "asset-b"] {
-            let mut record =
-                AssetRecord::new(asset_id, PathBuf::from(format!("/raw/{asset_id}.DNG")));
-            record.state = State::ConversionVerified;
-            record.proofs.insert(
-                "nas".to_string(),
-                json!({
-                    "canonical_path": format!("/raw/{asset_id}.DNG"),
-                    "relative_path": format!("{asset_id}.DNG"),
-                    "size_bytes": 9,
-                    "modified_unix_seconds": 1_800_000_000u64,
-                    "age_seconds": 2_592_000u64,
-                    "sha256": "raw-sha",
-                }),
-            );
-            manifest.upsert(record);
+        for asset_id in ["asset-no-action", "asset-needs-review"] {
+            manifest.upsert(failed_original_asset_resolve_record(
+                asset_id,
+                "1800000000.000000000Z",
+            ));
         }
-        let mut proofs = std::collections::BTreeMap::new();
-        proofs.insert(
-            "asset-a".to_string(),
-            crate::workflow::OriginalAssetProof {
-                record_name: "CPLAsset-original-a".to_string(),
-                record_change_tag: "tag-a".to_string(),
-                record_type: "CPLAsset".to_string(),
-                database_scope: Default::default(),
-                zone_name: "PrimarySync".to_string(),
-                filename: "asset-a.DNG".to_string(),
-                size_bytes: 9,
-                matched_raw_sha256: "raw-sha".to_string(),
-            },
-        );
+        let targets = ["asset-no-action", "asset-needs-review"]
+            .into_iter()
+            .map(|asset_id| CloudKitOriginalAssetResolveTarget {
+                asset_id: asset_id.to_string(),
+                raw_size_bytes: 9,
+                source_captured_unix_seconds: 1_700_000_000,
+                capture_tolerance_seconds: 2,
+                filename: format!("{asset_id}.DNG"),
+                matched_raw_sha256: "ab".repeat(32),
+                replacement_candidate: None,
+            })
+            .collect::<Vec<_>>();
         let outcome = CloudKitOriginalAssetBatchResolveOutcome {
             resolutions: std::collections::BTreeMap::from([
                 (
-                    "asset-a".to_string(),
-                    crate::upload::CloudKitOriginalAssetResolution {
-                        observations: Default::default(),
-                        disposition:
-                            crate::upload::CloudKitOriginalAssetResolveDisposition::ExactOriginal {
-                                proof: proofs.remove("asset-a").expect("proof should exist"),
-                            },
-                    },
-                ),
-                (
-                    "asset-b".to_string(),
+                    "asset-no-action".to_string(),
                     crate::upload::CloudKitOriginalAssetResolution {
                         observations: Default::default(),
                         disposition:
                             crate::upload::CloudKitOriginalAssetResolveDisposition::NoDateCandidate,
                     },
                 ),
+                (
+                    "asset-needs-review".to_string(),
+                    crate::upload::CloudKitOriginalAssetResolution {
+                        observations: crate::upload::CloudKitOriginalAssetResolveObservations {
+                            date_candidates: 1,
+                            raw_resources: 1,
+                            ..Default::default()
+                        },
+                        disposition:
+                            crate::upload::CloudKitOriginalAssetResolveDisposition::RawSizeMismatch,
+                    },
+                ),
             ]),
             inventory: Some(crate::upload::CloudKitOriginalAssetInventoryFingerprint {
-                resolver_version: "test".to_string(),
-                sha256: "test".to_string(),
+                resolver_version: crate::upload::CLOUDKIT_ORIGINAL_ASSET_RESOLVER_VERSION
+                    .to_string(),
+                sha256: "cd".repeat(32),
                 records_scanned: 1,
             }),
         };
         let mut summary = MonitorScanSummary::default();
+        let destination = test_delete_session().zone;
 
-        let changed = record_original_asset_batch_outcome(&mut manifest, outcome, &mut summary)
-            .expect("partial outcome should be recorded");
+        let resolution = record_original_asset_batch_outcome(
+            &mut manifest,
+            &targets,
+            &destination,
+            outcome,
+            1_800_000_000,
+            &mut summary,
+        )
+        .expect("complete outcome should be recorded");
 
-        assert!(changed);
-        let resolved = manifest
-            .get("asset-a")
-            .expect("resolved asset should exist");
-        assert_eq!(resolved.state, State::ConversionVerified);
-        assert_eq!(
-            resolved.proofs["original_asset"]["record_name"],
-            "CPLAsset-original-a"
+        assert!(resolution.manifest_changed());
+        let no_action = manifest
+            .get("asset-no-action")
+            .expect("no-action asset should exist");
+        assert_eq!(no_action.state, State::NoAction);
+        assert!(no_action.proofs.contains_key("original_asset_resolution"));
+        assert_eq!(no_action.failures[0].stage, "original_asset_resolve");
+        let needs_review = manifest
+            .get("asset-needs-review")
+            .expect("needs-review asset should exist");
+        assert_eq!(needs_review.state, State::NeedsReview);
+        assert!(
+            needs_review
+                .proofs
+                .contains_key("original_asset_resolution")
         );
-        assert!(resolved.failures.is_empty());
-        let unresolved = manifest
-            .get("asset-b")
-            .expect("unresolved asset should exist");
-        assert_eq!(unresolved.state, State::Failed);
-        assert!(!unresolved.proofs.contains_key("original_asset"));
-        assert_eq!(unresolved.failures[0].stage, "original_asset_resolve");
-        assert_eq!(summary.originals_resolved, 1);
-        assert_eq!(summary.failures, 1);
+        assert_eq!(needs_review.failures[0].stage, "original_asset_resolve");
+        assert_eq!(summary.originals_resolved, 0);
+        assert_eq!(summary.no_action_records, 1);
+        assert_eq!(summary.needs_review_records, 1);
+        assert_eq!(summary.failures, 0);
     }
 
     #[test]
-    fn original_asset_resolve_batch_event_carries_only_exact_unresolved_asset_ids() {
-        let exact_ids = vec!["asset-b".to_string(), "asset-c".to_string()];
-        let exact =
-            original_asset_resolve_batch_finished_fields(3, 1, 2, &exact_ids, 7, Some(4), None);
+    fn original_asset_resolve_batch_event_separates_terminal_outcomes_from_failures() {
+        let failed_ids = vec!["asset-b".to_string(), "asset-c".to_string()];
+        let reconciliation = OriginalAssetResolutionMonitorSummary {
+            applied: OriginalAssetResolutionBatchSummary {
+                exact_original: 1,
+                no_action: 2,
+                needs_review: 3,
+            },
+            deferred: 0,
+        };
+        let exact = original_asset_resolve_batch_finished_fields(
+            6,
+            &reconciliation,
+            2,
+            &failed_ids,
+            7,
+            Some(4),
+            None,
+        );
         assert_eq!(exact["unresolved"], 2);
         assert_eq!(exact["unresolved_asset_ids"], json!(["asset-b", "asset-c"]));
+        assert_eq!(exact["resolved"], 1);
+        assert_eq!(exact["no_action"], 2);
+        assert_eq!(exact["needs_review"], 3);
 
         let aggregate_only = original_asset_resolve_batch_finished_fields(
             3,
-            0,
+            &OriginalAssetResolutionMonitorSummary::default(),
             3,
             &[],
             7,

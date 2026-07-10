@@ -2129,6 +2129,14 @@ fn monitor_queue_json_classifies_retryable_and_blocked_failures() {
             )
             .expect("stale HEIC failure should record");
         manifest.upsert(deleted_metrics_record("asset-deleted", 400, 40));
+        for (asset_id, state) in [
+            ("asset-no-action", State::NoAction),
+            ("asset-needs-review", State::NeedsReview),
+        ] {
+            let mut terminal = AssetRecord::new(asset_id, format!("/assets/{asset_id}.DNG"));
+            terminal.state = state;
+            manifest.upsert(terminal);
+        }
         manifest
             .save_atomic(&manifest_path)
             .expect("manifest should save");
@@ -2164,6 +2172,20 @@ fn monitor_queue_json_classifies_retryable_and_blocked_failures() {
         1
     );
     assert_eq!(report["failure_counts"]["retryable_stale_heic_output"], 1);
+    assert_eq!(report["state_counts"]["no_action"], 1);
+    assert_eq!(report["state_counts"]["needs_review"], 1);
+    assert_eq!(report["verified_metrics"]["terminal_records"], 3);
+    assert_eq!(report["verified_metrics"]["no_action_records"], 1);
+    assert_eq!(report["verified_metrics"]["needs_review_records"], 1);
+    assert_eq!(report["verified_metrics"]["failed_records"], 3);
+    assert_eq!(report["verified_metrics"]["pending_records"], 0);
+    assert!(
+        report["active_lifecycle"]
+            .as_array()
+            .expect("active lifecycle should be an array")
+            .iter()
+            .all(|asset| asset["state"] != "no_action" && asset["state"] != "needs_review")
+    );
     assert_eq!(report["verified_metrics"]["uploaded_replacements"], 1);
     assert_eq!(report["verified_metrics"]["uploaded_heic_bytes"], 40);
     assert_eq!(report["verified_metrics"]["deleted_originals"], 1);

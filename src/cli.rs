@@ -2721,6 +2721,11 @@ fn stats_with_verified_metrics(mut stats: MonitorStats, metrics: &VerifiedMetric
     stats.deleted_raw_bytes = metrics.deleted_raw_bytes;
     stats.bytes_saved = metrics.verified_bytes_saved;
     stats.state_counts = metrics.state_counts.clone();
+    stats.terminal_records = metrics.terminal_records;
+    stats.no_action_records = metrics.no_action_records;
+    stats.needs_review_records = metrics.needs_review_records;
+    stats.failed_records = metrics.failed_records;
+    stats.pending_records = metrics.pending_records;
     stats
 }
 
@@ -3037,6 +3042,11 @@ fn append_counts(output: &mut String, counts: &BTreeMap<String, u64>) {
 fn render_verified_metrics(metrics: &VerifiedMetrics) -> String {
     format!(
         "verified manifest metrics\n\
+         terminal records: {}\n\
+         no-action records: {}\n\
+         needs-review records: {}\n\
+         failed records: {}\n\
+         pending records: {}\n\
          uploaded replacements: {}\n\
          uploaded HEIC bytes: {}\n\
          uploaded size proofs complete: {}\n\
@@ -3047,6 +3057,11 @@ fn render_verified_metrics(metrics: &VerifiedMetrics) -> String {
          verified bytes saved: {}\n\
          size proofs complete: {}\n\
          deleted records missing size proofs: {}\n",
+        metrics.terminal_records,
+        metrics.no_action_records,
+        metrics.needs_review_records,
+        metrics.failed_records,
+        metrics.pending_records,
         metrics.uploaded_replacements,
         metrics.uploaded_heic_bytes,
         metrics.uploaded_size_metrics_complete,

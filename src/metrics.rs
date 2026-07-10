@@ -4,13 +4,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::{AssetRecord, Manifest, State};
 
-const METRICS_SCHEMA_VERSION: u64 = 1;
+const METRICS_SCHEMA_VERSION: u64 = 2;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VerifiedMetrics {
     pub schema_version: u64,
     pub total_records: u64,
     pub state_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub terminal_records: u64,
+    #[serde(default)]
+    pub no_action_records: u64,
+    #[serde(default)]
+    pub needs_review_records: u64,
+    #[serde(default)]
+    pub failed_records: u64,
+    #[serde(default)]
+    pub pending_records: u64,
     pub uploaded_replacements: u64,
     pub uploaded_heic_bytes: u64,
     pub uploaded_size_metrics_complete: bool,
@@ -41,6 +51,24 @@ impl VerifiedMetrics {
                 .state_counts
                 .entry(record.state.as_str().to_string())
                 .or_insert(0) += 1;
+            if record.state.is_terminal() {
+                metrics.terminal_records = metrics.terminal_records.saturating_add(1);
+            }
+            match record.state {
+                State::NoAction => {
+                    metrics.no_action_records = metrics.no_action_records.saturating_add(1);
+                }
+                State::NeedsReview => {
+                    metrics.needs_review_records = metrics.needs_review_records.saturating_add(1);
+                }
+                State::Failed => {
+                    metrics.failed_records = metrics.failed_records.saturating_add(1);
+                }
+                state if !state.is_terminal() => {
+                    metrics.pending_records = metrics.pending_records.saturating_add(1);
+                }
+                _ => {}
+            }
 
             if record.proofs.contains_key("upload") {
                 metrics.uploaded_replacements = metrics.uploaded_replacements.saturating_add(1);

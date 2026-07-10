@@ -132,6 +132,31 @@ fn verified_metrics_mark_uploaded_sizes_incomplete_when_total_overflows_u64() {
     assert_eq!(metrics.uploaded_records_missing_size_proofs, 0);
 }
 
+#[test]
+fn verified_metrics_separate_terminal_reconciliation_outcomes_from_failures_and_pending_work() {
+    let mut manifest = Manifest::new();
+    for (asset_id, state) in [
+        ("deleted", State::Deleted),
+        ("no-action", State::NoAction),
+        ("needs-review", State::NeedsReview),
+        ("failed", State::Failed),
+        ("pending", State::NasVerified),
+    ] {
+        let mut record = AssetRecord::new(asset_id, format!("/assets/{asset_id}.DNG"));
+        record.state = state;
+        manifest.upsert(record);
+    }
+
+    let metrics = serde_json::to_value(VerifiedMetrics::from_manifest(&manifest))
+        .expect("metrics should serialize");
+
+    assert_eq!(metrics["terminal_records"], json!(3));
+    assert_eq!(metrics["no_action_records"], json!(1));
+    assert_eq!(metrics["needs_review_records"], json!(1));
+    assert_eq!(metrics["failed_records"], json!(1));
+    assert_eq!(metrics["pending_records"], json!(1));
+}
+
 fn deleted_record(asset_id: &str, raw_bytes: u64, heic_bytes: u64) -> AssetRecord {
     let mut record = upload_verified_record(asset_id, raw_bytes, heic_bytes);
     record.state = State::Deleted;
