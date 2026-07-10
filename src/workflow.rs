@@ -13,8 +13,8 @@ use crate::proof::{
     prove_nas_raw_with_min_age_seconds_and_fingerprint,
 };
 use crate::upload::{
-    CloudKitDatabaseScope, CloudKitDeleteOutcome, CloudKitDeleteRequest, CloudKitUploadedHeicAsset,
-    CloudKitUploadedHeicResolveRequest,
+    CloudKitDatabaseScope, CloudKitDeleteOutcome, CloudKitDeleteRequest,
+    CloudKitLibraryDestination, CloudKitUploadedHeicAsset, CloudKitUploadedHeicResolveRequest,
 };
 
 const NAS_PROOF: &str = "nas";
@@ -1939,6 +1939,206 @@ fn require_valid_conversion_performance(
     let (nas, conversion) = load_conversion_context(manifest, asset_id)?;
     validate_stored_conversion_performance(manifest, asset_id, &nas, &conversion)?;
     Ok((nas, conversion))
+}
+
+pub(crate) fn reconciliation_lifecycle_state(
+    manifest: &Manifest,
+    asset_id: &str,
+    destination: &CloudKitLibraryDestination,
+) -> Result<State, WorkflowError> {
+    let record = manifest.get(asset_id)?;
+    let conversion = optional_workflow_proof::<ConversionResultProof>(record, CONVERSION_PROOF)?;
+    let heic = optional_workflow_proof::<HeicVerificationProof>(record, HEIC_PROOF)?;
+    let upload = optional_workflow_proof::<UploadProof>(record, UPLOAD_PROOF)?;
+
+    let Some(conversion) = conversion else {
+        if heic.is_some() || upload.is_some() {
+            return Err(WorkflowError::InvalidProofField {
+                proof_key: CONVERSION_PROOF,
+                field: "lifecycle",
+                reason: "HEIC or upload proof exists without conversion",
+            });
+        }
+        return Ok(State::NasVerified);
+    };
+    if conversion.heic_path.as_os_str().is_empty()
+        || !is_sha256(&conversion.heic_sha256)
+        || conversion.size_bytes == 0
+    {
+        return Err(WorkflowError::InvalidProofField {
+            proof_key: CONVERSION_PROOF,
+            field: "conversion",
+            reason: "conversion output path, SHA-256, and size are required",
+        });
+    }
+
+    let Some(heic) = heic else {
+        if upload.is_some() {
+            return Err(WorkflowError::InvalidProofField {
+                proof_key: UPLOAD_PROOF,
+                field: "lifecycle",
+                reason: "upload proof exists without HEIC verification",
+            });
+        }
+        return Ok(State::Converted);
+    };
+    validate_heic_verification_flags(&heic)?;
+    if heic.heic_path.as_os_str().is_empty()
+        || !is_sha256(&heic.heic_sha256)
+        || heic.size_bytes == 0
+        || heic.heic_path != conversion.heic_path
+        || heic.heic_sha256 != conversion.heic_sha256
+        || heic.size_bytes != conversion.size_bytes
+    {
+        return Err(WorkflowError::InvalidProofField {
+            proof_key: HEIC_PROOF,
+            field: "conversion",
+            reason: "HEIC proof must match the conversion output path, SHA-256, and size",
+        });
+    }
+    require_valid_conversion_performance(manifest, asset_id)?;
+
+    let Some(upload) = upload else {
+        return Ok(State::ConversionVerified);
+    };
+    let uploaded_heic_path =
+        upload
+            .uploaded_heic_path
+            .as_ref()
+            .ok_or(WorkflowError::InvalidProofField {
+                proof_key: UPLOAD_PROOF,
+                field: "uploaded_heic_path",
+                reason: "is required",
+            })?;
+    if !is_safe_identity(&upload.uploaded_heic_asset_id)
+        || !is_sha256(&upload.uploaded_heic_sha256)
+        || uploaded_heic_path.as_os_str().is_empty()
+        || uploaded_heic_path != &heic.heic_path
+        || upload.uploaded_heic_sha256 != heic.heic_sha256
+        || upload.database_scope != destination.database_scope
+        || upload.zone_name != destination.zone_name
+    {
+        return Err(WorkflowError::InvalidProofField {
+            proof_key: UPLOAD_PROOF,
+            field: "HEIC",
+            reason: "upload proof must match the verified HEIC and destination",
+        });
+    }
+    Ok(State::UploadVerified)
+}
+
+pub(crate) fn reconciliation_exact_state_is_consistent(
+    manifest: &Manifest,
+    asset_id: &str,
+    destination: &CloudKitLibraryDestination,
+) -> Result<bool, WorkflowError> {
+    let record = manifest.get(asset_id)?;
+    let lifecycle_state = reconciliation_lifecycle_state(manifest, asset_id, destination)?;
+    let has_eligibility = record.proofs.contains_key(DELETE_ELIGIBILITY_PROOF);
+    let has_approval = record.proofs.contains_key(DELETE_APPROVAL_PROOF);
+    let has_delete = record.proofs.contains_key(DELETE_EXECUTION_PROOF);
+
+    match record.state {
+        State::NasVerified
+        | State::Converted
+        | State::ConversionVerified
+        | State::UploadVerified => {
+            Ok(record.state == lifecycle_state && !has_eligibility && !has_approval && !has_delete)
+        }
+        State::DeleteEligible => {
+            if lifecycle_state != State::UploadVerified || has_approval || has_delete {
+                return Ok(false);
+            }
+            let facts = validate_pre_delete_facts(manifest, asset_id)?;
+            validate_delete_eligibility_chain(manifest, asset_id, &facts)?;
+            Ok(true)
+        }
+        State::DeleteApproved => {
+            if lifecycle_state != State::UploadVerified || has_delete {
+                return Ok(false);
+            }
+            validate_stored_delete_plan_proofs(manifest, asset_id)?;
+            Ok(true)
+        }
+        State::Deleted => {
+            if lifecycle_state != State::UploadVerified {
+                return Ok(false);
+            }
+            validate_stored_delete_plan_proofs(manifest, asset_id)?;
+            validate_stored_delete_execution_proof(manifest, asset_id)?;
+            Ok(true)
+        }
+        State::Failed => {
+            if has_delete
+                || record
+                    .failures
+                    .last()
+                    .is_none_or(|failure| failure.stage == "original_asset_resolve")
+            {
+                return Ok(false);
+            }
+            if has_approval {
+                validate_stored_delete_plan_proofs(manifest, asset_id)?;
+            } else if has_eligibility {
+                let facts = validate_pre_delete_facts(manifest, asset_id)?;
+                validate_delete_eligibility_chain(manifest, asset_id, &facts)?;
+            }
+            Ok(true)
+        }
+        State::Discovered | State::NoAction | State::NeedsReview => Ok(false),
+    }
+}
+
+fn validate_stored_delete_execution_proof(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<(), WorkflowError> {
+    let original = stored_proof::<OriginalAssetProof>(manifest, asset_id, ORIGINAL_ASSET_PROOF)?;
+    let upload = stored_proof::<UploadProof>(manifest, asset_id, UPLOAD_PROOF)?;
+    let delete = stored_proof::<DeleteExecutionProof>(manifest, asset_id, DELETE_EXECUTION_PROOF)?;
+    let expected = delete_execution_proof(
+        &original.record_name,
+        &original.record_change_tag,
+        &upload.uploaded_heic_asset_id,
+        CloudKitDeleteOutcome {
+            record_name: delete.deleted_record_name.clone(),
+            record_change_tag: delete.confirmed_deleted_change_tag.clone(),
+        },
+    )?;
+    if delete != expected {
+        return Err(WorkflowError::ProofMismatch {
+            proof_key: DELETE_EXECUTION_PROOF,
+            field: "delete_execution",
+            expected: format!("{expected:?}"),
+            actual: format!("{delete:?}"),
+        });
+    }
+    Ok(())
+}
+
+fn optional_workflow_proof<T: DeserializeOwned>(
+    record: &AssetRecord,
+    proof_key: &'static str,
+) -> Result<Option<T>, WorkflowError> {
+    record
+        .proofs
+        .get(proof_key)
+        .map(|proof| {
+            serde_json::from_value(proof.clone()).map_err(|source| WorkflowError::ProofDecode {
+                asset_id: record.asset_id.clone(),
+                proof_key,
+                source,
+            })
+        })
+        .transpose()
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_safe_identity(value: &str) -> bool {
+    !value.trim().is_empty() && !value.chars().any(char::is_control)
 }
 
 fn validate_stored_conversion_performance(

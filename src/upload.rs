@@ -282,6 +282,8 @@ pub struct CloudKitOriginalAssetResolveObservations {
     pub raw_size_matches: u64,
     pub raw_hash_matches: u64,
     pub replacement_resource_matches: u64,
+    pub download_size_mismatches: u64,
+    pub ambiguity_evidence: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1089,16 +1091,22 @@ impl<T: CloudKitOriginalAssetReadTransport> CloudKitDeleteClient<T> {
                                     .raw_target_sizes
                                     .contains(&candidate.resource.size_bytes) =>
                             {
-                                work.incomplete_raw_sizes
-                                    .insert(candidate.resource.size_bytes);
+                                let count = work
+                                    .incomplete_raw_sizes
+                                    .entry(candidate.resource.size_bytes)
+                                    .or_default();
+                                *count = count.saturating_add(1);
                             }
                             CloudKitOriginalAssetCandidateKind::Replacement
                                 if cohort
                                     .replacement_target_sizes
                                     .contains(&candidate.resource.size_bytes) =>
                             {
-                                work.incomplete_replacement_sizes
-                                    .insert(candidate.resource.size_bytes);
+                                let count = work
+                                    .incomplete_replacement_sizes
+                                    .entry(candidate.resource.size_bytes)
+                                    .or_default();
+                                *count = count.saturating_add(1);
                             }
                             _ => {}
                         }
@@ -1290,24 +1298,44 @@ fn build_batch_resolve_outcome(
             observations.raw_hash_matches = raw_matches.map_or(0, |matches| matches.len() as u64);
             observations.replacement_resource_matches =
                 replacement_matches.map_or(0, |matches| matches.len() as u64);
-            let incomplete_candidate_evidence =
-                work.incomplete_raw_sizes.contains(&target.raw_size_bytes)
-                    || target
+            observations.download_size_mismatches = work
+                .incomplete_raw_sizes
+                .get(&target.raw_size_bytes)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(
+                    target
                         .replacement_candidate
                         .as_ref()
-                        .is_some_and(|replacement| {
+                        .and_then(|replacement| {
                             work.incomplete_replacement_sizes
-                                .contains(&replacement.size_bytes)
-                        });
-            let disposition = if force_transient || incomplete_candidate_evidence {
-                CloudKitOriginalAssetResolveDisposition::IncompleteTransient
-            } else if ambiguous_groups.contains(&raw_group)
+                                .get(&replacement.size_bytes)
+                        })
+                        .copied()
+                        .unwrap_or(0),
+                );
+            let incomplete_candidate_evidence = work
+                .incomplete_raw_sizes
+                .contains_key(&target.raw_size_bytes)
+                || target
+                    .replacement_candidate
+                    .as_ref()
+                    .is_some_and(|replacement| {
+                        work.incomplete_replacement_sizes
+                            .contains_key(&replacement.size_bytes)
+                    });
+            let ambiguous = ambiguous_groups.contains(&raw_group)
                 || replacement_group
                     .as_ref()
                     .is_some_and(|group| ambiguous_groups.contains(group))
                 || (raw_matches.is_some_and(|matches| !matches.is_empty())
-                    && replacement_matches.is_some_and(|matches| !matches.is_empty()))
-            {
+                    && replacement_matches.is_some_and(|matches| !matches.is_empty()));
+            if ambiguous {
+                observations.ambiguity_evidence = 1;
+            }
+            let disposition = if force_transient || incomplete_candidate_evidence {
+                CloudKitOriginalAssetResolveDisposition::IncompleteTransient
+            } else if ambiguous {
                 CloudKitOriginalAssetResolveDisposition::Ambiguous
             } else if let Some(candidate) = raw_matches.and_then(|matches| matches.values().next())
             {
@@ -2596,8 +2624,8 @@ enum CachedCloudKitResourceDownload {
 struct OriginalAssetCohortResolutionWork {
     observations: CloudKitOriginalAssetResolveObservations,
     raw_size_matches: BTreeMap<u64, u64>,
-    incomplete_raw_sizes: BTreeSet<u64>,
-    incomplete_replacement_sizes: BTreeSet<u64>,
+    incomplete_raw_sizes: BTreeMap<u64, u64>,
+    incomplete_replacement_sizes: BTreeMap<u64, u64>,
     raw_matches: BTreeMap<OriginalAssetMatchKey, BTreeMap<String, OriginalAssetRemoteMatch>>,
     replacement_matches:
         BTreeMap<OriginalAssetMatchKey, BTreeMap<String, OriginalAssetRemoteMatch>>,

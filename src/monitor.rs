@@ -7397,9 +7397,24 @@ mod tests {
 
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let helper_path = tempdir.path().join("fake-upload-proof-child");
+        let barrier_dir = tempdir.path().join("upload-barrier");
+        fs::create_dir(&barrier_dir).expect("barrier directory should be created");
         fs::write(
             &helper_path,
-            "#!/bin/sh\nsleep 1\nprintf '%s\\n' '{\"uploaded_heic_asset_id\":\"asset\",\"uploaded_heic_sha256\":\"sha\",\"database_scope\":\"private\",\"zone_name\":\"PrimarySync\",\"uploaded_heic_path\":\"/tmp/asset.heic\"}'\n",
+            format!(
+                "#!/bin/sh\n\
+                 /usr/bin/touch '{}/'$6\n\
+                 attempts=0\n\
+                 while [ ! -f '{}/asset-a' ] || [ ! -f '{}/asset-b' ]; do\n\
+                   attempts=$((attempts + 1))\n\
+                   [ \"$attempts\" -lt 200 ] || exit 97\n\
+                   /bin/sleep 0.05\n\
+                 done\n\
+                 printf '%s\\n' '{{\"uploaded_heic_asset_id\":\"asset\",\"uploaded_heic_sha256\":\"sha\",\"database_scope\":\"private\",\"zone_name\":\"PrimarySync\",\"uploaded_heic_path\":\"/tmp/asset.heic\"}}'\n",
+                barrier_dir.display(),
+                barrier_dir.display(),
+                barrier_dir.display(),
+            ),
         )
         .expect("helper should be written");
         let mut permissions = fs::metadata(&helper_path)
@@ -7413,8 +7428,6 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>();
-        let started = Instant::now();
-
         let outcomes = run_parallel_asset_job_chunk(&asset_ids, {
             let helper_path = helper_path.clone();
             move |asset_id| {
@@ -7423,18 +7436,20 @@ mod tests {
                     &manifest_path,
                     &asset_id,
                     &session_path,
-                    5,
+                    15,
                 )
             }
         });
 
-        assert!(
-            started.elapsed() < Duration::from_millis(1500),
-            "upload proof children should not be serialized, elapsed {:?}",
-            started.elapsed()
-        );
         assert_eq!(outcomes.len(), 2);
-        assert!(outcomes.iter().all(|outcome| outcome.result.is_ok()));
+        assert!(
+            outcomes.iter().all(|outcome| outcome.result.is_ok()),
+            "upload child failures: {:?}",
+            outcomes
+                .iter()
+                .filter_map(|outcome| outcome.result.as_ref().err())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[cfg(unix)]

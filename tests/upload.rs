@@ -2224,7 +2224,113 @@ fn cloudkit_original_asset_batch_reconciliation_marks_exact_and_replacement_ambi
         outcome.resolutions["asset-1"].disposition,
         CloudKitOriginalAssetResolveDisposition::Ambiguous
     ));
+    assert!(
+        outcome.resolutions["asset-1"]
+            .observations
+            .ambiguity_evidence
+            > 0
+    );
     assert!(outcome.exact_original_proofs().is_empty());
+}
+
+#[test]
+fn cloudkit_original_asset_batch_reconciliation_persists_download_size_mismatch_evidence() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let records = cloudkit_raw_pair_with(
+        "CPLAsset-size-mismatch",
+        "CPLMaster-size-mismatch",
+        "tag-size-mismatch",
+        9,
+        1_800_000_000_000,
+    );
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": records})],
+        vec![b"short".to_vec()],
+    );
+
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(
+            &session,
+            &batch_resolve_request(vec![batch_resolve_target(
+                "asset-1",
+                "IMG_0001.dng",
+                b"raw-bytes",
+            )]),
+        )
+        .expect("download-size mismatch should be a typed transient outcome");
+
+    let resolution = &outcome.resolutions["asset-1"];
+    assert!(matches!(
+        resolution.disposition,
+        CloudKitOriginalAssetResolveDisposition::IncompleteTransient
+    ));
+    assert_eq!(resolution.observations.download_size_mismatches, 1);
+}
+
+#[test]
+fn cloudkit_original_asset_download_mismatch_evidence_is_target_scoped() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut records = cloudkit_raw_pair_with_url(
+        "CPLAsset-mismatch",
+        "CPLMaster-mismatch",
+        "tag-mismatch",
+        5,
+        1_800_000_000_000,
+        "https://p140-icloud-content.icloud.com/mismatch",
+    )
+    .as_array()
+    .unwrap()
+    .clone();
+    records.extend(
+        cloudkit_raw_pair_with_url(
+            "CPLAsset-exact",
+            "CPLMaster-exact",
+            "tag-exact",
+            9,
+            1_800_000_000_000,
+            "https://p140-icloud-content.icloud.com/exact",
+        )
+        .as_array()
+        .unwrap()
+        .clone(),
+    );
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": records})],
+        vec![b"bad".to_vec(), b"raw-bytes".to_vec()],
+    );
+
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(
+            &session,
+            &batch_resolve_request(vec![
+                batch_resolve_target("mismatch", "IMG_0001.dng", b"small"),
+                batch_resolve_target("exact", "IMG_0002.dng", b"raw-bytes"),
+            ]),
+        )
+        .expect("one target's malformed download must not taint another target");
+
+    assert!(matches!(
+        outcome.resolutions["mismatch"].disposition,
+        CloudKitOriginalAssetResolveDisposition::IncompleteTransient
+    ));
+    assert_eq!(
+        outcome.resolutions["mismatch"]
+            .observations
+            .download_size_mismatches,
+        1
+    );
+    assert!(matches!(
+        outcome.resolutions["exact"].disposition,
+        CloudKitOriginalAssetResolveDisposition::ExactOriginal { .. }
+    ));
+    assert_eq!(
+        outcome.resolutions["exact"]
+            .observations
+            .download_size_mismatches,
+        0
+    );
 }
 
 #[test]
