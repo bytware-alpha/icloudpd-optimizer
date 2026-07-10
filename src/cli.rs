@@ -1239,6 +1239,7 @@ struct OriginalAssetsAuditReport {
 struct OriginalAssetsAuditDestinationReport {
     destination: CloudKitLibraryDestination,
     targets: usize,
+    elapsed_millis: u128,
     inventory: Option<CloudKitOriginalAssetInventoryFingerprint>,
     resolutions: BTreeMap<String, CloudKitOriginalAssetResolution>,
     batch_error: Option<OriginalAssetsAuditBatchError>,
@@ -1300,6 +1301,7 @@ fn monitor_original_assets_audit<W: Write>(
                 |(destination, targets)| OriginalAssetsAuditDestinationReport {
                     destination,
                     targets: targets.len(),
+                    elapsed_millis: 0,
                     inventory: None,
                     resolutions: BTreeMap::new(),
                     batch_error: Some(original_assets_audit_batch_error(&error)),
@@ -1318,11 +1320,13 @@ fn monitor_original_assets_audit<W: Write>(
     serde_json::to_writer_pretty(&mut *writer, &report)?;
     writeln!(writer)?;
     eprintln!(
-        "original-assets-audit: targets={} skipped={} destinations={} elapsed_ms={}",
-        report.targets,
-        report.skipped_targets,
-        report.destinations.len(),
-        report.elapsed_millis,
+        "{}",
+        original_assets_audit_human_summary(
+            report.targets,
+            report.skipped_targets,
+            &report.destinations,
+            report.elapsed_millis,
+        )
     );
     Ok(())
 }
@@ -1333,6 +1337,7 @@ fn original_assets_audit_destination_report(
     targets: Vec<CloudKitOriginalAssetResolveTarget>,
     config: &MonitorConfig,
 ) -> OriginalAssetsAuditDestinationReport {
+    let started = Instant::now();
     let mut destination_session = session.clone();
     destination_session.database_scope = destination.database_scope;
     destination_session.zone = destination.clone();
@@ -1354,7 +1359,8 @@ fn original_assets_audit_destination_report(
             OriginalAssetsAuditDestinationReport {
                 destination,
                 targets: targets.len(),
-                inventory: Some(inventory),
+                elapsed_millis: started.elapsed().as_millis(),
+                inventory,
                 resolutions: redact_audit_resolutions(outcome),
                 batch_error: None,
             }
@@ -1362,6 +1368,7 @@ fn original_assets_audit_destination_report(
         Err(error) => OriginalAssetsAuditDestinationReport {
             destination,
             targets: targets.len(),
+            elapsed_millis: started.elapsed().as_millis(),
             inventory: None,
             resolutions: BTreeMap::new(),
             batch_error: Some(original_assets_audit_batch_error(&error)),
@@ -1403,8 +1410,10 @@ fn original_assets_audit_eligible(record: &AssetRecord) -> bool {
             .failures
             .last()
             .is_some_and(|failure| failure.stage == "original_asset_resolve");
-    let missing_original =
-        record.state == State::UploadVerified && !record.proofs.contains_key("original_asset");
+    let missing_original = matches!(
+        record.state,
+        State::NasVerified | State::Converted | State::ConversionVerified | State::UploadVerified
+    ) && !record.proofs.contains_key("original_asset");
     failed_original_resolution || missing_original
 }
 
@@ -1555,6 +1564,43 @@ fn original_assets_audit_disposition_counts(
         *counts.entry(disposition.to_string()).or_default() += 1;
     }
     counts
+}
+
+fn original_assets_audit_human_summary(
+    targets: usize,
+    skipped_targets: usize,
+    reports: &[OriginalAssetsAuditDestinationReport],
+    elapsed_millis: u128,
+) -> String {
+    let counts = original_assets_audit_disposition_counts(reports);
+    let dispositions = if counts.is_empty() {
+        "none".to_string()
+    } else {
+        counts
+            .into_iter()
+            .map(|(disposition, count)| format!("{disposition}={count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let destination_timings = if reports.is_empty() {
+        "none".to_string()
+    } else {
+        reports
+            .iter()
+            .map(|report| {
+                format!(
+                    "{}:{}={}ms",
+                    report.destination.database_scope.as_str(),
+                    report.destination.zone_name,
+                    report.elapsed_millis,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        "original-assets-audit: targets={targets} skipped={skipped_targets} dispositions={dispositions} destination_timings={destination_timings} elapsed_ms={elapsed_millis}"
+    )
 }
 
 fn monitor_init(args: MonitorInitArgs) -> Result<(), CliError> {
@@ -2834,5 +2880,89 @@ mod original_assets_audit_tests {
         assert!(compact.starts_with("asset-"));
         assert!(!compact.contains("private"));
         assert!(!compact.contains('/'));
+    }
+
+    #[test]
+    fn audit_eligibility_covers_all_pre_delete_original_resolver_candidates() {
+        for state in [
+            State::NasVerified,
+            State::Converted,
+            State::ConversionVerified,
+            State::UploadVerified,
+        ] {
+            let mut record = AssetRecord::new("asset", "/raw/asset.DNG");
+            record.state = state;
+            assert!(
+                original_assets_audit_eligible(&record),
+                "{state:?} without original proof should be audited"
+            );
+            record
+                .proofs
+                .insert("original_asset".to_string(), serde_json::json!({}));
+            assert!(
+                !original_assets_audit_eligible(&record),
+                "{state:?} with original proof should not be audited"
+            );
+        }
+        for state in [State::DeleteApproved, State::Deleted] {
+            let mut record = AssetRecord::new("asset", "/raw/asset.DNG");
+            record.state = state;
+            assert!(
+                !original_assets_audit_eligible(&record),
+                "{state:?} must stay outside audit eligibility"
+            );
+        }
+        let mut failed = AssetRecord::new("failed", "/raw/failed.DNG");
+        failed.state = State::Failed;
+        failed.failures.push(crate::manifest::FailureRecord::new(
+            "original_asset_resolve",
+            "resolver interrupted",
+        ));
+        assert!(original_assets_audit_eligible(&failed));
+    }
+
+    #[test]
+    fn audit_human_summary_includes_counts_and_destination_timings() {
+        let reports = vec![OriginalAssetsAuditDestinationReport {
+            destination: CloudKitLibraryDestination::primary_sync(),
+            targets: 2,
+            inventory: None,
+            resolutions: BTreeMap::from([
+                (
+                    "asset-a".to_string(),
+                    CloudKitOriginalAssetResolution {
+                        observations: Default::default(),
+                        disposition: CloudKitOriginalAssetResolveDisposition::NoRawResource,
+                    },
+                ),
+                (
+                    "asset-b".to_string(),
+                    CloudKitOriginalAssetResolution {
+                        observations: Default::default(),
+                        disposition: CloudKitOriginalAssetResolveDisposition::ExactOriginal {
+                            proof: crate::workflow::OriginalAssetProof {
+                                record_name: "record".to_string(),
+                                record_change_tag: "tag".to_string(),
+                                record_type: "CPLAsset".to_string(),
+                                database_scope: CloudKitDatabaseScope::Private,
+                                zone_name: "PrimarySync".to_string(),
+                                filename: "asset.DNG".to_string(),
+                                size_bytes: 1,
+                                matched_raw_sha256: "sha".to_string(),
+                            },
+                        },
+                    },
+                ),
+            ]),
+            batch_error: None,
+            elapsed_millis: 7,
+        }];
+
+        let summary = original_assets_audit_human_summary(2, 0, &reports, 11);
+
+        assert!(summary.contains("exact_original=1"));
+        assert!(summary.contains("no_raw_resource=1"));
+        assert!(summary.contains("private:PrimarySync=7ms"));
+        assert!(summary.contains("elapsed_ms=11"));
     }
 }

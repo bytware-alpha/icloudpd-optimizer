@@ -1637,7 +1637,7 @@ fn cloudkit_original_asset_batch_resolver_counts_seek_probes_against_page_cap() 
         outcome.resolutions["asset-1"].disposition,
         CloudKitOriginalAssetResolveDisposition::IncompleteTransient
     ));
-    assert!(!outcome.inventory.complete);
+    assert!(outcome.inventory.is_none());
     assert_eq!(start_ranks(&transport), vec![0, 1, 2]);
     assert!(transport.downloaded_urls.is_empty());
 }
@@ -1801,7 +1801,7 @@ fn cloudkit_original_asset_batch_reconciliation_keeps_exact_and_absent_targets_t
         outcome.resolutions["asset-2"].observations.date_candidates,
         1
     );
-    assert!(outcome.inventory.complete);
+    assert!(outcome.inventory.is_some());
 }
 
 #[test]
@@ -2127,9 +2127,16 @@ fn cloudkit_original_asset_batch_inventory_fingerprint_includes_scanned_window_r
         .resolve_original_assets_batch_outcome(&session, &request)
         .expect("changed inventory should resolve");
 
-    assert!(first.inventory.complete);
-    assert_eq!(first.inventory.records_scanned, 4);
-    assert_ne!(first.inventory.sha256, second.inventory.sha256);
+    let first_inventory = first
+        .inventory
+        .as_ref()
+        .expect("inventory should be complete");
+    let second_inventory = second
+        .inventory
+        .as_ref()
+        .expect("inventory should be complete");
+    assert_eq!(first_inventory.records_scanned, 4);
+    assert_ne!(first_inventory.sha256, second_inventory.sha256);
 }
 
 #[test]
@@ -2214,7 +2221,7 @@ fn cloudkit_original_asset_batch_resolver_scan_cap_with_continuation_fails_close
         resolution.disposition,
         CloudKitOriginalAssetResolveDisposition::IncompleteTransient
     )));
-    assert!(!outcome.inventory.complete);
+    assert!(outcome.inventory.is_none());
 }
 
 #[test]

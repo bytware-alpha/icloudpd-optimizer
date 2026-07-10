@@ -309,14 +309,13 @@ pub struct CloudKitOriginalAssetResolution {
 pub struct CloudKitOriginalAssetInventoryFingerprint {
     pub resolver_version: String,
     pub sha256: String,
-    pub complete: bool,
     pub records_scanned: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CloudKitOriginalAssetBatchResolveOutcome {
     pub resolutions: BTreeMap<String, CloudKitOriginalAssetResolution>,
-    pub inventory: CloudKitOriginalAssetInventoryFingerprint,
+    pub inventory: Option<CloudKitOriginalAssetInventoryFingerprint>,
 }
 
 impl CloudKitOriginalAssetBatchResolveOutcome {
@@ -1228,12 +1227,13 @@ fn build_batch_resolve_outcome(
 
     CloudKitOriginalAssetBatchResolveOutcome {
         resolutions,
-        inventory: cloudkit_original_asset_inventory_fingerprint(
-            destination,
-            target_window,
-            &inventory_records,
-            complete,
-        ),
+        inventory: (complete && !force_transient).then(|| {
+            cloudkit_original_asset_inventory_fingerprint(
+                destination,
+                target_window,
+                &inventory_records,
+            )
+        }),
     }
 }
 
@@ -1241,7 +1241,6 @@ fn cloudkit_original_asset_inventory_fingerprint(
     destination: &CloudKitLibraryDestination,
     target_window: &OriginalAssetDateWindow,
     records: &BTreeSet<String>,
-    complete: bool,
 ) -> CloudKitOriginalAssetInventoryFingerprint {
     let mut hasher = Sha256::new();
     for component in [
@@ -1261,7 +1260,6 @@ fn cloudkit_original_asset_inventory_fingerprint(
     CloudKitOriginalAssetInventoryFingerprint {
         resolver_version: CLOUDKIT_ORIGINAL_ASSET_RESOLVER_VERSION.to_string(),
         sha256: format!("{:x}", hasher.finalize()),
-        complete,
         records_scanned: records.len() as u64,
     }
 }

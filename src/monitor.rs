@@ -10343,12 +10343,11 @@ mod tests {
                     },
                 ),
             ]),
-            inventory: crate::upload::CloudKitOriginalAssetInventoryFingerprint {
+            inventory: Some(crate::upload::CloudKitOriginalAssetInventoryFingerprint {
                 resolver_version: "test".to_string(),
                 sha256: "test".to_string(),
-                complete: true,
                 records_scanned: 1,
-            },
+            }),
         };
         let mut summary = MonitorScanSummary::default();
 
