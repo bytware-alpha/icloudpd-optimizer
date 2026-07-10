@@ -1324,6 +1324,7 @@ fn monitor_original_assets_audit<W: Write>(
     let (destination_targets, skipped_targets, skip_reason_counts) = original_assets_audit_targets(
         &manifest,
         &canonical_library_root,
+        &config.download_root,
         config.capture_tolerance_seconds,
     );
     let target_count = destination_targets.values().map(Vec::len).sum();
@@ -1483,6 +1484,7 @@ fn original_assets_audit_destination_report_from_result(
 fn original_assets_audit_targets(
     manifest: &Manifest,
     canonical_library_root: &Path,
+    configured_download_root: &Path,
     capture_tolerance_seconds: u64,
 ) -> (
     BTreeMap<CloudKitLibraryDestination, Vec<CloudKitOriginalAssetResolveTarget>>,
@@ -1492,6 +1494,10 @@ fn original_assets_audit_targets(
     let mut targets = BTreeMap::new();
     let mut skipped = 0_usize;
     let mut skip_reason_counts = BTreeMap::new();
+    let configured_library_destination = configured_download_root
+        .file_name()
+        .and_then(|component| component.to_str())
+        .and_then(original_assets_audit_library_destination);
     for record in manifest.records().values() {
         if !original_assets_audit_eligible(record) {
             continue;
@@ -1499,6 +1505,7 @@ fn original_assets_audit_targets(
         let target = match original_assets_audit_target(
             record,
             canonical_library_root,
+            configured_library_destination.as_ref(),
             capture_tolerance_seconds,
         ) {
             Ok(target) => target,
@@ -1534,6 +1541,7 @@ fn original_assets_audit_eligible(record: &AssetRecord) -> bool {
 fn original_assets_audit_target(
     record: &AssetRecord,
     canonical_library_root: &Path,
+    configured_library_destination: Option<&CloudKitLibraryDestination>,
     capture_tolerance_seconds: u64,
 ) -> Result<OriginalAssetsAuditTarget, OriginalAssetsAuditSkipReason> {
     let nas = original_assets_audit_nas_proof(record)?;
@@ -1543,8 +1551,9 @@ fn original_assets_audit_target(
     let relative_raw_path = canonical_raw_path
         .strip_prefix(canonical_library_root)
         .map_err(|_| OriginalAssetsAuditSkipReason::OutsideDownloadRoot)?;
-    let destination = original_assets_audit_destination(canonical_library_root, relative_raw_path)
-        .ok_or(OriginalAssetsAuditSkipReason::UnsupportedLibraryLayout)?;
+    let destination =
+        original_assets_audit_destination(configured_library_destination, relative_raw_path)
+            .ok_or(OriginalAssetsAuditSkipReason::UnsupportedLibraryLayout)?;
     let filename = original_assets_audit_filename(&canonical_raw_path)?;
     Ok(OriginalAssetsAuditTarget {
         destination,
@@ -1617,7 +1626,7 @@ fn original_assets_audit_filename(
 }
 
 fn original_assets_audit_destination(
-    canonical_library_root: &Path,
+    configured_library_destination: Option<&CloudKitLibraryDestination>,
     relative_raw_path: &Path,
 ) -> Option<CloudKitLibraryDestination> {
     if !relative_raw_path
@@ -1626,21 +1635,16 @@ fn original_assets_audit_destination(
     {
         return None;
     }
-    let library = canonical_library_root
-        .file_name()
-        .and_then(|component| component.to_str())
-        .and_then(original_assets_audit_library_destination)
-        .or_else(|| {
-            relative_raw_path
-                .components()
-                .next()
-                .and_then(|component| match component {
-                    Component::Normal(component) => component.to_str(),
-                    _ => None,
-                })
-                .and_then(original_assets_audit_library_destination)
-        })?;
-    Some(library)
+    configured_library_destination.cloned().or_else(|| {
+        relative_raw_path
+            .components()
+            .next()
+            .and_then(|component| match component {
+                Component::Normal(component) => component.to_str(),
+                _ => None,
+            })
+            .and_then(original_assets_audit_library_destination)
+    })
 }
 
 fn original_assets_audit_library_destination(library: &str) -> Option<CloudKitLibraryDestination> {
@@ -3071,6 +3075,48 @@ mod original_assets_audit_tests {
         record
     }
 
+    #[cfg(unix)]
+    fn audit_report_for_configured_root(
+        tempdir: &tempfile::TempDir,
+        download_root: &Path,
+        raw_path: PathBuf,
+        proof_root: &Path,
+    ) -> serde_json::Value {
+        let mut manifest = Manifest::new();
+        manifest.upsert(audit_record("symlinked-root-asset", raw_path, proof_root));
+        let manifest_path = tempdir.path().join("manifest.json");
+        manifest
+            .save_atomic(&manifest_path)
+            .expect("manifest should save");
+        AssetStateStore::open_writer(
+            &manifest_path,
+            "audit-symlink-root-test",
+            Duration::from_secs(1),
+        )
+        .expect("state store should open")
+        .load_or_import()
+        .expect("manifest should import into the state store");
+        let session_path = tempdir.path().join("session.json");
+        fs::write(&session_path, "{}".as_bytes()).expect("session fixture should save");
+        let config_path = tempdir.path().join("monitor.json");
+        let mut config =
+            MonitorConfig::new(download_root, &manifest_path, tempdir.path().join("heic"));
+        config.delete_session_path = Some(session_path);
+        config
+            .save_atomic(&config_path)
+            .expect("config should save");
+
+        let mut output = Vec::new();
+        monitor_original_assets_audit(
+            MonitorOriginalAssetsAuditArgs {
+                config: config_path,
+            },
+            &mut output,
+        )
+        .expect("audit should use the configured root without a CloudKit session");
+        serde_json::from_slice(&output).expect("audit output should be JSON")
+    }
+
     #[derive(Clone, Copy)]
     enum AuditReadFailure {
         Authentication,
@@ -3309,6 +3355,7 @@ mod original_assets_audit_tests {
         let (groups, skipped, skip_reasons) = original_assets_audit_targets(
             &manifest,
             &fs::canonicalize(&root).expect("root should canonicalize"),
+            &root,
             2,
         );
 
@@ -3354,6 +3401,7 @@ mod original_assets_audit_tests {
         let (groups, skipped, skip_reasons) = original_assets_audit_targets(
             &manifest,
             &fs::canonicalize(&root).expect("root should canonicalize"),
+            &root,
             2,
         );
 
@@ -3381,6 +3429,7 @@ mod original_assets_audit_tests {
         let (groups, skipped, skip_reasons) = original_assets_audit_targets(
             &manifest,
             &fs::canonicalize(&root).expect("root should canonicalize"),
+            &root,
             2,
         );
 
@@ -3396,6 +3445,75 @@ mod original_assets_audit_tests {
                 .expect("shared target should be grouped")
                 .len(),
             1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_uses_primary_sync_symlink_name_when_target_basename_is_neutral() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let target = tempdir.path().join("neutral-primary-target");
+        let raw = target.join("IMG_0001.DNG");
+        fs::create_dir_all(&target).expect("target directory should be created");
+        fs::write(&raw, b"primary-raw").expect("primary raw should save");
+        let configured_root = tempdir.path().join("PrimarySync");
+        symlink(&target, &configured_root).expect("primary symlink should be created");
+
+        let report = audit_report_for_configured_root(&tempdir, &configured_root, raw, &target);
+
+        assert_eq!(report["targets"], 1);
+        assert_eq!(report["skipped_targets"], 0);
+        assert_eq!(
+            report["destinations"][0]["destination"],
+            serde_json::json!({"database_scope": "private", "zone_name": "PrimarySync"})
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_uses_shared_sync_symlink_name_when_target_basename_is_neutral() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let target = tempdir.path().join("neutral-shared-target");
+        let raw = target.join("IMG_0002.DNG");
+        fs::create_dir_all(&target).expect("target directory should be created");
+        fs::write(&raw, b"shared-raw").expect("shared raw should save");
+        let configured_root = tempdir.path().join("SharedSync-family");
+        symlink(&target, &configured_root).expect("shared symlink should be created");
+
+        let report = audit_report_for_configured_root(&tempdir, &configured_root, raw, &target);
+
+        assert_eq!(report["targets"], 1);
+        assert_eq!(report["skipped_targets"], 0);
+        assert_eq!(
+            report["destinations"][0]["destination"],
+            serde_json::json!({"database_scope": "shared", "zone_name": "SharedSync-family"})
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_uses_relative_library_for_parent_root_symlink_with_neutral_name() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let target = tempdir.path().join("neutral-parent-target");
+        let raw = target.join("PrimarySync/IMG_0003.DNG");
+        fs::create_dir_all(raw.parent().expect("raw should have a parent"))
+            .expect("primary directory should be created");
+        fs::write(&raw, b"parent-raw").expect("parent raw should save");
+        let configured_root = tempdir.path().join("untrusted-parent-link");
+        symlink(&target, &configured_root).expect("parent symlink should be created");
+
+        let report = audit_report_for_configured_root(&tempdir, &configured_root, raw, &target);
+
+        assert_eq!(report["targets"], 1);
+        assert_eq!(
+            report["destinations"][0]["destination"],
+            serde_json::json!({"database_scope": "private", "zone_name": "PrimarySync"})
         );
     }
 
