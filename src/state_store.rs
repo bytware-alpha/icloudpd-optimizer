@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
@@ -15,6 +17,17 @@ use crate::manifest::{AssetRecord, Manifest, ManifestError};
 const SCHEMA_VERSION: i32 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WRITER_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_WRITER_OWNER_ID_BYTES: usize = 128;
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_INTEGRITY_CHECK: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_integrity_check_for_current_thread() {
+    FAIL_NEXT_INTEGRITY_CHECK.with(|fail| fail.set(true));
+}
 
 #[derive(Clone, Debug)]
 pub struct AssetStateStore {
@@ -80,6 +93,8 @@ impl AssetStateStore {
         owner_id: impl Into<String>,
         lease_ttl: Duration,
     ) -> Result<Self, AssetStateStoreError> {
+        let owner_id = owner_id.into();
+        validate_writer_owner_id(&owner_id)?;
         validate_writer_lease_ttl(lease_ttl)?;
         let manifest_path = manifest_path.as_ref().to_path_buf();
         let db_path = Self::db_path_for_manifest(&manifest_path);
@@ -96,7 +111,6 @@ impl AssetStateStore {
             db_path,
             writer: None,
         };
-        let owner_id = owner_id.into();
         let mut connection = store.connect_writer()?;
         ensure_wal(&connection, true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -104,7 +118,10 @@ impl AssetStateStore {
         let token =
             store.acquire_writer_lease_in_transaction(&transaction, &owner_id, lease_ttl)?;
         transaction.commit()?;
-        store.verify_integrity(&connection)?;
+        if let Err(error) = store.verify_integrity(&connection) {
+            store.release_writer_lease_for_token(&token)?;
+            return Err(error);
+        }
         store.writer = Some(Arc::new(token));
         Ok(store)
     }
@@ -130,6 +147,13 @@ impl AssetStateStore {
         let Some(token) = self.writer.as_ref() else {
             return Ok(());
         };
+        self.release_writer_lease_for_token(token)
+    }
+
+    fn release_writer_lease_for_token(
+        &self,
+        token: &WriterLeaseToken,
+    ) -> Result<(), AssetStateStoreError> {
         let mut connection = self.connect_writer()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let lease = load_writer_lease(&transaction)?;
@@ -336,6 +360,12 @@ impl AssetStateStore {
     }
 
     fn verify_integrity(&self, connection: &Connection) -> Result<(), AssetStateStoreError> {
+        #[cfg(test)]
+        if FAIL_NEXT_INTEGRITY_CHECK.with(|fail| fail.replace(false)) {
+            return Err(AssetStateStoreError::IntegrityCheck {
+                result: "forced test failure".to_string(),
+            });
+        }
         let result: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
         if result != "ok" {
             return Err(AssetStateStoreError::IntegrityCheck { result });
@@ -655,6 +685,16 @@ fn create_v2_schema(transaction: &Transaction<'_>) -> Result<(), AssetStateStore
     Ok(())
 }
 
+fn validate_writer_owner_id(owner_id: &str) -> Result<(), AssetStateStoreError> {
+    if owner_id.trim().is_empty() || owner_id.len() > MAX_WRITER_OWNER_ID_BYTES {
+        return Err(AssetStateStoreError::InvalidWriterOwnerId {
+            length: owner_id.len(),
+            maximum: MAX_WRITER_OWNER_ID_BYTES,
+        });
+    }
+    Ok(())
+}
+
 fn validate_writer_lease_ttl(lease_ttl: Duration) -> Result<(), AssetStateStoreError> {
     if lease_ttl.is_zero()
         || lease_ttl > MAX_WRITER_LEASE_TTL
@@ -943,6 +983,10 @@ pub enum AssetStateStoreError {
     DuplicateRecord { asset_id: String },
     #[error("writer lease is required for state mutation")]
     WriterLeaseRequired,
+    #[error(
+        "writer owner ID length {length} must be nonzero after trimming and at most {maximum} bytes"
+    )]
+    InvalidWriterOwnerId { length: usize, maximum: usize },
     #[error("state writer lease TTL {ttl:?} must be greater than zero and at most {maximum:?}")]
     InvalidWriterLeaseTtl { ttl: Duration, maximum: Duration },
     #[error("state writer lease is held by {owner_id} at epoch {epoch} until {expires_at_unix_ms}")]
@@ -1021,5 +1065,20 @@ mod tests {
                 .expect("takeover result should arrive after export"),
             "takeover should proceed after publication completes"
         );
+    }
+
+    #[test]
+    fn failed_post_acquisition_integrity_releases_the_writer_lease() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join("manifest.json");
+
+        fail_next_integrity_check_for_current_thread();
+        let error =
+            AssetStateStore::open_writer(&manifest_path, "writer-a", Duration::from_secs(1))
+                .expect_err("forced integrity failure should reject the writer");
+        assert!(matches!(error, AssetStateStoreError::IntegrityCheck { .. }));
+
+        AssetStateStore::open_writer(&manifest_path, "writer-b", Duration::from_secs(1))
+            .expect("failed post-acquisition integrity must not leave a held lease");
     }
 }

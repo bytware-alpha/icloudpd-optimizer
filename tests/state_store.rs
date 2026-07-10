@@ -186,6 +186,58 @@ fn writer_ttl_must_be_finite_and_bounded() {
 }
 
 #[test]
+fn invalid_writer_owners_do_not_bootstrap_or_share_the_sentinel_lease() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    for (name, path, owner) in [
+        ("empty-first", "empty/manifest.json", String::new()),
+        (
+            "whitespace",
+            "whitespace/manifest.json",
+            " \t\n".to_string(),
+        ),
+        ("excessive", "excessive/manifest.json", "a".repeat(129)),
+    ] {
+        let manifest_path = tempdir.path().join(path);
+        let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
+        let error = AssetStateStore::open_writer(&manifest_path, owner, Duration::from_secs(1))
+            .expect_err("invalid writer owner must be rejected before bootstrap");
+        assert!(matches!(
+            error,
+            AssetStateStoreError::InvalidWriterOwnerId { .. }
+        ));
+        assert!(
+            !db_path.exists(),
+            "{name} owner must not create a state database"
+        );
+        assert!(
+            !db_path.parent().expect("database parent").exists(),
+            "{name} owner must not create a state directory"
+        );
+    }
+
+    let manifest_path = tempdir.path().join("sentinel/manifest.json");
+    let first_writer = open_writer(&manifest_path, "writer-a");
+    first_writer
+        .release_writer_lease()
+        .expect("release the writer lease to its unowned sentinel");
+    let sentinel = lease_row(&manifest_path);
+
+    let error = AssetStateStore::open_writer(&manifest_path, "", Duration::from_secs(1))
+        .expect_err("an empty owner must not acquire the unowned sentinel lease");
+    assert!(matches!(
+        error,
+        AssetStateStoreError::InvalidWriterOwnerId { .. }
+    ));
+    assert_eq!(
+        lease_row(&manifest_path),
+        sentinel,
+        "an invalid owner must leave the unowned sentinel untouched"
+    );
+    AssetStateStore::open_writer(&manifest_path, "writer-b", Duration::from_secs(1))
+        .expect("a valid owner must be able to acquire the unowned sentinel lease");
+}
+
+#[test]
 fn concurrent_fresh_openers_observe_writer_lease_held() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let manifest_path = tempdir.path().join("manifest.json");
