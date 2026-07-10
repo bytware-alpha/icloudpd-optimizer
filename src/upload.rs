@@ -108,6 +108,19 @@ impl CloudKitDeleteSession {
             .map_err(|source| UploadError::DecodeSession { path: None, source })?;
         raw.validate()
     }
+
+    fn validate(&self) -> Result<(), UploadError> {
+        validate_dsid_value(&self.dsid)?;
+        validate_ckdatabasews_url(self.ckdatabasews_url.as_str())?;
+        validate_cloudkit_query_param_values(&self.cloudkit_query_params, &self.dsid)?;
+        if self.database_scope != self.zone.database_scope {
+            return Err(UploadError::InvalidSession(
+                "CloudKit session database scope must match its zone".to_string(),
+            ));
+        }
+        validate_library_destination(&self.zone)?;
+        validate_cloudkit_cookies(&self.cookies)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1509,6 +1522,7 @@ impl ReqwestCloudKitTransport {
         operation: &'static str,
         parse_response: fn(reqwest::blocking::Response, &'static str) -> Result<Value, UploadError>,
     ) -> Result<Value, UploadError> {
+        session.validate()?;
         let response = self
             .client
             .post(url)
@@ -1526,6 +1540,7 @@ impl ReqwestCloudKitTransport {
         expected_size_bytes: u64,
     ) -> Result<CloudKitResourceDownload, UploadError> {
         validate_cloudkit_resource_download_url(download_url)?;
+        session.validate()?;
         let mut response = self
             .client
             .get(download_url.clone())
@@ -1665,13 +1680,38 @@ impl CloudKitOriginalAssetReadTransport for ReqwestCloudKitDeleteTransport {
 /// ```
 pub struct ReqwestCloudKitReadTransport {
     transport: ReqwestCloudKitTransport,
+    #[cfg(test)]
+    endpoint_override: Option<Url>,
 }
 
 impl ReqwestCloudKitReadTransport {
     pub fn new() -> Result<Self, UploadError> {
         Ok(Self {
             transport: ReqwestCloudKitTransport::new()?,
+            #[cfg(test)]
+            endpoint_override: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_loopback_test(endpoint: Url) -> Result<Self, UploadError> {
+        validate_loopback_test_endpoint(&endpoint)?;
+        Ok(Self {
+            transport: ReqwestCloudKitTransport::new()?,
+            endpoint_override: Some(endpoint),
+        })
+    }
+
+    fn records_query_url(
+        &self,
+        session: &CloudKitDeleteSession,
+        database_scope: CloudKitDatabaseScope,
+    ) -> Result<Url, UploadError> {
+        #[cfg(test)]
+        if let Some(endpoint) = &self.endpoint_override {
+            return cloudkit_records_query_url_with_base(session, endpoint.clone(), database_scope);
+        }
+        cloudkit_records_query_url(session, database_scope)
     }
 }
 
@@ -1681,7 +1721,7 @@ impl CloudKitOriginalAssetReadTransport for ReqwestCloudKitReadTransport {
         session: &CloudKitDeleteSession,
         payload: Value,
     ) -> Result<Value, UploadError> {
-        let url = cloudkit_records_query_url(session, payload_database_scope(&payload, session))?;
+        let url = self.records_query_url(session, payload_database_scope(&payload, session))?;
         self.transport.post_records_json(
             session,
             url,
@@ -3579,7 +3619,14 @@ fn cloudkit_records_query_url(
     session: &CloudKitDeleteSession,
     database_scope: CloudKitDatabaseScope,
 ) -> Result<Url, UploadError> {
-    let mut base = session.ckdatabasews_url.clone();
+    cloudkit_records_query_url_with_base(session, session.ckdatabasews_url.clone(), database_scope)
+}
+
+fn cloudkit_records_query_url_with_base(
+    session: &CloudKitDeleteSession,
+    mut base: Url,
+    database_scope: CloudKitDatabaseScope,
+) -> Result<Url, UploadError> {
     base.set_path(&format!(
         "/database/1/com.apple.photos.cloud/production/{}/records/query",
         database_scope.as_str()
@@ -3637,6 +3684,24 @@ fn validate_signed_upload_url(url: &Url) -> Result<(), UploadError> {
     if !is_allowed_icloud_host(host) {
         return Err(UploadError::InvalidPhotosUploadResponse(
             "signed upload URL host is not an Apple iCloud host",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_loopback_test_endpoint(url: &Url) -> Result<(), UploadError> {
+    if url.scheme() != "http"
+        || url.host_str() != Some("127.0.0.1")
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.path().trim_end_matches('/').is_empty()
+    {
+        return Err(UploadError::InvalidSession(
+            "test CloudKit endpoint must be an absolute loopback HTTP URL".to_string(),
         ));
     }
     Ok(())
@@ -4077,14 +4142,16 @@ impl RawCloudKitDeleteSession {
                 "missing X-APPLE-WEBAUTH-TOKEN cookie".to_string(),
             ));
         }
-        Ok(CloudKitDeleteSession {
+        let session = CloudKitDeleteSession {
             dsid,
             ckdatabasews_url,
             cloudkit_query_params,
             cookies,
             database_scope,
             zone,
-        })
+        };
+        session.validate()?;
+        Ok(session)
     }
 }
 
@@ -4104,24 +4171,9 @@ impl RawCloudKitQueryParam {
     fn validate(self) -> Result<CloudKitQueryParam, UploadError> {
         let name = required_nonempty(self.name, "cloudkit query param name")?;
         let value = required_nonempty(self.value, "cloudkit query param value")?;
-        reject_control_chars(&name, "cloudkit query param name")?;
-        reject_control_chars(&value, "cloudkit query param value")?;
-        if name.trim() != name || value.trim() != value {
-            return Err(UploadError::InvalidSession(
-                "cloudkit query params must not include leading or trailing whitespace".to_string(),
-            ));
-        }
-        if !name.bytes().all(is_cloudkit_query_param_name_byte) {
-            return Err(UploadError::InvalidSession(
-                "cloudkit query param name contains an invalid character".to_string(),
-            ));
-        }
-        if !value.bytes().all(is_cloudkit_query_param_value_byte) {
-            return Err(UploadError::InvalidSession(
-                "cloudkit query param value contains an invalid character".to_string(),
-            ));
-        }
-        Ok(CloudKitQueryParam { name, value })
+        let param = CloudKitQueryParam { name, value };
+        validate_cloudkit_query_param(&param)?;
+        Ok(param)
     }
 }
 
@@ -4146,19 +4198,9 @@ impl RawCookie {
     fn validate(self) -> Result<UploadCookie, UploadError> {
         let name = required_nonempty(self.name, "cookie name")?;
         let value = required_nonempty(self.value, "cookie value")?;
-        reject_control_chars(&name, "cookie name")?;
-        reject_control_chars(&value, "cookie value")?;
-        if !name.bytes().all(is_cookie_name_byte) {
-            return Err(UploadError::InvalidSession(
-                "cookie name contains an invalid character".to_string(),
-            ));
-        }
-        if !value.bytes().all(is_cookie_value_byte) {
-            return Err(UploadError::InvalidSession(
-                "cookie value contains an invalid character".to_string(),
-            ));
-        }
-        Ok(UploadCookie { name, value })
+        let cookie = UploadCookie { name, value };
+        validate_cloudkit_cookie(&cookie)?;
+        Ok(cookie)
     }
 }
 
@@ -4264,13 +4306,21 @@ fn is_ckdatabasews_service_host(host: &str) -> bool {
 
 fn validate_dsid(value: Option<String>) -> Result<String, UploadError> {
     let dsid = required_nonempty(value, "dsid")?;
-    reject_control_chars(&dsid, "dsid")?;
+    validate_dsid_value(&dsid)?;
+    Ok(dsid)
+}
+
+fn validate_dsid_value(dsid: &str) -> Result<(), UploadError> {
+    if dsid.is_empty() {
+        return Err(UploadError::InvalidSession("dsid is required".to_string()));
+    }
+    reject_control_chars(dsid, "dsid")?;
     if !dsid.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(UploadError::InvalidSession(
             "dsid must contain only ASCII digits".to_string(),
         ));
     }
-    Ok(dsid)
+    Ok(())
 }
 
 fn validate_cloudkit_query_params(
@@ -4280,16 +4330,27 @@ fn validate_cloudkit_query_params(
     let raw_params = raw_params.ok_or_else(|| {
         UploadError::InvalidSession("cloudkit_query_params are required".to_string())
     })?;
-    if raw_params.is_empty() {
+    let mut params = Vec::with_capacity(raw_params.len());
+    for raw_param in raw_params {
+        params.push(raw_param.validate()?);
+    }
+    validate_cloudkit_query_param_values(&params, dsid)?;
+    Ok(params)
+}
+
+fn validate_cloudkit_query_param_values(
+    params: &[CloudKitQueryParam],
+    dsid: &str,
+) -> Result<(), UploadError> {
+    if params.is_empty() {
         return Err(UploadError::InvalidSession(
             "cloudkit_query_params cannot be empty".to_string(),
         ));
     }
 
     let mut seen = std::collections::BTreeSet::new();
-    let mut params = Vec::with_capacity(raw_params.len());
-    for raw_param in raw_params {
-        let param = raw_param.validate()?;
+    for param in params {
+        validate_cloudkit_query_param(param)?;
         if !REQUIRED_CLOUDKIT_QUERY_PARAM_NAMES.contains(&param.name.as_str()) {
             return Err(UploadError::InvalidSession(
                 "cloudkit_query_params contain an unsupported parameter".to_string(),
@@ -4300,7 +4361,6 @@ fn validate_cloudkit_query_params(
                 "cloudkit_query_params contain a duplicate parameter".to_string(),
             ));
         }
-        params.push(param);
     }
 
     for required in REQUIRED_CLOUDKIT_QUERY_PARAM_NAMES {
@@ -4339,8 +4399,74 @@ fn validate_cloudkit_query_params(
             )));
         }
     }
+    Ok(())
+}
 
-    Ok(params)
+fn validate_cloudkit_query_param(param: &CloudKitQueryParam) -> Result<(), UploadError> {
+    if param.name.is_empty() || param.value.is_empty() {
+        return Err(UploadError::InvalidSession(
+            "cloudkit query params cannot be empty".to_string(),
+        ));
+    }
+    reject_control_chars(&param.name, "cloudkit query param name")?;
+    reject_control_chars(&param.value, "cloudkit query param value")?;
+    if param.name.trim() != param.name || param.value.trim() != param.value {
+        return Err(UploadError::InvalidSession(
+            "cloudkit query params must not include leading or trailing whitespace".to_string(),
+        ));
+    }
+    if !param.name.bytes().all(is_cloudkit_query_param_name_byte) {
+        return Err(UploadError::InvalidSession(
+            "cloudkit query param name contains an invalid character".to_string(),
+        ));
+    }
+    if !param.value.bytes().all(is_cloudkit_query_param_value_byte) {
+        return Err(UploadError::InvalidSession(
+            "cloudkit query param value contains an invalid character".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cloudkit_cookies(cookies: &[UploadCookie]) -> Result<(), UploadError> {
+    if cookies.is_empty() {
+        return Err(UploadError::InvalidSession(
+            "cookies cannot be empty".to_string(),
+        ));
+    }
+    for cookie in cookies {
+        validate_cloudkit_cookie(cookie)?;
+    }
+    if !cookies
+        .iter()
+        .any(|cookie| cookie.name == "X-APPLE-WEBAUTH-TOKEN")
+    {
+        return Err(UploadError::InvalidSession(
+            "missing X-APPLE-WEBAUTH-TOKEN cookie".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cloudkit_cookie(cookie: &UploadCookie) -> Result<(), UploadError> {
+    if cookie.name.is_empty() || cookie.value.is_empty() {
+        return Err(UploadError::InvalidSession(
+            "cookies cannot be empty".to_string(),
+        ));
+    }
+    reject_control_chars(&cookie.name, "cookie name")?;
+    reject_control_chars(&cookie.value, "cookie value")?;
+    if !cookie.name.bytes().all(is_cookie_name_byte) {
+        return Err(UploadError::InvalidSession(
+            "cookie name contains an invalid character".to_string(),
+        ));
+    }
+    if !cookie.value.bytes().all(is_cookie_value_byte) {
+        return Err(UploadError::InvalidSession(
+            "cookie value contains an invalid character".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_library_destination(
@@ -4736,6 +4862,52 @@ mod tests {
             .to_string(),
         )
         .expect("session should load")
+    }
+
+    #[test]
+    fn cloudkit_session_revalidation_rejects_public_field_mutations() {
+        let mut session = valid_delete_session();
+        session.dsid = "not-a-dsid".to_string();
+        assert!(matches!(
+            session.validate(),
+            Err(UploadError::InvalidSession(_))
+        ));
+
+        let mut session = valid_delete_session();
+        session.ckdatabasews_url =
+            Url::parse("http://127.0.0.1:12345").expect("test URL should parse");
+        assert!(matches!(
+            session.validate(),
+            Err(UploadError::InvalidSession(_))
+        ));
+
+        let mut session = valid_delete_session();
+        session.cloudkit_query_params[3].value = "different-dsid".to_string();
+        assert!(matches!(
+            session.validate(),
+            Err(UploadError::InvalidSession(_))
+        ));
+
+        let mut session = valid_delete_session();
+        session.cookies[0].value = "cookie\nsmuggling".to_string();
+        assert!(matches!(
+            session.validate(),
+            Err(UploadError::InvalidSession(_))
+        ));
+
+        let mut session = valid_delete_session();
+        session.database_scope = CloudKitDatabaseScope::Shared;
+        assert!(matches!(
+            session.validate(),
+            Err(UploadError::InvalidSession(_))
+        ));
+
+        let mut session = valid_delete_session();
+        session.zone.zone_name = "SharedSync-mismatched-zone".to_string();
+        assert!(matches!(
+            session.validate(),
+            Err(UploadError::InvalidSession(_))
+        ));
     }
 
     #[test]

@@ -2914,9 +2914,11 @@ struct ToolReport {
 #[cfg(test)]
 mod original_assets_audit_tests {
     use super::*;
+    use crate::upload::CloudKitDeleteTransport;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
+    use std::time::{Duration, Instant};
 
     fn audit_record(asset_id: &str, raw_path: PathBuf, root: &Path) -> AssetRecord {
         let raw = fs::read(&raw_path).expect("raw should be readable");
@@ -3018,6 +3020,146 @@ mod original_assets_audit_tests {
             matched_raw_sha256: format!("{:x}", Sha256::digest(raw)),
             replacement_candidate: None,
         }
+    }
+
+    const RECORDING_SERVER_TIMEOUT: Duration = Duration::from_millis(500);
+
+    struct RecordingServer {
+        endpoint: url::Url,
+        listener: TcpListener,
+    }
+
+    impl RecordingServer {
+        fn bind() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+            listener
+                .set_nonblocking(true)
+                .expect("listener should become nonblocking");
+            let endpoint = url::Url::parse(&format!(
+                "http://{}",
+                listener
+                    .local_addr()
+                    .expect("listener should have a local address")
+            ))
+            .expect("loopback endpoint should parse");
+            Self { endpoint, listener }
+        }
+
+        fn endpoint(&self) -> &url::Url {
+            &self.endpoint
+        }
+
+        fn serve(self, responses: Vec<Vec<u8>>) -> thread::JoinHandle<Vec<String>> {
+            thread::spawn(move || {
+                let mut requests = Vec::with_capacity(responses.len());
+                for response in responses {
+                    let mut stream = accept_recording_connection(&self.listener);
+                    let request = read_recording_request(&mut stream);
+                    write_recording_response(&mut stream, &response);
+                    requests.push(request);
+                }
+                requests
+            })
+        }
+
+        fn assert_no_requests(self) -> thread::JoinHandle<()> {
+            thread::spawn(move || {
+                let deadline = Instant::now() + RECORDING_SERVER_TIMEOUT;
+                loop {
+                    match self.listener.accept() {
+                        Ok(_) => panic!("invalid session must not send a request"),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("recording server accept failed: {error}"),
+                    }
+                }
+            })
+        }
+    }
+
+    fn accept_recording_connection(listener: &TcpListener) -> TcpStream {
+        let deadline = Instant::now() + RECORDING_SERVER_TIMEOUT;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for expected request"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("recording server accept failed: {error}"),
+            }
+        }
+    }
+
+    fn read_recording_request(stream: &mut TcpStream) -> String {
+        let deadline = Instant::now() + RECORDING_SERVER_TIMEOUT;
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let header_end = loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("timed out reading request headers");
+            stream
+                .set_read_timeout(Some(remaining))
+                .expect("request read timeout should set");
+            let read = stream
+                .read(&mut buffer)
+                .expect("request should be readable");
+            assert!(read > 0, "request should include headers");
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let header_text = String::from_utf8(request[..header_end].to_vec())
+            .expect("request headers should be UTF-8");
+        let content_length = header_text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then_some(value.trim())
+            })
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("timed out reading request body");
+            stream
+                .set_read_timeout(Some(remaining))
+                .expect("request read timeout should set");
+            let read = stream
+                .read(&mut buffer)
+                .expect("request body should be readable");
+            assert!(read > 0, "request body should not end early");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        header_text
+            .lines()
+            .next()
+            .expect("request should include a request line")
+            .to_string()
+    }
+
+    fn write_recording_response(stream: &mut TcpStream, body: &[u8]) {
+        stream
+            .set_write_timeout(Some(RECORDING_SERVER_TIMEOUT))
+            .expect("response write timeout should set");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .expect("response headers should write");
+        stream.write_all(body).expect("response body should write");
     }
 
     #[test]
@@ -3243,12 +3385,13 @@ mod original_assets_audit_tests {
 
     #[test]
     fn audit_read_transport_only_queries_and_downloads_nonzero_targets() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-        let address = listener
-            .local_addr()
-            .expect("listener should have a local address");
+        let recorder = RecordingServer::bind();
         let raw = b"audit-raw".to_vec();
-        let resource_url = format!("http://{address}/resource");
+        let resource_url = recorder
+            .endpoint()
+            .join("resource")
+            .expect("resource URL should resolve")
+            .to_string();
         let query_response = serde_json::json!({
             "records": [
                 {
@@ -3277,72 +3420,10 @@ mod original_assets_audit_tests {
             ]
         })
         .to_string();
-        let server_raw = raw.clone();
-        let server = thread::spawn(move || {
-            let mut requests = Vec::new();
-            for (index, response_body) in [query_response.into_bytes(), server_raw]
-                .into_iter()
-                .enumerate()
-            {
-                let (mut stream, _) = listener.accept().expect("request should connect");
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 1024];
-                loop {
-                    let read = stream
-                        .read(&mut buffer)
-                        .expect("request should be readable");
-                    assert!(read > 0, "request should include headers");
-                    request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let header_end = request
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                    .expect("request should include a header terminator")
-                    + 4;
-                let header_text = String::from_utf8(request[..header_end].to_vec())
-                    .expect("request headers should be UTF-8");
-                let content_length = header_text
-                    .lines()
-                    .find_map(|line| line.strip_prefix("content-length: "))
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .unwrap_or(0);
-                while request.len() < header_end + content_length {
-                    let read = stream
-                        .read(&mut buffer)
-                        .expect("request body should be readable");
-                    assert!(read > 0, "request body should not end early");
-                    request.extend_from_slice(&buffer[..read]);
-                }
-                requests.push(
-                    header_text
-                        .lines()
-                        .next()
-                        .expect("request should include a request line")
-                        .to_string(),
-                );
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-                    response_body.len()
-                )
-                .expect("response headers should write");
-                stream
-                    .write_all(&response_body)
-                    .expect("response body should write");
-                assert!(
-                    index < 2,
-                    "server should only receive expected read requests"
-                );
-            }
-            requests
-        });
+        let endpoint = recorder.endpoint().clone();
+        let server = recorder.serve(vec![query_response.into_bytes(), raw]);
 
-        let mut session = audit_test_session();
-        session.ckdatabasews_url =
-            url::Url::parse(&format!("http://{address}")).expect("loopback URL should parse");
+        let session = audit_test_session();
         let config = MonitorConfig::new("/audit/download", "/audit/manifest.json", "/audit/heic");
         let target = audit_test_target();
         let report = original_assets_audit_destination_report_with_transport(
@@ -3350,7 +3431,8 @@ mod original_assets_audit_tests {
             CloudKitLibraryDestination::primary_sync(),
             vec![target],
             &config,
-            ReqwestCloudKitReadTransport::new().expect("read transport should build"),
+            ReqwestCloudKitReadTransport::new_for_loopback_test(endpoint)
+                .expect("read transport should build"),
         );
 
         assert_eq!(report.targets, 1);
@@ -3367,6 +3449,71 @@ mod original_assets_audit_tests {
                 .iter()
                 .all(|request| !request.contains("records/modify") && !request.contains("upload"))
         );
+    }
+
+    #[test]
+    fn audit_no_download_query_returns_without_waiting_for_an_extra_request() {
+        let recorder = RecordingServer::bind();
+        let endpoint = recorder.endpoint().clone();
+        let server = recorder.serve(vec![
+            serde_json::json!({"records": []}).to_string().into_bytes(),
+        ]);
+        let config = MonitorConfig::new("/audit/download", "/audit/manifest.json", "/audit/heic");
+        let report = original_assets_audit_destination_report_with_transport(
+            &audit_test_session(),
+            CloudKitLibraryDestination::primary_sync(),
+            vec![audit_test_target()],
+            &config,
+            ReqwestCloudKitReadTransport::new_for_loopback_test(endpoint)
+                .expect("read transport should build"),
+        );
+
+        assert!(report.batch_error.is_none(), "{:#?}", report.batch_error);
+        assert_eq!(
+            server
+                .join()
+                .expect("recording server should complete")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn mutated_http_or_non_apple_session_sends_no_cloudkit_request() {
+        for scheme in ["http", "https"] {
+            let recorder = RecordingServer::bind();
+            let endpoint = recorder.endpoint().clone();
+            let no_requests = recorder.assert_no_requests();
+            let mut session = audit_test_session();
+            let mut invalid_endpoint = endpoint.clone();
+            invalid_endpoint
+                .set_scheme(scheme)
+                .expect("test endpoint scheme should update");
+            session.ckdatabasews_url = invalid_endpoint;
+            let payload = serde_json::json!({"zoneID": {"zoneName": "PrimarySync"}});
+            let resource_url = endpoint
+                .join("resource")
+                .expect("resource URL should resolve");
+            let mut read_transport = ReqwestCloudKitReadTransport::new_for_loopback_test(endpoint)
+                .expect("read transport should build");
+            let mut delete_transport =
+                ReqwestCloudKitDeleteTransport::new().expect("delete transport should build");
+
+            for error in [
+                read_transport.post_records_query(&session, payload.clone()),
+                delete_transport.post_records_lookup(&session, payload.clone()),
+                delete_transport.post_records_modify(&session, payload.clone()),
+            ] {
+                assert!(matches!(error, Err(UploadError::InvalidSession(_))));
+            }
+            assert!(matches!(
+                read_transport.download_resource(&session, &resource_url, 1),
+                Err(UploadError::InvalidSession(_))
+            ));
+            no_requests
+                .join()
+                .expect("invalid session recorder should observe no requests");
+        }
     }
 
     #[test]
