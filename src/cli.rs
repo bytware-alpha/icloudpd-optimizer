@@ -1,15 +1,16 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -38,10 +39,12 @@ use crate::service::{
 use crate::state_store::{AssetStateStore, AssetStateStoreError};
 use crate::upload::{
     CloudKitDatabaseScope, CloudKitDeleteClient, CloudKitDeleteRequest, CloudKitLibraryDestination,
-    CloudKitOriginalAssetBatchResolveRequest, CloudKitOriginalAssetResolveRequest,
-    CloudKitOriginalAssetResolveTarget, IcloudUploadRequest, ReqwestCloudKitDeleteTransport,
-    UploadError, build_upload_proof, load_cloudkit_delete_session, load_upload_session,
-    run_icloud_upload, validate_library_destination, verify_local_heic,
+    CloudKitLocalReplacementCandidate, CloudKitOriginalAssetBatchResolveOutcome,
+    CloudKitOriginalAssetBatchResolveRequest, CloudKitOriginalAssetInventoryFingerprint,
+    CloudKitOriginalAssetResolution, CloudKitOriginalAssetResolveDisposition,
+    CloudKitOriginalAssetResolveRequest, CloudKitOriginalAssetResolveTarget, IcloudUploadRequest,
+    ReqwestCloudKitDeleteTransport, UploadError, build_upload_proof, load_cloudkit_delete_session,
+    load_upload_session, run_icloud_upload, validate_library_destination, verify_local_heic,
 };
 use crate::workflow::{
     ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, OriginalAssetProof,
@@ -164,6 +167,11 @@ enum MonitorCommand {
     Queue(MonitorQueueArgs),
     #[command(about = "Show a simple refreshing monitor TUI")]
     Tui(MonitorTuiArgs),
+    #[command(
+        name = "original-assets-audit",
+        about = "Read-only CloudKit original/replacement inventory audit"
+    )]
+    OriginalAssetsAudit(MonitorOriginalAssetsAuditArgs),
     #[command(
         name = "launchd-plist",
         about = "Print or write a macOS user LaunchAgent plist"
@@ -289,6 +297,12 @@ struct MonitorTuiArgs {
     refresh_seconds: u64,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     once: bool,
+}
+
+#[derive(Debug, Args)]
+struct MonitorOriginalAssetsAuditArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -904,6 +918,7 @@ fn run_monitor<W: Write>(args: MonitorArgs, writer: &mut W) -> Result<(), CliErr
         MonitorCommand::Stats(args) => monitor_stats(args, writer),
         MonitorCommand::Queue(args) => monitor_queue(args, writer),
         MonitorCommand::Tui(args) => monitor_tui(args, writer),
+        MonitorCommand::OriginalAssetsAudit(args) => monitor_original_assets_audit(args, writer),
         MonitorCommand::LaunchdPlist(args) => monitor_launchd_plist(args, writer),
         MonitorCommand::ScanRootPreflight(args) => monitor_scan_root_preflight(args),
     }
@@ -1209,6 +1224,337 @@ fn service_uninstall(args: ServiceUninstallArgs) -> Result<(), CliError> {
 fn monitor_scan_root_preflight(args: MonitorScanRootPreflightArgs) -> Result<(), CliError> {
     run_scan_root_preflight_probe(&args.path)?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct OriginalAssetsAuditReport {
+    targets: usize,
+    skipped_targets: usize,
+    destinations: Vec<OriginalAssetsAuditDestinationReport>,
+    disposition_counts: BTreeMap<String, u64>,
+    elapsed_millis: u128,
+}
+
+#[derive(Serialize)]
+struct OriginalAssetsAuditDestinationReport {
+    destination: CloudKitLibraryDestination,
+    targets: usize,
+    inventory: Option<CloudKitOriginalAssetInventoryFingerprint>,
+    resolutions: BTreeMap<String, CloudKitOriginalAssetResolution>,
+    batch_error: Option<OriginalAssetsAuditBatchError>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OriginalAssetsAuditBatchError {
+    Authentication,
+    MalformedResponse,
+    Transport,
+    Transient,
+}
+
+struct OriginalAssetsAuditTarget {
+    destination: CloudKitLibraryDestination,
+    target: CloudKitOriginalAssetResolveTarget,
+}
+
+fn monitor_original_assets_audit<W: Write>(
+    args: MonitorOriginalAssetsAuditArgs,
+    writer: &mut W,
+) -> Result<(), CliError> {
+    let started = Instant::now();
+    let config = MonitorConfig::load(&args.config)?;
+    config.validate()?;
+    let canonical_library_root = fs::canonicalize(&config.download_root).map_err(|source| {
+        MonitorError::CanonicalizeRoot {
+            path: config.download_root.clone(),
+            source,
+        }
+    })?;
+    run_scan_root_preflight_probe(&canonical_library_root)?;
+    let state_store = AssetStateStore::open_read_only(&config.manifest_path)?;
+    let manifest = state_store.load()?;
+    let (destination_targets, skipped_targets) = original_assets_audit_targets(
+        &manifest,
+        &canonical_library_root,
+        config.capture_tolerance_seconds,
+    );
+    let target_count = destination_targets.values().map(Vec::len).sum();
+    let session_path =
+        config
+            .delete_session_path
+            .as_deref()
+            .ok_or(CliError::InvalidCloudKitDestination {
+                message: "original-assets-audit requires delete_session_path".to_string(),
+            })?;
+    let destination_reports = match load_cloudkit_delete_session(session_path) {
+        Ok(session) => destination_targets
+            .into_iter()
+            .map(|(destination, targets)| {
+                original_assets_audit_destination_report(&session, destination, targets, &config)
+            })
+            .collect(),
+        Err(error) => destination_targets
+            .into_iter()
+            .map(
+                |(destination, targets)| OriginalAssetsAuditDestinationReport {
+                    destination,
+                    targets: targets.len(),
+                    inventory: None,
+                    resolutions: BTreeMap::new(),
+                    batch_error: Some(original_assets_audit_batch_error(&error)),
+                },
+            )
+            .collect(),
+    };
+    let mut report = OriginalAssetsAuditReport {
+        targets: target_count,
+        skipped_targets,
+        destinations: destination_reports,
+        disposition_counts: BTreeMap::new(),
+        elapsed_millis: started.elapsed().as_millis(),
+    };
+    report.disposition_counts = original_assets_audit_disposition_counts(&report.destinations);
+    serde_json::to_writer_pretty(&mut *writer, &report)?;
+    writeln!(writer)?;
+    eprintln!(
+        "original-assets-audit: targets={} skipped={} destinations={} elapsed_ms={}",
+        report.targets,
+        report.skipped_targets,
+        report.destinations.len(),
+        report.elapsed_millis,
+    );
+    Ok(())
+}
+
+fn original_assets_audit_destination_report(
+    session: &crate::upload::CloudKitDeleteSession,
+    destination: CloudKitLibraryDestination,
+    targets: Vec<CloudKitOriginalAssetResolveTarget>,
+    config: &MonitorConfig,
+) -> OriginalAssetsAuditDestinationReport {
+    let mut destination_session = session.clone();
+    destination_session.database_scope = destination.database_scope;
+    destination_session.zone = destination.clone();
+    let result = ReqwestCloudKitDeleteTransport::new().and_then(|transport| {
+        let mut client = CloudKitDeleteClient::new(transport);
+        client.resolve_original_assets_batch_outcome(
+            &destination_session,
+            &CloudKitOriginalAssetBatchResolveRequest {
+                targets: targets.clone(),
+                start_rank: config.cloudkit_start_rank,
+                page_size: config.cloudkit_page_size,
+                max_pages: config.cloudkit_max_pages,
+            },
+        )
+    });
+    match result {
+        Ok(outcome) => {
+            let inventory = outcome.inventory.clone();
+            OriginalAssetsAuditDestinationReport {
+                destination,
+                targets: targets.len(),
+                inventory: Some(inventory),
+                resolutions: redact_audit_resolutions(outcome),
+                batch_error: None,
+            }
+        }
+        Err(error) => OriginalAssetsAuditDestinationReport {
+            destination,
+            targets: targets.len(),
+            inventory: None,
+            resolutions: BTreeMap::new(),
+            batch_error: Some(original_assets_audit_batch_error(&error)),
+        },
+    }
+}
+
+fn original_assets_audit_targets(
+    manifest: &Manifest,
+    canonical_library_root: &Path,
+    capture_tolerance_seconds: u64,
+) -> (
+    BTreeMap<CloudKitLibraryDestination, Vec<CloudKitOriginalAssetResolveTarget>>,
+    usize,
+) {
+    let mut targets = BTreeMap::new();
+    let mut skipped = 0_usize;
+    for record in manifest.records().values() {
+        if !original_assets_audit_eligible(record) {
+            continue;
+        }
+        let Some(target) =
+            original_assets_audit_target(record, canonical_library_root, capture_tolerance_seconds)
+        else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        targets
+            .entry(target.destination)
+            .or_insert_with(Vec::new)
+            .push(target.target);
+    }
+    (targets, skipped)
+}
+
+fn original_assets_audit_eligible(record: &AssetRecord) -> bool {
+    let failed_original_resolution = record.state == State::Failed
+        && record
+            .failures
+            .last()
+            .is_some_and(|failure| failure.stage == "original_asset_resolve");
+    let missing_original =
+        record.state == State::UploadVerified && !record.proofs.contains_key("original_asset");
+    failed_original_resolution || missing_original
+}
+
+fn original_assets_audit_target(
+    record: &AssetRecord,
+    canonical_library_root: &Path,
+    capture_tolerance_seconds: u64,
+) -> Option<OriginalAssetsAuditTarget> {
+    let nas = serde_json::from_value::<NasRawProof>(record.proofs.get("nas")?.clone()).ok()?;
+    let source_age =
+        serde_json::from_value::<SourceAgeProof>(record.proofs.get("source_age")?.clone()).ok()?;
+    let canonical_raw_path = fs::canonicalize(&record.raw_path).ok()?;
+    let relative_raw_path = canonical_raw_path
+        .strip_prefix(canonical_library_root)
+        .ok()?;
+    let destination = original_assets_audit_destination(relative_raw_path)?;
+    let filename = canonical_raw_path.file_name()?.to_str()?.to_string();
+    Some(OriginalAssetsAuditTarget {
+        destination,
+        target: CloudKitOriginalAssetResolveTarget {
+            asset_id: record.asset_id.clone(),
+            raw_size_bytes: nas.size_bytes,
+            source_captured_unix_seconds: source_age.source_captured_unix_seconds,
+            capture_tolerance_seconds,
+            filename,
+            matched_raw_sha256: nas.sha256,
+            replacement_candidate: original_assets_audit_replacement_candidate(
+                canonical_library_root,
+                relative_raw_path,
+                &record.asset_id,
+            ),
+        },
+    })
+}
+
+fn original_assets_audit_destination(
+    relative_raw_path: &Path,
+) -> Option<CloudKitLibraryDestination> {
+    let Component::Normal(component) = relative_raw_path.components().next()? else {
+        return None;
+    };
+    let library = component.to_str()?;
+    if library == "PrimarySync" {
+        return Some(CloudKitLibraryDestination::primary_sync());
+    }
+    library
+        .starts_with("SharedSync-")
+        .then(|| CloudKitLibraryDestination {
+            database_scope: CloudKitDatabaseScope::Shared,
+            zone_name: library.to_string(),
+        })
+}
+
+fn original_assets_audit_replacement_candidate(
+    canonical_library_root: &Path,
+    relative_raw_path: &Path,
+    asset_id: &str,
+) -> Option<CloudKitLocalReplacementCandidate> {
+    if asset_id.is_empty() || asset_id == "." || asset_id == ".." || asset_id.contains(['/', '\\'])
+    {
+        return None;
+    }
+    let candidate = canonical_library_root
+        .join(relative_raw_path.parent()?)
+        .join(format!("{asset_id}.HEIC"));
+    let canonical_candidate = fs::canonicalize(candidate).ok()?;
+    if !canonical_candidate.starts_with(canonical_library_root) || !canonical_candidate.is_file() {
+        return None;
+    }
+    let size_bytes = canonical_candidate.metadata().ok()?.len();
+    if size_bytes == 0 {
+        return None;
+    }
+    Some(CloudKitLocalReplacementCandidate {
+        sha256: sha256_file(&canonical_candidate).ok()?,
+        size_bytes,
+    })
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn redact_audit_resolutions(
+    outcome: CloudKitOriginalAssetBatchResolveOutcome,
+) -> BTreeMap<String, CloudKitOriginalAssetResolution> {
+    outcome
+        .resolutions
+        .into_iter()
+        .map(|(asset_id, resolution)| (compact_audit_asset_id(&asset_id), resolution))
+        .collect()
+}
+
+fn compact_audit_asset_id(asset_id: &str) -> String {
+    let digest = Sha256::digest(asset_id.as_bytes());
+    format!(
+        "asset-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5]
+    )
+}
+
+fn original_assets_audit_batch_error(error: &UploadError) -> OriginalAssetsAuditBatchError {
+    match error {
+        UploadError::InvalidSession(_) | UploadError::DecodeSession { .. } => {
+            OriginalAssetsAuditBatchError::Authentication
+        }
+        UploadError::InvalidCloudKitOriginalAssetResponse(_) => {
+            OriginalAssetsAuditBatchError::MalformedResponse
+        }
+        UploadError::Network { .. }
+        | UploadError::HttpClient { .. }
+        | UploadError::UploadHttpStatus { .. }
+        | UploadError::ReadUploadResponse { .. } => OriginalAssetsAuditBatchError::Transport,
+        _ => OriginalAssetsAuditBatchError::Transient,
+    }
+}
+
+fn original_assets_audit_disposition_counts(
+    reports: &[OriginalAssetsAuditDestinationReport],
+) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for resolution in reports
+        .iter()
+        .flat_map(|report| report.resolutions.values())
+    {
+        let disposition = match &resolution.disposition {
+            CloudKitOriginalAssetResolveDisposition::ExactOriginal { .. } => "exact_original",
+            CloudKitOriginalAssetResolveDisposition::ReplacementPresent { .. } => {
+                "replacement_present"
+            }
+            CloudKitOriginalAssetResolveDisposition::NoDateCandidate => "no_date_candidate",
+            CloudKitOriginalAssetResolveDisposition::NoRawResource => "no_raw_resource",
+            CloudKitOriginalAssetResolveDisposition::RawSizeMismatch => "raw_size_mismatch",
+            CloudKitOriginalAssetResolveDisposition::RawHashMismatch => "raw_hash_mismatch",
+            CloudKitOriginalAssetResolveDisposition::Ambiguous => "ambiguous",
+            CloudKitOriginalAssetResolveDisposition::IncompleteTransient => "incomplete_transient",
+        };
+        *counts.entry(disposition.to_string()).or_default() += 1;
+    }
+    counts
 }
 
 fn monitor_init(args: MonitorInitArgs) -> Result<(), CliError> {
@@ -2165,6 +2511,7 @@ fn workflow_original_assets_resolve_batch(
                 capture_tolerance_seconds: args.capture_tolerance_seconds,
                 filename,
                 matched_raw_sha256: nas.sha256,
+                replacement_candidate: None,
             })
         })
         .collect::<Result<_, CliError>>()?;
@@ -2385,4 +2732,107 @@ struct DoctorConversionBackendReport {
 struct ToolReport {
     name: &'static str,
     present: bool,
+}
+
+#[cfg(test)]
+mod original_assets_audit_tests {
+    use super::*;
+
+    fn audit_record(asset_id: &str, raw_path: PathBuf, root: &Path) -> AssetRecord {
+        let raw = fs::read(&raw_path).expect("raw should be readable");
+        let mut record = AssetRecord::new(asset_id, raw_path.clone());
+        record.state = State::UploadVerified;
+        record.proofs.insert(
+            "nas".to_string(),
+            serde_json::to_value(NasRawProof {
+                canonical_path: fs::canonicalize(&raw_path).expect("raw should canonicalize"),
+                relative_path: raw_path
+                    .strip_prefix(root)
+                    .expect("raw should be under the library root")
+                    .to_path_buf(),
+                size_bytes: raw.len() as u64,
+                modified_unix_seconds: 1_700_000_000,
+                age_seconds: 40 * DAY_SECONDS,
+                sha256: format!("{:x}", Sha256::digest(raw)),
+            })
+            .expect("NAS proof should serialize"),
+        );
+        record.proofs.insert(
+            "source_age".to_string(),
+            serde_json::to_value(SourceAgeProof {
+                source_captured_unix_seconds: 1_800_000_000,
+                verified_at_unix_seconds: 1_800_000_100,
+                min_age_seconds: 30 * DAY_SECONDS,
+            })
+            .expect("source age proof should serialize"),
+        );
+        record
+    }
+
+    #[test]
+    fn audit_groups_primary_and_shared_assets_and_hashes_safe_siblings() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let root = tempdir.path().join("library");
+        let primary_raw = root.join("PrimarySync/IMG_0001.DNG");
+        let shared_raw = root.join("SharedSync-family/IMG_0002.DNG");
+        fs::create_dir_all(primary_raw.parent().expect("raw should have a parent"))
+            .expect("primary directory should be created");
+        fs::create_dir_all(shared_raw.parent().expect("raw should have a parent"))
+            .expect("shared directory should be created");
+        fs::write(&primary_raw, b"primary-raw").expect("primary raw should save");
+        fs::write(&shared_raw, b"shared-raw").expect("shared raw should save");
+        fs::write(
+            primary_raw
+                .parent()
+                .expect("raw should have a parent")
+                .join("asset-primary.HEIC"),
+            b"replacement",
+        )
+        .expect("replacement should save");
+        let mut manifest = Manifest::new();
+        manifest.upsert(audit_record("asset-primary", primary_raw, &root));
+        manifest.upsert(audit_record("asset-shared", shared_raw, &root));
+
+        let (groups, skipped) = original_assets_audit_targets(
+            &manifest,
+            &fs::canonicalize(&root).expect("root should canonicalize"),
+            2,
+        );
+
+        assert_eq!(skipped, 0);
+        assert_eq!(groups.len(), 2);
+        let primary = groups
+            .get(&CloudKitLibraryDestination::primary_sync())
+            .expect("primary target should be grouped");
+        assert_eq!(primary.len(), 1);
+        assert_eq!(
+            primary[0]
+                .replacement_candidate
+                .as_ref()
+                .expect("safe sibling should be hashed")
+                .size_bytes,
+            b"replacement".len() as u64
+        );
+        let shared_destination = CloudKitLibraryDestination {
+            database_scope: CloudKitDatabaseScope::Shared,
+            zone_name: "SharedSync-family".to_string(),
+        };
+        assert_eq!(
+            groups
+                .get(&shared_destination)
+                .expect("shared target should be grouped")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn audit_output_ids_are_compact_and_do_not_echo_paths() {
+        let asset_id = "/private/library/SharedSync-family/IMG_0001.DNG";
+        let compact = compact_audit_asset_id(asset_id);
+
+        assert!(compact.starts_with("asset-"));
+        assert!(!compact.contains("private"));
+        assert!(!compact.contains('/'));
+    }
 }

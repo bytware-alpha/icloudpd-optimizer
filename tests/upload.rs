@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use icloudpd_optimizer::upload::{
     CloudKitDatabaseScope, CloudKitDeleteBatchRequest, CloudKitDeleteBatchSendError,
     CloudKitDeleteClient, CloudKitDeleteOutcome, CloudKitDeleteRequest, CloudKitDeleteSession,
-    CloudKitDeleteTransport, CloudKitLibraryDestination, CloudKitOriginalAssetBatchResolveRequest,
+    CloudKitDeleteTransport, CloudKitLibraryDestination, CloudKitLocalReplacementCandidate,
+    CloudKitOriginalAssetBatchResolveRequest, CloudKitOriginalAssetResolveDisposition,
     CloudKitOriginalAssetResolveRequest, CloudKitOriginalAssetResolveTarget,
     CloudKitUploadedHeicResolveRequest, IcloudUploadOutcome, IcloudUploadRequest,
     IcloudUploadResponse, PhotosUploadClient, PhotosUploadEndpoint, PhotosUploadTransport,
@@ -265,6 +266,7 @@ fn batch_resolve_target(
         capture_tolerance_seconds: 2,
         filename: filename.to_string(),
         matched_raw_sha256: sha256_hex(raw_bytes),
+        replacement_candidate: None,
     }
 }
 
@@ -1627,14 +1629,15 @@ fn cloudkit_original_asset_batch_resolver_counts_seek_probes_against_page_cap() 
         )}),
     ]);
 
-    let error = CloudKitDeleteClient::new(&mut transport)
-        .resolve_original_assets_batch(&session, &request)
-        .expect_err("unbracketed date seek should fail closed at the cap");
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(&session, &request)
+        .expect("unbracketed date seek should remain a typed transient outcome");
 
     assert!(matches!(
-        error,
-        UploadError::OriginalAssetResolveIncomplete { matches: 0 }
+        outcome.resolutions["asset-1"].disposition,
+        CloudKitOriginalAssetResolveDisposition::IncompleteTransient
     ));
+    assert!(!outcome.inventory.complete);
     assert_eq!(start_ranks(&transport), vec![0, 1, 2]);
     assert!(transport.downloaded_urls.is_empty());
 }
@@ -1713,7 +1716,7 @@ fn cloudkit_original_asset_batch_resolver_fails_when_any_target_unresolved() {
             &session,
             &batch_resolve_request(vec![
                 batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes"),
-                batch_resolve_target("asset-2", "IMG_0002.dng", b"missing"),
+                batch_resolve_target("asset-2", "IMG_0002.dng", b"other-raw"),
             ]),
         )
         .expect_err("one unresolved target must fail the whole batch");
@@ -1745,16 +1748,388 @@ fn cloudkit_original_asset_batch_outcome_isolates_unresolved_targets() {
             &session,
             &batch_resolve_request(vec![
                 batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes"),
-                batch_resolve_target("asset-2", "IMG_0002.dng", b"missing"),
+                batch_resolve_target("asset-2", "IMG_0002.dng", b"other-raw"),
             ]),
         )
         .expect("monitor-facing outcome should preserve partial resolution");
 
     assert_eq!(
-        outcome.proofs["asset-1"].record_name,
+        outcome.exact_original_proofs()["asset-1"].record_name,
         "CPLAsset-original-123"
     );
-    assert_eq!(outcome.unresolved_asset_ids, vec!["asset-2".to_string()]);
+    assert!(matches!(
+        outcome.resolutions["asset-2"].disposition,
+        CloudKitOriginalAssetResolveDisposition::RawHashMismatch
+    ));
+}
+
+#[test]
+fn cloudkit_original_asset_batch_reconciliation_keeps_exact_and_absent_targets_typed() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let records = cloudkit_raw_pair_with(
+        "CPLAsset-original-123",
+        "CPLMaster-raw-123",
+        "tag-1",
+        9,
+        1_800_000_000_000,
+    );
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": records})],
+        vec![b"raw-bytes".to_vec()],
+    );
+
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(
+            &session,
+            &batch_resolve_request(vec![
+                batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes"),
+                batch_resolve_target("asset-2", "IMG_0002.dng", b"other-raw"),
+            ]),
+        )
+        .expect("the completed inventory should report a disposition for every target");
+
+    assert!(matches!(
+        outcome.resolutions["asset-1"].disposition,
+        CloudKitOriginalAssetResolveDisposition::ExactOriginal { .. }
+    ));
+    assert!(matches!(
+        outcome.resolutions["asset-2"].disposition,
+        CloudKitOriginalAssetResolveDisposition::RawHashMismatch
+    ));
+    assert_eq!(
+        outcome.resolutions["asset-2"].observations.date_candidates,
+        1
+    );
+    assert!(outcome.inventory.complete);
+}
+
+#[test]
+fn cloudkit_original_asset_batch_reconciliation_classifies_each_terminal_absence() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let captured = 1_800_000_000_u64;
+    let mut records = cloudkit_raw_pair_with(
+        "CPLAsset-exact",
+        "CPLMaster-exact",
+        "tag-exact",
+        9,
+        (captured * 1000) as i64,
+    );
+    let mut no_raw = cloudkit_raw_pair_with(
+        "CPLAsset-no-raw",
+        "CPLMaster-no-raw",
+        "tag-no-raw",
+        9,
+        ((captured + 10) * 1000) as i64,
+    );
+    no_raw[1]["fields"] = json!({});
+    records
+        .as_array_mut()
+        .expect("records should be an array")
+        .extend(
+            no_raw
+                .as_array()
+                .expect("records should be an array")
+                .clone(),
+        );
+    records
+        .as_array_mut()
+        .expect("records should be an array")
+        .extend(
+            cloudkit_raw_pair_with(
+                "CPLAsset-wrong-size",
+                "CPLMaster-wrong-size",
+                "tag-wrong-size",
+                8,
+                ((captured + 20) * 1000) as i64,
+            )
+            .as_array()
+            .expect("records should be an array")
+            .clone(),
+        );
+    records
+        .as_array_mut()
+        .expect("records should be an array")
+        .extend(
+            cloudkit_raw_pair_with_url(
+                "CPLAsset-wrong-hash",
+                "CPLMaster-wrong-hash",
+                "tag-wrong-hash",
+                9,
+                ((captured + 30) * 1000) as i64,
+                "https://p140-icloud-content.icloud.com/wrong-hash",
+            )
+            .as_array()
+            .expect("records should be an array")
+            .clone(),
+        );
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": records})],
+        vec![b"raw-bytes".to_vec(), b"other-raw".to_vec()],
+    );
+    let target = |asset_id: &str, timestamp: u64| {
+        let mut target = batch_resolve_target(asset_id, "IMG_0001.dng", b"raw-bytes");
+        target.source_captured_unix_seconds = timestamp;
+        target.capture_tolerance_seconds = 0;
+        target
+    };
+
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(
+            &session,
+            &batch_resolve_request(vec![
+                target("exact", captured),
+                target("no-raw", captured + 10),
+                target("wrong-size", captured + 20),
+                target("wrong-hash", captured + 30),
+                target("no-date", captured + 100),
+            ]),
+        )
+        .expect("a complete scan should classify every target without a batch abort");
+
+    assert!(matches!(
+        outcome.resolutions["exact"].disposition,
+        CloudKitOriginalAssetResolveDisposition::ExactOriginal { .. }
+    ));
+    assert!(matches!(
+        outcome.resolutions["no-raw"].disposition,
+        CloudKitOriginalAssetResolveDisposition::NoRawResource
+    ));
+    assert!(matches!(
+        outcome.resolutions["wrong-size"].disposition,
+        CloudKitOriginalAssetResolveDisposition::RawSizeMismatch
+    ));
+    assert!(matches!(
+        outcome.resolutions["wrong-hash"].disposition,
+        CloudKitOriginalAssetResolveDisposition::RawHashMismatch
+    ));
+    assert!(matches!(
+        outcome.resolutions["no-date"].disposition,
+        CloudKitOriginalAssetResolveDisposition::NoDateCandidate
+    ));
+    assert_eq!(
+        outcome.resolutions["wrong-hash"]
+            .observations
+            .date_candidates,
+        1
+    );
+    assert_eq!(
+        outcome.resolutions["wrong-hash"].observations.raw_resources,
+        1
+    );
+    assert_eq!(
+        outcome.resolutions["wrong-hash"]
+            .observations
+            .raw_size_matches,
+        1
+    );
+    assert_eq!(
+        outcome.resolutions["wrong-hash"]
+            .observations
+            .raw_hash_matches,
+        0
+    );
+    assert!(transport.payloads.is_empty());
+    assert!(transport.lookup_payloads.is_empty());
+}
+
+#[test]
+fn cloudkit_original_asset_batch_reconciliation_reports_remote_replacement_without_delete_proof() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let replacement = b"replacement-heic";
+    let mut records = cloudkit_raw_pair_with(
+        "CPLAsset-replacement",
+        "CPLMaster-replacement",
+        "tag-replacement",
+        9,
+        1_800_000_000_000,
+    );
+    records[1]["fields"]["resOriginalAltRes"] = json!({"value": {
+        "size": replacement.len(),
+        "downloadURL": "https://p140-icloud-content.icloud.com/replacement"
+    }});
+    records[1]["fields"]["resOriginalAltFileType"] = json!({"value": "public.heic"});
+    let mut target = batch_resolve_target("asset-1", "IMG_0001.dng", b"other-raw");
+    target.replacement_candidate = Some(CloudKitLocalReplacementCandidate {
+        sha256: sha256_hex(replacement),
+        size_bytes: replacement.len() as u64,
+    });
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": records})],
+        vec![b"raw-bytes".to_vec(), replacement.to_vec()],
+    );
+
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(&session, &batch_resolve_request(vec![target]))
+        .expect("a replacement match should be an audit result");
+
+    let CloudKitOriginalAssetResolveDisposition::ReplacementPresent { proof } =
+        &outcome.resolutions["asset-1"].disposition
+    else {
+        panic!("replacement must not be reported as an original-delete proof");
+    };
+    assert_eq!(proof.record_name, "CPLAsset-replacement");
+    assert_eq!(proof.size_bytes, replacement.len() as u64);
+    assert!(outcome.exact_original_proofs().is_empty());
+    assert_eq!(
+        outcome.resolutions["asset-1"]
+            .observations
+            .replacement_resource_matches,
+        1
+    );
+}
+
+#[test]
+fn cloudkit_original_asset_batch_reconciliation_marks_exact_and_replacement_ambiguous() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let replacement = b"replacement-heic";
+    let mut records = cloudkit_raw_pair_with(
+        "CPLAsset-both",
+        "CPLMaster-both",
+        "tag-both",
+        9,
+        1_800_000_000_000,
+    );
+    records[1]["fields"]["resOriginalAltRes"] = json!({"value": {
+        "size": replacement.len(),
+        "downloadURL": "https://p140-icloud-content.icloud.com/both-replacement"
+    }});
+    records[1]["fields"]["resOriginalAltFileType"] = json!({"value": "public.heif"});
+    let mut target = batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes");
+    target.replacement_candidate = Some(CloudKitLocalReplacementCandidate {
+        sha256: sha256_hex(replacement),
+        size_bytes: replacement.len() as u64,
+    });
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": records})],
+        vec![b"raw-bytes".to_vec(), replacement.to_vec()],
+    );
+
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(&session, &batch_resolve_request(vec![target]))
+        .expect("both evidence classes should remain manual-safe");
+
+    assert!(matches!(
+        outcome.resolutions["asset-1"].disposition,
+        CloudKitOriginalAssetResolveDisposition::Ambiguous
+    ));
+    assert!(outcome.exact_original_proofs().is_empty());
+}
+
+#[test]
+fn cloudkit_original_asset_batch_reconciliation_scans_four_thousand_targets_once() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let targets = (0..4_000)
+        .map(|index| batch_resolve_target(&format!("asset-{index}"), "IMG_0001.dng", b"raw-bytes"))
+        .collect();
+    let mut transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": cloudkit_raw_pair_with(
+            "CPLAsset-shared",
+            "CPLMaster-shared",
+            "tag-shared",
+            9,
+            1_800_000_000_000,
+        )})],
+        vec![b"raw-bytes".to_vec()],
+    );
+
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(&session, &batch_resolve_request(targets))
+        .expect("one destination inventory should cover every target");
+
+    assert_eq!(outcome.resolutions.len(), 4_000);
+    assert_eq!(transport.query_payloads.len(), 1);
+    assert_eq!(transport.downloaded_urls.len(), 1);
+    assert!(outcome.resolutions.values().all(|resolution| matches!(
+        resolution.disposition,
+        CloudKitOriginalAssetResolveDisposition::Ambiguous
+    )));
+}
+
+#[test]
+fn cloudkit_original_asset_batch_reconciliation_rejects_an_invalid_local_replacement_candidate() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let mut target = batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes");
+    target.replacement_candidate = Some(CloudKitLocalReplacementCandidate {
+        sha256: String::new(),
+        size_bytes: 0,
+    });
+    let mut transport = FakeCloudKitDeleteTransport::query_responses(vec![]);
+
+    let error = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(&session, &batch_resolve_request(vec![target]))
+        .expect_err("a malformed local replacement candidate must not start a CloudKit scan");
+
+    assert!(matches!(
+        error,
+        UploadError::InvalidCloudKitOriginalAssetRequest(_)
+    ));
+    assert!(transport.query_payloads.is_empty());
+}
+
+#[test]
+fn cloudkit_original_asset_batch_inventory_fingerprint_includes_scanned_window_records() {
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let captured = 1_800_000_000_u64;
+    let request = {
+        let mut first = batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes");
+        first.source_captured_unix_seconds = captured;
+        first.capture_tolerance_seconds = 0;
+        let mut second = batch_resolve_target("asset-2", "IMG_0002.dng", b"other-raw");
+        second.source_captured_unix_seconds = captured + 100;
+        second.capture_tolerance_seconds = 0;
+        batch_resolve_request(vec![first, second])
+    };
+    let mut records = cloudkit_raw_pair_with(
+        "CPLAsset-exact",
+        "CPLMaster-exact",
+        "tag-exact",
+        9,
+        (captured * 1000) as i64,
+    );
+    let gap_records = cloudkit_raw_pair_with(
+        "CPLAsset-gap",
+        "CPLMaster-gap",
+        "tag-gap",
+        9,
+        ((captured + 50) * 1000) as i64,
+    );
+    records
+        .as_array_mut()
+        .expect("records should be an array")
+        .extend(
+            gap_records
+                .as_array()
+                .expect("records should be an array")
+                .clone(),
+        );
+    let mut changed_records = records.clone();
+    changed_records[2]["recordChangeTag"] = json!("tag-gap-changed");
+    let mut first_transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": records})],
+        vec![b"raw-bytes".to_vec()],
+    );
+    let mut second_transport = FakeCloudKitDeleteTransport::query_responses_with_downloads(
+        vec![json!({"records": changed_records})],
+        vec![b"raw-bytes".to_vec()],
+    );
+
+    let first = CloudKitDeleteClient::new(&mut first_transport)
+        .resolve_original_assets_batch_outcome(&session, &request)
+        .expect("first inventory should resolve");
+    let second = CloudKitDeleteClient::new(&mut second_transport)
+        .resolve_original_assets_batch_outcome(&session, &request)
+        .expect("changed inventory should resolve");
+
+    assert!(first.inventory.complete);
+    assert_eq!(first.inventory.records_scanned, 4);
+    assert_ne!(first.inventory.sha256, second.inventory.sha256);
 }
 
 #[test]
@@ -1831,14 +2206,15 @@ fn cloudkit_original_asset_batch_resolver_scan_cap_with_continuation_fails_close
         vec![b"raw-bytes".to_vec()],
     );
 
-    let error = CloudKitDeleteClient::new(&mut transport)
-        .resolve_original_assets_batch(&session, &request)
-        .expect_err("scan cap before exhaustion must fail closed");
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(&session, &request)
+        .expect("scan cap before exhaustion should remain a typed transient outcome");
 
-    assert!(matches!(
-        error,
-        UploadError::OriginalAssetResolveIncomplete { matches: 1 }
-    ));
+    assert!(outcome.resolutions.values().all(|resolution| matches!(
+        resolution.disposition,
+        CloudKitOriginalAssetResolveDisposition::IncompleteTransient
+    )));
+    assert!(!outcome.inventory.complete);
 }
 
 #[test]
@@ -1872,8 +2248,8 @@ fn cloudkit_original_asset_batch_resolver_duplicate_candidate_for_one_target_fai
         vec![b"raw-bytes".to_vec(), b"raw-bytes".to_vec()],
     );
 
-    let error = CloudKitDeleteClient::new(&mut transport)
-        .resolve_original_assets_batch(
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(
             &session,
             &batch_resolve_request(vec![batch_resolve_target(
                 "asset-1",
@@ -1881,11 +2257,11 @@ fn cloudkit_original_asset_batch_resolver_duplicate_candidate_for_one_target_fai
                 b"raw-bytes",
             )]),
         )
-        .expect_err("duplicate exact candidates must fail closed");
+        .expect("duplicate exact candidates should stay scoped to the affected target");
 
     assert!(matches!(
-        error,
-        UploadError::OriginalAssetResolveNotUnique { matches: 2 }
+        outcome.resolutions["asset-1"].disposition,
+        CloudKitOriginalAssetResolveDisposition::Ambiguous
     ));
 }
 
@@ -1905,20 +2281,20 @@ fn cloudkit_original_asset_batch_resolver_duplicate_original_for_two_targets_fai
         vec![b"raw-bytes".to_vec()],
     );
 
-    let error = CloudKitDeleteClient::new(&mut transport)
-        .resolve_original_assets_batch(
+    let outcome = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_assets_batch_outcome(
             &session,
             &batch_resolve_request(vec![
                 batch_resolve_target("asset-1", "IMG_0001.dng", b"raw-bytes"),
                 batch_resolve_target("asset-2", "IMG_0002.dng", b"raw-bytes"),
             ]),
         )
-        .expect_err("one CloudKit original must not prove two local targets");
+        .expect("one CloudKit original should only make its conflicting targets ambiguous");
 
-    assert!(matches!(
-        error,
-        UploadError::OriginalAssetResolveNotUnique { matches: 2 }
-    ));
+    assert!(outcome.resolutions.values().all(|resolution| matches!(
+        resolution.disposition,
+        CloudKitOriginalAssetResolveDisposition::Ambiguous
+    )));
 }
 
 #[test]

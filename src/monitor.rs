@@ -3551,9 +3551,9 @@ fn resolve_original_asset_batches(
             },
         ) {
             Ok(outcome) => {
-                let resolved = outcome.proofs.len();
-                let unresolved = outcome.unresolved_asset_ids.len();
-                let unresolved_asset_ids = outcome.unresolved_asset_ids.clone();
+                let resolved = outcome.exact_original_proofs().len();
+                let unresolved_asset_ids = outcome.non_exact_asset_ids();
+                let unresolved = unresolved_asset_ids.len();
                 if record_original_asset_batch_outcome(manifest, outcome, summary)? {
                     checkpoint_manifest_state(state_store, manifest)?;
                 }
@@ -3730,9 +3730,9 @@ fn record_original_asset_batch_job_result(
     let OriginalAssetResolveBatchJobResult { job, result } = job_result;
     match result {
         Ok(outcome) => {
-            let resolved = outcome.proofs.len();
-            let unresolved = outcome.unresolved_asset_ids.len();
-            let unresolved_asset_ids = outcome.unresolved_asset_ids.clone();
+            let resolved = outcome.exact_original_proofs().len();
+            let unresolved_asset_ids = outcome.non_exact_asset_ids();
+            let unresolved = unresolved_asset_ids.len();
             if record_original_asset_batch_outcome(manifest, outcome, summary)? {
                 checkpoint_manifest_state(state_store, manifest)?;
             }
@@ -6516,6 +6516,7 @@ fn original_asset_resolve_target(
         capture_tolerance_seconds: config.capture_tolerance_seconds,
         filename,
         matched_raw_sha256: nas.sha256,
+        replacement_candidate: None,
     })
 }
 
@@ -6831,12 +6832,24 @@ fn record_original_asset_batch_outcome(
     outcome: CloudKitOriginalAssetBatchResolveOutcome,
     summary: &mut MonitorScanSummary,
 ) -> Result<bool, MonitorError> {
-    let resolved = outcome.proofs.len() as u64;
-    let unresolved_asset_ids = outcome.unresolved_asset_ids;
+    let proofs = outcome.exact_original_proofs();
+    let resolved = proofs.len() as u64;
+    let unresolved_asset_ids = outcome
+        .resolutions
+        .iter()
+        .filter(|(_, resolution)| {
+            !matches!(
+                resolution.disposition,
+                crate::upload::CloudKitOriginalAssetResolveDisposition::ExactOriginal { .. }
+                    | crate::upload::CloudKitOriginalAssetResolveDisposition::IncompleteTransient
+            )
+        })
+        .map(|(asset_id, _)| asset_id.clone())
+        .collect::<Vec<_>>();
     let has_manifest_changes = resolved > 0 || !unresolved_asset_ids.is_empty();
     if resolved > 0 {
-        let resolved_asset_ids = outcome.proofs.keys().cloned().collect::<Vec<_>>();
-        record_original_asset_batch_proofs(manifest, &resolved_asset_ids, outcome.proofs)?;
+        let resolved_asset_ids = proofs.keys().cloned().collect::<Vec<_>>();
+        record_original_asset_batch_proofs(manifest, &resolved_asset_ids, proofs)?;
         summary.originals_resolved = summary.originals_resolved.saturating_add(resolved);
     }
     if !unresolved_asset_ids.is_empty() {
@@ -10310,8 +10323,32 @@ mod tests {
             },
         );
         let outcome = CloudKitOriginalAssetBatchResolveOutcome {
-            proofs,
-            unresolved_asset_ids: vec!["asset-b".to_string()],
+            resolutions: std::collections::BTreeMap::from([
+                (
+                    "asset-a".to_string(),
+                    crate::upload::CloudKitOriginalAssetResolution {
+                        observations: Default::default(),
+                        disposition:
+                            crate::upload::CloudKitOriginalAssetResolveDisposition::ExactOriginal {
+                                proof: proofs.remove("asset-a").expect("proof should exist"),
+                            },
+                    },
+                ),
+                (
+                    "asset-b".to_string(),
+                    crate::upload::CloudKitOriginalAssetResolution {
+                        observations: Default::default(),
+                        disposition:
+                            crate::upload::CloudKitOriginalAssetResolveDisposition::NoDateCandidate,
+                    },
+                ),
+            ]),
+            inventory: crate::upload::CloudKitOriginalAssetInventoryFingerprint {
+                resolver_version: "test".to_string(),
+                sha256: "test".to_string(),
+                complete: true,
+                records_scanned: 1,
+            },
         };
         let mut summary = MonitorScanSummary::default();
 

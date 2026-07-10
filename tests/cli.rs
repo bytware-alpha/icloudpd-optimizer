@@ -8,7 +8,9 @@ use icloudpd_optimizer::conversion_backend::{
     TargetPlatform, backend_report_for_target, required_tools_for_target,
 };
 use icloudpd_optimizer::manifest::{AssetRecord, Manifest, State};
+use icloudpd_optimizer::monitor::MonitorConfig;
 use icloudpd_optimizer::proof::NasRawProof;
+use icloudpd_optimizer::state_store::AssetStateStore;
 use icloudpd_optimizer::workflow::{
     ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, SourceAgeProof,
     discover_raw_asset, record_conversion_performance, record_conversion_result,
@@ -1981,6 +1983,81 @@ fn monitor_queue_json_classifies_retryable_and_blocked_failures() {
     assert_eq!(
         report["verified_metrics"]["deleted_records_missing_size_proofs"],
         0
+    );
+}
+
+#[test]
+fn monitor_original_assets_audit_is_read_only_and_redacts_local_paths() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let config_path = tempdir.path().join("monitor.json");
+    let download_root = tempdir.path().join("download");
+    let heic_dir = tempdir.path().join("heic");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let session_path = tempdir.path().join("delete-session.json");
+    fs::create_dir_all(&download_root).expect("download root should be created");
+    Manifest::new()
+        .save_atomic(&manifest_path)
+        .expect("manifest should save");
+    let state_store =
+        AssetStateStore::open_writer(&manifest_path, "cli-audit-test", Duration::from_secs(1))
+            .expect("state store should open");
+    state_store
+        .load_or_import()
+        .expect("manifest should import");
+    drop(state_store);
+    let mut config = MonitorConfig::new(&download_root, &manifest_path, &heic_dir);
+    config.delete_session_path = Some(session_path.clone());
+    config
+        .save_atomic(&config_path)
+        .expect("config should save");
+    fs::write(
+        &session_path,
+        json!({
+            "dsid": "123456789",
+            "ckdatabasews_url": "https://p140-ckdatabasews.icloud.com:443",
+            "cloudkit_query_params": [
+                {"name": "clientBuildNumber", "value": "2522Project44"},
+                {"name": "clientMasteringNumber", "value": "2522B2"},
+                {"name": "clientId", "value": "4f0b58d4-ff9d-4dc5-8f0b-9c4efc4fdb27"},
+                {"name": "dsid", "value": "123456789"},
+                {"name": "remapEnums", "value": "True"},
+                {"name": "getCurrentSyncToken", "value": "True"}
+            ],
+            "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "secret-cookie"}]
+        })
+        .to_string(),
+    )
+    .expect("session should save");
+    let manifest_before = fs::read(&manifest_path).expect("manifest should be readable");
+    let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
+    let database_before = fs::read(&db_path).expect("database should be readable");
+
+    let output = binary()
+        .args([
+            "monitor",
+            "original-assets-audit",
+            "--config",
+            config_path.to_str().expect("config path should be utf8"),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("audit output should be JSON");
+
+    assert_eq!(report["targets"], 0);
+    assert_eq!(report["destinations"], json!([]));
+    let shown = String::from_utf8(output).expect("audit output should be utf8");
+    assert!(!shown.contains(tempdir.path().to_str().expect("temp path should be utf8")));
+    assert!(!shown.contains("secret-cookie"));
+    assert_eq!(
+        fs::read(&manifest_path).expect("manifest should be readable"),
+        manifest_before
+    );
+    assert_eq!(
+        fs::read(&db_path).expect("database should be readable"),
+        database_before
     );
 }
 
