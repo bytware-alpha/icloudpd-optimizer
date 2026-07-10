@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::conversion_execution::{
     ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversion,
@@ -61,6 +62,7 @@ const DEFAULT_UPLOAD_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_HEIC_VERIFY_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_MAX_ORIGINAL_RESOLVER_RETRIES_PER_SCAN: usize = 16;
 const DEFAULT_ORIGINAL_RESOLVER_RETRY_MIN_AGE_SECONDS: u64 = 24 * 60 * 60;
+const MONITOR_STATE_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 const DELETE_LIVE_RAW_MAX_AGE: Duration = Duration::from_secs(30);
 const ORIGINAL_ASSET_RESOLVE_BATCH_WINDOW_SECONDS: u64 = 60 * 60;
 const DEFAULT_ROLLING_ORIGINAL_RESOLVE_ACTIVE_WINDOW_MULTIPLIER: usize = 2;
@@ -549,7 +551,10 @@ pub struct MonitorScanSummary {
     pub state_counts: BTreeMap<String, u64>,
 }
 
-pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, MonitorError> {
+pub fn run_monitor_once(
+    config: &MonitorConfig,
+    guard: &mut MonitorRunGuard,
+) -> Result<MonitorScanSummary, MonitorError> {
     clear_pending_monitor_failure_correlation();
     config.validate()?;
     fs::create_dir_all(&config.heic_output_dir).map_err(|source| MonitorError::CreateDir {
@@ -562,7 +567,15 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
     stats.scans_started = stats.scans_started.saturating_add(1);
     stats.last_scan_started_unix_seconds = Some(started);
 
-    let state_store = Arc::new(AssetStateStore::open(&config.manifest_path)?);
+    let download_root = fs::canonicalize(&config.download_root).map_err(|source| {
+        MonitorError::CanonicalizeRoot {
+            path: config.download_root.clone(),
+            source,
+        }
+    })?;
+    ensure_scan_root_access(&download_root, config.scan_root_preflight_timeout_seconds)?;
+
+    let state_store = Arc::new(guard.state_store(&config.manifest_path)?.clone());
     let mut manifest = state_store.load_or_import()?;
     let mut summary = MonitorScanSummary {
         started_unix_seconds: started,
@@ -662,13 +675,6 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
         config.max_lifecycle_per_scan,
     );
     if new_work_skip_reason.is_none() {
-        let download_root = fs::canonicalize(&config.download_root).map_err(|source| {
-            MonitorError::CanonicalizeRoot {
-                path: config.download_root.clone(),
-                source,
-            }
-        })?;
-        ensure_scan_root_access(&download_root, config.scan_root_preflight_timeout_seconds)?;
         let now = SystemTime::now();
         let mut pending_capacity = config
             .max_conversions_per_scan
@@ -850,6 +856,8 @@ pub fn run_monitor_once(config: &MonitorConfig) -> Result<MonitorScanSummary, Mo
 #[derive(Debug)]
 pub struct MonitorRunGuard {
     file: File,
+    owner_id: String,
+    state_store: Option<AssetStateStore>,
 }
 
 pub fn monitor_run_lock_path(config: &MonitorConfig) -> PathBuf {
@@ -895,12 +903,14 @@ pub fn acquire_monitor_run_guard(config: &MonitorConfig) -> Result<MonitorRunGua
         }
     }
 
+    let owner_id = format!("pid-{}-{}", std::process::id(), Uuid::new_v4());
     file.set_len(0)
         .and_then(|()| {
             write!(
                 file,
-                "pid={}\nmanifest={}\n",
+                "pid={}\nowner={}\nmanifest={}\n",
                 std::process::id(),
+                owner_id,
                 config.manifest_path.display()
             )
         })
@@ -910,11 +920,34 @@ pub fn acquire_monitor_run_guard(config: &MonitorConfig) -> Result<MonitorRunGua
             source,
         })?;
 
-    Ok(MonitorRunGuard { file })
+    Ok(MonitorRunGuard {
+        file,
+        owner_id,
+        state_store: None,
+    })
+}
+
+impl MonitorRunGuard {
+    fn state_store(&mut self, manifest_path: &Path) -> Result<&AssetStateStore, MonitorError> {
+        match self.state_store.as_ref() {
+            Some(store) => store.renew_writer_lease()?,
+            None => {
+                self.state_store = Some(AssetStateStore::open_writer(
+                    manifest_path,
+                    self.owner_id.clone(),
+                    MONITOR_STATE_LEASE_TTL,
+                )?);
+            }
+        }
+        Ok(self.state_store.as_ref().expect("state store should exist"))
+    }
 }
 
 impl Drop for MonitorRunGuard {
     fn drop(&mut self) {
+        if let Some(state_store) = self.state_store.as_ref() {
+            let _ = state_store.release_writer_lease();
+        }
         #[cfg(unix)]
         {
             let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
@@ -12450,6 +12483,37 @@ mod tests {
         drop(first);
 
         acquire_monitor_run_guard(&config).expect("lock should release when owner drops");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_monitor_once_preflight_failure_does_not_create_state_db() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let download_root = tempdir.path().join("download");
+        fs::create_dir_all(&download_root).expect("download root should be created");
+        fs::set_permissions(&download_root, fs::Permissions::from_mode(0o000))
+            .expect("permissions should be restricted");
+        let config = MonitorConfig::new(
+            download_root.clone(),
+            tempdir.path().join("state/manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        let mut guard = acquire_monitor_run_guard(&config).expect("monitor guard should lock");
+
+        let result = run_monitor_once(&config, &mut guard);
+
+        fs::set_permissions(&download_root, fs::Permissions::from_mode(0o700))
+            .expect("permissions should be restored");
+        assert!(matches!(
+            result,
+            Err(MonitorError::DownloadRootAccess { .. })
+        ));
+        assert!(
+            !AssetStateStore::db_path_for_manifest(&config.manifest_path).exists(),
+            "preflight failure should not create or mutate the durable state database"
+        );
     }
 
     #[cfg(unix)]

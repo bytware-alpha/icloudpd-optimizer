@@ -1260,9 +1260,9 @@ fn monitor_init(args: MonitorInitArgs) -> Result<(), CliError> {
 fn monitor_run<W: Write>(args: MonitorRunArgs, writer: &mut W) -> Result<(), CliError> {
     let config = MonitorConfig::load(&args.config)?;
     config.validate()?;
-    let _guard = acquire_monitor_run_guard(&config)?;
+    let mut guard = acquire_monitor_run_guard(&config)?;
     loop {
-        match run_monitor_once(&config) {
+        match run_monitor_once(&config, &mut guard) {
             Ok(summary) => write_scan_summary(writer, &summary)?,
             Err(error) if args.once => {
                 log_monitor_failure_event(&error);
