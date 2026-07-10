@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fmt;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::ErrorKind;
 use std::io::{self, Read, Write};
@@ -39,7 +40,7 @@ use crate::service::{
     DEFAULT_SERVICE_LABEL, ServiceError, ServiceInstallRequest, default_plist_path,
     install_service, service_status, start_service, stop_service, tail_logs, uninstall_service,
 };
-use crate::state_store::{AssetStateStore, AssetStateStoreError};
+use crate::state_store::{AssetRecordExactCasUpdate, AssetStateStore, AssetStateStoreError};
 use crate::upload::{
     CloudKitDatabaseScope, CloudKitDeleteClient, CloudKitDeleteRequest, CloudKitLibraryDestination,
     CloudKitLocalReplacementCandidate, CloudKitOriginalAssetBatchResolveOutcome,
@@ -62,6 +63,7 @@ use crate::workflow::{
 };
 
 const DAY_SECONDS: u64 = 24 * 60 * 60;
+const ORIGINAL_ASSETS_TARGET_SET_FINGERPRINT_VERSION: &[u8] = b"original-assets-target-set-v1";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -339,6 +341,8 @@ struct MonitorOriginalAssetsReconcileArgs {
     expected_unselected_destination_target_count: u64,
     #[arg(long)]
     expected_skipped_target_count: u64,
+    #[arg(long)]
+    expected_target_set_sha256: String,
     #[arg(long)]
     expected_inventory_sha256: String,
     #[arg(long)]
@@ -851,6 +855,14 @@ pub enum CliError {
     InvalidCloudKitDestination { message: String },
     #[error("original-assets-reconcile gate failed: {message}")]
     OriginalAssetsReconcileGate { message: String },
+    #[error("original-assets-reconcile {stage} failed")]
+    OriginalAssetsReconcileFailure {
+        stage: OriginalAssetsReconcileFailureStage,
+    },
+    #[error("original-assets-reconcile CloudKit {kind} failure")]
+    OriginalAssetsReconcileCloudKitFailure {
+        kind: OriginalAssetsReconcileCloudKitFailureKind,
+    },
     #[error("original asset reconciliation failed: {0}")]
     OriginalAssetResolution(#[from] OriginalAssetResolutionError),
     #[error("original-assets-reconcile database commit succeeded but the JSON checkpoint is stale")]
@@ -865,6 +877,52 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
     #[error("failed to write output: {0}")]
     Output(#[from] io::Error),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OriginalAssetsReconcileFailureStage {
+    Configuration,
+    Root,
+    State,
+    Session,
+    Domain,
+    Persistence,
+    Output,
+}
+
+impl fmt::Display for OriginalAssetsReconcileFailureStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let stage = match self {
+            Self::Configuration => "configuration",
+            Self::Root => "root",
+            Self::State => "state",
+            Self::Session => "session",
+            Self::Domain => "domain",
+            Self::Persistence => "persistence",
+            Self::Output => "output",
+        };
+        formatter.write_str(stage)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OriginalAssetsReconcileCloudKitFailureKind {
+    Authentication,
+    MalformedResponse,
+    Transport,
+    Transient,
+}
+
+impl fmt::Display for OriginalAssetsReconcileCloudKitFailureKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Authentication => "authentication",
+            Self::MalformedResponse => "malformed-response",
+            Self::Transport => "transport",
+            Self::Transient => "transient",
+        };
+        formatter.write_str(kind)
+    }
 }
 
 pub fn run() -> Result<(), CliError> {
@@ -1315,6 +1373,7 @@ struct OriginalAssetsAuditReport {
 struct OriginalAssetsAuditDestinationReport {
     destination: CloudKitLibraryDestination,
     targets: usize,
+    target_set_sha256: String,
     elapsed_millis: u128,
     inventory: Option<CloudKitOriginalAssetInventoryFingerprint>,
     resolutions: BTreeMap<String, CloudKitOriginalAssetResolution>,
@@ -1399,6 +1458,7 @@ fn monitor_original_assets_audit<W: Write>(
             .into_iter()
             .map(
                 |(destination, targets)| OriginalAssetsAuditDestinationReport {
+                    target_set_sha256: original_assets_target_set_sha256(&destination, &targets),
                     destination,
                     targets: targets.len(),
                     elapsed_millis: 0,
@@ -1439,6 +1499,7 @@ struct OriginalAssetsReconcileExpectations {
     selected_target_count: u64,
     unselected_destination_target_count: u64,
     skipped_target_count: u64,
+    target_set_sha256: String,
     inventory_sha256: String,
     records_scanned: u64,
     disposition_counts: OriginalAssetsReconcileDispositionCounts,
@@ -1455,6 +1516,7 @@ impl OriginalAssetsReconcileExpectations {
             selected_target_count: args.expected_selected_target_count,
             unselected_destination_target_count: args.expected_unselected_destination_target_count,
             skipped_target_count: args.expected_skipped_target_count,
+            target_set_sha256: args.expected_target_set_sha256.clone(),
             inventory_sha256: args.expected_inventory_sha256.clone(),
             records_scanned: args.expected_records_scanned,
             disposition_counts: OriginalAssetsReconcileDispositionCounts {
@@ -1481,6 +1543,11 @@ impl OriginalAssetsReconcileExpectations {
         if !is_sha256_fingerprint(&self.inventory_sha256) {
             return Err(original_assets_reconcile_gate(
                 "expected inventory SHA-256 must be 64 hexadecimal characters",
+            ));
+        }
+        if !is_sha256_fingerprint(&self.target_set_sha256) {
+            return Err(original_assets_reconcile_gate(
+                "expected target-set SHA-256 must be 64 hexadecimal characters",
             ));
         }
         if self.disposition_counts.total() != self.selected_target_count {
@@ -1553,6 +1620,7 @@ impl OriginalAssetsReconcileDispositionCounts {
 #[derive(Serialize)]
 struct OriginalAssetsReconcileReport {
     destination: CloudKitLibraryDestination,
+    target_set_sha256: String,
     counts: OriginalAssetsReconcileCounts,
     inventory: CloudKitOriginalAssetInventoryFingerprint,
     verified: bool,
@@ -1578,7 +1646,8 @@ fn monitor_original_assets_reconcile<W: Write>(
     args: MonitorOriginalAssetsReconcileArgs,
     writer: &mut W,
 ) -> Result<(), CliError> {
-    let transport = ReqwestCloudKitReadTransport::new()?;
+    let transport =
+        ReqwestCloudKitReadTransport::new().map_err(original_assets_reconcile_cloudkit_failure)?;
     monitor_original_assets_reconcile_with_transport(args, writer, transport)
 }
 
@@ -1590,26 +1659,46 @@ fn monitor_original_assets_reconcile_with_transport<
     writer: &mut W,
     transport: T,
 ) -> Result<(), CliError> {
-    let config = MonitorConfig::load(&args.config)?;
-    config.validate()?;
-    let expectations = OriginalAssetsReconcileExpectations::from_args(&args)?;
-    let canonical_library_root = fs::canonicalize(&config.download_root).map_err(|source| {
-        MonitorError::CanonicalizeRoot {
-            path: config.download_root.clone(),
-            source,
-        }
+    let config = MonitorConfig::load(&args.config).map_err(|error| {
+        original_assets_reconcile_stage_failure(
+            error,
+            OriginalAssetsReconcileFailureStage::Configuration,
+        )
     })?;
-    run_scan_root_preflight_probe(&canonical_library_root)?;
+    config.validate().map_err(|_| {
+        original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::Configuration)
+    })?;
+    let expectations = OriginalAssetsReconcileExpectations::from_args(&args).map_err(|_| {
+        original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::Configuration)
+    })?;
+    let canonical_library_root = fs::canonicalize(&config.download_root).map_err(|_| {
+        original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::Root)
+    })?;
+    run_scan_root_preflight_probe(&canonical_library_root).map_err(|_| {
+        original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::Root)
+    })?;
 
     let mut guard = args
         .apply
         .then(|| acquire_monitor_run_guard(&config))
-        .transpose()?;
+        .transpose()
+        .map_err(|_| {
+            original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::State)
+        })?;
     let state_store = match guard.as_mut() {
-        Some(guard) => guard.state_store(&config.manifest_path)?.clone(),
-        None => AssetStateStore::open_read_only(&config.manifest_path)?,
+        Some(guard) => guard
+            .state_store(&config.manifest_path)
+            .map_err(|_| {
+                original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::State)
+            })?
+            .clone(),
+        None => AssetStateStore::open_read_only(&config.manifest_path).map_err(|_| {
+            original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::State)
+        })?,
     };
-    let mut manifest = state_store.load()?;
+    let mut manifest = state_store.load().map_err(|_| {
+        original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::State)
+    })?;
     let (mut destination_targets, skipped_targets, _) = original_assets_audit_targets(
         &manifest,
         &canonical_library_root,
@@ -1620,6 +1709,8 @@ fn monitor_original_assets_reconcile_with_transport<
         .remove(&expectations.destination)
         .unwrap_or_default();
     let selected_target_count = selected_targets.len() as u64;
+    let target_set_sha256 =
+        original_assets_target_set_sha256(&expectations.destination, &selected_targets);
     let unselected_destination_targets = destination_targets
         .values()
         .map(|targets| targets.len() as u64)
@@ -1632,18 +1723,41 @@ fn monitor_original_assets_reconcile_with_transport<
         unselected_destination_targets,
         skipped_targets,
     )?;
+    validate_original_assets_reconcile_target_set_gate(&expectations, &target_set_sha256)?;
+    let expected_records = if args.apply {
+        selected_targets
+            .iter()
+            .map(|target| {
+                manifest
+                    .records()
+                    .get(&target.asset_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        original_assets_reconcile_gate(
+                            "selected target no longer has a manifest record",
+                        )
+                    })
+                    .map(|record| (target.asset_id.clone(), record))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?
+    } else {
+        BTreeMap::new()
+    };
 
     let session_path = config.delete_session_path.as_deref().ok_or_else(|| {
         original_assets_reconcile_gate("original-assets-reconcile requires delete_session_path")
     })?;
-    let session = load_cloudkit_delete_session(session_path)?;
+    let session = load_cloudkit_delete_session(session_path).map_err(|_| {
+        original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::Session)
+    })?;
     let outcome = resolve_original_assets_audit_destination(
         &session,
         &expectations.destination,
         &selected_targets,
         &config,
         transport,
-    )?;
+    )
+    .map_err(original_assets_reconcile_cloudkit_failure)?;
     let (verified, applied, changed_count, commit_elapsed_millis) = if args.apply {
         let (verified, changed_records) = apply_verified_original_assets_reconcile(
             &mut manifest,
@@ -1653,9 +1767,30 @@ fn monitor_original_assets_reconcile_with_transport<
             skipped_targets,
             outcome,
             current_unix_seconds_for_cli(),
-        )?;
+        )
+        .map_err(|_| {
+            original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::Domain)
+        })?;
         let changed_count = changed_records.len() as u64;
-        let elapsed = state_store.persist_records_atomic(changed_records.iter())?;
+        let elapsed = state_store
+            .persist_records_exact_cas_atomic(
+                changed_records
+                    .iter()
+                    .map(|updated| {
+                        expected_records
+                        .get(&updated.asset_id)
+                        .map(|expected| AssetRecordExactCasUpdate { expected, updated })
+                        .ok_or_else(|| {
+                            original_assets_reconcile_gate(
+                                "reconciliation update did not have a pre-scan manifest snapshot",
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .map_err(|_| {
+                original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::Persistence)
+            })?;
         ensure_original_assets_reconcile_checkpoint(|| state_store.export_json())?;
         (verified, true, changed_count, elapsed.as_millis())
     } else {
@@ -1675,6 +1810,7 @@ fn monitor_original_assets_reconcile_with_transport<
 
     let report = OriginalAssetsReconcileReport {
         destination: expectations.destination,
+        target_set_sha256,
         counts: OriginalAssetsReconcileCounts {
             selected_targets: selected_target_count,
             unselected_destination_targets,
@@ -1687,8 +1823,12 @@ fn monitor_original_assets_reconcile_with_transport<
         changed_count,
         commit_elapsed_millis,
     };
-    serde_json::to_writer_pretty(&mut *writer, &report)?;
-    writeln!(writer)?;
+    serde_json::to_writer_pretty(&mut *writer, &report).map_err(|_| {
+        original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::Output)
+    })?;
+    writeln!(writer).map_err(|_| {
+        original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::Output)
+    })?;
     Ok(())
 }
 
@@ -1733,6 +1873,10 @@ fn verify_original_assets_reconcile_outcome(
         selected_targets.len() as u64,
         unselected_destination_target_count,
         skipped_target_count,
+    )?;
+    validate_original_assets_reconcile_target_set_gate(
+        expectations,
+        &original_assets_target_set_sha256(&expectations.destination, selected_targets),
     )?;
     let target_ids = selected_targets
         .iter()
@@ -1822,6 +1966,49 @@ fn original_assets_reconcile_gate(message: impl Into<String>) -> CliError {
     }
 }
 
+fn original_assets_reconcile_failure(stage: OriginalAssetsReconcileFailureStage) -> CliError {
+    CliError::OriginalAssetsReconcileFailure { stage }
+}
+
+fn original_assets_reconcile_stage_failure<E>(
+    _error: E,
+    stage: OriginalAssetsReconcileFailureStage,
+) -> CliError {
+    original_assets_reconcile_failure(stage)
+}
+
+fn original_assets_reconcile_cloudkit_failure(error: UploadError) -> CliError {
+    let kind = match error {
+        UploadError::InvalidSession(_) | UploadError::DecodeSession { .. } => {
+            OriginalAssetsReconcileCloudKitFailureKind::Authentication
+        }
+        UploadError::MalformedCloudKitResponse { .. }
+        | UploadError::InvalidCloudKitOriginalAssetResponse(_) => {
+            OriginalAssetsReconcileCloudKitFailureKind::MalformedResponse
+        }
+        UploadError::Network { .. }
+        | UploadError::HttpClient { .. }
+        | UploadError::UploadHttpStatus { .. }
+        | UploadError::ReadUploadResponse { .. } => {
+            OriginalAssetsReconcileCloudKitFailureKind::Transport
+        }
+        _ => OriginalAssetsReconcileCloudKitFailureKind::Transient,
+    };
+    CliError::OriginalAssetsReconcileCloudKitFailure { kind }
+}
+
+fn validate_original_assets_reconcile_target_set_gate(
+    expectations: &OriginalAssetsReconcileExpectations,
+    target_set_sha256: &str,
+) -> Result<(), CliError> {
+    if expectations.target_set_sha256 != target_set_sha256 {
+        return Err(original_assets_reconcile_gate(
+            "selected target set did not match the expected fingerprint",
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_original_assets_reconcile_checkpoint(
     export: impl FnOnce() -> Result<Manifest, AssetStateStoreError>,
 ) -> Result<(), CliError> {
@@ -1834,6 +2021,77 @@ fn is_sha256_fingerprint(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn original_assets_target_set_sha256(
+    destination: &CloudKitLibraryDestination,
+    targets: &[CloudKitOriginalAssetResolveTarget],
+) -> String {
+    let mut encoded = Vec::new();
+    original_assets_target_set_append_bytes_field(
+        &mut encoded,
+        ORIGINAL_ASSETS_TARGET_SET_FINGERPRINT_VERSION,
+    );
+    original_assets_target_set_append_bytes_field(
+        &mut encoded,
+        destination.database_scope.as_str().as_bytes(),
+    );
+    original_assets_target_set_append_bytes_field(&mut encoded, destination.zone_name.as_bytes());
+    let mut encoded_targets = targets
+        .iter()
+        .map(original_assets_target_set_target_bytes)
+        .collect::<Vec<_>>();
+    encoded_targets.sort();
+    original_assets_target_set_append_bytes_field(
+        &mut encoded,
+        &(encoded_targets.len() as u64).to_be_bytes(),
+    );
+    for encoded_target in encoded_targets {
+        original_assets_target_set_append_bytes_field(&mut encoded, &encoded_target);
+    }
+    format!("{:x}", Sha256::digest(encoded))
+}
+
+fn original_assets_target_set_target_bytes(target: &CloudKitOriginalAssetResolveTarget) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    original_assets_target_set_append_bytes_field(&mut encoded, target.asset_id.as_bytes());
+    original_assets_target_set_append_bytes_field(
+        &mut encoded,
+        &target.source_captured_unix_seconds.to_be_bytes(),
+    );
+    original_assets_target_set_append_bytes_field(
+        &mut encoded,
+        &target.capture_tolerance_seconds.to_be_bytes(),
+    );
+    original_assets_target_set_append_bytes_field(&mut encoded, target.filename.as_bytes());
+    original_assets_target_set_append_bytes_field(
+        &mut encoded,
+        &target.raw_size_bytes.to_be_bytes(),
+    );
+    original_assets_target_set_append_bytes_field(
+        &mut encoded,
+        target.matched_raw_sha256.as_bytes(),
+    );
+    match &target.replacement_candidate {
+        Some(candidate) => {
+            original_assets_target_set_append_bytes_field(&mut encoded, &[1]);
+            original_assets_target_set_append_bytes_field(
+                &mut encoded,
+                &candidate.size_bytes.to_be_bytes(),
+            );
+            original_assets_target_set_append_bytes_field(
+                &mut encoded,
+                candidate.sha256.as_bytes(),
+            );
+        }
+        None => original_assets_target_set_append_bytes_field(&mut encoded, &[0]),
+    }
+    encoded
+}
+
+fn original_assets_target_set_append_bytes_field(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    output.extend_from_slice(value);
+}
+
 fn original_assets_audit_destination_report(
     session: &crate::upload::CloudKitDeleteSession,
     destination: CloudKitLibraryDestination,
@@ -1841,6 +2099,7 @@ fn original_assets_audit_destination_report(
     config: &MonitorConfig,
 ) -> OriginalAssetsAuditDestinationReport {
     let started = Instant::now();
+    let target_set_sha256 = original_assets_target_set_sha256(&destination, &targets);
     let result = ReqwestCloudKitReadTransport::new().and_then(|transport| {
         resolve_original_assets_audit_destination(
             session,
@@ -1853,6 +2112,7 @@ fn original_assets_audit_destination_report(
     original_assets_audit_destination_report_from_result(
         destination,
         targets.len(),
+        target_set_sha256,
         started,
         result,
     )
@@ -1869,6 +2129,7 @@ fn original_assets_audit_destination_report_with_transport<
     transport: T,
 ) -> OriginalAssetsAuditDestinationReport {
     let started = Instant::now();
+    let target_set_sha256 = original_assets_target_set_sha256(&destination, &targets);
     let result = resolve_original_assets_audit_destination(
         session,
         &destination,
@@ -1879,6 +2140,7 @@ fn original_assets_audit_destination_report_with_transport<
     original_assets_audit_destination_report_from_result(
         destination,
         targets.len(),
+        target_set_sha256,
         started,
         result,
     )
@@ -1909,6 +2171,7 @@ fn resolve_original_assets_audit_destination<T: CloudKitOriginalAssetReadTranspo
 fn original_assets_audit_destination_report_from_result(
     destination: CloudKitLibraryDestination,
     targets: usize,
+    target_set_sha256: String,
     started: Instant,
     result: Result<CloudKitOriginalAssetBatchResolveOutcome, UploadError>,
 ) -> OriginalAssetsAuditDestinationReport {
@@ -1918,6 +2181,7 @@ fn original_assets_audit_destination_report_from_result(
             OriginalAssetsAuditDestinationReport {
                 destination,
                 targets,
+                target_set_sha256,
                 elapsed_millis: started.elapsed().as_millis(),
                 inventory,
                 resolutions: redact_audit_resolutions(outcome),
@@ -1927,6 +2191,7 @@ fn original_assets_audit_destination_report_from_result(
         Err(error) => OriginalAssetsAuditDestinationReport {
             destination,
             targets,
+            target_set_sha256,
             elapsed_millis: started.elapsed().as_millis(),
             inventory: None,
             resolutions: BTreeMap::new(),
@@ -4133,6 +4398,7 @@ mod original_assets_audit_tests {
         let reports = vec![OriginalAssetsAuditDestinationReport {
             destination: CloudKitLibraryDestination::primary_sync(),
             targets: 2,
+            target_set_sha256: "a".repeat(64),
             inventory: None,
             resolutions: BTreeMap::from([
                 (
@@ -4305,6 +4571,13 @@ mod original_assets_audit_tests {
         assert_eq!(report.targets, 1);
         assert!(report.batch_error.is_none(), "{:#?}", report.batch_error);
         assert_eq!(report.resolutions.len(), 1);
+        assert_eq!(
+            report.target_set_sha256,
+            original_assets_target_set_sha256(
+                &CloudKitLibraryDestination::primary_sync(),
+                &[audit_test_target()],
+            )
+        );
         let requests = server.join().expect("recording server should complete");
         assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with(
@@ -4507,6 +4780,10 @@ mod original_assets_audit_tests {
             selected_target_count: targets.len() as u64,
             unselected_destination_target_count: 0,
             skipped_target_count: 0,
+            target_set_sha256: original_assets_target_set_sha256(
+                &CloudKitLibraryDestination::primary_sync(),
+                targets,
+            ),
             inventory_sha256: "b".repeat(64),
             records_scanned: targets.len() as u64,
             disposition_counts: OriginalAssetsReconcileDispositionCounts {
@@ -4634,6 +4911,31 @@ mod original_assets_audit_tests {
         }
     }
 
+    #[test]
+    fn original_assets_reconcile_rejects_same_count_target_source_substitution() {
+        let target = reconcile_test_target("asset-a");
+        let mut substituted = target.clone();
+        substituted.source_captured_unix_seconds =
+            substituted.source_captured_unix_seconds.saturating_add(1);
+
+        let result = verify_original_assets_reconcile_outcome(
+            &reconcile_test_expectations(&[target]),
+            &[substituted.clone()],
+            0,
+            0,
+            &reconcile_test_outcome(&[substituted]),
+        );
+        assert!(result.is_err());
+        let error = result
+            .err()
+            .expect("target-set gate should reject substitution");
+
+        assert!(matches!(
+            error,
+            CliError::OriginalAssetsReconcileGate { .. }
+        ));
+    }
+
     fn reconcile_test_query_response(endpoint: &url::Url, raw: &[u8]) -> Vec<u8> {
         let resource_url = endpoint
             .join("resource")
@@ -4670,14 +4972,55 @@ mod original_assets_audit_tests {
         .into_bytes()
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct ReconcileStateDirectoryEntry {
+        contents: Vec<u8>,
+        size_bytes: u64,
+        read_only: bool,
+        modified_unix_nanos: Option<u128>,
+    }
+
+    fn reconcile_state_directory_snapshot(
+        directory: &Path,
+    ) -> BTreeMap<String, ReconcileStateDirectoryEntry> {
+        fs::read_dir(directory)
+            .expect("state directory should be readable")
+            .map(|entry| {
+                let entry = entry.expect("state directory entry should be readable");
+                let path = entry.path();
+                let metadata = entry.metadata().expect("state entry metadata should load");
+                assert!(
+                    metadata.is_file(),
+                    "state directory must contain only files"
+                );
+                let modified_unix_nanos = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos());
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    ReconcileStateDirectoryEntry {
+                        contents: fs::read(path).expect("state entry should be readable"),
+                        size_bytes: metadata.len(),
+                        read_only: metadata.permissions().readonly(),
+                        modified_unix_nanos,
+                    },
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn original_assets_reconcile_query_only_keeps_database_and_json_byte_identical() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let state_dir = tempdir.path().join("state");
         let download_root = tempdir.path().join("download");
         let raw_path = download_root.join("PrimarySync/IMG_0001.DNG");
-        let manifest_path = tempdir.path().join("manifest.json");
-        let config_path = tempdir.path().join("monitor.json");
-        let session_path = tempdir.path().join("delete-session.json");
+        let manifest_path = state_dir.join("manifest.json");
+        let config_path = state_dir.join("monitor.json");
+        let session_path = state_dir.join("delete-session.json");
+        fs::create_dir_all(&state_dir).expect("state directory should create");
         fs::create_dir_all(raw_path.parent().expect("raw parent should exist"))
             .expect("raw parent should create");
         let raw = b"audit-raw".to_vec();
@@ -4759,9 +5102,7 @@ mod original_assets_audit_tests {
         let disposition_counts =
             OriginalAssetsReconcileDispositionCounts::from_resolutions(&outcome.resolutions);
         assert_eq!(disposition_counts.incomplete_transient, 0);
-        let manifest_before = fs::read(&manifest_path).expect("manifest should read");
-        let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
-        let database_before = fs::read(&db_path).expect("database should read");
+        let state_before = reconcile_state_directory_snapshot(&state_dir);
 
         let recorder = RecordingServer::bind();
         let endpoint = recorder.endpoint().clone();
@@ -4775,6 +5116,10 @@ mod original_assets_audit_tests {
                 expected_selected_target_count: 1,
                 expected_unselected_destination_target_count: 0,
                 expected_skipped_target_count: 0,
+                expected_target_set_sha256: original_assets_target_set_sha256(
+                    &CloudKitLibraryDestination::primary_sync(),
+                    &targets,
+                ),
                 expected_inventory_sha256: inventory.sha256,
                 expected_records_scanned: inventory.records_scanned,
                 expected_exact_original_count: disposition_counts.exact_original,
@@ -4799,13 +5144,18 @@ mod original_assets_audit_tests {
                 .iter()
                 .all(|request| !request.contains("records/modify") && !request.contains("upload"))
         );
-        assert_eq!(
-            fs::read(&manifest_path).expect("manifest should read"),
-            manifest_before
-        );
-        assert_eq!(
-            fs::read(&db_path).expect("database should read"),
-            database_before
+        let state_after = reconcile_state_directory_snapshot(&state_dir);
+        let changed_entries = state_before
+            .keys()
+            .chain(state_after.keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|name| state_before.get(*name) != state_after.get(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            changed_entries.is_empty(),
+            "query-only reconciliation changed state entries: {changed_entries:?}"
         );
         let rendered = String::from_utf8(output).expect("report should be UTF-8");
         assert!(!rendered.contains(tempdir.path().to_str().expect("temp path should be UTF-8")));
@@ -4930,6 +5280,64 @@ mod original_assets_audit_tests {
                 .expect("checkpoint record should exist")
                 .proofs
                 .contains_key("original_asset_resolution")
+        );
+    }
+
+    #[test]
+    fn original_assets_reconcile_errors_redact_underlying_sensitive_values() {
+        let secret = "/secret/local/path asset-id cookie-value remote-record remote-tag";
+        let errors = vec![
+            original_assets_reconcile_stage_failure(
+                MonitorError::InvalidConfig {
+                    message: secret.to_string(),
+                },
+                OriginalAssetsReconcileFailureStage::Configuration,
+            ),
+            original_assets_reconcile_stage_failure(
+                MonitorError::CanonicalizeRoot {
+                    path: PathBuf::from(secret),
+                    source: io::Error::other(secret),
+                },
+                OriginalAssetsReconcileFailureStage::Root,
+            ),
+            original_assets_reconcile_stage_failure(
+                AssetStateStoreError::StaleRecord {
+                    asset_id: secret.to_string(),
+                },
+                OriginalAssetsReconcileFailureStage::State,
+            ),
+            original_assets_reconcile_stage_failure(
+                UploadError::InvalidSession(secret.to_string()),
+                OriginalAssetsReconcileFailureStage::Session,
+            ),
+            original_assets_reconcile_cloudkit_failure(UploadError::InvalidSession(
+                secret.to_string(),
+            )),
+            original_assets_reconcile_stage_failure(
+                OriginalAssetResolutionError::InvalidTarget {
+                    asset_id: secret.to_string(),
+                    reason: "sensitive details",
+                },
+                OriginalAssetsReconcileFailureStage::Domain,
+            ),
+            original_assets_reconcile_stage_failure(
+                AssetStateStoreError::ExactCasMismatch {
+                    asset_id: secret.to_string(),
+                },
+                OriginalAssetsReconcileFailureStage::Persistence,
+            ),
+            original_assets_reconcile_stage_failure(
+                io::Error::other(secret),
+                OriginalAssetsReconcileFailureStage::Output,
+            ),
+        ];
+
+        for error in errors {
+            assert!(!error.to_string().contains(secret));
+        }
+        assert_eq!(
+            CliError::OriginalAssetsReconcileCheckpointStale.to_string(),
+            "original-assets-reconcile database commit succeeded but the JSON checkpoint is stale"
         );
     }
 }

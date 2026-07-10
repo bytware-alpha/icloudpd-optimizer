@@ -2261,6 +2261,7 @@ fn monitor_original_assets_reconcile_requires_explicit_reconciliation_gates() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--expected-selected-target-count"))
+        .stdout(predicate::str::contains("--expected-target-set-sha256"))
         .stdout(predicate::str::contains(
             "--expected-incomplete-transient-count",
         ))

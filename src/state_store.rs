@@ -73,6 +73,12 @@ pub struct AssetStateStore {
     writer: Option<Arc<WriterLeaseToken>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct AssetRecordExactCasUpdate<'a> {
+    pub expected: &'a AssetRecord,
+    pub updated: &'a AssetRecord,
+}
+
 #[derive(Debug)]
 struct WriterLeaseToken {
     owner_id: String,
@@ -372,6 +378,13 @@ impl AssetStateStore {
         self.persist_records_atomic_with_owned_lease(records)
     }
 
+    pub fn persist_records_exact_cas_atomic<'a>(
+        &self,
+        updates: impl IntoIterator<Item = AssetRecordExactCasUpdate<'a>>,
+    ) -> Result<Duration, AssetStateStoreError> {
+        self.persist_records_exact_cas_atomic_with_owned_lease(updates)
+    }
+
     pub fn persist_manifest_records(
         &self,
         manifest: &Manifest,
@@ -441,13 +454,26 @@ impl AssetStateStore {
     }
 
     fn connect_read_only(&self) -> Result<Connection, AssetStateStoreError> {
-        let connection =
-            Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
-                |source| AssetStateStoreError::OpenDatabase {
-                    path: self.db_path.clone(),
-                    source,
-                },
-            )?;
+        let wal_path = sqlite_wal_path(&self.db_path);
+        let wal_len = match fs::metadata(&wal_path) {
+            Ok(metadata) => metadata.len(),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => 0,
+            Err(source) => return Err(AssetStateStoreError::ReadOnlyWalMetadata { source }),
+        };
+        if wal_len > 0 {
+            return Err(AssetStateStoreError::ReadOnlyWalPending);
+        }
+        let mut uri = url::Url::from_file_path(&self.db_path)
+            .map_err(|_| AssetStateStoreError::ReadOnlyUri)?;
+        uri.set_query(Some("immutable=1"));
+        let connection = Connection::open_with_flags(
+            uri.as_str(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|source| AssetStateStoreError::OpenDatabase {
+            path: self.db_path.clone(),
+            source,
+        })?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
         Ok(connection)
     }
@@ -470,7 +496,7 @@ impl AssetStateStore {
                 });
             }
             (SCHEMA_VERSION, 0) => return Err(AssetStateStoreError::MissingSchema),
-            (SCHEMA_VERSION, _) => ensure_wal(connection, false)?,
+            (SCHEMA_VERSION, _) => {}
             (_, 0) => return Err(AssetStateStoreError::MissingSchema),
             (actual, _) => {
                 return Err(AssetStateStoreError::UnsupportedSchema {
@@ -682,6 +708,76 @@ impl AssetStateStore {
         Ok(started.elapsed())
     }
 
+    fn persist_records_exact_cas_atomic_with_owned_lease<'a>(
+        &self,
+        updates: impl IntoIterator<Item = AssetRecordExactCasUpdate<'a>>,
+    ) -> Result<Duration, AssetStateStoreError> {
+        let token = self.writer_token()?;
+        let started = Instant::now();
+        let mut asset_ids = BTreeSet::new();
+        let mut prepared = Vec::new();
+        for update in updates {
+            if update.expected.asset_id != update.updated.asset_id {
+                return Err(AssetStateStoreError::ExactCasMismatchedIds {
+                    expected_asset_id: update.expected.asset_id.clone(),
+                    updated_asset_id: update.updated.asset_id.clone(),
+                });
+            }
+            if !asset_ids.insert(update.expected.asset_id.clone()) {
+                return Err(AssetStateStoreError::DuplicateRecord {
+                    asset_id: update.expected.asset_id.clone(),
+                });
+            }
+            prepared.push((
+                update.expected,
+                update.updated,
+                encode_record(update.expected)?,
+                encode_record(update.updated)?,
+            ));
+        }
+        if prepared.is_empty() {
+            return Ok(started.elapsed());
+        }
+
+        let mut connection = self.connect_writer()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.validate_writer_lease(&transaction, token)?;
+        {
+            let mut statement =
+                transaction.prepare("SELECT record_json FROM assets WHERE asset_id = ?1")?;
+            for (expected, _, expected_json, _) in &prepared {
+                let persisted = statement
+                    .query_row([expected.asset_id.as_str()], |row| row.get::<_, String>(0))
+                    .optional()?;
+                if persisted.as_deref() != Some(expected_json.as_str()) {
+                    return Err(AssetStateStoreError::ExactCasMismatch {
+                        asset_id: expected.asset_id.clone(),
+                    });
+                }
+            }
+        }
+        for (_, updated, _, updated_json) in prepared {
+            let changed = transaction.execute(
+                "UPDATE assets
+                 SET state = ?1, updated_at = ?2, record_json = ?3
+                 WHERE asset_id = ?4",
+                params![
+                    updated.state.as_str(),
+                    updated.updated_at,
+                    updated_json,
+                    updated.asset_id,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(AssetStateStoreError::ExactCasMismatch {
+                    asset_id: updated.asset_id.clone(),
+                });
+            }
+        }
+        transaction.commit()?;
+        Ok(started.elapsed())
+    }
+
     fn persist_manifest_records_with_owned_lease(
         &self,
         manifest: &Manifest,
@@ -760,10 +856,12 @@ impl AssetStateStore {
     }
 
     fn load_database_manifest(&self) -> Result<Manifest, AssetStateStoreError> {
-        if self.writer.is_some() {
+        let connection = if self.writer.is_some() {
             self.writer_token()?;
-        }
-        let connection = self.connect_read_only()?;
+            self.connect_writer()?
+        } else {
+            self.connect_read_only()?
+        };
         let mut statement = connection.prepare(
             "SELECT asset_id, state, updated_at, record_json FROM assets ORDER BY asset_id",
         )?;
@@ -1499,6 +1597,12 @@ fn load_database_manifest_from_transaction(
     load_database_manifest_from_statement(&mut statement)
 }
 
+fn sqlite_wal_path(database_path: &Path) -> PathBuf {
+    let mut wal_path = database_path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    PathBuf::from(wal_path)
+}
+
 fn load_database_manifest_from_statement(
     statement: &mut Statement<'_>,
 ) -> Result<Manifest, AssetStateStoreError> {
@@ -1707,6 +1811,12 @@ pub enum AssetStateStoreError {
     MissingSchema,
     #[error("state database WAL mode is unavailable; current mode is {mode}")]
     WalUnavailable { mode: String },
+    #[error("state database cannot be opened immutably because its WAL has unapplied changes")]
+    ReadOnlyWalPending,
+    #[error("failed to inspect state database WAL before immutable read-only open: {source}")]
+    ReadOnlyWalMetadata { source: io::Error },
+    #[error("state database path cannot be represented as an immutable SQLite URI")]
+    ReadOnlyUri,
     #[error("state database integrity check failed: {result}")]
     IntegrityCheck { result: String },
     #[error("state database columns do not match the stored record for {asset_id}")]
@@ -1715,6 +1825,15 @@ pub enum AssetStateStoreError {
     StaleRecord { asset_id: String },
     #[error("atomic state batch contains duplicate asset ID {asset_id}")]
     DuplicateRecord { asset_id: String },
+    #[error(
+        "exact-CAS state batch expected asset ID {expected_asset_id} but update was for {updated_asset_id}"
+    )]
+    ExactCasMismatchedIds {
+        expected_asset_id: String,
+        updated_asset_id: String,
+    },
+    #[error("exact-CAS state batch snapshot did not match durable record {asset_id}")]
+    ExactCasMismatch { asset_id: String },
     #[error("writer lease is required for state mutation")]
     WriterLeaseRequired,
     #[error(
@@ -2038,5 +2157,170 @@ mod tests {
             format!("{:x}", Sha256::digest(durable_json.as_bytes())),
             asset_digest_before
         );
+    }
+
+    #[test]
+    fn exact_cas_batch_rolls_back_when_a_same_or_earlier_timestamp_record_changes() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&manifest_path, "cas-writer", Duration::from_secs(30))
+                .expect("state store should open");
+        store
+            .load_or_import()
+            .expect("empty manifest should import");
+
+        let mut first = AssetRecord::new("asset-first", "/nas/first.dng");
+        first.updated_at = "100.000000000Z".to_string();
+        let mut second = AssetRecord::new("asset-second", "/nas/second.dng");
+        second.updated_at = "100.000000000Z".to_string();
+        store
+            .persist_records_atomic([&first, &second])
+            .expect("initial records should persist");
+        let expected_first = first.clone();
+        let expected_second = second.clone();
+        first.updated_at = "200.000000000Z".to_string();
+        second.updated_at = "200.000000000Z".to_string();
+
+        let mut out_of_band = expected_second.clone();
+        out_of_band.raw_path = PathBuf::from("/secret/out-of-band.dng");
+        out_of_band.updated_at = "099.000000000Z".to_string();
+        let out_of_band_json = serde_json::to_string(&out_of_band).expect("record should encode");
+        let connection = Connection::open(AssetStateStore::db_path_for_manifest(&manifest_path))
+            .expect("out-of-band connection should open");
+        connection
+            .execute(
+                "UPDATE assets SET state = ?1, updated_at = ?2, record_json = ?3 WHERE asset_id = ?4",
+                params![
+                    out_of_band.state.as_str(),
+                    out_of_band.updated_at,
+                    out_of_band_json,
+                    out_of_band.asset_id,
+                ],
+            )
+            .expect("out-of-band mutation should commit");
+        drop(connection);
+
+        let error = store
+            .persist_records_exact_cas_atomic([
+                AssetRecordExactCasUpdate {
+                    expected: &expected_first,
+                    updated: &first,
+                },
+                AssetRecordExactCasUpdate {
+                    expected: &expected_second,
+                    updated: &second,
+                },
+            ])
+            .expect_err("any exact-CAS mismatch must roll back the whole batch");
+        assert!(matches!(
+            error,
+            AssetStateStoreError::ExactCasMismatch { .. }
+        ));
+
+        let persisted = store.load().expect("persisted state should load");
+        assert_eq!(
+            persisted
+                .get("asset-first")
+                .expect("first record should exist"),
+            &expected_first,
+            "earlier out-of-band mutation must prevent a partial first-record write"
+        );
+        assert_eq!(
+            persisted
+                .get("asset-second")
+                .expect("second record should exist"),
+            &out_of_band,
+            "exact CAS must reject an out-of-band change regardless of timestamp"
+        );
+    }
+
+    #[test]
+    fn exact_cas_batch_rejects_mismatched_and_duplicate_asset_ids() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&manifest_path, "cas-writer", Duration::from_secs(30))
+                .expect("state store should open");
+        store
+            .load_or_import()
+            .expect("empty manifest should import");
+        let first = AssetRecord::new("asset-first", "/nas/first.dng");
+        let second = AssetRecord::new("asset-second", "/nas/second.dng");
+
+        let mismatched = store
+            .persist_records_exact_cas_atomic([AssetRecordExactCasUpdate {
+                expected: &first,
+                updated: &second,
+            }])
+            .expect_err("exact CAS must bind the expected and updated asset IDs");
+        assert!(matches!(
+            mismatched,
+            AssetStateStoreError::ExactCasMismatchedIds { .. }
+        ));
+
+        let duplicate = store
+            .persist_records_exact_cas_atomic([
+                AssetRecordExactCasUpdate {
+                    expected: &first,
+                    updated: &first,
+                },
+                AssetRecordExactCasUpdate {
+                    expected: &first,
+                    updated: &first,
+                },
+            ])
+            .expect_err("exact CAS must reject duplicate updates");
+        assert!(matches!(
+            duplicate,
+            AssetStateStoreError::DuplicateRecord { .. }
+        ));
+    }
+
+    #[test]
+    fn exact_cas_batch_rejects_an_out_of_band_same_timestamp_change() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&manifest_path, "cas-writer", Duration::from_secs(30))
+                .expect("state store should open");
+        store
+            .load_or_import()
+            .expect("empty manifest should import");
+        let mut expected = AssetRecord::new("asset", "/nas/original.dng");
+        expected.updated_at = "100.000000000Z".to_string();
+        store
+            .persist_record(&expected)
+            .expect("initial record should persist");
+        let mut updated = expected.clone();
+        updated.updated_at = "200.000000000Z".to_string();
+
+        let mut out_of_band = expected.clone();
+        out_of_band.raw_path = PathBuf::from("/secret/same-timestamp.dng");
+        let connection = Connection::open(AssetStateStore::db_path_for_manifest(&manifest_path))
+            .expect("out-of-band connection should open");
+        connection
+            .execute(
+                "UPDATE assets SET state = ?1, updated_at = ?2, record_json = ?3 WHERE asset_id = ?4",
+                params![
+                    out_of_band.state.as_str(),
+                    out_of_band.updated_at,
+                    serde_json::to_string(&out_of_band).expect("record should encode"),
+                    out_of_band.asset_id,
+                ],
+        )
+        .expect("out-of-band mutation should commit");
+        drop(connection);
+
+        let error = store
+            .persist_records_exact_cas_atomic([AssetRecordExactCasUpdate {
+                expected: &expected,
+                updated: &updated,
+            }])
+            .expect_err("exact CAS must reject same-timestamp JSON changes");
+        assert!(matches!(
+            error,
+            AssetStateStoreError::ExactCasMismatch { .. }
+        ));
     }
 }
