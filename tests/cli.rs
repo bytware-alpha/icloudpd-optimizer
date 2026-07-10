@@ -1023,11 +1023,17 @@ fn manifest_migrate_upgrades_only_the_existing_v1_database_and_returns_json_summ
         )
         .expect("v1 asset should be inserted");
     fs::write(
+        manifest_path.with_extension("monitor.lock"),
+        b"legacy monitor lock\n",
+    )
+    .expect("legacy monitor lock should be created");
+    fs::write(
         &manifest_path,
         b"{malformed manifest JSON must remain untouched",
     )
     .expect("manifest sentinel should be written");
     let manifest_before = fs::read(&manifest_path).expect("manifest sentinel should be readable");
+    drop(connection);
 
     let output = binary()
         .args(["manifest", "migrate", "--manifest"])
@@ -1127,6 +1133,19 @@ fn manifest_migrate_rejects_missing_wrong_and_already_migrated_databases_without
             ],
         )
         .expect("v1 asset should be inserted");
+    let lock_path = manifest_path.with_extension("monitor.lock");
+    drop(connection);
+
+    binary()
+        .args(["manifest", "migrate", "--manifest"])
+        .arg(&manifest_path)
+        .args(["--from", "1", "--to", "2"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "requires an existing legacy manifest monitor lock",
+        ));
+    assert!(!lock_path.exists());
 
     binary()
         .args(["manifest", "migrate", "--manifest"])
@@ -1135,10 +1154,13 @@ fn manifest_migrate_rejects_missing_wrong_and_already_migrated_databases_without
         .assert()
         .failure()
         .stderr(predicate::str::contains("only supports from=1 to=2"));
+    let connection = rusqlite::Connection::open(&db_path).expect("reopen v1 database");
     let version: i32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("wrong request should not change version");
     assert_eq!(version, 1);
+    fs::write(&lock_path, b"legacy monitor lock\n").expect("legacy monitor lock should be created");
+    drop(connection);
 
     binary()
         .args(["manifest", "migrate", "--manifest"])

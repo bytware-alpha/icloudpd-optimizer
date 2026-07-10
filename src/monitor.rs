@@ -883,7 +883,7 @@ pub fn run_monitor_once(
 
 #[derive(Debug)]
 pub struct MonitorRunGuard {
-    _lock: ManifestLockGuard,
+    lock: ManifestLockGuard,
     owner_id: String,
     state_store: Option<AssetStateStore>,
     heartbeat: Option<MonitorLeaseHeartbeat>,
@@ -946,7 +946,7 @@ pub fn acquire_monitor_run_guard(config: &MonitorConfig) -> Result<MonitorRunGua
         .map_err(monitor_lock_error)?;
 
     Ok(MonitorRunGuard {
-        _lock: lock,
+        lock,
         owner_id,
         state_store: None,
         heartbeat: None,
@@ -955,6 +955,7 @@ pub fn acquire_monitor_run_guard(config: &MonitorConfig) -> Result<MonitorRunGua
 
 impl MonitorRunGuard {
     fn state_store(&mut self, manifest_path: &Path) -> Result<&AssetStateStore, MonitorError> {
+        self.lock.revalidate().map_err(monitor_lock_error)?;
         match self.state_store.as_ref() {
             Some(store) => store.renew_writer_lease()?,
             None => {
@@ -986,6 +987,10 @@ fn monitor_lock_error(error: ManifestLockError) -> MonitorError {
     match error {
         ManifestLockError::UnsupportedPlatform => MonitorError::MonitorLockUnsupported,
         ManifestLockError::Held { lock_path } => MonitorError::MonitorAlreadyRunning { lock_path },
+        ManifestLockError::Missing { lock_path } => MonitorError::MonitorLockIo {
+            path: lock_path,
+            source: io::Error::other("monitor lock disappeared before it could be opened"),
+        },
         ManifestLockError::Symlink { path } => MonitorError::MonitorLockIo {
             path,
             source: io::Error::other("monitor lock must not be a symbolic link"),
@@ -12779,6 +12784,28 @@ mod tests {
 
         AssetStateStore::open_writer(&config.manifest_path, "writer-b", Duration::from_secs(1))
             .expect("dropping the guard should release the sqlite writer lease");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn monitor_guard_revalidates_its_lock_before_opening_a_state_writer() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("state/manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        let mut guard = acquire_monitor_run_guard(&config).expect("monitor guard should lock");
+        let lock_path = monitor_run_lock_path(&config);
+        let moved_lock_path = tempdir.path().join("moved-monitor.lock");
+        fs::rename(&lock_path, &moved_lock_path).expect("move held lock path");
+        fs::write(&lock_path, b"replacement monitor lock\n").expect("replace lock path");
+
+        let error = guard
+            .state_store(&config.manifest_path)
+            .expect_err("replaced lock must block state-writer creation");
+        assert!(matches!(error, MonitorError::MonitorLockIo { path, .. } if path == lock_path));
+        assert!(!AssetStateStore::db_path_for_manifest(&config.manifest_path).exists());
     }
 
     #[cfg(unix)]

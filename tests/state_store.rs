@@ -69,6 +69,15 @@ fn create_v1_database(manifest_path: &std::path::Path, records: &[AssetRecord]) 
             )
             .expect("insert v1 asset record");
     }
+    create_legacy_monitor_lock(manifest_path);
+}
+
+fn create_legacy_monitor_lock(manifest_path: &std::path::Path) {
+    fs::write(
+        manifest_path.with_extension("monitor.lock"),
+        b"legacy monitor lock\n",
+    )
+    .expect("create legacy monitor lock");
 }
 
 fn asset_row_digest(manifest_path: &std::path::Path) -> String {
@@ -132,6 +141,7 @@ fn create_custom_v1_database(
             )
             .expect("insert custom v1 asset record");
     }
+    create_legacy_monitor_lock(manifest_path);
 }
 
 fn migration_schema_digest(manifest_path: &std::path::Path) -> String {
@@ -629,6 +639,7 @@ fn failed_v1_to_v2_migration_rolls_back_without_partial_v2_tables() {
              COMMIT;",
         )
         .expect("create v1 schema plus conflicting view");
+    create_legacy_monitor_lock(&manifest_path);
 
     let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
         .expect_err("migration conflict should fail closed");
@@ -699,6 +710,7 @@ fn migrates_v1_database_without_reimporting_json_checkpoint() {
             ],
         )
         .expect("insert durable record");
+    create_legacy_monitor_lock(&manifest_path);
 
     let mut newer_json = Manifest::new();
     let mut newer = durable.clone();
@@ -1105,6 +1117,7 @@ fn schema_only_migration_rejects_symlinked_database_and_lock_files() {
         &[AssetRecord::new("asset-2", "/photos/asset-2.dng")],
     );
     let lock_path = manifest_path.with_extension("monitor.lock");
+    fs::remove_file(&lock_path).expect("remove legacy lock before symlink test");
     let lock_target = tempdir.path().join("lock-target");
     fs::write(&lock_target, b"not a lock").expect("write lock target");
     symlink(&lock_target, &lock_path).expect("symlink monitor lock");
@@ -1128,6 +1141,8 @@ fn schema_only_migration_rejects_hard_linked_lock_without_mutating_the_other_nam
     let unrelated_path = tempdir.path().join("unrelated-lock-target");
     let unrelated_bytes = b"unrelated bytes must remain unchanged";
     fs::write(&unrelated_path, unrelated_bytes).expect("write unrelated file");
+    fs::remove_file(manifest_path.with_extension("monitor.lock"))
+        .expect("remove legacy lock before hard-link test");
     fs::hard_link(
         &unrelated_path,
         manifest_path.with_extension("monitor.lock"),
@@ -1259,6 +1274,7 @@ fn schema_only_migration_rejects_missing_wrong_or_already_migrated_databases_wit
     let empty_manifest_path = tempdir.path().join("empty.json");
     let empty_db_path = AssetStateStore::db_path_for_manifest(&empty_manifest_path);
     let empty_connection = rusqlite::Connection::open(&empty_db_path).expect("open empty state db");
+    create_legacy_monitor_lock(&empty_manifest_path);
     let journal_before: String = empty_connection
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .expect("read empty journal mode");
@@ -1299,6 +1315,31 @@ fn schema_only_migration_rejects_missing_wrong_or_already_migrated_databases_wit
             actual: 3
         }
     ));
+}
+
+#[test]
+fn schema_only_migration_requires_existing_legacy_monitor_lock_without_mutation() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("manifest.json");
+    create_v1_database(
+        &manifest_path,
+        &[AssetRecord::new("asset-1", "/photos/asset-1.dng")],
+    );
+    let lock_path = manifest_path.with_extension("monitor.lock");
+    fs::remove_file(&lock_path).expect("remove legacy monitor lock");
+    let schema_before = migration_schema_digest(&manifest_path);
+    let assets_before = asset_row_digest(&manifest_path);
+
+    let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+        .expect_err("migration must not create a missing legacy monitor lock");
+
+    assert!(matches!(
+        error,
+        AssetStateStoreError::MigrationMonitorLockMissing { lock_path: path } if path == lock_path
+    ));
+    assert!(!lock_path.exists());
+    assert_eq!(migration_schema_digest(&manifest_path), schema_before);
+    assert_eq!(asset_row_digest(&manifest_path), assets_before);
 }
 
 #[test]

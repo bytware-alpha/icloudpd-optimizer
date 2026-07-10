@@ -15,6 +15,18 @@ use thiserror::Error;
 #[derive(Debug)]
 pub struct ManifestLockGuard {
     file: File,
+    #[cfg(unix)]
+    lock_path: PathBuf,
+    #[cfg(unix)]
+    identity: LockIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LockIdentity {
+    device: u64,
+    inode: u64,
+    links: u64,
 }
 
 #[derive(Debug, Error)]
@@ -23,6 +35,10 @@ pub enum ManifestLockError {
     UnsupportedPlatform,
     #[error("manifest monitor lock is already held at {lock_path}")]
     Held { lock_path: PathBuf },
+    #[error(
+        "legacy manifest monitor lock does not exist at {lock_path}; start and stop the local monitor once before schema migration"
+    )]
+    Missing { lock_path: PathBuf },
     #[error("manifest monitor lock must not be a symbolic link: {path}")]
     Symlink { path: PathBuf },
     #[error("manifest monitor lock must be a regular file: {path}")]
@@ -50,7 +66,24 @@ pub fn acquire_manifest_lock(
         return Err(ManifestLockError::UnsupportedPlatform);
     }
     #[cfg(unix)]
-    acquire_manifest_lock_unix(manifest_path, owner_id, create_parent)
+    acquire_manifest_lock_unix(manifest_path, owner_id, create_parent, false)
+}
+
+/// Acquires an existing legacy monitor lock without creating it.
+///
+/// Schema migration uses this path so it cannot manufacture a lock namespace that a
+/// legacy monitor might not share.
+pub fn acquire_existing_manifest_lock(
+    manifest_path: &Path,
+    owner_id: &str,
+) -> Result<ManifestLockGuard, ManifestLockError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (manifest_path, owner_id);
+        return Err(ManifestLockError::UnsupportedPlatform);
+    }
+    #[cfg(unix)]
+    acquire_manifest_lock_unix(manifest_path, owner_id, false, true)
 }
 
 #[cfg(unix)]
@@ -58,6 +91,7 @@ fn acquire_manifest_lock_unix(
     manifest_path: &Path,
     owner_id: &str,
     create_parent: bool,
+    require_existing: bool,
 ) -> Result<ManifestLockGuard, ManifestLockError> {
     let lock_path = manifest_lock_path(manifest_path);
     let parent = lock_path
@@ -77,6 +111,9 @@ fn acquire_manifest_lock_unix(
             open_lock_file(&lock_path, false)?
         }
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            if require_existing {
+                return Err(ManifestLockError::Missing { lock_path });
+            }
             open_lock_file(&lock_path, true)?
         }
         Err(source) => {
@@ -86,7 +123,7 @@ fn acquire_manifest_lock_unix(
             });
         }
     };
-    validate_open_lock_identity(&lock_path, &file)?;
+    let identity = validate_open_lock_identity(&lock_path, &file, None)?;
 
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result != 0 {
@@ -116,11 +153,15 @@ fn acquire_manifest_lock_unix(
         })
         .and_then(|()| file.sync_data())
         .map_err(|source| ManifestLockError::Io {
-            path: lock_path,
+            path: lock_path.clone(),
             source,
         })?;
 
-    Ok(ManifestLockGuard { file })
+    Ok(ManifestLockGuard {
+        file,
+        lock_path,
+        identity,
+    })
 }
 
 #[cfg(unix)]
@@ -160,7 +201,11 @@ fn validate_lock_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), Ma
 }
 
 #[cfg(unix)]
-fn validate_open_lock_identity(path: &Path, file: &File) -> Result<(), ManifestLockError> {
+fn validate_open_lock_identity(
+    path: &Path,
+    file: &File,
+    expected: Option<LockIdentity>,
+) -> Result<LockIdentity, ManifestLockError> {
     let path_metadata = fs::symlink_metadata(path).map_err(|source| ManifestLockError::Io {
         path: path.to_path_buf(),
         source,
@@ -171,12 +216,38 @@ fn validate_open_lock_identity(path: &Path, file: &File) -> Result<(), ManifestL
         source,
     })?;
     validate_lock_metadata(path, &file_metadata)?;
-    if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino() {
+    let path_identity = LockIdentity {
+        device: path_metadata.dev(),
+        inode: path_metadata.ino(),
+        links: path_metadata.nlink(),
+    };
+    let file_identity = LockIdentity {
+        device: file_metadata.dev(),
+        inode: file_metadata.ino(),
+        links: file_metadata.nlink(),
+    };
+    if path_identity != file_identity || expected.is_some_and(|identity| identity != file_identity)
+    {
         return Err(ManifestLockError::IdentityChanged {
             path: path.to_path_buf(),
         });
     }
-    Ok(())
+    Ok(file_identity)
+}
+
+impl ManifestLockGuard {
+    /// Fails closed if the lock path no longer resolves to the inode that was flocked.
+    pub fn revalidate(&self) -> Result<(), ManifestLockError> {
+        #[cfg(not(unix))]
+        {
+            return Err(ManifestLockError::UnsupportedPlatform);
+        }
+        #[cfg(unix)]
+        {
+            validate_open_lock_identity(&self.lock_path, &self.file, Some(self.identity))?;
+            Ok(())
+        }
+    }
 }
 
 impl Drop for ManifestLockGuard {
@@ -197,5 +268,28 @@ mod tests {
         let error = acquire_manifest_lock(Path::new("manifest.json"), "owner", false)
             .expect_err("unfenced manifest locking must not be available");
         assert!(matches!(error, ManifestLockError::UnsupportedPlatform));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn guard_revalidation_rejects_a_replaced_lock_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let lock_path = manifest_lock_path(&manifest_path);
+        fs::write(&lock_path, b"legacy monitor lock\n").expect("create legacy lock");
+        let guard =
+            acquire_existing_manifest_lock(&manifest_path, "owner").expect("acquire existing lock");
+        let moved_lock_path = tempdir.path().join("moved-monitor.lock");
+        fs::rename(&lock_path, &moved_lock_path).expect("move locked path");
+        fs::write(&lock_path, b"replacement lock\n").expect("replace locked path");
+
+        let error = guard
+            .revalidate()
+            .expect_err("replaced lock path must invalidate the guard");
+        assert!(matches!(error, ManifestLockError::IdentityChanged { path } if path == lock_path));
     }
 }

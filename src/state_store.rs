@@ -1,10 +1,12 @@
 #[cfg(test)]
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(unix)]
 use std::fs::{File, OpenOptions};
 use std::io;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -23,7 +25,7 @@ use uuid::Uuid;
 
 use crate::manifest::{AssetRecord, Manifest, ManifestError};
 #[cfg(unix)]
-use crate::manifest_lock::{ManifestLockError, acquire_manifest_lock};
+use crate::manifest_lock::{ManifestLockError, acquire_existing_manifest_lock};
 
 const SCHEMA_VERSION: i32 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,12 +43,30 @@ const CANONICAL_V1_ASSETS_STATE_INDEX_SQL: &str =
 #[cfg(test)]
 std::thread_local! {
     static FAIL_NEXT_INTEGRITY_CHECK: Cell<bool> = const { Cell::new(false) };
+    static MIGRATION_PRECOMMIT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
 fn fail_next_integrity_check_for_current_thread() {
     FAIL_NEXT_INTEGRITY_CHECK.with(|fail| fail.set(true));
 }
+
+#[cfg(test)]
+fn set_migration_precommit_hook_for_current_thread(hook: impl FnOnce() + 'static) {
+    MIGRATION_PRECOMMIT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_migration_precommit_hook() {
+    MIGRATION_PRECOMMIT_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_migration_precommit_hook() {}
 
 #[derive(Clone, Debug)]
 pub struct AssetStateStore {
@@ -127,6 +147,24 @@ struct VerifiedDatabasePath {
 struct DatabaseIdentity {
     device: u64,
     inode: u64,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct ParentDirectoryWitness {
+    path: PathBuf,
+    identity: DirectoryIdentity,
 }
 
 impl AssetStateStore {
@@ -215,10 +253,12 @@ impl AssetStateStore {
 
             let manifest_path = manifest_path.as_ref().to_path_buf();
             let requested_db_path = Self::db_path_for_manifest(&manifest_path);
-            let verified_database = verify_existing_database_path(&requested_db_path)?;
+            preflight_existing_database_path(&requested_db_path)?;
             let owner_id = format!("schema-migrate-{}", Uuid::new_v4());
-            let _manifest_lock = acquire_manifest_lock(&manifest_path, &owner_id, false)
+            let manifest_lock = acquire_existing_manifest_lock(&manifest_path, &owner_id)
                 .map_err(migration_lock_error)?;
+            manifest_lock.revalidate().map_err(migration_lock_error)?;
+            let verified_database = verify_existing_database_path(&requested_db_path)?;
 
             let store = Self {
                 manifest_path,
@@ -253,7 +293,13 @@ impl AssetStateStore {
             )?;
             release_writer_lease_in_transaction(&transaction, &token)?;
             let quick_check = quick_check_in_transaction(&transaction)?;
+            // SQLite may create WAL/SHM sidecars while the DDL above runs. Capture the
+            // directory only after that expected churn so a later path ABA is observable.
+            let directory_witness = capture_parent_directory_witness(&verified_database)?;
+            run_migration_precommit_hook();
+            manifest_lock.revalidate().map_err(migration_lock_error)?;
             revalidate_verified_database_path(&verified_database)?;
+            revalidate_parent_directory_witness(&directory_witness)?;
             transaction.commit()?;
 
             Ok(SchemaMigrationSummary {
@@ -1110,6 +1156,32 @@ fn database_id(verified_database: &VerifiedDatabasePath) -> String {
 fn verify_existing_database_path(
     path: &Path,
 ) -> Result<VerifiedDatabasePath, AssetStateStoreError> {
+    preflight_existing_database_path(path)?;
+    let canonical_path = fs::canonicalize(path).map_err(|source| {
+        AssetStateStoreError::MigrationDatabaseMetadata {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    let canonical_metadata = fs::symlink_metadata(&canonical_path).map_err(|source| {
+        AssetStateStoreError::MigrationDatabaseMetadata {
+            path: canonical_path.clone(),
+            source,
+        }
+    })?;
+    validate_database_path_metadata(&canonical_path, &canonical_metadata)?;
+    let file = open_verified_database_file(&canonical_path)?;
+    let identity = validate_database_identity(&canonical_path, &file)?;
+    lock_verified_database_file(&canonical_path, &file)?;
+    Ok(VerifiedDatabasePath {
+        canonical_path,
+        identity,
+        file,
+    })
+}
+
+#[cfg(unix)]
+fn preflight_existing_database_path(path: &Path) -> Result<(), AssetStateStoreError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -1124,6 +1196,14 @@ fn verify_existing_database_path(
             });
         }
     };
+    validate_database_path_metadata(path, &metadata)
+}
+
+#[cfg(unix)]
+fn validate_database_path_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), AssetStateStoreError> {
     if metadata.file_type().is_symlink() {
         return Err(AssetStateStoreError::MigrationDatabaseSymlink {
             path: path.to_path_buf(),
@@ -1140,36 +1220,7 @@ fn verify_existing_database_path(
             links: metadata.nlink(),
         });
     }
-    let canonical_path = fs::canonicalize(path).map_err(|source| {
-        AssetStateStoreError::MigrationDatabaseMetadata {
-            path: path.to_path_buf(),
-            source,
-        }
-    })?;
-    let canonical_metadata = fs::symlink_metadata(&canonical_path).map_err(|source| {
-        AssetStateStoreError::MigrationDatabaseMetadata {
-            path: canonical_path.clone(),
-            source,
-        }
-    })?;
-    if canonical_metadata.file_type().is_symlink() || !canonical_metadata.file_type().is_file() {
-        return Err(AssetStateStoreError::MigrationDatabaseNotFile {
-            path: canonical_path,
-        });
-    }
-    if canonical_metadata.nlink() != 1 {
-        return Err(AssetStateStoreError::MigrationDatabaseHardLink {
-            path: canonical_path,
-            links: canonical_metadata.nlink(),
-        });
-    }
-    let file = open_verified_database_file(&canonical_path)?;
-    let identity = validate_database_identity(&canonical_path, &file)?;
-    Ok(VerifiedDatabasePath {
-        canonical_path,
-        identity,
-        file,
-    })
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1182,6 +1233,27 @@ fn open_verified_database_file(path: &Path) -> Result<File, AssetStateStoreError
             path: path.to_path_buf(),
             source,
         })
+}
+
+#[cfg(unix)]
+fn lock_verified_database_file(path: &Path, file: &File) -> Result<(), AssetStateStoreError> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(());
+    }
+    let source = io::Error::last_os_error();
+    if matches!(
+        source.raw_os_error(),
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+    ) {
+        return Err(AssetStateStoreError::MigrationDatabaseGuardHeld {
+            path: path.to_path_buf(),
+        });
+    }
+    Err(AssetStateStoreError::MigrationDatabaseMetadata {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(unix)]
@@ -1245,6 +1317,55 @@ fn revalidate_verified_database_path(
 }
 
 #[cfg(unix)]
+fn capture_parent_directory_witness(
+    verified_database: &VerifiedDatabasePath,
+) -> Result<ParentDirectoryWitness, AssetStateStoreError> {
+    let path = verified_database
+        .canonical_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let identity = directory_identity(&path)?;
+    Ok(ParentDirectoryWitness { path, identity })
+}
+
+#[cfg(unix)]
+fn revalidate_parent_directory_witness(
+    witness: &ParentDirectoryWitness,
+) -> Result<(), AssetStateStoreError> {
+    if directory_identity(&witness.path)? != witness.identity {
+        return Err(AssetStateStoreError::MigrationDatabaseDirectoryChanged {
+            path: witness.path.clone(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn directory_identity(path: &Path) -> Result<DirectoryIdentity, AssetStateStoreError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| {
+        AssetStateStoreError::MigrationDatabaseMetadata {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(AssetStateStoreError::MigrationDatabaseDirectoryChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+#[cfg(unix)]
 fn migration_lock_error(error: ManifestLockError) -> AssetStateStoreError {
     match error {
         ManifestLockError::UnsupportedPlatform => {
@@ -1252,6 +1373,9 @@ fn migration_lock_error(error: ManifestLockError) -> AssetStateStoreError {
         }
         ManifestLockError::Held { lock_path } => {
             AssetStateStoreError::MigrationMonitorLockHeld { lock_path }
+        }
+        ManifestLockError::Missing { lock_path } => {
+            AssetStateStoreError::MigrationMonitorLockMissing { lock_path }
         }
         ManifestLockError::Symlink { path } => {
             AssetStateStoreError::MigrationMonitorLockSymlink { path }
@@ -1555,14 +1679,24 @@ pub enum AssetStateStoreError {
     MigrationDatabaseNotFile { path: PathBuf },
     #[error("state database for schema migration must not be hard-linked ({links} links): {path}")]
     MigrationDatabaseHardLink { path: PathBuf, links: u64 },
+    #[error(
+        "state database guard is already held at {path}; stop all database writers before schema migration"
+    )]
+    MigrationDatabaseGuardHeld { path: PathBuf },
     #[error("state database identity changed during schema migration verification: {path}")]
     MigrationDatabaseIdentityChanged { path: PathBuf },
+    #[error("state database parent directory changed during schema migration: {path}")]
+    MigrationDatabaseDirectoryChanged { path: PathBuf },
     #[error("failed to inspect state database for schema migration at {path}: {source}")]
     MigrationDatabaseMetadata { path: PathBuf, source: io::Error },
     #[error(
         "schema-only migration cannot acquire manifest monitor lock at {lock_path}; stop the monitor before migrating"
     )]
     MigrationMonitorLockHeld { lock_path: PathBuf },
+    #[error(
+        "schema-only migration requires an existing legacy manifest monitor lock at {lock_path}; start and stop the local monitor once before migrating"
+    )]
+    MigrationMonitorLockMissing { lock_path: PathBuf },
     #[error("schema-only migration monitor lock must not be a symbolic link: {path}")]
     MigrationMonitorLockSymlink { path: PathBuf },
     #[error("schema-only migration monitor lock must be a regular file: {path}")]
@@ -1642,8 +1776,49 @@ pub enum AssetStateStoreError {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use std::sync::mpsc;
     use std::thread;
+
+    #[cfg(unix)]
+    fn create_migratable_v1_database(manifest_path: &Path, record: &AssetRecord) -> String {
+        let db_path = AssetStateStore::db_path_for_manifest(manifest_path);
+        let record_json = serde_json::to_string(record).expect("encode asset record");
+        let connection = Connection::open(&db_path).expect("open v1 state db");
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 BEGIN IMMEDIATE;
+                 CREATE TABLE assets (
+                   asset_id TEXT PRIMARY KEY NOT NULL,
+                   state TEXT NOT NULL,
+                   updated_at TEXT NOT NULL,
+                   record_json TEXT NOT NULL
+                 );
+                 CREATE INDEX assets_state_index ON assets(state);
+                 PRAGMA user_version = 1;
+                 COMMIT;",
+            )
+            .expect("create v1 schema");
+        connection
+            .execute(
+                "INSERT INTO assets (asset_id, state, updated_at, record_json) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    record.asset_id,
+                    record.state.as_str(),
+                    record.updated_at,
+                    record_json
+                ],
+            )
+            .expect("insert v1 asset");
+        fs::write(
+            manifest_path.with_extension("monitor.lock"),
+            b"legacy monitor lock\n",
+        )
+        .expect("create legacy monitor lock");
+        record_json
+    }
 
     #[test]
     fn export_keeps_fencing_transaction_until_publication_succeeds() {
@@ -1711,6 +1886,101 @@ mod tests {
             .expect("failed post-acquisition integrity must not leave a held lease");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn schema_only_migration_rolls_back_when_the_locked_path_is_replaced_before_commit() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let record = AssetRecord::new("asset-1", "/photos/asset-1.dng");
+        let record_json = create_migratable_v1_database(&manifest_path, &record);
+        let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
+        let lock_path = manifest_path.with_extension("monitor.lock");
+        let moved_lock_path = tempdir.path().join("moved-monitor.lock");
+        let digest_before = format!("{:x}", Sha256::digest(record_json.as_bytes()));
+
+        set_migration_precommit_hook_for_current_thread(move || {
+            fs::rename(&lock_path, &moved_lock_path).expect("move held lock path");
+            fs::write(&lock_path, b"replacement monitor lock\n").expect("replace lock path");
+        });
+        let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+            .expect_err("replaced lock path must roll back before commit");
+
+        assert!(matches!(
+            error,
+            AssetStateStoreError::MigrationMonitorLockIdentityChanged { .. }
+        ));
+        let connection = Connection::open(db_path).expect("reopen rolled-back state db");
+        let version: i32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read rolled-back schema version");
+        assert_eq!(version, 1);
+        let durable_json: String = connection
+            .query_row(
+                "SELECT record_json FROM assets WHERE asset_id = 'asset-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read rolled-back asset record");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(durable_json.as_bytes())),
+            digest_before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_only_migration_detects_database_path_aba_and_preserves_database_identity() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let record = AssetRecord::new("asset-1", "/photos/asset-1.dng");
+        let record_json = create_migratable_v1_database(&manifest_path, &record);
+        let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
+        let canonical_path = fs::canonicalize(&db_path).expect("canonicalize database");
+        let metadata = fs::metadata(&canonical_path).expect("inspect database");
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_path.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        hasher.update(metadata.dev().to_le_bytes());
+        hasher.update(metadata.ino().to_le_bytes());
+        let expected_database_id = format!("sha256:{:x}", hasher.finalize());
+        let moved_db_path = tempdir.path().join("moved-state.sqlite3");
+        let digest_before = format!("{:x}", Sha256::digest(record_json.as_bytes()));
+        let db_path_for_hook = db_path.clone();
+
+        set_migration_precommit_hook_for_current_thread(move || {
+            fs::rename(&db_path_for_hook, &moved_db_path).expect("move verified database path");
+            fs::rename(&moved_db_path, &db_path_for_hook).expect("restore verified database path");
+        });
+        let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+            .expect_err("database path ABA must roll back before commit");
+
+        assert!(matches!(
+            error,
+            AssetStateStoreError::MigrationDatabaseDirectoryChanged { .. }
+        ));
+        let connection = Connection::open(&db_path).expect("reopen rolled-back state db");
+        let version: i32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read rolled-back schema version");
+        assert_eq!(version, 1);
+        let durable_json: String = connection
+            .query_row(
+                "SELECT record_json FROM assets WHERE asset_id = 'asset-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read rolled-back asset record");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(durable_json.as_bytes())),
+            digest_before
+        );
+        drop(connection);
+
+        let summary = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+            .expect("restored verified path should migrate normally");
+        assert_eq!(summary.database_id, expected_database_id);
+    }
+
     #[test]
     fn schema_only_migration_integrity_failure_after_ddl_rolls_back_every_change() {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -1746,6 +2016,11 @@ mod tests {
                 ],
             )
             .expect("insert v1 asset");
+        fs::write(
+            manifest_path.with_extension("monitor.lock"),
+            b"legacy monitor lock\n",
+        )
+        .expect("create legacy monitor lock");
 
         fail_next_integrity_check_for_current_thread();
         let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
