@@ -190,13 +190,13 @@ implicitly. Stop the local monitor before running this command: it holds the sam
 file to already exist and never creates it; if it is absent, start and stop the local monitor
 once to create its single-link lock file, then stop every writer before retrying. That flock is
 local to one shared filesystem, so stop any cross-VM or Docker writers whose lock domain is not
-shared before migrating. Schema migration is supported only on Unix hosts with OS file fencing,
-holds a separate database-inode flock, and refuses symbolic-link or hard-link state databases
-and lock files rather than risking an alias write. It revalidates the lock and database paths
-before commit, including a parent-directory change witness for path replacement. These checks
-fail closed for ordinary races, but no POSIX path protocol can defend against a same-user actor
-with write access deliberately coordinating hostile filesystem/VFS changes; run migration from
-a private directory and stop such actors first.
+shared before migrating. Schema migration is supported only on Unix hosts with OS file fencing
+and refuses symbolic-link or hard-link state databases and lock files rather than risking an
+alias write. It revalidates the manifest lock and the opened database inode before commit,
+including a parent-directory change witness for path replacement. These checks fail closed for
+ordinary races, but no POSIX path protocol can defend against a same-user actor with write access
+deliberately coordinating hostile filesystem/VFS changes; run migration from a private directory
+and stop such actors first.
 
 Verify that a RAW file is safely present under your storage root:
 

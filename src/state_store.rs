@@ -6,8 +6,6 @@ use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io;
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1172,7 +1170,6 @@ fn verify_existing_database_path(
     validate_database_path_metadata(&canonical_path, &canonical_metadata)?;
     let file = open_verified_database_file(&canonical_path)?;
     let identity = validate_database_identity(&canonical_path, &file)?;
-    lock_verified_database_file(&canonical_path, &file)?;
     Ok(VerifiedDatabasePath {
         canonical_path,
         identity,
@@ -1233,27 +1230,6 @@ fn open_verified_database_file(path: &Path) -> Result<File, AssetStateStoreError
             path: path.to_path_buf(),
             source,
         })
-}
-
-#[cfg(unix)]
-fn lock_verified_database_file(path: &Path, file: &File) -> Result<(), AssetStateStoreError> {
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        return Ok(());
-    }
-    let source = io::Error::last_os_error();
-    if matches!(
-        source.raw_os_error(),
-        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
-    ) {
-        return Err(AssetStateStoreError::MigrationDatabaseGuardHeld {
-            path: path.to_path_buf(),
-        });
-    }
-    Err(AssetStateStoreError::MigrationDatabaseMetadata {
-        path: path.to_path_buf(),
-        source,
-    })
 }
 
 #[cfg(unix)]
@@ -1679,10 +1655,6 @@ pub enum AssetStateStoreError {
     MigrationDatabaseNotFile { path: PathBuf },
     #[error("state database for schema migration must not be hard-linked ({links} links): {path}")]
     MigrationDatabaseHardLink { path: PathBuf, links: u64 },
-    #[error(
-        "state database guard is already held at {path}; stop all database writers before schema migration"
-    )]
-    MigrationDatabaseGuardHeld { path: PathBuf },
     #[error("state database identity changed during schema migration verification: {path}")]
     MigrationDatabaseIdentityChanged { path: PathBuf },
     #[error("state database parent directory changed during schema migration: {path}")]
@@ -2025,7 +1997,10 @@ mod tests {
         fail_next_integrity_check_for_current_thread();
         let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
             .expect_err("post-DDL integrity failure must roll back the migration");
-        assert!(matches!(error, AssetStateStoreError::IntegrityCheck { .. }));
+        assert!(
+            matches!(error, AssetStateStoreError::IntegrityCheck { .. }),
+            "expected post-DDL integrity failure, got {error:?}"
+        );
 
         let connection = Connection::open(db_path).expect("reopen rolled-back state db");
         let version: i32 = connection
