@@ -1,0 +1,39 @@
+FROM docker.io/rust:1.86-bookworm AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked
+
+FROM docker.io/debian:bookworm-slim
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    imagemagick \
+    libheif-examples \
+    libimage-exiftool-perl \
+  && sed -i \
+    -e 's/name="memory" value="[^"]*"/name="memory" value="1GiB"/' \
+    -e 's/name="map" value="[^"]*"/name="map" value="2GiB"/' \
+    -e 's/name="area" value="[^"]*"/name="area" value="512MP"/' \
+    -e 's/name="disk" value="[^"]*"/name="disk" value="8GiB"/' \
+    /etc/ImageMagick-6/policy.xml \
+  && sed -i '/<\/policymap>/i\  <policy domain="resource" name="thread" value="2"/>' /etc/ImageMagick-6/policy.xml \
+  && grep -q 'name="memory" value="1GiB"' /etc/ImageMagick-6/policy.xml \
+  && grep -q 'name="map" value="2GiB"' /etc/ImageMagick-6/policy.xml \
+  && grep -q 'name="area" value="512MP"' /etc/ImageMagick-6/policy.xml \
+  && grep -q 'name="disk" value="8GiB"' /etc/ImageMagick-6/policy.xml \
+  && grep -q 'name="thread" value="2"' /etc/ImageMagick-6/policy.xml \
+  && rm -rf /var/lib/apt/lists/* \
+  && printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'if [ "${1:-}" = "compare" ]; then' \
+    '  shift' \
+    '  exec /usr/bin/compare "$@"' \
+    'fi' \
+    'exec /usr/bin/convert "$@"' \
+    > /usr/local/bin/magick \
+  && chmod +x /usr/local/bin/magick
+COPY --from=builder /src/target/release/icloudpd-optimizer /usr/local/bin/icloudpd-optimizer
+ENTRYPOINT ["icloudpd-optimizer"]
+CMD ["--help"]
