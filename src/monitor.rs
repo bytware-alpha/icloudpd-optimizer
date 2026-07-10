@@ -62,7 +62,10 @@ const DEFAULT_UPLOAD_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_HEIC_VERIFY_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_MAX_ORIGINAL_RESOLVER_RETRIES_PER_SCAN: usize = 16;
 const DEFAULT_ORIGINAL_RESOLVER_RETRY_MIN_AGE_SECONDS: u64 = 24 * 60 * 60;
+#[cfg(not(test))]
 const MONITOR_STATE_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
+#[cfg(test)]
+const MONITOR_STATE_LEASE_TTL: Duration = Duration::from_millis(40);
 const DELETE_LIVE_RAW_MAX_AGE: Duration = Duration::from_secs(30);
 const ORIGINAL_ASSET_RESOLVE_BATCH_WINDOW_SECONDS: u64 = 60 * 60;
 const DEFAULT_ROLLING_ORIGINAL_RESOLVE_ACTIVE_WINDOW_MULTIPLIER: usize = 2;
@@ -882,6 +885,54 @@ pub struct MonitorRunGuard {
     file: File,
     owner_id: String,
     state_store: Option<AssetStateStore>,
+    heartbeat: Option<MonitorLeaseHeartbeat>,
+}
+
+#[derive(Debug)]
+struct MonitorLeaseHeartbeat {
+    stop_tx: Option<mpsc::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl MonitorLeaseHeartbeat {
+    fn start(state_store: AssetStateStore) -> Self {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let interval = Duration::from_millis(
+            u64::try_from((MONITOR_STATE_LEASE_TTL.as_millis() / 3).max(1))
+                .expect("monitor lease heartbeat interval should fit u64"),
+        );
+        let thread = thread::spawn(move || {
+            loop {
+                match stop_rx.recv_timeout(interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Err(error) = state_store.renew_writer_lease() {
+                            state_store.record_writer_lease_heartbeat_failure(error.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            stop_tx: Some(stop_tx),
+            thread: Some(thread),
+        }
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop_tx.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for MonitorLeaseHeartbeat {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
 }
 
 pub fn monitor_run_lock_path(config: &MonitorConfig) -> PathBuf {
@@ -948,6 +999,7 @@ pub fn acquire_monitor_run_guard(config: &MonitorConfig) -> Result<MonitorRunGua
         file,
         owner_id,
         state_store: None,
+        heartbeat: None,
     })
 }
 
@@ -956,11 +1008,13 @@ impl MonitorRunGuard {
         match self.state_store.as_ref() {
             Some(store) => store.renew_writer_lease()?,
             None => {
-                self.state_store = Some(AssetStateStore::open_writer(
+                let state_store = AssetStateStore::open_writer(
                     manifest_path,
                     self.owner_id.clone(),
                     MONITOR_STATE_LEASE_TTL,
-                )?);
+                )?;
+                self.heartbeat = Some(MonitorLeaseHeartbeat::start(state_store.clone()));
+                self.state_store = Some(state_store);
             }
         }
         Ok(self.state_store.as_ref().expect("state store should exist"))
@@ -969,6 +1023,9 @@ impl MonitorRunGuard {
 
 impl Drop for MonitorRunGuard {
     fn drop(&mut self) {
+        if let Some(mut heartbeat) = self.heartbeat.take() {
+            heartbeat.stop_and_join();
+        }
         if let Some(state_store) = self.state_store.as_ref() {
             let _ = state_store.release_writer_lease();
         }
@@ -8367,8 +8424,14 @@ mod tests {
             started_unix_seconds: 1,
             ..MonitorScanSummary::default()
         };
-        let state_store =
-            Arc::new(AssetStateStore::open_read_only(&config.manifest_path).expect("state store"));
+        let state_store = Arc::new(
+            AssetStateStore::open_writer(
+                &config.manifest_path,
+                "test-writer",
+                Duration::from_secs(60),
+            )
+            .expect("state store"),
+        );
 
         run_rolling_lifecycle_delete_batch(
             &config,
@@ -12708,6 +12771,68 @@ mod tests {
 
         AssetStateStore::open_writer(&config.manifest_path, "writer-b", Duration::from_secs(1))
             .expect("dropping the guard should release the sqlite writer lease");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn monitor_guard_heartbeat_keeps_short_lease_live_and_surfaces_fencing() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("state/manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        let mut guard = acquire_monitor_run_guard(&config).expect("monitor guard should lock");
+        let state_store = guard
+            .state_store(&config.manifest_path)
+            .expect("guard should own state writer")
+            .clone();
+
+        thread::sleep(MONITOR_STATE_LEASE_TTL.saturating_mul(3));
+        assert!(matches!(
+            AssetStateStore::open_writer(&config.manifest_path, "writer-b", Duration::from_secs(1)),
+            Err(AssetStateStoreError::WriterLeaseHeld { .. })
+        ));
+
+        state_store
+            .release_writer_lease()
+            .expect("force heartbeat fencing for regression coverage");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match state_store.load() {
+                Err(AssetStateStoreError::WriterLeaseHeartbeatLost { .. }) => break,
+                Ok(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                Ok(_) => panic!("a fenced heartbeat must be reported instead of continuing"),
+                Err(error) => panic!("heartbeat must surface its fencing error: {error}"),
+            }
+        }
+        assert!(matches!(
+            guard.state_store(&config.manifest_path),
+            Err(MonitorError::StateStore(
+                AssetStateStoreError::WriterLeaseHeartbeatLost { .. },
+            ))
+        ));
+
+        drop(guard);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match AssetStateStore::open_writer(
+                &config.manifest_path,
+                "writer-c",
+                Duration::from_secs(1),
+            ) {
+                Ok(writer) => {
+                    writer
+                        .release_writer_lease()
+                        .expect("replacement writer should release its lease");
+                    break;
+                }
+                Err(AssetStateStoreError::WriterLeaseHeld { .. }) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("heartbeat shutdown must allow bounded takeover: {error}"),
+            }
+        }
     }
 
     #[cfg(unix)]

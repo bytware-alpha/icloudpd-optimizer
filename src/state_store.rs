@@ -2,11 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{
-    Connection, OptionalExtension, Statement, Transaction, TransactionBehavior, params,
+    Connection, OpenFlags, OptionalExtension, Statement, Transaction, TransactionBehavior, params,
 };
 use thiserror::Error;
 
@@ -14,6 +14,7 @@ use crate::manifest::{AssetRecord, Manifest, ManifestError};
 
 const SCHEMA_VERSION: i32 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_WRITER_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug)]
 pub struct AssetStateStore {
@@ -22,11 +23,12 @@ pub struct AssetStateStore {
     writer: Option<Arc<WriterLeaseToken>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct WriterLeaseToken {
     owner_id: String,
     epoch: u64,
     lease_ttl: Duration,
+    heartbeat_failure: Mutex<Option<String>>,
 }
 
 #[derive(Debug)]
@@ -62,22 +64,13 @@ impl AssetStateStore {
     pub fn open_read_only(manifest_path: impl AsRef<Path>) -> Result<Self, AssetStateStoreError> {
         let manifest_path = manifest_path.as_ref().to_path_buf();
         let db_path = Self::db_path_for_manifest(&manifest_path);
-        let parent = db_path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(|source| AssetStateStoreError::CreateDirectory {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-
         let store = Self {
             manifest_path,
             db_path,
             writer: None,
         };
-        let mut connection = store.connect()?;
-        store.initialize(&mut connection)?;
+        let connection = store.connect_read_only()?;
+        store.verify_read_only_schema(&connection)?;
         store.verify_integrity(&connection)?;
         Ok(store)
     }
@@ -87,9 +80,31 @@ impl AssetStateStore {
         owner_id: impl Into<String>,
         lease_ttl: Duration,
     ) -> Result<Self, AssetStateStoreError> {
-        let mut store = Self::open_read_only(manifest_path)?;
+        validate_writer_lease_ttl(lease_ttl)?;
+        let manifest_path = manifest_path.as_ref().to_path_buf();
+        let db_path = Self::db_path_for_manifest(&manifest_path);
+        let parent = db_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|source| AssetStateStoreError::CreateDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let mut store = Self {
+            manifest_path,
+            db_path,
+            writer: None,
+        };
         let owner_id = owner_id.into();
-        let token = store.acquire_writer_lease(&owner_id, lease_ttl)?;
+        let mut connection = store.connect_writer()?;
+        ensure_wal(&connection, true)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        store.initialize_writer(&transaction)?;
+        let token =
+            store.acquire_writer_lease_in_transaction(&transaction, &owner_id, lease_ttl)?;
+        transaction.commit()?;
+        store.verify_integrity(&connection)?;
         store.writer = Some(Arc::new(token));
         Ok(store)
     }
@@ -103,10 +118,8 @@ impl AssetStateStore {
     }
 
     pub fn renew_writer_lease(&self) -> Result<(), AssetStateStoreError> {
-        let Some(token) = self.writer.as_ref() else {
-            return Err(AssetStateStoreError::WriterLeaseRequired);
-        };
-        let mut connection = self.connect()?;
+        let token = self.writer_token()?;
+        let mut connection = self.connect_writer()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.validate_writer_lease(&transaction, token)?;
         transaction.commit()?;
@@ -117,7 +130,7 @@ impl AssetStateStore {
         let Some(token) = self.writer.as_ref() else {
             return Ok(());
         };
-        let mut connection = self.connect()?;
+        let mut connection = self.connect_writer()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let lease = load_writer_lease(&transaction)?;
         if lease.owner_id == token.owner_id && lease.epoch == token.epoch {
@@ -162,7 +175,36 @@ impl AssetStateStore {
         self.export_json_with_owned_lease()
     }
 
-    fn connect(&self) -> Result<Connection, AssetStateStoreError> {
+    pub(crate) fn record_writer_lease_heartbeat_failure(&self, reason: String) {
+        let Some(token) = self.writer.as_ref() else {
+            return;
+        };
+        let mut failure = token
+            .heartbeat_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if failure.is_none() {
+            *failure = Some(reason);
+        }
+    }
+
+    fn writer_token(&self) -> Result<&Arc<WriterLeaseToken>, AssetStateStoreError> {
+        let token = self
+            .writer
+            .as_ref()
+            .ok_or(AssetStateStoreError::WriterLeaseRequired)?;
+        let failure = token
+            .heartbeat_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(reason) = failure {
+            return Err(AssetStateStoreError::WriterLeaseHeartbeatLost { reason });
+        }
+        Ok(token)
+    }
+
+    fn connect_writer(&self) -> Result<Connection, AssetStateStoreError> {
         let connection = Connection::open(&self.db_path).map_err(|source| {
             AssetStateStoreError::OpenDatabase {
                 path: self.db_path.clone(),
@@ -175,7 +217,19 @@ impl AssetStateStore {
         Ok(connection)
     }
 
-    fn initialize(&self, connection: &mut Connection) -> Result<(), AssetStateStoreError> {
+    fn connect_read_only(&self) -> Result<Connection, AssetStateStoreError> {
+        let connection =
+            Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
+                |source| AssetStateStoreError::OpenDatabase {
+                    path: self.db_path.clone(),
+                    source,
+                },
+            )?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        Ok(connection)
+    }
+
+    fn verify_read_only_schema(&self, connection: &Connection) -> Result<(), AssetStateStoreError> {
         let schema_version: i32 =
             connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         let user_table_count: i64 = connection.query_row(
@@ -185,13 +239,12 @@ impl AssetStateStore {
         )?;
 
         match (schema_version, user_table_count) {
-            (0, 0) => {
-                ensure_wal(connection, true)?;
-                create_v2_schema(connection)?;
-            }
+            (0, 0) => return Err(AssetStateStoreError::MissingSchema),
             (1, _) => {
-                ensure_wal(connection, true)?;
-                self.migrate_v1_to_v2(connection)?;
+                return Err(AssetStateStoreError::UnsupportedSchema {
+                    expected: SCHEMA_VERSION,
+                    actual: 1,
+                });
             }
             (SCHEMA_VERSION, 0) => return Err(AssetStateStoreError::MissingSchema),
             (SCHEMA_VERSION, _) => ensure_wal(connection, false)?,
@@ -207,19 +260,42 @@ impl AssetStateStore {
         Ok(())
     }
 
-    fn migrate_v1_to_v2(&self, connection: &mut Connection) -> Result<(), AssetStateStoreError> {
+    fn initialize_writer(&self, transaction: &Transaction<'_>) -> Result<(), AssetStateStoreError> {
+        let schema_version: i32 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let user_table_count: i64 = transaction.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        match (schema_version, user_table_count) {
+            (0, 0) => create_v2_schema(transaction)?,
+            (1, _) => self.migrate_v1_to_v2(transaction)?,
+            (SCHEMA_VERSION, 0) => return Err(AssetStateStoreError::MissingSchema),
+            (SCHEMA_VERSION, _) => {}
+            (_, 0) => return Err(AssetStateStoreError::MissingSchema),
+            (actual, _) => {
+                return Err(AssetStateStoreError::UnsupportedSchema {
+                    expected: SCHEMA_VERSION,
+                    actual,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn migrate_v1_to_v2(&self, transaction: &Transaction<'_>) -> Result<(), AssetStateStoreError> {
         let asset_count: i64 =
-            connection.query_row("SELECT count(*) FROM assets", [], |row| row.get(0))?;
+            transaction.query_row("SELECT count(*) FROM assets", [], |row| row.get(0))?;
         let (source_size_bytes, source_mtime_unix_nanos) =
             manifest_file_metadata(&self.manifest_path)?;
         let imported_once = asset_count > 0;
         let imported_at_unix_ms = imported_once.then_some(current_unix_millis());
         let import_note = imported_once.then_some("legacy_v1_migration");
 
-        connection.execute_batch("BEGIN IMMEDIATE;")?;
-        let result = (|| -> Result<(), AssetStateStoreError> {
-            connection.execute_batch(
-                "CREATE TABLE writer_lease (
+        transaction.execute_batch(
+            "CREATE TABLE writer_lease (
                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                    owner_id TEXT NOT NULL,
                    epoch INTEGER NOT NULL,
@@ -239,30 +315,24 @@ impl AssetStateStore {
                    imported_at_unix_ms INTEGER,
                    import_note TEXT
                  );",
-            )?;
-            connection.execute(
-                "INSERT INTO json_import_metadata (
+        )?;
+        transaction.execute(
+            "INSERT INTO json_import_metadata (
                    singleton, imported_once, source_path, source_size_bytes,
                    source_mtime_unix_nanos, imported_at_unix_ms, import_note
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    1_i64,
-                    if imported_once { 1_i64 } else { 0_i64 },
-                    imported_once.then(|| self.manifest_path.display().to_string()),
-                    source_size_bytes,
-                    source_mtime_unix_nanos,
-                    imported_at_unix_ms,
-                    import_note
-                ],
-            )?;
-            connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            connection.execute_batch("COMMIT;")?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = connection.execute_batch("ROLLBACK;");
-        }
-        result
+            params![
+                1_i64,
+                if imported_once { 1_i64 } else { 0_i64 },
+                imported_once.then(|| self.manifest_path.display().to_string()),
+                source_size_bytes,
+                source_mtime_unix_nanos,
+                imported_at_unix_ms,
+                import_note
+            ],
+        )?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(())
     }
 
     fn verify_integrity(&self, connection: &Connection) -> Result<(), AssetStateStoreError> {
@@ -273,14 +343,13 @@ impl AssetStateStore {
         Ok(())
     }
 
-    fn acquire_writer_lease(
+    fn acquire_writer_lease_in_transaction(
         &self,
+        transaction: &Transaction<'_>,
         owner_id: &str,
         lease_ttl: Duration,
     ) -> Result<WriterLeaseToken, AssetStateStoreError> {
-        let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = load_writer_lease(&transaction)?;
+        let current = load_writer_lease(transaction)?;
         let now = current_unix_millis();
         let expires_at_unix_ms = now.saturating_add(duration_millis_i64(lease_ttl));
 
@@ -317,11 +386,11 @@ impl AssetStateStore {
                 now
             ],
         )?;
-        transaction.commit()?;
         Ok(WriterLeaseToken {
             owner_id: owner_id.to_string(),
             epoch,
             lease_ttl,
+            heartbeat_failure: Mutex::new(None),
         })
     }
 
@@ -356,16 +425,13 @@ impl AssetStateStore {
     }
 
     fn load_or_import_with_owned_lease(&self) -> Result<Manifest, AssetStateStoreError> {
-        let snapshot = self.load_json_manifest_snapshot()?;
-        let token = self
-            .writer
-            .as_ref()
-            .ok_or(AssetStateStoreError::WriterLeaseRequired)?;
-        let mut connection = self.connect()?;
+        let token = self.writer_token()?;
+        let mut connection = self.connect_writer()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.validate_writer_lease(&transaction, token)?;
         let import_metadata = load_json_import_metadata(&transaction)?;
         if !import_metadata.imported_once {
+            let snapshot = self.load_json_manifest_snapshot()?;
             for record in snapshot.manifest.records().values() {
                 upsert_record(&transaction, record)?;
             }
@@ -380,12 +446,9 @@ impl AssetStateStore {
         &self,
         record: &AssetRecord,
     ) -> Result<Duration, AssetStateStoreError> {
-        let token = self
-            .writer
-            .as_ref()
-            .ok_or(AssetStateStoreError::WriterLeaseRequired)?;
+        let token = self.writer_token()?;
         let started = Instant::now();
-        let mut connection = self.connect()?;
+        let mut connection = self.connect_writer()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.validate_writer_lease(&transaction, token)?;
         let changed = upsert_record(&transaction, record)?;
@@ -398,10 +461,7 @@ impl AssetStateStore {
         &self,
         records: impl IntoIterator<Item = &'a AssetRecord>,
     ) -> Result<Duration, AssetStateStoreError> {
-        let token = self
-            .writer
-            .as_ref()
-            .ok_or(AssetStateStoreError::WriterLeaseRequired)?;
+        let token = self.writer_token()?;
         let started = Instant::now();
         let mut asset_ids = BTreeSet::new();
         let mut prepared = Vec::new();
@@ -417,7 +477,7 @@ impl AssetStateStore {
             return Ok(started.elapsed());
         }
 
-        let mut connection = self.connect()?;
+        let mut connection = self.connect_writer()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.validate_writer_lease(&transaction, token)?;
         {
@@ -443,10 +503,7 @@ impl AssetStateStore {
         &self,
         manifest: &Manifest,
     ) -> Result<(), AssetStateStoreError> {
-        let token = self
-            .writer
-            .as_ref()
-            .ok_or(AssetStateStoreError::WriterLeaseRequired)?;
+        let token = self.writer_token()?;
         if manifest.records().is_empty() {
             return Ok(());
         }
@@ -456,7 +513,7 @@ impl AssetStateStore {
             .values()
             .map(|record| Ok((record, encode_record(record)?)))
             .collect::<Result<Vec<_>, AssetStateStoreError>>()?;
-        let mut connection = self.connect()?;
+        let mut connection = self.connect_writer()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.validate_writer_lease(&transaction, token)?;
         let persisted_records = load_persisted_records(&transaction)?;
@@ -485,11 +542,8 @@ impl AssetStateStore {
     where
         F: FnOnce(&Manifest, &Path) -> Result<(), ManifestError>,
     {
-        let token = self
-            .writer
-            .as_ref()
-            .ok_or(AssetStateStoreError::WriterLeaseRequired)?;
-        let mut connection = self.connect()?;
+        let token = self.writer_token()?;
+        let mut connection = self.connect_writer()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.validate_writer_lease(&transaction, token)?;
         let manifest = load_database_manifest_from_transaction(&transaction)?;
@@ -523,7 +577,10 @@ impl AssetStateStore {
     }
 
     fn load_database_manifest(&self) -> Result<Manifest, AssetStateStoreError> {
-        let connection = self.connect()?;
+        if self.writer.is_some() {
+            self.writer_token()?;
+        }
+        let connection = self.connect_read_only()?;
         let mut statement = connection.prepare(
             "SELECT asset_id, state, updated_at, record_json FROM assets ORDER BY asset_id",
         )?;
@@ -560,10 +617,9 @@ fn ensure_wal(connection: &Connection, allow_enable: bool) -> Result<(), AssetSt
     Err(AssetStateStoreError::WalUnavailable { mode: journal_mode })
 }
 
-fn create_v2_schema(connection: &Connection) -> Result<(), AssetStateStoreError> {
-    connection.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE assets (
+fn create_v2_schema(transaction: &Transaction<'_>) -> Result<(), AssetStateStoreError> {
+    transaction.execute_batch(
+        "CREATE TABLE assets (
            asset_id TEXT PRIMARY KEY NOT NULL,
            state TEXT NOT NULL,
            updated_at TEXT NOT NULL,
@@ -594,9 +650,21 @@ fn create_v2_schema(connection: &Connection) -> Result<(), AssetStateStoreError>
            singleton, imported_once, source_path, source_size_bytes,
            source_mtime_unix_nanos, imported_at_unix_ms, import_note
          ) VALUES (1, 0, NULL, NULL, NULL, NULL, NULL);
-         PRAGMA user_version = 2;
-         COMMIT;",
+         PRAGMA user_version = 2;",
     )?;
+    Ok(())
+}
+
+fn validate_writer_lease_ttl(lease_ttl: Duration) -> Result<(), AssetStateStoreError> {
+    if lease_ttl.is_zero()
+        || lease_ttl > MAX_WRITER_LEASE_TTL
+        || i64::try_from(lease_ttl.as_millis()).is_err()
+    {
+        return Err(AssetStateStoreError::InvalidWriterLeaseTtl {
+            ttl: lease_ttl,
+            maximum: MAX_WRITER_LEASE_TTL,
+        });
+    }
     Ok(())
 }
 
@@ -875,6 +943,8 @@ pub enum AssetStateStoreError {
     DuplicateRecord { asset_id: String },
     #[error("writer lease is required for state mutation")]
     WriterLeaseRequired,
+    #[error("state writer lease TTL {ttl:?} must be greater than zero and at most {maximum:?}")]
+    InvalidWriterLeaseTtl { ttl: Duration, maximum: Duration },
     #[error("state writer lease is held by {owner_id} at epoch {epoch} until {expires_at_unix_ms}")]
     WriterLeaseHeld {
         owner_id: String,
@@ -892,6 +962,8 @@ pub enum AssetStateStoreError {
         current_owner_id: String,
         current_epoch: u64,
     },
+    #[error("state writer lease heartbeat was lost: {reason}")]
+    WriterLeaseHeartbeatLost { reason: String },
 }
 
 #[cfg(test)]

@@ -92,6 +92,163 @@ fn json_manifest_is_imported_only_once() {
 }
 
 #[test]
+fn imported_sqlite_state_loads_when_legacy_json_is_malformed_or_missing() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("manifest.json");
+    manifest_with_record("asset-1")
+        .save_atomic(&manifest_path)
+        .expect("save initial json");
+    let store = open_writer(&manifest_path, "writer-a");
+    store.load_or_import().expect("import initial json");
+
+    fs::write(&manifest_path, b"not json").expect("corrupt legacy json");
+    assert!(
+        store
+            .load_or_import()
+            .expect("durable state must not reread malformed imported json")
+            .get("asset-1")
+            .is_ok()
+    );
+
+    fs::remove_file(&manifest_path).expect("remove legacy json");
+    assert!(
+        store
+            .load_or_import()
+            .expect("durable state must not require imported json")
+            .get("asset-1")
+            .is_ok()
+    );
+}
+
+#[test]
+fn read_only_open_never_bootstraps_or_migrates_schema() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let fresh_manifest_path = tempdir.path().join("fresh/manifest.json");
+    let fresh_db_path = AssetStateStore::db_path_for_manifest(&fresh_manifest_path);
+    assert!(AssetStateStore::open_read_only(&fresh_manifest_path).is_err());
+    assert!(
+        !fresh_db_path.exists(),
+        "read-only opening must not create a state database"
+    );
+
+    let v1_manifest_path = tempdir.path().join("v1/manifest.json");
+    let v1_db_path = AssetStateStore::db_path_for_manifest(&v1_manifest_path);
+    fs::create_dir_all(v1_db_path.parent().expect("state parent")).expect("create state parent");
+    let connection = rusqlite::Connection::open(&v1_db_path).expect("open v1 database");
+    connection
+        .execute_batch(
+            "CREATE TABLE assets (
+               asset_id TEXT PRIMARY KEY NOT NULL,
+               state TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               record_json TEXT NOT NULL
+             );
+             CREATE INDEX assets_state_index ON assets(state);
+             PRAGMA user_version = 1;",
+        )
+        .expect("create v1 schema");
+
+    assert!(matches!(
+        AssetStateStore::open_read_only(&v1_manifest_path),
+        Err(AssetStateStoreError::UnsupportedSchema {
+            expected: 2,
+            actual: 1
+        })
+    ));
+    let version: i32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("read v1 schema version");
+    assert_eq!(version, 1);
+    let writer_lease_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'writer_lease'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count v2 writer lease table");
+    assert_eq!(writer_lease_count, 0);
+}
+
+#[test]
+fn writer_ttl_must_be_finite_and_bounded() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    for (name, ttl) in [
+        ("zero", Duration::ZERO),
+        ("excessive", Duration::from_secs(5 * 60 + 1)),
+        ("unbounded", Duration::MAX),
+    ] {
+        let manifest_path = tempdir.path().join(format!("{name}.json"));
+        assert!(
+            AssetStateStore::open_writer(&manifest_path, "writer-a", ttl).is_err(),
+            "{name} writer lease TTL must be rejected"
+        );
+    }
+}
+
+#[test]
+fn concurrent_fresh_openers_observe_writer_lease_held() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let first_path = manifest_path.clone();
+    let first = thread::spawn(move || {
+        let writer = AssetStateStore::open_writer(&first_path, "writer-a", Duration::from_secs(1))
+            .expect("first fresh writer should bootstrap and acquire");
+        acquired_tx.send(()).expect("signal acquired writer");
+        release_rx.recv().expect("wait for release");
+        drop(writer);
+    });
+    acquired_rx.recv().expect("wait for fresh bootstrap");
+
+    assert!(matches!(
+        AssetStateStore::open_writer(&manifest_path, "writer-b", Duration::from_secs(1)),
+        Err(AssetStateStoreError::WriterLeaseHeld { .. })
+    ));
+    release_tx.send(()).expect("release first writer");
+    first.join().expect("join first writer");
+}
+
+#[test]
+fn concurrent_v1_openers_observe_writer_lease_held() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("manifest.json");
+    let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
+    let connection = rusqlite::Connection::open(&db_path).expect("open v1 database");
+    connection
+        .execute_batch(
+            "CREATE TABLE assets (
+               asset_id TEXT PRIMARY KEY NOT NULL,
+               state TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               record_json TEXT NOT NULL
+             );
+             CREATE INDEX assets_state_index ON assets(state);
+             PRAGMA user_version = 1;",
+        )
+        .expect("create v1 schema");
+
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let first_path = manifest_path.clone();
+    let first = thread::spawn(move || {
+        let writer = AssetStateStore::open_writer(&first_path, "writer-a", Duration::from_secs(1))
+            .expect("first v1 writer should migrate and acquire");
+        acquired_tx.send(()).expect("signal acquired writer");
+        release_rx.recv().expect("wait for release");
+        drop(writer);
+    });
+    acquired_rx.recv().expect("wait for v1 migration");
+
+    assert!(matches!(
+        AssetStateStore::open_writer(&manifest_path, "writer-b", Duration::from_secs(1)),
+        Err(AssetStateStoreError::WriterLeaseHeld { .. })
+    ));
+    release_tx.send(()).expect("release first writer");
+    first.join().expect("join first writer");
+}
+
+#[test]
 fn concurrent_readers_observe_committed_records() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let manifest_path = tempdir.path().join("manifest.json");
@@ -303,9 +460,12 @@ fn failed_v1_to_v2_migration_rolls_back_without_partial_v2_tables() {
         )
         .expect("create v1 schema plus conflicting view");
 
-    let error = AssetStateStore::open_read_only(&manifest_path)
+    let error = AssetStateStore::open_writer(&manifest_path, "writer-a", Duration::from_secs(1))
         .expect_err("migration conflict should fail closed");
-    assert!(matches!(error, AssetStateStoreError::Database(_)));
+    assert!(
+        matches!(error, AssetStateStoreError::Database(_)),
+        "expected writer-side migration error, got {error:?}"
+    );
 
     let connection = rusqlite::Connection::open(&db_path).expect("reopen sqlite");
     let version: i32 = connection
