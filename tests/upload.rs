@@ -6,8 +6,9 @@ use icloudpd_optimizer::upload::{
     CloudKitDatabaseScope, CloudKitDeleteBatchRequest, CloudKitDeleteBatchSendError,
     CloudKitDeleteClient, CloudKitDeleteOutcome, CloudKitDeleteRequest, CloudKitDeleteSession,
     CloudKitDeleteTransport, CloudKitLibraryDestination, CloudKitLocalReplacementCandidate,
-    CloudKitOriginalAssetBatchResolveRequest, CloudKitOriginalAssetResolveDisposition,
-    CloudKitOriginalAssetResolveRequest, CloudKitOriginalAssetResolveTarget,
+    CloudKitOriginalAssetBatchResolveRequest, CloudKitOriginalAssetReadTransport,
+    CloudKitOriginalAssetResolveDisposition, CloudKitOriginalAssetResolveRequest,
+    CloudKitOriginalAssetResolveTarget, CloudKitResourceDownload,
     CloudKitUploadedHeicResolveRequest, IcloudUploadOutcome, IcloudUploadRequest,
     IcloudUploadResponse, PhotosUploadClient, PhotosUploadEndpoint, PhotosUploadTransport,
     SingleFileUploadRequest, UploadError, UploadSession, build_upload_proof, load_upload_session,
@@ -256,6 +257,66 @@ fn original_asset_resolve_request() -> CloudKitOriginalAssetResolveRequest {
         page_size: 200,
         max_pages: 100,
     }
+}
+
+struct ReadOnlyOriginalAssetTransport {
+    query_response: Value,
+    resource_body: Vec<u8>,
+}
+
+impl CloudKitOriginalAssetReadTransport for ReadOnlyOriginalAssetTransport {
+    fn post_records_query(
+        &mut self,
+        _session: &CloudKitDeleteSession,
+        _payload: Value,
+    ) -> Result<Value, UploadError> {
+        Ok(self.query_response.clone())
+    }
+
+    fn download_resource(
+        &mut self,
+        _session: &CloudKitDeleteSession,
+        _download_url: &url::Url,
+        expected_size_bytes: u64,
+    ) -> Result<CloudKitResourceDownload, UploadError> {
+        let size_bytes = self.resource_body.len() as u64;
+        if size_bytes != expected_size_bytes {
+            return Err(UploadError::CloudKitOriginalAssetDownloadSizeMismatch {
+                expected: expected_size_bytes,
+                actual: size_bytes,
+            });
+        }
+        Ok(CloudKitResourceDownload {
+            sha256: sha256_hex(&self.resource_body),
+            size_bytes,
+        })
+    }
+}
+
+#[test]
+fn original_asset_resolution_accepts_transport_without_delete_capability() {
+    let raw = b"raw-bytes";
+    let mut transport = ReadOnlyOriginalAssetTransport {
+        query_response: json!({
+            "records": cloudkit_raw_pair_with_url(
+                "raw-asset",
+                "raw-master",
+                "raw-change-tag",
+                raw.len() as u64,
+                1_800_000_000_000,
+                "https://p140-icloud-content.icloud.com/raw-original",
+            ),
+        }),
+        resource_body: raw.to_vec(),
+    };
+
+    let session = CloudKitDeleteSession::from_json(&valid_delete_session_json())
+        .expect("session should load");
+    let proof = CloudKitDeleteClient::new(&mut transport)
+        .resolve_original_asset(&session, &original_asset_resolve_request())
+        .expect("read-only transport should resolve the original asset");
+
+    assert_eq!(proof.record_name, "raw-asset");
 }
 
 fn batch_resolve_target(
@@ -3862,15 +3923,6 @@ impl CloudKitDeleteTransport for FakeCloudKitDeleteTransport {
         Ok(self.response.clone())
     }
 
-    fn post_records_query(
-        &mut self,
-        _session: &CloudKitDeleteSession,
-        payload: Value,
-    ) -> Result<Value, UploadError> {
-        self.query_payloads.push(payload);
-        Ok(self.query_responses.remove(0))
-    }
-
     fn post_records_lookup(
         &mut self,
         _session: &CloudKitDeleteSession,
@@ -3878,6 +3930,17 @@ impl CloudKitDeleteTransport for FakeCloudKitDeleteTransport {
     ) -> Result<Value, UploadError> {
         self.lookup_payloads.push(payload);
         Ok(self.lookup_responses.remove(0))
+    }
+}
+
+impl CloudKitOriginalAssetReadTransport for FakeCloudKitDeleteTransport {
+    fn post_records_query(
+        &mut self,
+        _session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        self.query_payloads.push(payload);
+        Ok(self.query_responses.remove(0))
     }
 
     fn download_resource(

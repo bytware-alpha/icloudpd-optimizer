@@ -438,13 +438,15 @@ pub trait CloudKitDeleteTransport {
         payload: Value,
     ) -> Result<Value, UploadError>;
 
-    fn post_records_query(
+    fn post_records_lookup(
         &mut self,
         session: &CloudKitDeleteSession,
         payload: Value,
     ) -> Result<Value, UploadError>;
+}
 
-    fn post_records_lookup(
+pub trait CloudKitOriginalAssetReadTransport {
+    fn post_records_query(
         &mut self,
         session: &CloudKitDeleteSession,
         payload: Value,
@@ -467,20 +469,22 @@ impl<T: CloudKitDeleteTransport + ?Sized> CloudKitDeleteTransport for &mut T {
         (**self).post_records_modify(session, payload)
     }
 
-    fn post_records_query(
-        &mut self,
-        session: &CloudKitDeleteSession,
-        payload: Value,
-    ) -> Result<Value, UploadError> {
-        (**self).post_records_query(session, payload)
-    }
-
     fn post_records_lookup(
         &mut self,
         session: &CloudKitDeleteSession,
         payload: Value,
     ) -> Result<Value, UploadError> {
         (**self).post_records_lookup(session, payload)
+    }
+}
+
+impl<T: CloudKitOriginalAssetReadTransport + ?Sized> CloudKitOriginalAssetReadTransport for &mut T {
+    fn post_records_query(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        (**self).post_records_query(session, payload)
     }
 
     fn download_resource(
@@ -677,11 +681,13 @@ pub struct CloudKitDeleteClient<T> {
     transport: T,
 }
 
-impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
+impl<T> CloudKitDeleteClient<T> {
     pub fn new(transport: T) -> Self {
         Self { transport }
     }
+}
 
+impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
     pub fn delete_original(
         &mut self,
         session: &CloudKitDeleteSession,
@@ -762,7 +768,9 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
         )?;
         parse_cloudkit_delete_state_lookup_response(response, request)
     }
+}
 
+impl<T: CloudKitDeleteTransport + CloudKitOriginalAssetReadTransport> CloudKitDeleteClient<T> {
     pub fn resolve_uploaded_heic_asset(
         &mut self,
         session: &CloudKitDeleteSession,
@@ -823,7 +831,9 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
             size_bytes: download.size_bytes,
         })
     }
+}
 
+impl<T: CloudKitOriginalAssetReadTransport> CloudKitDeleteClient<T> {
     pub fn resolve_original_asset(
         &mut self,
         session: &CloudKitDeleteSession,
@@ -1473,7 +1483,7 @@ impl PhotosUploadTransport for ReqwestPhotosUploadTransport {
     }
 }
 
-pub struct ReqwestCloudKitDeleteTransport {
+struct ReqwestCloudKitTransport {
     client: reqwest::blocking::Client,
 }
 
@@ -1481,7 +1491,7 @@ const CLOUDKIT_ORIGIN: &str = "https://www.icloud.com";
 const CLOUDKIT_REFERER: &str = "https://www.icloud.com/";
 const CLOUDKIT_BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 
-impl ReqwestCloudKitDeleteTransport {
+impl ReqwestCloudKitTransport {
     pub fn new() -> Result<Self, UploadError> {
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -1490,68 +1500,27 @@ impl ReqwestCloudKitDeleteTransport {
             .map_err(|source| UploadError::HttpClient { source })?;
         Ok(Self { client })
     }
-}
 
-impl CloudKitDeleteTransport for ReqwestCloudKitDeleteTransport {
-    fn post_records_modify(
-        &mut self,
+    fn post_records_json(
+        &self,
         session: &CloudKitDeleteSession,
+        url: Url,
         payload: Value,
+        operation: &'static str,
+        parse_response: fn(reqwest::blocking::Response, &'static str) -> Result<Value, UploadError>,
     ) -> Result<Value, UploadError> {
-        let url = cloudkit_records_modify_url(session, payload_database_scope(&payload, session))?;
         let response = self
             .client
             .post(url)
             .headers(cloudkit_records_request_headers(session)?)
             .body(payload.to_string())
             .send()
-            .map_err(|source| UploadError::Network {
-                operation: "records_modify",
-                source,
-            })?;
-        read_json_response(response, "records_modify")
-    }
-
-    fn post_records_query(
-        &mut self,
-        session: &CloudKitDeleteSession,
-        payload: Value,
-    ) -> Result<Value, UploadError> {
-        let url = cloudkit_records_query_url(session, payload_database_scope(&payload, session))?;
-        let response = self
-            .client
-            .post(url)
-            .headers(cloudkit_records_request_headers(session)?)
-            .body(payload.to_string())
-            .send()
-            .map_err(|source| UploadError::Network {
-                operation: "records_query",
-                source,
-            })?;
-        read_cloudkit_json_response(response, "records_query")
-    }
-
-    fn post_records_lookup(
-        &mut self,
-        session: &CloudKitDeleteSession,
-        payload: Value,
-    ) -> Result<Value, UploadError> {
-        let url = cloudkit_records_lookup_url(session, payload_database_scope(&payload, session))?;
-        let response = self
-            .client
-            .post(url)
-            .headers(cloudkit_records_request_headers(session)?)
-            .body(payload.to_string())
-            .send()
-            .map_err(|source| UploadError::Network {
-                operation: "records_lookup",
-                source,
-            })?;
-        read_json_response(response, "records_lookup")
+            .map_err(|source| UploadError::Network { operation, source })?;
+        parse_response(response, operation)
     }
 
     fn download_resource(
-        &mut self,
+        &self,
         session: &CloudKitDeleteSession,
         download_url: &Url,
         expected_size_bytes: u64,
@@ -1612,6 +1581,124 @@ impl CloudKitDeleteTransport for ReqwestCloudKitDeleteTransport {
             sha256: format!("{:x}", hasher.finalize()),
             size_bytes,
         })
+    }
+}
+
+pub struct ReqwestCloudKitDeleteTransport {
+    transport: ReqwestCloudKitTransport,
+}
+
+impl ReqwestCloudKitDeleteTransport {
+    pub fn new() -> Result<Self, UploadError> {
+        Ok(Self {
+            transport: ReqwestCloudKitTransport::new()?,
+        })
+    }
+}
+
+impl CloudKitDeleteTransport for ReqwestCloudKitDeleteTransport {
+    fn post_records_modify(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        let url = cloudkit_records_modify_url(session, payload_database_scope(&payload, session))?;
+        self.transport.post_records_json(
+            session,
+            url,
+            payload,
+            "records_modify",
+            read_json_response,
+        )
+    }
+
+    fn post_records_lookup(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        let url = cloudkit_records_lookup_url(session, payload_database_scope(&payload, session))?;
+        self.transport.post_records_json(
+            session,
+            url,
+            payload,
+            "records_lookup",
+            read_json_response,
+        )
+    }
+}
+
+impl CloudKitOriginalAssetReadTransport for ReqwestCloudKitDeleteTransport {
+    fn post_records_query(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        let url = cloudkit_records_query_url(session, payload_database_scope(&payload, session))?;
+        self.transport.post_records_json(
+            session,
+            url,
+            payload,
+            "records_query",
+            read_cloudkit_json_response,
+        )
+    }
+
+    fn download_resource(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        download_url: &Url,
+        expected_size_bytes: u64,
+    ) -> Result<CloudKitResourceDownload, UploadError> {
+        self.transport
+            .download_resource(session, download_url, expected_size_bytes)
+    }
+}
+
+/// CloudKit transport restricted to original-asset queries and resource downloads.
+///
+/// ```compile_fail
+/// use icloudpd_optimizer::upload::{CloudKitDeleteTransport, ReqwestCloudKitReadTransport};
+///
+/// fn requires_delete<T: CloudKitDeleteTransport>(_transport: T) {}
+/// requires_delete(ReqwestCloudKitReadTransport::new().unwrap());
+/// ```
+pub struct ReqwestCloudKitReadTransport {
+    transport: ReqwestCloudKitTransport,
+}
+
+impl ReqwestCloudKitReadTransport {
+    pub fn new() -> Result<Self, UploadError> {
+        Ok(Self {
+            transport: ReqwestCloudKitTransport::new()?,
+        })
+    }
+}
+
+impl CloudKitOriginalAssetReadTransport for ReqwestCloudKitReadTransport {
+    fn post_records_query(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        let url = cloudkit_records_query_url(session, payload_database_scope(&payload, session))?;
+        self.transport.post_records_json(
+            session,
+            url,
+            payload,
+            "records_query",
+            read_cloudkit_json_response,
+        )
+    }
+
+    fn download_resource(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        download_url: &Url,
+        expected_size_bytes: u64,
+    ) -> Result<CloudKitResourceDownload, UploadError> {
+        self.transport
+            .download_resource(session, download_url, expected_size_bytes)
     }
 }
 
@@ -3556,7 +3643,12 @@ fn validate_signed_upload_url(url: &Url) -> Result<(), UploadError> {
 }
 
 fn validate_cloudkit_resource_download_url(url: &Url) -> Result<(), UploadError> {
-    if url.scheme() != "https" {
+    #[cfg(test)]
+    let loopback_test_url =
+        url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && url.port().is_some();
+    #[cfg(not(test))]
+    let loopback_test_url = false;
+    if url.scheme() != "https" && !loopback_test_url {
         return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
             "resource downloadURL must use https",
         ));
@@ -3576,7 +3668,7 @@ fn validate_cloudkit_resource_download_url(url: &Url) -> Result<(), UploadError>
         .ok_or(UploadError::InvalidCloudKitOriginalAssetResponse(
             "resource downloadURL host is required",
         ))?;
-    if !is_allowed_icloud_host(host) {
+    if !loopback_test_url && !is_allowed_icloud_host(host) {
         return Err(UploadError::InvalidCloudKitOriginalAssetResponse(
             "resource downloadURL host is not an Apple iCloud host",
         ));

@@ -7168,29 +7168,12 @@ mod tests {
             }
         }
 
-        fn post_records_query(
-            &mut self,
-            _session: &CloudKitDeleteSession,
-            _payload: Value,
-        ) -> Result<Value, UploadError> {
-            unreachable!("delete batch tests should not query records")
-        }
-
         fn post_records_lookup(
             &mut self,
             _session: &CloudKitDeleteSession,
             _payload: Value,
         ) -> Result<Value, UploadError> {
             unreachable!("delete batch tests should not lookup records")
-        }
-
-        fn download_resource(
-            &mut self,
-            _session: &CloudKitDeleteSession,
-            _download_url: &url::Url,
-            _expected_size_bytes: u64,
-        ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
-            unreachable!("delete batch tests should not download resources")
         }
     }
 
@@ -7212,29 +7195,12 @@ mod tests {
             Ok(self.response.clone())
         }
 
-        fn post_records_query(
-            &mut self,
-            _session: &CloudKitDeleteSession,
-            _payload: Value,
-        ) -> Result<Value, UploadError> {
-            unreachable!("delete batch tests should not query records")
-        }
-
         fn post_records_lookup(
             &mut self,
             _session: &CloudKitDeleteSession,
             _payload: Value,
         ) -> Result<Value, UploadError> {
             unreachable!("delete batch tests should not lookup records")
-        }
-
-        fn download_resource(
-            &mut self,
-            _session: &CloudKitDeleteSession,
-            _download_url: &url::Url,
-            _expected_size_bytes: u64,
-        ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
-            unreachable!("delete batch tests should not download resources")
         }
     }
 
@@ -7256,14 +7222,6 @@ mod tests {
             ))
         }
 
-        fn post_records_query(
-            &mut self,
-            _session: &CloudKitDeleteSession,
-            _payload: Value,
-        ) -> Result<Value, UploadError> {
-            unreachable!("delete batch tests should not query records")
-        }
-
         fn post_records_lookup(
             &mut self,
             _session: &CloudKitDeleteSession,
@@ -7271,15 +7229,6 @@ mod tests {
         ) -> Result<Value, UploadError> {
             self.lookup_payloads.push(payload);
             Ok(self.lookup_response.clone())
-        }
-
-        fn download_resource(
-            &mut self,
-            _session: &CloudKitDeleteSession,
-            _download_url: &url::Url,
-            _expected_size_bytes: u64,
-        ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
-            unreachable!("delete batch tests should not download resources")
         }
     }
 
@@ -7300,14 +7249,6 @@ mod tests {
             Ok(self.modify_response.clone())
         }
 
-        fn post_records_query(
-            &mut self,
-            _session: &CloudKitDeleteSession,
-            _payload: Value,
-        ) -> Result<Value, UploadError> {
-            unreachable!("delete integration tests should not query records")
-        }
-
         fn post_records_lookup(
             &mut self,
             _session: &CloudKitDeleteSession,
@@ -7315,15 +7256,6 @@ mod tests {
         ) -> Result<Value, UploadError> {
             self.lookup_payloads.push(payload);
             Ok(self.lookup_response.clone())
-        }
-
-        fn download_resource(
-            &mut self,
-            _session: &CloudKitDeleteSession,
-            _download_url: &url::Url,
-            _expected_size_bytes: u64,
-        ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
-            unreachable!("delete integration tests should not download resources")
         }
     }
 
@@ -7352,29 +7284,12 @@ mod tests {
             Ok(self.response.clone())
         }
 
-        fn post_records_query(
-            &mut self,
-            _session: &CloudKitDeleteSession,
-            _payload: Value,
-        ) -> Result<Value, UploadError> {
-            unreachable!("delete batch tests should not query records")
-        }
-
         fn post_records_lookup(
             &mut self,
             _session: &CloudKitDeleteSession,
             _payload: Value,
         ) -> Result<Value, UploadError> {
             unreachable!("successful modify should not require lookup")
-        }
-
-        fn download_resource(
-            &mut self,
-            _session: &CloudKitDeleteSession,
-            _download_url: &url::Url,
-            _expected_size_bytes: u64,
-        ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
-            unreachable!("delete batch tests should not download resources")
         }
     }
 

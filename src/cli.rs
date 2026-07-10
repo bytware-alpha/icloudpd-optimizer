@@ -43,9 +43,10 @@ use crate::upload::{
     CloudKitDatabaseScope, CloudKitDeleteClient, CloudKitDeleteRequest, CloudKitLibraryDestination,
     CloudKitLocalReplacementCandidate, CloudKitOriginalAssetBatchResolveOutcome,
     CloudKitOriginalAssetBatchResolveRequest, CloudKitOriginalAssetInventoryFingerprint,
-    CloudKitOriginalAssetResolution, CloudKitOriginalAssetResolveDisposition,
-    CloudKitOriginalAssetResolveRequest, CloudKitOriginalAssetResolveTarget, IcloudUploadRequest,
-    ReqwestCloudKitDeleteTransport, UploadError, build_upload_proof, load_cloudkit_delete_session,
+    CloudKitOriginalAssetReadTransport, CloudKitOriginalAssetResolution,
+    CloudKitOriginalAssetResolveDisposition, CloudKitOriginalAssetResolveRequest,
+    CloudKitOriginalAssetResolveTarget, IcloudUploadRequest, ReqwestCloudKitDeleteTransport,
+    ReqwestCloudKitReadTransport, UploadError, build_upload_proof, load_cloudkit_delete_session,
     load_upload_session, run_icloud_upload, validate_library_destination, verify_local_heic,
 };
 use crate::workflow::{
@@ -1266,7 +1267,7 @@ struct OriginalAssetsAuditDestinationReport {
     batch_error: Option<OriginalAssetsAuditBatchError>,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum OriginalAssetsAuditBatchError {
     Authentication,
@@ -1359,27 +1360,83 @@ fn original_assets_audit_destination_report(
     config: &MonitorConfig,
 ) -> OriginalAssetsAuditDestinationReport {
     let started = Instant::now();
+    let result = ReqwestCloudKitReadTransport::new().and_then(|transport| {
+        resolve_original_assets_audit_destination(
+            session,
+            &destination,
+            &targets,
+            config,
+            transport,
+        )
+    });
+    original_assets_audit_destination_report_from_result(
+        destination,
+        targets.len(),
+        started,
+        result,
+    )
+}
+
+#[cfg(test)]
+fn original_assets_audit_destination_report_with_transport<
+    T: CloudKitOriginalAssetReadTransport,
+>(
+    session: &crate::upload::CloudKitDeleteSession,
+    destination: CloudKitLibraryDestination,
+    targets: Vec<CloudKitOriginalAssetResolveTarget>,
+    config: &MonitorConfig,
+    transport: T,
+) -> OriginalAssetsAuditDestinationReport {
+    let started = Instant::now();
+    let result = resolve_original_assets_audit_destination(
+        session,
+        &destination,
+        &targets,
+        config,
+        transport,
+    );
+    original_assets_audit_destination_report_from_result(
+        destination,
+        targets.len(),
+        started,
+        result,
+    )
+}
+
+fn resolve_original_assets_audit_destination<T: CloudKitOriginalAssetReadTransport>(
+    session: &crate::upload::CloudKitDeleteSession,
+    destination: &CloudKitLibraryDestination,
+    targets: &[CloudKitOriginalAssetResolveTarget],
+    config: &MonitorConfig,
+    transport: T,
+) -> Result<CloudKitOriginalAssetBatchResolveOutcome, UploadError> {
     let mut destination_session = session.clone();
     destination_session.database_scope = destination.database_scope;
     destination_session.zone = destination.clone();
-    let result = ReqwestCloudKitDeleteTransport::new().and_then(|transport| {
-        let mut client = CloudKitDeleteClient::new(transport);
-        client.resolve_original_assets_batch_outcome(
-            &destination_session,
-            &CloudKitOriginalAssetBatchResolveRequest {
-                targets: targets.clone(),
-                start_rank: config.cloudkit_start_rank,
-                page_size: config.cloudkit_page_size,
-                max_pages: config.cloudkit_max_pages,
-            },
-        )
-    });
+    let mut client = CloudKitDeleteClient::new(transport);
+    client.resolve_original_assets_batch_outcome(
+        &destination_session,
+        &CloudKitOriginalAssetBatchResolveRequest {
+            targets: targets.to_vec(),
+            start_rank: config.cloudkit_start_rank,
+            page_size: config.cloudkit_page_size,
+            max_pages: config.cloudkit_max_pages,
+        },
+    )
+}
+
+fn original_assets_audit_destination_report_from_result(
+    destination: CloudKitLibraryDestination,
+    targets: usize,
+    started: Instant,
+    result: Result<CloudKitOriginalAssetBatchResolveOutcome, UploadError>,
+) -> OriginalAssetsAuditDestinationReport {
     match result {
         Ok(outcome) => {
             let inventory = outcome.inventory.clone();
             OriginalAssetsAuditDestinationReport {
                 destination,
-                targets: targets.len(),
+                targets,
                 elapsed_millis: started.elapsed().as_millis(),
                 inventory,
                 resolutions: redact_audit_resolutions(outcome),
@@ -1388,7 +1445,7 @@ fn original_assets_audit_destination_report(
         }
         Err(error) => OriginalAssetsAuditDestinationReport {
             destination,
-            targets: targets.len(),
+            targets,
             elapsed_millis: started.elapsed().as_millis(),
             inventory: None,
             resolutions: BTreeMap::new(),
@@ -2857,6 +2914,9 @@ struct ToolReport {
 #[cfg(test)]
 mod original_assets_audit_tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     fn audit_record(asset_id: &str, raw_path: PathBuf, root: &Path) -> AssetRecord {
         let raw = fs::read(&raw_path).expect("raw should be readable");
@@ -2887,6 +2947,77 @@ mod original_assets_audit_tests {
             .expect("source age proof should serialize"),
         );
         record
+    }
+
+    #[derive(Clone, Copy)]
+    enum AuditReadFailure {
+        Authentication,
+        MalformedResponse,
+    }
+
+    struct FailingAuditReadTransport {
+        failure: AuditReadFailure,
+    }
+
+    impl CloudKitOriginalAssetReadTransport for FailingAuditReadTransport {
+        fn post_records_query(
+            &mut self,
+            _session: &crate::upload::CloudKitDeleteSession,
+            _payload: serde_json::Value,
+        ) -> Result<serde_json::Value, UploadError> {
+            match self.failure {
+                AuditReadFailure::Authentication => Err(UploadError::InvalidSession(
+                    "expired audit session".to_string(),
+                )),
+                AuditReadFailure::MalformedResponse => {
+                    Err(UploadError::MalformedCloudKitResponse {
+                        operation: "records_query",
+                    })
+                }
+            }
+        }
+
+        fn download_resource(
+            &mut self,
+            _session: &crate::upload::CloudKitDeleteSession,
+            _download_url: &url::Url,
+            _expected_size_bytes: u64,
+        ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
+            unreachable!("query failures must remain batch-level")
+        }
+    }
+
+    fn audit_test_session() -> crate::upload::CloudKitDeleteSession {
+        crate::upload::CloudKitDeleteSession::from_json(
+            &serde_json::json!({
+                "dsid": "123456789",
+                "ckdatabasews_url": "https://p140-ckdatabasews.icloud.com:443",
+                "cloudkit_query_params": [
+                    {"name": "clientBuildNumber", "value": "2522Project44"},
+                    {"name": "clientMasteringNumber", "value": "2522B2"},
+                    {"name": "clientId", "value": "4f0b58d4-ff9d-4dc5-8f0b-9c4efc4fdb27"},
+                    {"name": "dsid", "value": "123456789"},
+                    {"name": "remapEnums", "value": "True"},
+                    {"name": "getCurrentSyncToken", "value": "True"}
+                ],
+                "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "test-cookie"}]
+            })
+            .to_string(),
+        )
+        .expect("session should load")
+    }
+
+    fn audit_test_target() -> CloudKitOriginalAssetResolveTarget {
+        let raw = b"audit-raw";
+        CloudKitOriginalAssetResolveTarget {
+            asset_id: "local-audit-asset".to_string(),
+            raw_size_bytes: raw.len() as u64,
+            source_captured_unix_seconds: 1_800_000_000,
+            capture_tolerance_seconds: 2,
+            filename: "IMG_0001.DNG".to_string(),
+            matched_raw_sha256: format!("{:x}", Sha256::digest(raw)),
+            replacement_candidate: None,
+        }
     }
 
     #[test]
@@ -3108,5 +3239,159 @@ mod original_assets_audit_tests {
             }),
             OriginalAssetsAuditBatchError::MalformedResponse
         ));
+    }
+
+    #[test]
+    fn audit_read_transport_only_queries_and_downloads_nonzero_targets() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        let raw = b"audit-raw".to_vec();
+        let resource_url = format!("http://{address}/resource");
+        let query_response = serde_json::json!({
+            "records": [
+                {
+                    "recordName": "remote-raw-asset",
+                    "recordType": "CPLAsset",
+                    "recordChangeTag": "raw-change-tag",
+                    "fields": {
+                        "masterRef": {"value": {"recordName": "remote-raw-master"}},
+                        "assetDate": {"value": 1_800_000_000_000_i64}
+                    }
+                },
+                {
+                    "recordName": "remote-raw-master",
+                    "recordType": "CPLMaster",
+                    "fields": {
+                        "resOriginalRes": {
+                            "value": {
+                                "size": raw.len(),
+                                "downloadURL": resource_url
+                            }
+                        },
+                        "resOriginalFileType": {"value": "com.adobe.raw-image"},
+                        "resOriginalFingerprint": {"value": "raw-fingerprint"}
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let server_raw = raw.clone();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (index, response_body) in [query_response.into_bytes(), server_raw]
+                .into_iter()
+                .enumerate()
+            {
+                let (mut stream, _) = listener.accept().expect("request should connect");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .expect("request should be readable");
+                    assert!(read > 0, "request should include headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .expect("request should include a header terminator")
+                    + 4;
+                let header_text = String::from_utf8(request[..header_end].to_vec())
+                    .expect("request headers should be UTF-8");
+                let content_length = header_text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let read = stream
+                        .read(&mut buffer)
+                        .expect("request body should be readable");
+                    assert!(read > 0, "request body should not end early");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                requests.push(
+                    header_text
+                        .lines()
+                        .next()
+                        .expect("request should include a request line")
+                        .to_string(),
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    response_body.len()
+                )
+                .expect("response headers should write");
+                stream
+                    .write_all(&response_body)
+                    .expect("response body should write");
+                assert!(
+                    index < 2,
+                    "server should only receive expected read requests"
+                );
+            }
+            requests
+        });
+
+        let mut session = audit_test_session();
+        session.ckdatabasews_url =
+            url::Url::parse(&format!("http://{address}")).expect("loopback URL should parse");
+        let config = MonitorConfig::new("/audit/download", "/audit/manifest.json", "/audit/heic");
+        let target = audit_test_target();
+        let report = original_assets_audit_destination_report_with_transport(
+            &session,
+            CloudKitLibraryDestination::primary_sync(),
+            vec![target],
+            &config,
+            ReqwestCloudKitReadTransport::new().expect("read transport should build"),
+        );
+
+        assert_eq!(report.targets, 1);
+        assert!(report.batch_error.is_none(), "{:#?}", report.batch_error);
+        assert_eq!(report.resolutions.len(), 1);
+        let requests = server.join().expect("recording server should complete");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with(
+            "POST /database/1/com.apple.photos.cloud/production/private/records/query?"
+        ));
+        assert_eq!(requests[1], "GET /resource HTTP/1.1");
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("records/modify") && !request.contains("upload"))
+        );
+    }
+
+    #[test]
+    fn audit_authentication_and_malformed_read_failures_are_batch_level() {
+        let config = MonitorConfig::new("/audit/download", "/audit/manifest.json", "/audit/heic");
+        for (failure, expected) in [
+            (
+                AuditReadFailure::Authentication,
+                OriginalAssetsAuditBatchError::Authentication,
+            ),
+            (
+                AuditReadFailure::MalformedResponse,
+                OriginalAssetsAuditBatchError::MalformedResponse,
+            ),
+        ] {
+            let report = original_assets_audit_destination_report_with_transport(
+                &audit_test_session(),
+                CloudKitLibraryDestination::primary_sync(),
+                vec![audit_test_target()],
+                &config,
+                FailingAuditReadTransport { failure },
+            );
+
+            assert!(report.resolutions.is_empty());
+            assert_eq!(report.batch_error, Some(expected));
+        }
     }
 }
