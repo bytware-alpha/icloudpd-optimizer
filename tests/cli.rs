@@ -2254,6 +2254,19 @@ fn monitor_original_assets_audit_is_read_only_and_redacts_local_paths() {
     );
 }
 
+#[test]
+fn monitor_original_assets_reconcile_requires_explicit_reconciliation_gates() {
+    binary()
+        .args(["monitor", "original-assets-reconcile", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--expected-selected-target-count"))
+        .stdout(predicate::str::contains(
+            "--expected-incomplete-transient-count",
+        ))
+        .stdout(predicate::str::contains("--apply"));
+}
+
 #[cfg(unix)]
 #[test]
 fn monitor_run_once_marks_failed_conversion_and_keeps_successful_peer() {

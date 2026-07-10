@@ -956,7 +956,10 @@ pub fn acquire_monitor_run_guard(config: &MonitorConfig) -> Result<MonitorRunGua
 }
 
 impl MonitorRunGuard {
-    fn state_store(&mut self, manifest_path: &Path) -> Result<&AssetStateStore, MonitorError> {
+    pub(crate) fn state_store(
+        &mut self,
+        manifest_path: &Path,
+    ) -> Result<&AssetStateStore, MonitorError> {
         self.lock.revalidate().map_err(monitor_lock_error)?;
         match self.state_store.as_ref() {
             Some(store) => store.renew_writer_lease()?,
