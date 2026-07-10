@@ -1692,7 +1692,7 @@ fn monitor_original_assets_reconcile_with_transport<
                 original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::State)
             })?
             .clone(),
-        None => AssetStateStore::open_read_only(&config.manifest_path).map_err(|_| {
+        None => AssetStateStore::open_immutable_read_only(&config.manifest_path).map_err(|_| {
             original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::State)
         })?,
     };
@@ -1758,6 +1758,13 @@ fn monitor_original_assets_reconcile_with_transport<
         transport,
     )
     .map_err(original_assets_reconcile_cloudkit_failure)?;
+    if !args.apply {
+        state_store
+            .revalidate_immutable_read_snapshot()
+            .map_err(|_| {
+                original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::State)
+            })?;
+    }
     let (verified, applied, changed_count, commit_elapsed_millis) = if args.apply {
         let (verified, changed_records) = apply_verified_original_assets_reconcile(
             &mut manifest,
@@ -1772,6 +1779,7 @@ fn monitor_original_assets_reconcile_with_transport<
             original_assets_reconcile_failure(OriginalAssetsReconcileFailureStage::Domain)
         })?;
         let changed_count = changed_records.len() as u64;
+        validate_original_assets_reconcile_update_set(&expected_records, &changed_records)?;
         let elapsed = state_store
             .persist_records_exact_cas_atomic(
                 changed_records
@@ -2004,6 +2012,26 @@ fn validate_original_assets_reconcile_target_set_gate(
     if expectations.target_set_sha256 != target_set_sha256 {
         return Err(original_assets_reconcile_gate(
             "selected target set did not match the expected fingerprint",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_original_assets_reconcile_update_set(
+    expected_records: &BTreeMap<String, AssetRecord>,
+    changed_records: &[AssetRecord],
+) -> Result<(), CliError> {
+    let changed_ids = changed_records
+        .iter()
+        .map(|record| record.asset_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_ids = expected_records
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if changed_ids != expected_ids || changed_records.len() != expected_records.len() {
+        return Err(original_assets_reconcile_gate(
+            "reconciliation updates did not match the complete pre-scan target set",
         ));
     }
     Ok(())
@@ -4934,6 +4962,28 @@ mod original_assets_audit_tests {
             error,
             CliError::OriginalAssetsReconcileGate { .. }
         ));
+    }
+
+    #[test]
+    fn original_assets_reconcile_requires_one_update_for_every_pre_scan_target() {
+        let first = reconcile_test_record(&reconcile_test_target("asset-a"));
+        let second = reconcile_test_record(&reconcile_test_target("asset-b"));
+        let expected = BTreeMap::from([
+            (first.asset_id.clone(), first.clone()),
+            (second.asset_id.clone(), second.clone()),
+        ]);
+
+        assert!(
+            validate_original_assets_reconcile_update_set(&expected, std::slice::from_ref(&first),)
+                .is_err()
+        );
+        assert!(
+            validate_original_assets_reconcile_update_set(
+                &BTreeMap::from([(first.asset_id.clone(), first.clone())]),
+                &[first.clone(), first],
+            )
+            .is_err()
+        );
     }
 
     fn reconcile_test_query_response(endpoint: &url::Url, raw: &[u8]) -> Vec<u8> {

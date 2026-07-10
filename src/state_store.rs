@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(unix)]
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -15,7 +15,6 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Statement, Transaction, TransactionBehavior, params,
 };
 use serde::Serialize;
-#[cfg(unix)]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 #[cfg(unix)]
@@ -70,7 +69,29 @@ fn run_migration_precommit_hook() {}
 pub struct AssetStateStore {
     manifest_path: PathBuf,
     db_path: PathBuf,
+    read_mode: StateStoreReadMode,
     writer: Option<Arc<WriterLeaseToken>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StateStoreReadMode {
+    Normal,
+    Immutable(Arc<ImmutableReadWitness>),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ImmutableReadWitness {
+    size_bytes: u64,
+    modified_unix_nanos: Option<u128>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    sha256: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -186,12 +207,43 @@ impl AssetStateStore {
         let store = Self {
             manifest_path,
             db_path,
+            read_mode: StateStoreReadMode::Normal,
             writer: None,
         };
         let connection = store.connect_read_only()?;
         store.verify_read_only_schema(&connection)?;
         store.verify_integrity(&connection)?;
         Ok(store)
+    }
+
+    pub fn open_immutable_read_only(
+        manifest_path: impl AsRef<Path>,
+    ) -> Result<Self, AssetStateStoreError> {
+        let manifest_path = manifest_path.as_ref().to_path_buf();
+        let db_path = Self::db_path_for_manifest(&manifest_path);
+        let witness = capture_immutable_read_witness(&db_path)?;
+        let store = Self {
+            manifest_path,
+            db_path,
+            read_mode: StateStoreReadMode::Immutable(Arc::new(witness)),
+            writer: None,
+        };
+        let connection = store.connect_immutable_read_only()?;
+        store.verify_read_only_schema(&connection)?;
+        store.verify_integrity(&connection)?;
+        store.revalidate_immutable_read_snapshot()?;
+        Ok(store)
+    }
+
+    pub fn revalidate_immutable_read_snapshot(&self) -> Result<(), AssetStateStoreError> {
+        let StateStoreReadMode::Immutable(expected) = &self.read_mode else {
+            return Err(AssetStateStoreError::ImmutableReadWitnessRequired);
+        };
+        let actual = capture_immutable_read_witness(&self.db_path)?;
+        if actual != **expected {
+            return Err(AssetStateStoreError::ImmutableReadSnapshotChanged);
+        }
+        Ok(())
     }
 
     pub fn open_writer(
@@ -215,6 +267,7 @@ impl AssetStateStore {
         let mut store = Self {
             manifest_path,
             db_path,
+            read_mode: StateStoreReadMode::Normal,
             writer: None,
         };
         let mut connection = store.connect_writer()?;
@@ -267,6 +320,7 @@ impl AssetStateStore {
             let store = Self {
                 manifest_path,
                 db_path: verified_database.canonical_path.clone(),
+                read_mode: StateStoreReadMode::Normal,
                 writer: None,
             };
             let mut connection = store.connect_existing_writer()?;
@@ -454,15 +508,19 @@ impl AssetStateStore {
     }
 
     fn connect_read_only(&self) -> Result<Connection, AssetStateStoreError> {
-        let wal_path = sqlite_wal_path(&self.db_path);
-        let wal_len = match fs::metadata(&wal_path) {
-            Ok(metadata) => metadata.len(),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => 0,
-            Err(source) => return Err(AssetStateStoreError::ReadOnlyWalMetadata { source }),
-        };
-        if wal_len > 0 {
-            return Err(AssetStateStoreError::ReadOnlyWalPending);
-        }
+        let connection =
+            Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
+                |source| AssetStateStoreError::OpenDatabase {
+                    path: self.db_path.clone(),
+                    source,
+                },
+            )?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        Ok(connection)
+    }
+
+    fn connect_immutable_read_only(&self) -> Result<Connection, AssetStateStoreError> {
+        self.revalidate_immutable_read_snapshot()?;
         let mut uri = url::Url::from_file_path(&self.db_path)
             .map_err(|_| AssetStateStoreError::ReadOnlyUri)?;
         uri.set_query(Some("immutable=1"));
@@ -743,13 +801,26 @@ impl AssetStateStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.validate_writer_lease(&transaction, token)?;
         {
-            let mut statement =
-                transaction.prepare("SELECT record_json FROM assets WHERE asset_id = ?1")?;
+            let mut statement = transaction
+                .prepare("SELECT state, updated_at, record_json FROM assets WHERE asset_id = ?1")?;
             for (expected, _, expected_json, _) in &prepared {
                 let persisted = statement
-                    .query_row([expected.asset_id.as_str()], |row| row.get::<_, String>(0))
+                    .query_row([expected.asset_id.as_str()], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
                     .optional()?;
-                if persisted.as_deref() != Some(expected_json.as_str()) {
+                if persisted
+                    .as_ref()
+                    .is_none_or(|(state, updated_at, record_json)| {
+                        state != expected.state.as_str()
+                            || updated_at != &expected.updated_at
+                            || record_json != expected_json
+                    })
+                {
                     return Err(AssetStateStoreError::ExactCasMismatch {
                         asset_id: expected.asset_id.clone(),
                     });
@@ -860,12 +931,21 @@ impl AssetStateStore {
             self.writer_token()?;
             self.connect_writer()?
         } else {
-            self.connect_read_only()?
+            match &self.read_mode {
+                StateStoreReadMode::Normal => self.connect_read_only()?,
+                StateStoreReadMode::Immutable(_) => self.connect_immutable_read_only()?,
+            }
         };
         let mut statement = connection.prepare(
             "SELECT asset_id, state, updated_at, record_json FROM assets ORDER BY asset_id",
         )?;
-        load_database_manifest_from_statement(&mut statement)
+        let manifest = load_database_manifest_from_statement(&mut statement)?;
+        drop(statement);
+        drop(connection);
+        if matches!(self.read_mode, StateStoreReadMode::Immutable(_)) {
+            self.revalidate_immutable_read_snapshot()?;
+        }
+        Ok(manifest)
     }
 }
 
@@ -1603,6 +1683,85 @@ fn sqlite_wal_path(database_path: &Path) -> PathBuf {
     PathBuf::from(wal_path)
 }
 
+fn capture_immutable_read_witness(
+    database_path: &Path,
+) -> Result<ImmutableReadWitness, AssetStateStoreError> {
+    if immutable_wal_len(database_path)? > 0 {
+        return Err(AssetStateStoreError::ReadOnlyWalPending);
+    }
+
+    let mut file = fs::File::open(database_path)
+        .map_err(|source| AssetStateStoreError::ImmutableReadDatabaseIo { source })?;
+    let before = file
+        .metadata()
+        .map_err(|source| AssetStateStoreError::ImmutableReadDatabaseIo { source })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let bytes_read = file
+            .read(&mut buffer)
+            .map_err(|source| AssetStateStoreError::ImmutableReadDatabaseIo { source })?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    let after = file
+        .metadata()
+        .map_err(|source| AssetStateStoreError::ImmutableReadDatabaseIo { source })?;
+    let path_metadata = fs::metadata(database_path)
+        .map_err(|source| AssetStateStoreError::ImmutableReadDatabaseIo { source })?;
+    if !immutable_database_metadata_matches(&before, &after)
+        || !immutable_database_metadata_matches(&after, &path_metadata)
+        || immutable_wal_len(database_path)? > 0
+    {
+        return Err(AssetStateStoreError::ImmutableReadSnapshotChanged);
+    }
+
+    Ok(ImmutableReadWitness {
+        size_bytes: after.len(),
+        modified_unix_nanos: after
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos()),
+        #[cfg(unix)]
+        device: after.dev(),
+        #[cfg(unix)]
+        inode: after.ino(),
+        #[cfg(unix)]
+        changed_seconds: after.ctime(),
+        #[cfg(unix)]
+        changed_nanoseconds: after.ctime_nsec(),
+        sha256: format!("{:x}", hasher.finalize()),
+    })
+}
+
+fn immutable_wal_len(database_path: &Path) -> Result<u64, AssetStateStoreError> {
+    match fs::metadata(sqlite_wal_path(database_path)) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(source) => Err(AssetStateStoreError::ReadOnlyWalMetadata { source }),
+    }
+}
+
+fn immutable_database_metadata_matches(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    if left.len() != right.len() || left.modified().ok() != right.modified().ok() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        left.dev() == right.dev()
+            && left.ino() == right.ino()
+            && left.ctime() == right.ctime()
+            && left.ctime_nsec() == right.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn load_database_manifest_from_statement(
     statement: &mut Statement<'_>,
 ) -> Result<Manifest, AssetStateStoreError> {
@@ -1817,6 +1976,12 @@ pub enum AssetStateStoreError {
     ReadOnlyWalMetadata { source: io::Error },
     #[error("state database path cannot be represented as an immutable SQLite URI")]
     ReadOnlyUri,
+    #[error("immutable state database read requires an immutable snapshot witness")]
+    ImmutableReadWitnessRequired,
+    #[error("immutable state database snapshot changed during the read")]
+    ImmutableReadSnapshotChanged,
+    #[error("failed to read immutable state database snapshot: {source}")]
+    ImmutableReadDatabaseIo { source: io::Error },
     #[error("state database integrity check failed: {result}")]
     IntegrityCheck { result: String },
     #[error("state database columns do not match the stored record for {asset_id}")]
@@ -2321,6 +2486,123 @@ mod tests {
         assert!(matches!(
             error,
             AssetStateStoreError::ExactCasMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn normal_read_only_observes_wal_while_immutable_read_fails_closed() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let writer =
+            AssetStateStore::open_writer(&manifest_path, "wal-writer", Duration::from_secs(30))
+                .expect("state store should open");
+        writer
+            .load_or_import()
+            .expect("empty manifest should import");
+
+        let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
+        let connection = Connection::open(&db_path).expect("WAL connection should open");
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("automatic checkpointing should disable");
+        let record = AssetRecord::new("wal-asset", "/nas/wal-asset.dng");
+        let record_json = encode_record(&record).expect("record should encode");
+        connection
+            .execute(
+                "INSERT INTO assets (asset_id, state, updated_at, record_json) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &record.asset_id,
+                    record.state.as_str(),
+                    &record.updated_at,
+                    record_json,
+                ],
+            )
+            .expect("WAL record should commit");
+        assert!(
+            fs::metadata(sqlite_wal_path(&db_path))
+                .expect("WAL should exist")
+                .len()
+                > 0
+        );
+
+        let read_only = AssetStateStore::open_read_only(&manifest_path)
+            .expect("normal read-only access should follow the WAL");
+        assert!(read_only.load().unwrap().get("wal-asset").is_ok());
+        assert!(matches!(
+            AssetStateStore::open_immutable_read_only(&manifest_path),
+            Err(AssetStateStoreError::ReadOnlyWalPending)
+        ));
+    }
+
+    #[test]
+    fn exact_cas_rejects_indexed_columns_that_diverge_from_record_json() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&manifest_path, "cas-writer", Duration::from_secs(30))
+                .expect("state store should open");
+        store
+            .load_or_import()
+            .expect("empty manifest should import");
+        let expected = AssetRecord::new("asset", "/nas/original.dng");
+        store
+            .persist_record(&expected)
+            .expect("initial record should persist");
+        let mut updated = expected.clone();
+        updated.updated_at = "999.000000000Z".to_string();
+
+        let connection = Connection::open(AssetStateStore::db_path_for_manifest(&manifest_path))
+            .expect("out-of-band connection should open");
+        connection
+            .execute(
+                "UPDATE assets SET state = 'failed' WHERE asset_id = ?1",
+                [&expected.asset_id],
+            )
+            .expect("indexed state should diverge");
+
+        assert!(matches!(
+            store.persist_records_exact_cas_atomic([AssetRecordExactCasUpdate {
+                expected: &expected,
+                updated: &updated,
+            }]),
+            Err(AssetStateStoreError::ExactCasMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn immutable_snapshot_witness_detects_a_writer_after_open() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let writer =
+            AssetStateStore::open_writer(&manifest_path, "snapshot-setup", Duration::from_secs(30))
+                .expect("state store should open");
+        writer
+            .load_or_import()
+            .expect("empty manifest should import");
+        drop(writer);
+
+        let immutable = AssetStateStore::open_immutable_read_only(&manifest_path)
+            .expect("quiescent database should open immutably");
+        let record = AssetRecord::new("late-writer", "/nas/late-writer.dng");
+        let record_json = encode_record(&record).expect("record should encode");
+        let connection = Connection::open(AssetStateStore::db_path_for_manifest(&manifest_path))
+            .expect("late writer should open");
+        connection
+            .execute(
+                "INSERT INTO assets (asset_id, state, updated_at, record_json) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &record.asset_id,
+                    record.state.as_str(),
+                    &record.updated_at,
+                    record_json,
+                ],
+            )
+            .expect("late writer should commit");
+
+        assert!(matches!(
+            immutable.revalidate_immutable_read_snapshot(),
+            Err(AssetStateStoreError::ReadOnlyWalPending)
+                | Err(AssetStateStoreError::ImmutableReadSnapshotChanged)
         ));
     }
 }
