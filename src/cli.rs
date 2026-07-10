@@ -1584,7 +1584,8 @@ fn original_assets_audit_batch_error(error: &UploadError) -> OriginalAssetsAudit
         UploadError::InvalidSession(_) | UploadError::DecodeSession { .. } => {
             OriginalAssetsAuditBatchError::Authentication
         }
-        UploadError::InvalidCloudKitOriginalAssetResponse(_) => {
+        UploadError::MalformedCloudKitResponse { .. }
+        | UploadError::InvalidCloudKitOriginalAssetResponse(_) => {
             OriginalAssetsAuditBatchError::MalformedResponse
         }
         UploadError::Network { .. }
@@ -3078,5 +3079,15 @@ mod original_assets_audit_tests {
         .expect_err("replaced path must not produce an exact local candidate");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn original_assets_audit_marks_malformed_cloudkit_response_as_malformed() {
+        assert!(matches!(
+            original_assets_audit_batch_error(&UploadError::MalformedCloudKitResponse {
+                operation: "records_query",
+            }),
+            OriginalAssetsAuditBatchError::MalformedResponse
+        ));
     }
 }

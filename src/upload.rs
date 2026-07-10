@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -6,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -1526,7 +1528,7 @@ impl CloudKitDeleteTransport for ReqwestCloudKitDeleteTransport {
                 operation: "records_query",
                 source,
             })?;
-        read_json_response(response, "records_query")
+        read_cloudkit_json_response(response, "records_query")
     }
 
     fn post_records_lookup(
@@ -3639,9 +3641,26 @@ fn cookie_header_for(cookies: &[UploadCookie]) -> Result<String, UploadError> {
 }
 
 fn read_json_response(
-    mut response: reqwest::blocking::Response,
+    response: reqwest::blocking::Response,
     operation: &'static str,
 ) -> Result<Value, UploadError> {
+    let body = read_json_response_body(response, operation)?;
+    serde_json::from_slice(&body)
+        .map_err(|source| UploadError::DecodeUploadResponse { operation, source })
+}
+
+fn read_cloudkit_json_response(
+    response: reqwest::blocking::Response,
+    operation: &'static str,
+) -> Result<Value, UploadError> {
+    let body = read_json_response_body(response, operation)?;
+    parse_cloudkit_json_response(&body, operation)
+}
+
+fn read_json_response_body(
+    mut response: reqwest::blocking::Response,
+    operation: &'static str,
+) -> Result<Vec<u8>, UploadError> {
     let status = response.status();
     if !status.is_success() {
         return Err(UploadError::UploadHttpStatus {
@@ -3657,8 +3676,108 @@ fn read_json_response(
     if body.len() as u64 > MAX_UPLOAD_RESPONSE_BYTES {
         return Err(UploadError::UploadResponseTooLarge { operation });
     }
-    serde_json::from_slice(&body)
-        .map_err(|source| UploadError::DecodeUploadResponse { operation, source })
+    Ok(body)
+}
+
+fn parse_cloudkit_json_response(
+    body: &[u8],
+    operation: &'static str,
+) -> Result<Value, UploadError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let StrictJsonValue(value) = StrictJsonValue::deserialize(&mut deserializer)
+        .map_err(|_| UploadError::MalformedCloudKitResponse { operation })?;
+    deserializer
+        .end()
+        .map_err(|_| UploadError::MalformedCloudKitResponse { operation })?;
+    Ok(value)
+}
+
+struct StrictJsonValue(Value);
+
+impl<'de> Deserialize<'de> for StrictJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictJsonValueVisitor)
+    }
+}
+
+struct StrictJsonValueVisitor;
+
+impl<'de> Visitor<'de> for StrictJsonValueVisitor {
+    type Value = StrictJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(|value| StrictJsonValue(Value::Number(value)))
+            .ok_or_else(|| E::custom("JSON number must be finite"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::String(value.to_string())))
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::String(value.to_string())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(StrictJsonValue(value)) = sequence.next_element()? {
+            values.push(value);
+        }
+        Ok(StrictJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(de::Error::custom("duplicate JSON object key"));
+            }
+            let StrictJsonValue(value) = map.next_value()?;
+            object.insert(key, value);
+        }
+        Ok(StrictJsonValue(Value::Object(object)))
+    }
 }
 
 fn finalize_hash_progress(
@@ -4663,6 +4782,8 @@ pub enum UploadError {
         operation: &'static str,
         source: serde_json::Error,
     },
+    #[error("CloudKit response during {operation} is malformed")]
+    MalformedCloudKitResponse { operation: &'static str },
     #[error("invalid iCloud Photos upload response: {0}")]
     InvalidPhotosUploadResponse(&'static str),
     #[error("invalid CloudKit delete request: {0}")]
@@ -4739,6 +4860,54 @@ pub enum UploadError {
 #[cfg(test)]
 mod batch_reconciliation_performance_tests {
     use super::*;
+
+    #[test]
+    fn cloudkit_records_query_response_rejects_duplicate_fingerprint_object_keys() {
+        let error = parse_cloudkit_json_response(
+            br#"{
+                "records": [{
+                    "recordName": "CPLMaster-1",
+                    "recordType": "CPLMaster",
+                    "fields": {
+                        "resOriginalFingerprint": {"value": "fingerprint-first"},
+                        "resOriginalFingerprint": {"value": "fingerprint-second"}
+                    }
+                }]
+            }"#,
+            "records_query",
+        )
+        .expect_err("duplicate CloudKit object keys must not reach the resolver as a Value");
+
+        assert!(matches!(
+            error,
+            UploadError::MalformedCloudKitResponse {
+                operation: "records_query"
+            }
+        ));
+    }
+
+    #[test]
+    fn cloudkit_records_query_response_accepts_unique_nested_fingerprint_keys() {
+        let response = parse_cloudkit_json_response(
+            br#"{
+                "records": [{
+                    "recordName": "CPLMaster-1",
+                    "recordType": "CPLMaster",
+                    "fields": {
+                        "resOriginalFingerprint": {"value": "fingerprint-original"},
+                        "resOriginalAltFingerprint": {"value": "fingerprint-alternative"}
+                    }
+                }]
+            }"#,
+            "records_query",
+        )
+        .expect("unique CloudKit response should decode");
+
+        assert_eq!(
+            response["records"][0]["fields"]["resOriginalFingerprint"]["value"],
+            "fingerprint-original"
+        );
+    }
 
     #[test]
     fn dense_timestamp_cohort_indexes_thousands_of_targets_and_records_once() {
