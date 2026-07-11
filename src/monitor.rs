@@ -2747,7 +2747,8 @@ fn run_rolling_asset_verify(
         asset_id,
         config.heic_verify_timeout_seconds,
     ) {
-        Ok(proof) => {
+        Ok(verification) => {
+            let visual_metrics = verification.visual_metrics;
             let result = {
                 let mut manifest = lock_shared(manifest, "rolling lifecycle manifest")?;
                 let mut summary = lock_shared(summary, "rolling lifecycle summary")?;
@@ -2756,7 +2757,7 @@ fn run_rolling_asset_verify(
                     &mut manifest,
                     &mut summary,
                     asset_id,
-                    proof,
+                    verification.proof,
                 );
                 persist_asset_record(
                     state_store,
@@ -2770,28 +2771,24 @@ fn run_rolling_asset_verify(
             };
             match result {
                 Ok(()) => {
-                    log_monitor_event(
-                        "heic_verify_finished",
-                        scan_started,
-                        json!({
-                            "asset_id": asset_id,
-                            "verified": true,
-                            "mode": "rolling_asset_queue",
-                        }),
-                    );
+                    let mut fields = json!({
+                        "asset_id": asset_id,
+                        "verified": true,
+                        "mode": "rolling_asset_queue",
+                    });
+                    append_visual_verification_event_fields(&mut fields, visual_metrics);
+                    log_monitor_event("heic_verify_finished", scan_started, fields);
                     Ok(RollingAssetStepOutcome::completed())
                 }
                 Err(message) => {
-                    log_monitor_event(
-                        "heic_verify_finished",
-                        scan_started,
-                        json!({
-                            "asset_id": asset_id,
-                            "verified": false,
-                            "error": message,
-                            "mode": "rolling_asset_queue",
-                        }),
-                    );
+                    let mut fields = json!({
+                        "asset_id": asset_id,
+                        "verified": false,
+                        "error": message,
+                        "mode": "rolling_asset_queue",
+                    });
+                    append_visual_verification_event_fields(&mut fields, visual_metrics);
+                    log_monitor_event("heic_verify_finished", scan_started, fields);
                     Ok(RollingAssetStepOutcome::failed(false))
                 }
             }
@@ -3427,26 +3424,31 @@ fn verify_converted_heics(
             verify_converted_heic(&manifest_snapshot, &asset_id, timeout_seconds)
         });
         let mut should_stop = false;
-        let mut verified_asset_ids = Vec::new();
+        let mut verified_assets = Vec::new();
         for outcome in outcomes {
             match outcome.result {
-                Ok(proof) => {
+                Ok(verification) => {
+                    let visual_metrics = verification.visual_metrics;
                     match record_heic_verification_or_failure(
                         manifest,
                         summary,
                         &outcome.asset_id,
-                        proof,
+                        verification.proof,
                     ) {
-                        Ok(()) => verified_asset_ids.push(outcome.asset_id),
-                        Err(message) => log_monitor_event(
-                            "heic_verify_finished",
-                            summary.started_unix_seconds,
-                            json!({
+                        Ok(()) => verified_assets.push((outcome.asset_id, visual_metrics)),
+                        Err(message) => {
+                            let mut fields = json!({
                                 "asset_id": outcome.asset_id,
                                 "verified": false,
                                 "error": message,
-                            }),
-                        ),
+                            });
+                            append_visual_verification_event_fields(&mut fields, visual_metrics);
+                            log_monitor_event(
+                                "heic_verify_finished",
+                                summary.started_unix_seconds,
+                                fields,
+                            );
+                        }
                     }
                 }
                 Err(error) => {
@@ -3465,17 +3467,15 @@ fn verify_converted_heics(
                 }
             }
         }
-        if !verified_asset_ids.is_empty() {
+        if !verified_assets.is_empty() {
             checkpoint_manifest_state(state_store, manifest)?;
-            for asset_id in verified_asset_ids {
-                log_monitor_event(
-                    "heic_verify_finished",
-                    summary.started_unix_seconds,
-                    json!({
-                        "asset_id": asset_id,
-                        "verified": true,
-                    }),
-                );
+            for (asset_id, visual_metrics) in verified_assets {
+                let mut fields = json!({
+                    "asset_id": asset_id,
+                    "verified": true,
+                });
+                append_visual_verification_event_fields(&mut fields, visual_metrics);
+                log_monitor_event("heic_verify_finished", summary.started_unix_seconds, fields);
             }
         }
         if should_stop {
@@ -6519,7 +6519,7 @@ fn verify_converted_heic(
     manifest: &Manifest,
     asset_id: &str,
     timeout_seconds: u64,
-) -> Result<HeicVerificationProof, MonitorError> {
+) -> Result<VerifiedHeic, MonitorError> {
     let record = manifest.get(asset_id)?;
     let conversion = decode_monitor_proof::<ConversionResultProof>(record, "conversion")?;
     command_status_ok(
@@ -6542,20 +6542,23 @@ fn verify_converted_heic(
         .is_some_and(visual_match_is_within_bounds);
     let visual_content_ok = heic_has_visual_content(visual_metrics.candidate_stdev);
 
-    Ok(HeicVerificationProof {
-        heic_path: conversion.heic_path,
-        heic_sha256: conversion.heic_sha256,
-        size_bytes: conversion.size_bytes,
-        heif_info_ok: true,
-        metadata_copied,
-        visual_content_ok,
-        visual_match_ok,
-        visual_rmse_ppm: visual_metrics
-            .reference_error
-            .map(|metrics| normalized_metric_ppm(metrics.rmse)),
-        visual_mae_ppm: visual_metrics
-            .reference_error
-            .map(|metrics| normalized_metric_ppm(metrics.mae)),
+    Ok(VerifiedHeic {
+        proof: HeicVerificationProof {
+            heic_path: conversion.heic_path,
+            heic_sha256: conversion.heic_sha256,
+            size_bytes: conversion.size_bytes,
+            heif_info_ok: true,
+            metadata_copied,
+            visual_content_ok,
+            visual_match_ok,
+            visual_rmse_ppm: visual_metrics
+                .reference_error
+                .map(|metrics| normalized_metric_ppm(metrics.rmse)),
+            visual_mae_ppm: visual_metrics
+                .reference_error
+                .map(|metrics| normalized_metric_ppm(metrics.mae)),
+        },
+        visual_metrics,
     })
 }
 
@@ -6641,6 +6644,8 @@ struct RgbPreview {
 struct VisualMetrics {
     candidate_stdev: f64,
     reference_error: Option<VisualErrorMetrics>,
+    direct_reference_error: Option<VisualErrorMetrics>,
+    match_basis: VisualMatchBasis,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -6649,16 +6654,101 @@ struct VisualErrorMetrics {
     mae: f64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VisualMatchBasis {
+    Direct,
+    CodecNormalized,
+    MissingReference,
+}
+
+impl VisualMatchBasis {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::CodecNormalized => "codec_normalized",
+            Self::MissingReference => "missing_reference",
+        }
+    }
+}
+
+fn append_visual_verification_event_fields(fields: &mut serde_json::Value, metrics: VisualMetrics) {
+    let Some(fields) = fields.as_object_mut() else {
+        return;
+    };
+    fields.insert(
+        "visual_match_basis".to_string(),
+        json!(metrics.match_basis.as_str()),
+    );
+    fields.insert(
+        "visual_rmse_ppm".to_string(),
+        json!(
+            metrics
+                .reference_error
+                .map(|error| normalized_metric_ppm(error.rmse))
+        ),
+    );
+    fields.insert(
+        "visual_mae_ppm".to_string(),
+        json!(
+            metrics
+                .reference_error
+                .map(|error| normalized_metric_ppm(error.mae))
+        ),
+    );
+    fields.insert(
+        "direct_visual_rmse_ppm".to_string(),
+        json!(
+            metrics
+                .direct_reference_error
+                .map(|error| normalized_metric_ppm(error.rmse))
+        ),
+    );
+    fields.insert(
+        "direct_visual_mae_ppm".to_string(),
+        json!(
+            metrics
+                .direct_reference_error
+                .map(|error| normalized_metric_ppm(error.mae))
+        ),
+    );
+}
+
+#[derive(Clone, Debug)]
+struct VerifiedHeic {
+    proof: HeicVerificationProof,
+    visual_metrics: VisualMetrics,
+}
+
 fn visual_metrics_for_conversion(
     reference: &Path,
     candidate: &Path,
     timeout_seconds: u64,
 ) -> Result<VisualMetrics, MonitorError> {
+    visual_metrics_for_conversion_with_sips(
+        reference,
+        candidate,
+        timeout_seconds,
+        Path::new("sips"),
+    )
+}
+
+fn visual_metrics_for_conversion_with_sips(
+    reference: &Path,
+    candidate: &Path,
+    timeout_seconds: u64,
+    sips_program: &Path,
+) -> Result<VisualMetrics, MonitorError> {
     let candidate_preview_path = verification_preview_path(candidate, "heic");
     let reference_preview_path = verification_preview_path(candidate, "raw");
+    let codec_normalized_reference_path = codec_normalized_reference_path(candidate);
+    let codec_normalized_candidate_preview_path =
+        verification_preview_path(candidate, "codec-normalized-candidate");
+    let codec_normalized_reference_preview_path =
+        verification_preview_path(&codec_normalized_reference_path, "heic");
     let result = (|| {
         if reference.exists() {
-            render_visual_preview_pair(
+            render_visual_preview_pair_with_sips(
+                sips_program,
                 candidate,
                 &candidate_preview_path,
                 reference,
@@ -6666,45 +6756,149 @@ fn visual_metrics_for_conversion(
                 timeout_seconds,
             )?;
         } else {
-            render_visual_preview(candidate, &candidate_preview_path, timeout_seconds)?;
+            render_visual_preview_with_sips(
+                sips_program,
+                candidate,
+                &candidate_preview_path,
+                timeout_seconds,
+            )?;
         }
         let candidate_preview = read_rgb_preview(&candidate_preview_path)?;
         let candidate_stdev = rgb_standard_deviation(&candidate_preview.pixels);
-        let reference_error = if reference.exists() {
-            let reference_preview = read_rgb_preview(&reference_preview_path)?;
-            Some(normalized_rgb_error_metrics(
-                &reference_preview,
-                &candidate_preview,
-            )?)
-        } else {
-            None
+        let Some(direct_reference_error) = reference
+            .exists()
+            .then(|| {
+                let reference_preview = read_rgb_preview(&reference_preview_path)?;
+                normalized_rgb_error_metrics(&reference_preview, &candidate_preview)
+            })
+            .transpose()?
+        else {
+            return Ok(VisualMetrics {
+                candidate_stdev,
+                reference_error: None,
+                direct_reference_error: None,
+                match_basis: VisualMatchBasis::MissingReference,
+            });
         };
+
+        if !heic_has_visual_content(candidate_stdev)
+            || visual_match_is_within_bounds(direct_reference_error)
+        {
+            return Ok(VisualMetrics {
+                candidate_stdev,
+                reference_error: Some(direct_reference_error),
+                direct_reference_error: Some(direct_reference_error),
+                match_basis: VisualMatchBasis::Direct,
+            });
+        }
+
+        encode_codec_normalized_reference(
+            sips_program,
+            reference,
+            &codec_normalized_reference_path,
+            timeout_seconds,
+        )?;
+        render_visual_preview_pair_with_sips(
+            sips_program,
+            candidate,
+            &codec_normalized_candidate_preview_path,
+            &codec_normalized_reference_path,
+            &codec_normalized_reference_preview_path,
+            timeout_seconds,
+        )?;
+        let codec_normalized_candidate_preview =
+            read_rgb_preview(&codec_normalized_candidate_preview_path)?;
+        let codec_normalized_reference_preview =
+            read_rgb_preview(&codec_normalized_reference_preview_path)?;
+        let codec_normalized_error = normalized_rgb_error_metrics(
+            &codec_normalized_reference_preview,
+            &codec_normalized_candidate_preview,
+        )?;
         Ok(VisualMetrics {
-            candidate_stdev,
-            reference_error,
+            candidate_stdev: rgb_standard_deviation(&codec_normalized_candidate_preview.pixels),
+            reference_error: Some(codec_normalized_error),
+            direct_reference_error: Some(direct_reference_error),
+            match_basis: VisualMatchBasis::CodecNormalized,
         })
     })();
     let _ = fs::remove_file(candidate_preview_path);
     let _ = fs::remove_file(reference_preview_path);
+    let _ = fs::remove_file(codec_normalized_candidate_preview_path);
+    let _ = fs::remove_file(codec_normalized_reference_preview_path);
+    let _ = fs::remove_file(codec_normalized_reference_path);
     result
 }
 
-fn render_visual_preview_pair(
+fn codec_normalized_reference_path(candidate: &Path) -> PathBuf {
+    let mut reference_path = candidate.to_path_buf();
+    reference_path.set_extension("codec-normalized-reference.heic");
+    reference_path
+}
+
+fn encode_codec_normalized_reference(
+    sips_program: &Path,
+    reference: &Path,
+    output_path: &Path,
+    timeout_seconds: u64,
+) -> Result<(), MonitorError> {
+    let mut command = Command::new(sips_program);
+    command
+        .args(["-s", "format", "heic", "-s", "formatOptions", "100"])
+        .arg(reference)
+        .arg("--out")
+        .arg(output_path);
+    let output = run_external_command_with_timeout("sips", command, timeout_seconds)?;
+    if !output.status.success() {
+        return Err(MonitorError::CommandFailed {
+            program: "sips",
+            message: format!("exited with {}", output.status),
+        });
+    }
+    let metadata = fs::metadata(output_path).map_err(|source| MonitorError::ReadMetadata {
+        path: output_path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(MonitorError::CommandFailed {
+            program: "sips",
+            message: format!(
+                "codec-normalized reference was not created at {}",
+                output_path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn render_visual_preview_pair_with_sips(
+    sips_program: &Path,
     candidate: &Path,
     candidate_output_path: &Path,
     reference: &Path,
     reference_output_path: &Path,
     timeout_seconds: u64,
 ) -> Result<(), MonitorError> {
+    let sips_program = sips_program.to_path_buf();
     let candidate = candidate.to_path_buf();
     let candidate_output_path = candidate_output_path.to_path_buf();
     let reference = reference.to_path_buf();
     let reference_output_path = reference_output_path.to_path_buf();
+    let candidate_sips_program = sips_program.clone();
     let candidate_handle = thread::spawn(move || {
-        render_visual_preview(&candidate, &candidate_output_path, timeout_seconds)
+        render_visual_preview_with_sips(
+            &candidate_sips_program,
+            &candidate,
+            &candidate_output_path,
+            timeout_seconds,
+        )
     });
     let reference_handle = thread::spawn(move || {
-        render_visual_preview(&reference, &reference_output_path, timeout_seconds)
+        render_visual_preview_with_sips(
+            &sips_program,
+            &reference,
+            &reference_output_path,
+            timeout_seconds,
+        )
     });
     let candidate_result = join_visual_preview_render(candidate_handle);
     let reference_result = join_visual_preview_render(reference_handle);
@@ -6728,12 +6922,13 @@ fn verification_preview_path(heic_path: &Path, label: &str) -> PathBuf {
     preview_path
 }
 
-fn render_visual_preview(
+fn render_visual_preview_with_sips(
+    sips_program: &Path,
     source: &Path,
     output_path: &Path,
     timeout_seconds: u64,
 ) -> Result<(), MonitorError> {
-    let mut command = Command::new("sips");
+    let mut command = Command::new(sips_program);
     command
         .args(["-Z", MONITOR_VERIFY_PREVIEW_MAX_EDGE, "-s", "format", "png"])
         .arg(source)
@@ -7260,6 +7455,129 @@ mod tests {
     use filetime::{FileTime, set_file_mtime};
     use serde_json::Value;
     use serde_json::json;
+
+    #[cfg(unix)]
+    struct FakeNativeVisualVerifier {
+        _tempdir: tempfile::TempDir,
+        program: PathBuf,
+        reference: PathBuf,
+        candidate: PathBuf,
+        command_log: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl FakeNativeVisualVerifier {
+        fn new(
+            direct_reference: RgbPreview,
+            candidate: RgbPreview,
+            normalized_reference: RgbPreview,
+            fail_normalized_render: bool,
+        ) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let tempdir = tempfile::tempdir().expect("tempdir should be created");
+            let reference = tempdir.path().join("oriented-preview.jpg");
+            let candidate_path = tempdir.path().join("candidate.heic");
+            let direct_reference_png = tempdir.path().join("direct-reference.png");
+            let candidate_png = tempdir.path().join("candidate.png");
+            let normalized_reference_png = tempdir.path().join("normalized-reference.png");
+            let command_log = tempdir.path().join("sips.log");
+            let program = tempdir.path().join("sips");
+
+            fs::write(&reference, b"oriented preview").expect("reference source should be created");
+            fs::write(&candidate_path, b"candidate heic")
+                .expect("candidate source should be created");
+            write_rgb_preview_png(&direct_reference_png, &direct_reference);
+            write_rgb_preview_png(&candidate_png, &candidate);
+            write_rgb_preview_png(&normalized_reference_png, &normalized_reference);
+
+            fs::write(
+                &program,
+                format!(
+                    r#"#!/bin/sh
+args="$*"
+out=""
+source=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--out" ]; then
+    out="$2"
+    break
+  fi
+  source="$1"
+  shift
+done
+[ -n "$out" ] || exit 64
+case "$out" in
+  *.codec-normalized-reference.heic)
+    case "$args" in
+      *"formatOptions 100"*) ;;
+      *) exit 65 ;;
+    esac
+    printf '%s\n' encode >> '{}'
+    printf 'heic' > "$out"
+    exit 0
+    ;;
+esac
+case "$source" in
+  *candidate.heic)
+    printf '%s\n' direct_candidate >> '{}'
+    /bin/cp '{}' "$out"
+    ;;
+  *oriented-preview.jpg)
+    printf '%s\n' direct_reference >> '{}'
+    /bin/cp '{}' "$out"
+    ;;
+  *codec-normalized-reference.heic)
+    printf '%s\n' normalized_reference >> '{}'
+    [ '{}' = "1" ] && exit 66
+    /bin/cp '{}' "$out"
+    ;;
+  *) exit 67 ;;
+esac
+"#,
+                    command_log.display(),
+                    command_log.display(),
+                    candidate_png.display(),
+                    command_log.display(),
+                    direct_reference_png.display(),
+                    command_log.display(),
+                    if fail_normalized_render { "1" } else { "0" },
+                    normalized_reference_png.display(),
+                ),
+            )
+            .expect("fake sips script should be written");
+            let mut permissions = fs::metadata(&program)
+                .expect("fake sips metadata should be readable")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&program, permissions)
+                .expect("fake sips script should be executable");
+
+            Self {
+                _tempdir: tempdir,
+                program,
+                reference,
+                candidate: candidate_path,
+                command_log,
+            }
+        }
+
+        fn command_log(&self) -> Vec<String> {
+            fs::read_to_string(&self.command_log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_rgb_preview_png(path: &Path, preview: &RgbPreview) {
+        let image =
+            image::RgbImage::from_raw(preview.width, preview.height, preview.pixels.clone())
+                .expect("RGB preview pixels should match dimensions");
+        image.save(path).expect("RGB preview PNG should be written");
+    }
 
     struct FakeDeleteTransport {
         payloads: Vec<Value>,
@@ -12891,6 +13209,219 @@ mod tests {
             mae: MONITOR_VISUAL_MAE_MAX + 0.000_1,
         }));
         assert_eq!(normalized_metric_ppm(0.026_874_4), 26_874);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_visual_verification_direct_pass_skips_codec_normalization() {
+        let candidate = RgbPreview {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 0, 0, 255, 255, 255],
+        };
+        let fake =
+            FakeNativeVisualVerifier::new(candidate.clone(), candidate.clone(), candidate, false);
+
+        let metrics = visual_metrics_for_conversion_with_sips(
+            &fake.reference,
+            &fake.candidate,
+            1,
+            &fake.program,
+        )
+        .expect("directly matching previews should verify");
+
+        assert_eq!(metrics.match_basis, VisualMatchBasis::Direct);
+        assert!(
+            metrics
+                .reference_error
+                .is_some_and(visual_match_is_within_bounds)
+        );
+        assert!(
+            metrics
+                .direct_reference_error
+                .is_some_and(visual_match_is_within_bounds)
+        );
+        let commands = fake.command_log();
+        assert_eq!(commands.len(), 2);
+        assert!(!commands.iter().any(|command| command == "encode"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_visual_verification_blank_candidate_skips_codec_normalization() {
+        let blank = RgbPreview {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 0, 0, 0, 0, 0],
+        };
+        let fake = FakeNativeVisualVerifier::new(
+            RgbPreview {
+                width: 2,
+                height: 1,
+                pixels: vec![255, 255, 255, 255, 255, 255],
+            },
+            blank.clone(),
+            blank,
+            false,
+        );
+
+        let metrics = visual_metrics_for_conversion_with_sips(
+            &fake.reference,
+            &fake.candidate,
+            1,
+            &fake.program,
+        )
+        .expect("blank candidate should remain a verification result");
+
+        assert_eq!(metrics.match_basis, VisualMatchBasis::Direct);
+        assert!(!heic_has_visual_content(metrics.candidate_stdev));
+        assert!(
+            metrics
+                .reference_error
+                .is_some_and(|error| !visual_match_is_within_bounds(error))
+        );
+        assert!(!fake.command_log().iter().any(|command| command == "encode"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_visual_verification_uses_codec_normalized_metrics_after_direct_failure() {
+        let candidate = RgbPreview {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 0, 0, 255, 255, 255],
+        };
+        let fake = FakeNativeVisualVerifier::new(
+            RgbPreview {
+                width: 2,
+                height: 1,
+                pixels: vec![0, 0, 0, 0, 0, 0],
+            },
+            candidate.clone(),
+            candidate,
+            false,
+        );
+        let baseline = codec_normalized_reference_path(&fake.candidate);
+        let temporary_paths = [
+            verification_preview_path(&fake.candidate, "heic"),
+            verification_preview_path(&fake.candidate, "raw"),
+            baseline.clone(),
+            verification_preview_path(&baseline, "heic"),
+            verification_preview_path(&fake.candidate, "codec-normalized-candidate"),
+        ];
+
+        let metrics = visual_metrics_for_conversion_with_sips(
+            &fake.reference,
+            &fake.candidate,
+            1,
+            &fake.program,
+        )
+        .expect("codec-normalized preview should verify");
+
+        assert_eq!(metrics.match_basis, VisualMatchBasis::CodecNormalized);
+        assert!(
+            metrics
+                .direct_reference_error
+                .is_some_and(|error| !visual_match_is_within_bounds(error))
+        );
+        assert!(
+            metrics
+                .reference_error
+                .is_some_and(visual_match_is_within_bounds)
+        );
+        let commands = fake.command_log();
+        assert_eq!(commands.len(), 5);
+        assert!(commands.iter().any(|command| command == "encode"));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command == "normalized_reference")
+        );
+        assert!(temporary_paths.iter().all(|path| !path.exists()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_visual_verification_rejects_failed_codec_normalized_metrics() {
+        let candidate = RgbPreview {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 0, 0, 255, 255, 255],
+        };
+        let fake = FakeNativeVisualVerifier::new(
+            RgbPreview {
+                width: 2,
+                height: 1,
+                pixels: vec![0, 0, 0, 0, 0, 0],
+            },
+            candidate,
+            RgbPreview {
+                width: 2,
+                height: 1,
+                pixels: vec![0, 0, 0, 0, 0, 0],
+            },
+            false,
+        );
+
+        let metrics = visual_metrics_for_conversion_with_sips(
+            &fake.reference,
+            &fake.candidate,
+            1,
+            &fake.program,
+        )
+        .expect("failed normalized metrics should remain a verification result");
+
+        assert_eq!(metrics.match_basis, VisualMatchBasis::CodecNormalized);
+        assert!(
+            metrics
+                .reference_error
+                .is_some_and(|error| !visual_match_is_within_bounds(error))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_visual_verification_cleans_up_and_fails_closed_when_normalized_render_fails() {
+        let candidate = RgbPreview {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 0, 0, 255, 255, 255],
+        };
+        let fake = FakeNativeVisualVerifier::new(
+            RgbPreview {
+                width: 2,
+                height: 1,
+                pixels: vec![0, 0, 0, 0, 0, 0],
+            },
+            candidate.clone(),
+            candidate,
+            true,
+        );
+        let baseline = codec_normalized_reference_path(&fake.candidate);
+        let temporary_paths = [
+            verification_preview_path(&fake.candidate, "heic"),
+            verification_preview_path(&fake.candidate, "raw"),
+            baseline.clone(),
+            verification_preview_path(&baseline, "heic"),
+            verification_preview_path(&fake.candidate, "codec-normalized-candidate"),
+        ];
+
+        let error = visual_metrics_for_conversion_with_sips(
+            &fake.reference,
+            &fake.candidate,
+            1,
+            &fake.program,
+        )
+        .expect_err("normalized preview render failure must fail verification");
+
+        assert!(matches!(
+            error,
+            MonitorError::CommandFailed {
+                program: "sips",
+                ..
+            }
+        ));
+        assert!(temporary_paths.iter().all(|path| !path.exists()));
     }
 
     #[test]
