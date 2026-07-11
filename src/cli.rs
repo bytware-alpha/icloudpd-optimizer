@@ -262,6 +262,10 @@ struct MonitorInitArgs {
     max_original_resolver_retries_per_scan: usize,
     #[arg(long, default_value_t = 86_400)]
     original_resolver_retry_min_age_seconds: u64,
+    #[arg(long, default_value_t = 16)]
+    max_failed_retry_admissions_per_scan: usize,
+    #[arg(long, default_value_t = 300)]
+    failed_retry_min_age_seconds: u64,
     #[arg(long, default_value_t = 2)]
     capture_tolerance_seconds: u64,
     #[arg(long, default_value_t = 0)]
@@ -3141,6 +3145,8 @@ fn monitor_init(args: MonitorInitArgs) -> Result<(), CliError> {
     config.max_lifecycle_per_scan = args.max_lifecycle_per_scan;
     config.max_original_resolver_retries_per_scan = args.max_original_resolver_retries_per_scan;
     config.original_resolver_retry_min_age_seconds = args.original_resolver_retry_min_age_seconds;
+    config.max_failed_retry_admissions_per_scan = args.max_failed_retry_admissions_per_scan;
+    config.failed_retry_min_age_seconds = args.failed_retry_min_age_seconds;
     config.capture_tolerance_seconds = args.capture_tolerance_seconds;
     config.cloudkit_start_rank = args.cloudkit_start_rank;
     config.cloudkit_page_size = args.cloudkit_page_size;
@@ -3259,6 +3265,8 @@ struct MonitorQueueReport {
     max_lifecycle_per_scan: usize,
     max_original_resolver_retries_per_scan: usize,
     original_resolver_retry_min_age_seconds: u64,
+    max_failed_retry_admissions_per_scan: usize,
+    failed_retry_min_age_seconds: u64,
     max_conversions_per_scan: usize,
     state_counts: BTreeMap<String, u64>,
     queue_counts: BTreeMap<String, u64>,
@@ -3294,6 +3302,8 @@ impl MonitorQueueReport {
             max_lifecycle_per_scan: config.max_lifecycle_per_scan,
             max_original_resolver_retries_per_scan: config.max_original_resolver_retries_per_scan,
             original_resolver_retry_min_age_seconds: config.original_resolver_retry_min_age_seconds,
+            max_failed_retry_admissions_per_scan: config.max_failed_retry_admissions_per_scan,
+            failed_retry_min_age_seconds: config.failed_retry_min_age_seconds,
             max_conversions_per_scan: config.max_conversions_per_scan,
             state_counts: verified_metrics.state_counts.clone(),
             queue_counts: queue_counts(manifest, config, &active_lifecycle),
@@ -3341,41 +3351,7 @@ fn queue_counts(
 }
 
 fn queue_failure_counts(manifest: &Manifest) -> BTreeMap<String, u64> {
-    let mut counts = BTreeMap::new();
-    for record in manifest.records().values() {
-        if record.state != State::Failed {
-            continue;
-        }
-        let message = record
-            .failures
-            .last()
-            .map(|failure| failure.message.as_str())
-            .unwrap_or("");
-        let bucket = if message.contains("CloudKit original asset resolver found no exact RAW") {
-            "blocked_original_asset_resolve"
-        } else if message.contains("heif-enc") && message.contains("timed out") {
-            "retryable_conversion_timeout"
-        } else if message.contains("raw_staging") && message.contains("timed out") {
-            "retryable_raw_staging_timeout"
-        } else if message.contains("converted output already exists")
-            || message.contains("failed to read verified HEIC")
-            || message.contains("verified HEIC is empty")
-            || message.contains("HEIC size mismatch")
-            || message.contains("HEIC SHA-256 mismatch")
-        {
-            "retryable_stale_heic_output"
-        } else if message.contains("staged RAW already exists") {
-            "retryable_stale_staged_raw"
-        } else if message.contains("visual_content_ok") {
-            "blocked_visual_content"
-        } else if message.contains("neither PreviewImage nor JpgFromRaw") {
-            "blocked_missing_embedded_preview"
-        } else {
-            "failed_other"
-        };
-        increment_count(&mut counts, bucket);
-    }
-    counts
+    crate::monitor::failed_retry_queue_counts(manifest)
 }
 
 fn increment_count(counts: &mut BTreeMap<String, u64>, key: &str) {

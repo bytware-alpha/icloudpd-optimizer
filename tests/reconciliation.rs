@@ -151,6 +151,7 @@ fn failed_resolver_record(asset_id: &str) -> AssetRecord {
         stage: "original_asset_resolve".to_string(),
         message: "old resolver failure".to_string(),
         recorded_at: "1700000000.000000000Z".to_string(),
+        kind: None,
     });
     record
 }
@@ -631,6 +632,7 @@ fn persisted_exact_resolution_accepts_a_proven_later_failure() {
         stage: "upload_verify".to_string(),
         message: "later retryable failure".to_string(),
         recorded_at: "1800000001.000000000Z".to_string(),
+        kind: None,
     });
 
     let mut manifest = Manifest::new();

@@ -71,6 +71,38 @@ pub struct FailureRecord {
     pub stage: String,
     pub message: String,
     pub recorded_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<FailureKind>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    HeicVisualContent,
+    HeicVisualMatch,
+    ConversionTimedOut,
+    RawStagingTimedOut,
+    ConversionOutputUnreadable,
+    ConversionOutputAlreadyExists,
+    StagedRawAlreadyExists,
+    ConversionMetadataFailed,
+    EmbeddedPreviewUnavailable,
+}
+
+impl FailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HeicVisualContent => "heic_visual_content",
+            Self::HeicVisualMatch => "heic_visual_match",
+            Self::ConversionTimedOut => "conversion_timed_out",
+            Self::RawStagingTimedOut => "raw_staging_timed_out",
+            Self::ConversionOutputUnreadable => "conversion_output_unreadable",
+            Self::ConversionOutputAlreadyExists => "conversion_output_already_exists",
+            Self::StagedRawAlreadyExists => "staged_raw_already_exists",
+            Self::ConversionMetadataFailed => "conversion_metadata_failed",
+            Self::EmbeddedPreviewUnavailable => "embedded_preview_unavailable",
+        }
+    }
 }
 
 pub const FAILURE_QUARANTINE_PROOF_NAME: &str = "failure_quarantine";
@@ -120,6 +152,20 @@ impl FailureRecord {
             stage: stage.into(),
             message: message.into(),
             recorded_at: current_timestamp(),
+            kind: None,
+        }
+    }
+
+    pub fn new_with_kind(
+        stage: impl Into<String>,
+        message: impl Into<String>,
+        kind: FailureKind,
+    ) -> Self {
+        Self {
+            stage: stage.into(),
+            message: message.into(),
+            recorded_at: current_timestamp(),
+            kind: Some(kind),
         }
     }
 }
@@ -214,6 +260,16 @@ impl Manifest {
         stage: impl Into<String>,
         message: impl Into<String>,
     ) -> Result<&AssetRecord, ManifestError> {
+        self.record_failure_with_kind(asset_id, stage, message, None)
+    }
+
+    pub fn record_failure_with_kind(
+        &mut self,
+        asset_id: &str,
+        stage: impl Into<String>,
+        message: impl Into<String>,
+        kind: Option<FailureKind>,
+    ) -> Result<&AssetRecord, ManifestError> {
         let current_state = self.get(asset_id)?.state;
         if current_state.is_terminal() {
             return Err(ManifestError::InvalidTransition {
@@ -235,6 +291,7 @@ impl Manifest {
             stage: stage.into(),
             message: message.into(),
             recorded_at: recorded_at.clone(),
+            kind,
         });
         record.updated_at = recorded_at;
         Ok(record)
@@ -297,6 +354,34 @@ impl Manifest {
             FAILURE_QUARANTINE_PROOF_NAME.to_string(),
             serde_json::to_value(proof)?,
         );
+        record.updated_at = updated_at;
+        Ok(record)
+    }
+
+    pub fn terminalize_failed_with_proof(
+        &mut self,
+        asset_id: &str,
+        proof_name: impl Into<String>,
+        proof: Value,
+    ) -> Result<&AssetRecord, ManifestError> {
+        let current_state = self.get(asset_id)?.state;
+        if current_state != State::Failed {
+            return Err(ManifestError::InvalidTransition {
+                asset_id: asset_id.to_string(),
+                from: current_state,
+                to: State::NeedsReview,
+            });
+        }
+
+        let updated_at = current_timestamp();
+        let record = self
+            .records
+            .get_mut(asset_id)
+            .ok_or_else(|| ManifestError::UnknownAsset {
+                asset_id: asset_id.to_string(),
+            })?;
+        record.state = State::NeedsReview;
+        record.proofs.insert(proof_name.into(), proof);
         record.updated_at = updated_at;
         Ok(record)
     }
@@ -485,6 +570,25 @@ fn timestamp_nanos() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_record_kind_is_backward_compatible_and_stable_when_present() {
+        let legacy = r#"{"stage":"conversion","message":"failed","recorded_at":"100.000000000Z"}"#;
+        let legacy_record: FailureRecord =
+            serde_json::from_str(legacy).expect("legacy failure record should deserialize");
+        assert_eq!(
+            serde_json::to_string(&legacy_record).expect("legacy record should serialize"),
+            legacy
+        );
+
+        let typed = r#"{"stage":"heic_verify","message":"HEIC verification failed: visual_content_ok","recorded_at":"101.000000000Z","kind":"heic_visual_content"}"#;
+        let typed_record: FailureRecord =
+            serde_json::from_str(typed).expect("typed failure record should deserialize");
+        assert_eq!(
+            serde_json::to_string(&typed_record).expect("typed record should serialize"),
+            typed
+        );
+    }
 
     #[test]
     fn reconciliation_terminal_states_are_serialized_and_cannot_enter_lifecycle() {

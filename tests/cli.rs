@@ -1741,6 +1741,10 @@ fn monitor_init_can_enable_guarded_full_lifecycle_config() {
             "2",
             "--original-resolver-retry-min-age-seconds",
             "43200",
+            "--max-failed-retry-admissions-per-scan",
+            "7",
+            "--failed-retry-min-age-seconds",
+            "420",
             "--cloudkit-page-size",
             "50",
             "--cloudkit-max-pages",
@@ -1787,6 +1791,8 @@ fn monitor_init_can_enable_guarded_full_lifecycle_config() {
     assert_eq!(config["max_lifecycle_per_scan"], 3);
     assert_eq!(config["max_original_resolver_retries_per_scan"], 2);
     assert_eq!(config["original_resolver_retry_min_age_seconds"], 43_200);
+    assert_eq!(config["max_failed_retry_admissions_per_scan"], 7);
+    assert_eq!(config["failed_retry_min_age_seconds"], 420);
     assert_eq!(config["cloudkit_page_size"], 50);
     assert_eq!(config["cloudkit_max_pages"], 12);
     assert_eq!(config["capture_tolerance_seconds"], 4);
@@ -2198,7 +2204,7 @@ fn monitor_queue_shows_active_lifecycle_worker_slots_and_failures() {
     assert!(shown.contains("mode: rolling"));
     assert!(shown.contains("cpu_slots="));
     assert!(shown.contains("convert_slots="));
-    assert!(shown.contains("retryable_stale_heic_output: 1"));
+    assert!(shown.contains("blocked_source_proof: 1"));
     assert!(shown.contains("worker 1"));
     assert!(shown.contains(
         "convert_heic -> verify_converted_heics -> upload_verified_heics -> record_local_mirrors"
@@ -2333,12 +2339,8 @@ fn monitor_queue_json_classifies_retryable_and_blocked_failures() {
     assert!(report["convert_stage_slots"].as_u64().unwrap_or(0) >= 1);
     assert!(report["convert_stage_slots"].as_u64() <= report["cpu_stage_slots"].as_u64());
     assert!(report["worker_slots"].is_array());
-    assert_eq!(report["failure_counts"]["retryable_conversion_timeout"], 1);
-    assert_eq!(
-        report["failure_counts"]["blocked_original_asset_resolve"],
-        1
-    );
-    assert_eq!(report["failure_counts"]["retryable_stale_heic_output"], 1);
+    assert_eq!(report["failure_counts"]["blocked_source_proof"], 1);
+    assert_eq!(report["failure_counts"]["failed_unknown"], 2);
     assert_eq!(report["state_counts"]["no_action"], 1);
     assert_eq!(report["state_counts"]["needs_review"], 1);
     assert_eq!(report["verified_metrics"]["terminal_records"], 3);

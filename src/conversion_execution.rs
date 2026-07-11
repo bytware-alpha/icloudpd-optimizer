@@ -18,7 +18,7 @@ use crate::conversion::{
     plan_conversion_for_target_with_preview_tag_and_orientation,
 };
 use crate::conversion_backend::{TargetPlatform, backend_report_for_target};
-use crate::manifest::{Manifest, ManifestError, State};
+use crate::manifest::{FailureKind, Manifest, ManifestError, State};
 use crate::proof::NasRawProof;
 use crate::workflow::{
     ConversionCommandTiming, ConversionPerformanceInput, ConversionResultProof, WorkflowError,
@@ -1515,6 +1515,31 @@ pub enum ConversionExecutionError {
     },
 }
 
+impl ConversionExecutionError {
+    pub fn failure_kind(&self) -> Option<FailureKind> {
+        match self {
+            Self::CommandTimedOut {
+                stage: RAW_STAGING_STAGE,
+                ..
+            } => Some(FailureKind::RawStagingTimedOut),
+            Self::CommandTimedOut { .. } => Some(FailureKind::ConversionTimedOut),
+            Self::OutputUnreadable { .. } => Some(FailureKind::ConversionOutputUnreadable),
+            Self::OutputAlreadyExists { .. } => Some(FailureKind::ConversionOutputAlreadyExists),
+            Self::StagedRawAlreadyExists { .. } => Some(FailureKind::StagedRawAlreadyExists),
+            Self::CommandFailed {
+                stage: "metadata",
+                program,
+                ..
+            } if program == "exiftool" => Some(FailureKind::ConversionMetadataFailed),
+            Self::EmbeddedPreviewUnavailable { .. } => {
+                Some(FailureKind::EmbeddedPreviewUnavailable)
+            }
+            Self::BatchConversionFailed { source, .. } => source.failure_kind(),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1525,6 +1550,67 @@ mod tests {
 
     use crate::proof::NasRawProof;
     use crate::workflow::{discover_raw_asset, record_nas_proof};
+
+    #[test]
+    fn conversion_errors_expose_stable_failure_kinds_before_stringification() {
+        use crate::manifest::FailureKind;
+
+        let cases = [
+            (
+                ConversionExecutionError::CommandTimedOut {
+                    stage: "conversion",
+                    program: "heif-enc".to_string(),
+                    timeout_millis: 120_000,
+                },
+                FailureKind::ConversionTimedOut,
+            ),
+            (
+                ConversionExecutionError::CommandTimedOut {
+                    stage: "raw_staging",
+                    program: "icloudpd-optimizer".to_string(),
+                    timeout_millis: 120_000,
+                },
+                FailureKind::RawStagingTimedOut,
+            ),
+            (
+                ConversionExecutionError::OutputUnreadable {
+                    path: PathBuf::from("asset.oriented-preview.jpg"),
+                    source: io::Error::other("unreadable"),
+                },
+                FailureKind::ConversionOutputUnreadable,
+            ),
+            (
+                ConversionExecutionError::OutputAlreadyExists {
+                    path: PathBuf::from("asset.heic"),
+                },
+                FailureKind::ConversionOutputAlreadyExists,
+            ),
+            (
+                ConversionExecutionError::StagedRawAlreadyExists {
+                    path: PathBuf::from("asset.staged-raw.dng"),
+                },
+                FailureKind::StagedRawAlreadyExists,
+            ),
+            (
+                ConversionExecutionError::CommandFailed {
+                    stage: "metadata",
+                    program: "exiftool".to_string(),
+                    status: "exit status: 1".to_string(),
+                },
+                FailureKind::ConversionMetadataFailed,
+            ),
+            (
+                ConversionExecutionError::EmbeddedPreviewUnavailable {
+                    path: PathBuf::from("asset.dng"),
+                },
+                FailureKind::EmbeddedPreviewUnavailable,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.failure_kind(), Some(expected));
+        }
+    }
 
     #[cfg(unix)]
     static PATH_LOCK: Mutex<()> = Mutex::new(());

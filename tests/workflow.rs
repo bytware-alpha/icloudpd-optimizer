@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use filetime::{FileTime, set_file_mtime};
-use icloudpd_optimizer::manifest::{AssetRecord, Manifest, ManifestError, State};
+use icloudpd_optimizer::manifest::{AssetRecord, FailureKind, Manifest, ManifestError, State};
 use icloudpd_optimizer::proof::{NasRawProof, ProofError, prove_nas_raw};
 use icloudpd_optimizer::upload::{CloudKitDeleteOutcome, CloudKitUploadedHeicAsset};
 use icloudpd_optimizer::workflow::{
@@ -16,8 +16,8 @@ use icloudpd_optimizer::workflow::{
     record_icloudpd_local_mirror_proof, record_nas_proof, record_original_asset_batch_proofs,
     record_original_asset_proof, record_prevalidated_delete_execution,
     record_reconciled_delete_execution, record_source_age_proof, record_stage_failure,
-    record_upload_proof, record_uploaded_heic_delete, upload_ready_heic_proof,
-    uploaded_heic_delete_request,
+    record_stage_failure_with_kind, record_upload_proof, record_uploaded_heic_delete,
+    upload_ready_heic_proof, uploaded_heic_delete_request,
 };
 use serde_json::json;
 
@@ -1796,6 +1796,32 @@ fn failure_records_block_delete_eligibility() {
     assert_eq!(after.state, State::Failed);
     assert_eq!(after.failures[0].stage, "conversion");
     assert!(!after.proofs.contains_key("delete_eligibility"));
+}
+
+#[test]
+fn typed_stage_failure_persists_its_stable_kind() {
+    let mut manifest = Manifest::new();
+    discover_raw_asset(&mut manifest, "asset-1", "/nas/photos/IMG_0001.dng")
+        .expect("asset should be discovered");
+    record_nas_proof(&mut manifest, "asset-1", nas_proof()).expect("NAS proof should record");
+
+    record_stage_failure_with_kind(
+        &mut manifest,
+        "asset-1",
+        "conversion",
+        "converted output is missing or unreadable",
+        FailureKind::ConversionOutputUnreadable,
+    )
+    .expect("typed failure should record");
+
+    assert_eq!(
+        manifest
+            .get("asset-1")
+            .expect("asset should remain")
+            .failures[0]
+            .kind,
+        Some(FailureKind::ConversionOutputUnreadable)
+    );
 }
 
 #[test]

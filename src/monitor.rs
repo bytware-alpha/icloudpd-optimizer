@@ -21,7 +21,7 @@ use crate::conversion_execution::{
     ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversion,
 };
 use crate::local_mirror::{IcloudpdLocalMirrorRequest, LocalMirrorError};
-use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
+use crate::manifest::{AssetRecord, FailureKind, FailureRecord, Manifest, ManifestError, State};
 use crate::manifest_lock::{
     ManifestLockError, ManifestLockGuard, acquire_manifest_lock, manifest_lock_path,
 };
@@ -46,7 +46,8 @@ use crate::workflow::{
     prepare_delete_reconciliation, prevalidate_approved_original_delete, prove_and_record_nas,
     record_heic_verification, record_icloudpd_local_mirror_proof,
     record_prevalidated_delete_execution, record_reconciled_delete_execution,
-    record_source_age_proof, record_stage_failure, record_upload_proof, upload_ready_heic_proof,
+    record_source_age_proof, record_stage_failure, record_stage_failure_with_kind,
+    record_upload_proof, upload_ready_heic_proof,
 };
 
 static MONITOR_FAILURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -66,6 +67,12 @@ const DEFAULT_UPLOAD_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_HEIC_VERIFY_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_MAX_ORIGINAL_RESOLVER_RETRIES_PER_SCAN: usize = 16;
 const DEFAULT_ORIGINAL_RESOLVER_RETRY_MIN_AGE_SECONDS: u64 = 24 * 60 * 60;
+const DEFAULT_MAX_FAILED_RETRY_ADMISSIONS_PER_SCAN: usize = 16;
+const DEFAULT_FAILED_RETRY_MIN_AGE_SECONDS: u64 = 300;
+const FAILED_RETRY_POLICY_SCHEMA_VERSION: u64 = 1;
+const FAILED_RETRY_POLICY_GENERATION: &str = "codec_normalized_v1";
+const FAILURE_RETRY_PROOF: &str = "failure_retry";
+const FAILURE_REVIEW_PROOF: &str = "failure_review";
 #[cfg(not(test))]
 const MONITOR_STATE_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 #[cfg(test)]
@@ -79,8 +86,6 @@ const MONITOR_VISUAL_RMSE_MAX: f64 = 0.03;
 const MONITOR_VISUAL_MAE_MAX: f64 = 0.02;
 const MONITOR_HEIC_STDEV_MIN: f64 = 0.001;
 const DEFAULT_LAUNCHD_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-const RETRYABLE_UPLOAD_CONFLICT_MESSAGE: &str =
-    "iCloud Photos putAsset rejected the upload with status 409";
 const RAW_EXTENSIONS: &[&str] = &[
     "dng", "cr2", "cr3", "nef", "arw", "raf", "rw2", "orf", "pef", "srw", "raw",
 ];
@@ -98,6 +103,14 @@ fn default_max_original_resolver_retries_per_scan() -> usize {
 
 fn default_original_resolver_retry_min_age_seconds() -> u64 {
     DEFAULT_ORIGINAL_RESOLVER_RETRY_MIN_AGE_SECONDS
+}
+
+fn default_max_failed_retry_admissions_per_scan() -> usize {
+    DEFAULT_MAX_FAILED_RETRY_ADMISSIONS_PER_SCAN
+}
+
+fn default_failed_retry_min_age_seconds() -> u64 {
+    DEFAULT_FAILED_RETRY_MIN_AGE_SECONDS
 }
 
 fn default_capture_tolerance_seconds() -> u64 {
@@ -182,6 +195,10 @@ pub struct MonitorConfig {
     pub max_original_resolver_retries_per_scan: usize,
     #[serde(default = "default_original_resolver_retry_min_age_seconds")]
     pub original_resolver_retry_min_age_seconds: u64,
+    #[serde(default = "default_max_failed_retry_admissions_per_scan")]
+    pub max_failed_retry_admissions_per_scan: usize,
+    #[serde(default = "default_failed_retry_min_age_seconds")]
+    pub failed_retry_min_age_seconds: u64,
     #[serde(default = "default_capture_tolerance_seconds")]
     pub capture_tolerance_seconds: u64,
     #[serde(default)]
@@ -241,6 +258,8 @@ impl MonitorConfig {
             ),
             original_resolver_retry_min_age_seconds:
                 default_original_resolver_retry_min_age_seconds(),
+            max_failed_retry_admissions_per_scan: default_max_failed_retry_admissions_per_scan(),
+            failed_retry_min_age_seconds: default_failed_retry_min_age_seconds(),
             capture_tolerance_seconds: default_capture_tolerance_seconds(),
             cloudkit_start_rank: 0,
             cloudkit_page_size: default_cloudkit_page_size(),
@@ -413,6 +432,16 @@ impl MonitorConfig {
         if self.heic_verify_timeout_seconds == 0 {
             return Err(MonitorError::InvalidConfig {
                 message: "heic_verify_timeout_seconds must be greater than 0".to_string(),
+            });
+        }
+        if self.max_failed_retry_admissions_per_scan == 0 {
+            return Err(MonitorError::InvalidConfig {
+                message: "max_failed_retry_admissions_per_scan must be greater than 0".to_string(),
+            });
+        }
+        if self.failed_retry_min_age_seconds == 0 {
+            return Err(MonitorError::InvalidConfig {
+                message: "failed_retry_min_age_seconds must be greater than 0".to_string(),
             });
         }
         if self.rolling_original_resolve_active_window_multiplier == 0 {
@@ -608,9 +637,17 @@ pub fn run_monitor_once(
         started_unix_seconds: started,
         ..MonitorScanSummary::default()
     };
-    let recovered_upload_conflicts = recover_retryable_upload_conflicts(&mut manifest);
-    let recovered_retryable_failures = recover_retryable_failed_assets(&mut manifest);
-    let recovered_retryable_failure_total: usize = recovered_retryable_failures.values().sum();
+    let failed_retry_admission = admit_failed_retryable_assets(
+        &mut manifest,
+        if config.full_lifecycle {
+            config.max_lifecycle_per_scan
+        } else {
+            0
+        },
+        config.max_failed_retry_admissions_per_scan,
+        config.failed_retry_min_age_seconds,
+        started,
+    )?;
     let original_asset_resolver_retry_admission = recover_original_asset_resolver_retries(
         &mut manifest,
         if config.full_lifecycle {
@@ -622,31 +659,16 @@ pub fn run_monitor_once(
         config.original_resolver_retry_min_age_seconds,
         started,
     )?;
-    if recovered_upload_conflicts > 0
-        || recovered_retryable_failure_total > 0
+    if failed_retry_admission.manifest_changed()
         || original_asset_resolver_retry_admission.manifest_changed()
     {
         checkpoint_manifest_state(&state_store, &manifest)?;
     }
-    if recovered_upload_conflicts > 0 {
-        log_monitor_event(
-            "retryable_upload_conflicts_recovered",
-            started,
-            json!({
-                "count": recovered_upload_conflicts,
-            }),
-        );
-    }
-    if recovered_retryable_failure_total > 0 {
-        log_monitor_event(
-            "retryable_failed_assets_recovered",
-            started,
-            json!({
-                "count": recovered_retryable_failure_total,
-                "buckets": recovered_retryable_failures,
-            }),
-        );
-    }
+    log_monitor_event(
+        "failed_retry_policy_admission",
+        started,
+        failed_retry_policy_admission_fields(&failed_retry_admission),
+    );
     log_monitor_event(
         "original_asset_resolver_retry_admission",
         started,
@@ -1307,8 +1329,9 @@ fn execute_monitor_conversions(
                     );
                 }
                 Ok(Err(error)) => {
+                    let kind = error.failure_kind();
                     let message = error.to_string();
-                    record_stage_failure(manifest, &asset_id, "conversion", &message)?;
+                    record_conversion_execution_failure(manifest, &asset_id, &message, kind)?;
                     summary.failures = summary.failures.saturating_add(1);
                     summary.last_error =
                         Some(format!("conversion failed for {asset_id}: {message}"));
@@ -2657,6 +2680,7 @@ fn run_rolling_asset_conversion(
             Ok(RollingAssetStepOutcome::completed())
         }
         Err(error) => {
+            let kind = error.failure_kind();
             let message = error.to_string();
             {
                 let mut manifest = lock_shared(manifest, "rolling lifecycle manifest")?;
@@ -2674,7 +2698,7 @@ fn run_rolling_asset_conversion(
                     return Ok(RollingAssetStepOutcome::attempted(false));
                 }
                 let previous = manifest.get(asset_id)?.clone();
-                record_stage_failure(&mut manifest, asset_id, "conversion", &message)?;
+                record_conversion_execution_failure(&mut manifest, asset_id, &message, kind)?;
                 persist_asset_record(
                     state_store,
                     &mut manifest,
@@ -3497,15 +3521,51 @@ fn record_heic_verification_or_failure(
             Ok(())
         }
         Err(error) => {
+            let kind = workflow_failure_kind(&error);
             let message = error.to_string();
             record_monitor_failure(summary, MonitorError::Workflow(error));
-            if let Err(failure_error) =
-                record_stage_failure(manifest, asset_id, "heic_verify", &message)
-            {
+            let recorded = match kind {
+                Some(kind) => record_stage_failure_with_kind(
+                    manifest,
+                    asset_id,
+                    "heic_verify",
+                    &message,
+                    kind,
+                ),
+                None => record_stage_failure(manifest, asset_id, "heic_verify", &message),
+            };
+            if let Err(failure_error) = recorded {
                 record_monitor_failure(summary, MonitorError::Workflow(failure_error));
             }
             Err(message)
         }
+    }
+}
+
+fn record_conversion_execution_failure(
+    manifest: &mut Manifest,
+    asset_id: &str,
+    message: &str,
+    kind: Option<FailureKind>,
+) -> Result<(), WorkflowError> {
+    match kind {
+        Some(kind) => {
+            record_stage_failure_with_kind(manifest, asset_id, "conversion", message, kind)
+        }
+        None => record_stage_failure(manifest, asset_id, "conversion", message),
+    }?;
+    Ok(())
+}
+
+fn workflow_failure_kind(error: &WorkflowError) -> Option<FailureKind> {
+    match error {
+        WorkflowError::HeicVerificationFailed {
+            field: "visual_content_ok",
+        } => Some(FailureKind::HeicVisualContent),
+        WorkflowError::HeicVerificationFailed {
+            field: "visual_match_ok",
+        } => Some(FailureKind::HeicVisualMatch),
+        _ => None,
     }
 }
 
@@ -5764,36 +5824,6 @@ fn asset_ids_matching(
         .collect()
 }
 
-fn recover_retryable_upload_conflicts(manifest: &mut Manifest) -> usize {
-    let recoverable = manifest
-        .records()
-        .values()
-        .filter(|record| retryable_upload_conflict_can_recover(record))
-        .map(|record| record.asset_id.clone())
-        .collect::<Vec<_>>();
-    let mut recovered = 0;
-    for asset_id in recoverable {
-        if manifest
-            .recover_failed_for_retry(&asset_id, State::ConversionVerified)
-            .is_ok()
-        {
-            recovered += 1;
-        }
-    }
-    recovered
-}
-
-fn retryable_upload_conflict_can_recover(record: &AssetRecord) -> bool {
-    record.state == State::Failed
-        && record.proofs.contains_key("heic")
-        && record.proofs.contains_key("original_asset")
-        && !record.proofs.contains_key("upload")
-        && record
-            .failures
-            .last()
-            .is_some_and(|failure| failure.message.contains(RETRYABLE_UPLOAD_CONFLICT_MESSAGE))
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct OriginalAssetResolverRetryAdmission {
     interrupted_retries_requeued: usize,
@@ -6087,72 +6117,524 @@ fn original_asset_resolver_retry_admission_fields(
     })
 }
 
-fn recover_retryable_failed_assets(manifest: &mut Manifest) -> BTreeMap<&'static str, usize> {
-    let recoverable = manifest
-        .records()
-        .values()
-        .filter_map(|record| {
-            retryable_failed_asset_recovery_bucket(record).map(|bucket| {
-                (
-                    bucket,
-                    record.asset_id.clone(),
-                    retryable_failed_asset_recovery_state(bucket),
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut buckets = BTreeMap::new();
-    for (bucket, asset_id, retry_state) in recoverable {
-        if manifest
-            .recover_failed_for_retry(&asset_id, retry_state)
-            .is_ok()
-        {
-            *buckets.entry(bucket).or_default() += 1;
-        }
-    }
-    buckets
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct FailedRetryPolicyAdmission {
+    admitted_by_category: BTreeMap<&'static str, usize>,
+    terminalized_by_reason: BTreeMap<&'static str, usize>,
+    exhausted: usize,
+    blocked_missing_preview: usize,
+    blocked_downstream_proof: usize,
+    blocked_source_proof: usize,
+    backoff: usize,
+    unknown: usize,
 }
 
-fn retryable_failed_asset_recovery_bucket(record: &AssetRecord) -> Option<&'static str> {
-    if record.state != State::Failed
-        || !record.proofs.contains_key("nas")
-        || !record.proofs.contains_key("source_age")
-        || !record.proofs.contains_key("original_asset")
-        || record.proofs.contains_key("heic")
-        || record.proofs.contains_key("upload")
-    {
+impl FailedRetryPolicyAdmission {
+    fn manifest_changed(&self) -> bool {
+        !self.admitted_by_category.is_empty() || !self.terminalized_by_reason.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct FailureRetryProof {
+    schema_version: u64,
+    policy_generation: String,
+    category: FailureKind,
+    attempt: u64,
+    last_failure_stage: String,
+    last_failure_kind: FailureKind,
+    last_failure_digest: String,
+    admitted_at_unix_seconds: u64,
+    retry_state: State,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FailureReviewProof {
+    schema_version: u64,
+    reason_code: String,
+    policy_generation: String,
+    last_failure_stage: String,
+    last_failure_kind: FailureKind,
+    last_failure_digest: String,
+    attempts_exhausted: u64,
+    current_attempt: u64,
+    applied_at_unix_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FailedRetryPolicy {
+    bucket: &'static str,
+    retry_state: State,
+    max_attempts: u64,
+}
+
+#[derive(Clone, Debug)]
+struct FailedRetryCandidate {
+    asset_id: String,
+    failure_timestamp: (u64, u32),
+    kind: FailureKind,
+    attempt: u64,
+    policy: FailedRetryPolicy,
+}
+
+const RETRY_BLOCKING_PROOFS: [&str; 7] = [
+    "heic",
+    "upload",
+    "icloudpd_local_mirror",
+    "delete_eligibility",
+    "delete_approval",
+    "delete",
+    "uploaded_heic_delete",
+];
+
+fn admit_failed_retryable_assets(
+    manifest: &mut Manifest,
+    max_lifecycle_per_scan: usize,
+    max_failed_retry_admissions_per_scan: usize,
+    retry_min_age_seconds: u64,
+    current_unix_seconds: u64,
+) -> Result<FailedRetryPolicyAdmission, ManifestError> {
+    let mut admission = FailedRetryPolicyAdmission::default();
+    let mut candidates = Vec::new();
+    let mut exhausted = Vec::new();
+    let terminalize = manifest
+        .records()
+        .values()
+        .filter(|record| {
+            record.state == State::Failed
+                && last_failure_kind(record) == Some(FailureKind::HeicVisualContent)
+        })
+        .map(|record| record.asset_id.clone())
+        .collect::<Vec<_>>();
+
+    for asset_id in terminalize {
+        terminalize_failure_for_review(
+            manifest,
+            &asset_id,
+            FailureKind::HeicVisualContent,
+            "heic_visual_content",
+            0,
+            current_unix_seconds,
+        )?;
+        increment_static_count(&mut admission.terminalized_by_reason, "heic_visual_content");
+    }
+
+    for record in manifest.records().values() {
+        if record.state != State::Failed {
+            continue;
+        }
+        if has_retry_blocking_proof(record) {
+            admission.blocked_downstream_proof =
+                admission.blocked_downstream_proof.saturating_add(1);
+            continue;
+        }
+        let Some(kind) = last_failure_kind(record) else {
+            admission.unknown = admission.unknown.saturating_add(1);
+            continue;
+        };
+        if kind == FailureKind::EmbeddedPreviewUnavailable {
+            admission.blocked_missing_preview = admission.blocked_missing_preview.saturating_add(1);
+            continue;
+        }
+        let Some(policy) = failed_retry_policy(kind) else {
+            admission.unknown = admission.unknown.saturating_add(1);
+            continue;
+        };
+        if !failed_retry_source_proofs_are_valid(record) {
+            admission.blocked_source_proof = admission.blocked_source_proof.saturating_add(1);
+            continue;
+        }
+        let Ok(attempt) = failed_retry_attempt(record, kind) else {
+            admission.unknown = admission.unknown.saturating_add(1);
+            continue;
+        };
+        if attempt >= policy.max_attempts {
+            exhausted.push((record.asset_id.clone(), kind, attempt));
+            continue;
+        }
+        if kind == FailureKind::HeicVisualMatch && !conversion_output_still_matches_proof(record) {
+            admission.blocked_source_proof = admission.blocked_source_proof.saturating_add(1);
+            continue;
+        }
+        let Some(failure_timestamp) = record
+            .failures
+            .last()
+            .and_then(|failure| parse_monitor_timestamp(&failure.recorded_at))
+        else {
+            admission.backoff = admission.backoff.saturating_add(1);
+            continue;
+        };
+        if !monitor_timestamp_is_at_least_age(
+            failure_timestamp,
+            retry_min_age_seconds,
+            current_unix_seconds,
+        ) {
+            admission.backoff = admission.backoff.saturating_add(1);
+            continue;
+        }
+        candidates.push(FailedRetryCandidate {
+            asset_id: record.asset_id.clone(),
+            failure_timestamp,
+            kind,
+            attempt,
+            policy,
+        });
+    }
+
+    for (asset_id, kind, attempt) in exhausted {
+        terminalize_failure_for_review(
+            manifest,
+            &asset_id,
+            kind,
+            "retry_attempts_exhausted",
+            attempt,
+            current_unix_seconds,
+        )?;
+        admission.exhausted = admission.exhausted.saturating_add(1);
+        increment_static_count(
+            &mut admission.terminalized_by_reason,
+            "retry_attempts_exhausted",
+        );
+    }
+
+    let available_lifecycle_capacity =
+        max_lifecycle_per_scan.saturating_sub(pending_lifecycle_count(manifest));
+    let admission_limit = available_lifecycle_capacity.min(max_failed_retry_admissions_per_scan);
+    candidates.sort_by(|left, right| {
+        left.failure_timestamp
+            .cmp(&right.failure_timestamp)
+            .then_with(|| left.asset_id.cmp(&right.asset_id))
+    });
+    for candidate in candidates.into_iter().take(admission_limit) {
+        admit_failed_retry(manifest, &candidate, current_unix_seconds)?;
+        increment_static_count(&mut admission.admitted_by_category, candidate.policy.bucket);
+    }
+    Ok(admission)
+}
+
+fn failed_retry_policy_admission_fields(
+    admission: &FailedRetryPolicyAdmission,
+) -> serde_json::Value {
+    json!({
+        "admitted_by_category": admission.admitted_by_category,
+        "terminalized_by_reason": admission.terminalized_by_reason,
+        "exhausted": admission.exhausted,
+        "blocked_missing_preview": admission.blocked_missing_preview,
+        "blocked_downstream_proof": admission.blocked_downstream_proof,
+        "blocked_source_proof": admission.blocked_source_proof,
+        "backoff": admission.backoff,
+        "unknown": admission.unknown,
+    })
+}
+
+fn failed_retry_policy(kind: FailureKind) -> Option<FailedRetryPolicy> {
+    match kind {
+        FailureKind::HeicVisualMatch => Some(FailedRetryPolicy {
+            bucket: "retryable_heic_visual_match",
+            retry_state: State::Converted,
+            max_attempts: 1,
+        }),
+        FailureKind::ConversionOutputUnreadable => Some(FailedRetryPolicy {
+            bucket: "retryable_conversion_output_unreadable",
+            retry_state: State::NasVerified,
+            max_attempts: 1,
+        }),
+        FailureKind::ConversionMetadataFailed => Some(FailedRetryPolicy {
+            bucket: "retryable_conversion_metadata_failed",
+            retry_state: State::NasVerified,
+            max_attempts: 1,
+        }),
+        FailureKind::ConversionTimedOut => Some(FailedRetryPolicy {
+            bucket: "retryable_conversion_timed_out",
+            retry_state: State::NasVerified,
+            max_attempts: 3,
+        }),
+        FailureKind::RawStagingTimedOut => Some(FailedRetryPolicy {
+            bucket: "retryable_raw_staging_timed_out",
+            retry_state: State::NasVerified,
+            max_attempts: 3,
+        }),
+        FailureKind::ConversionOutputAlreadyExists => Some(FailedRetryPolicy {
+            bucket: "retryable_conversion_output_already_exists",
+            retry_state: State::NasVerified,
+            max_attempts: 3,
+        }),
+        FailureKind::StagedRawAlreadyExists => Some(FailedRetryPolicy {
+            bucket: "retryable_staged_raw_already_exists",
+            retry_state: State::NasVerified,
+            max_attempts: 3,
+        }),
+        FailureKind::HeicVisualContent | FailureKind::EmbeddedPreviewUnavailable => None,
+    }
+}
+
+pub fn failed_retry_queue_counts(manifest: &Manifest) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for record in manifest.records().values() {
+        if record.state != State::Failed {
+            continue;
+        }
+        let bucket = if has_retry_blocking_proof(record) {
+            "blocked_downstream_proof"
+        } else {
+            match last_failure_kind(record) {
+                Some(FailureKind::HeicVisualContent) => "terminalize_heic_visual_content",
+                Some(FailureKind::EmbeddedPreviewUnavailable) => "blocked_missing_embedded_preview",
+                Some(kind) => match failed_retry_policy(kind) {
+                    Some(_) if !failed_retry_source_proofs_are_valid(record) => {
+                        "blocked_source_proof"
+                    }
+                    Some(_)
+                        if kind == FailureKind::HeicVisualMatch
+                            && !conversion_output_still_matches_proof(record) =>
+                    {
+                        "blocked_source_proof"
+                    }
+                    Some(policy) => match failed_retry_attempt(record, kind) {
+                        Ok(attempt) if attempt >= policy.max_attempts => {
+                            "terminalize_retry_attempts_exhausted"
+                        }
+                        Ok(_) => policy.bucket,
+                        Err(_) => "failed_unknown",
+                    },
+                    None => "failed_unknown",
+                },
+                None => "failed_unknown",
+            }
+        };
+        *counts.entry(bucket.to_string()).or_default() += 1;
+    }
+    counts
+}
+
+fn admit_failed_retry(
+    manifest: &mut Manifest,
+    candidate: &FailedRetryCandidate,
+    admitted_at_unix_seconds: u64,
+) -> Result<(), ManifestError> {
+    let failure = manifest
+        .get(&candidate.asset_id)?
+        .failures
+        .last()
+        .cloned()
+        .ok_or_else(|| ManifestError::UnknownAsset {
+            asset_id: candidate.asset_id.clone(),
+        })?;
+    let proof = FailureRetryProof {
+        schema_version: FAILED_RETRY_POLICY_SCHEMA_VERSION,
+        policy_generation: FAILED_RETRY_POLICY_GENERATION.to_string(),
+        category: candidate.kind,
+        attempt: candidate.attempt.saturating_add(1),
+        last_failure_stage: failure.stage.clone(),
+        last_failure_kind: candidate.kind,
+        last_failure_digest: failure_digest(&failure),
+        admitted_at_unix_seconds,
+        retry_state: candidate.policy.retry_state,
+    };
+    manifest.record_proof(
+        &candidate.asset_id,
+        FAILURE_RETRY_PROOF,
+        serde_json::to_value(proof)?,
+    )?;
+    manifest.recover_failed_for_retry(&candidate.asset_id, candidate.policy.retry_state)?;
+    Ok(())
+}
+
+fn failed_retry_attempt(record: &AssetRecord, kind: FailureKind) -> Result<u64, ()> {
+    let Some(proof) = record.proofs.get(FAILURE_RETRY_PROOF) else {
+        return Ok(0);
+    };
+    let proof = serde_json::from_value::<FailureRetryProof>(proof.clone()).map_err(|_| ())?;
+    (proof.schema_version == FAILED_RETRY_POLICY_SCHEMA_VERSION
+        && proof.policy_generation == FAILED_RETRY_POLICY_GENERATION
+        && proof.category == kind
+        && proof.last_failure_kind == kind
+        && proof.attempt > 0)
+        .then_some(proof.attempt)
+        .ok_or(())
+}
+
+fn has_retry_blocking_proof(record: &AssetRecord) -> bool {
+    RETRY_BLOCKING_PROOFS
+        .iter()
+        .any(|proof_key| record.proofs.contains_key(*proof_key))
+}
+
+fn failed_retry_source_proofs_are_valid(record: &AssetRecord) -> bool {
+    if !original_asset_resolver_source_proofs_are_valid(record) {
+        return false;
+    }
+    let Some(nas) = record
+        .proofs
+        .get("nas")
+        .and_then(|proof| serde_json::from_value::<NasRawProof>(proof.clone()).ok())
+    else {
+        return false;
+    };
+    let Some(original) = record
+        .proofs
+        .get("original_asset")
+        .and_then(|proof| serde_json::from_value::<OriginalAssetProof>(proof.clone()).ok())
+    else {
+        return false;
+    };
+    record.raw_path.file_name().and_then(OsStr::to_str) == Some(original.filename.as_str())
+        && original.size_bytes == nas.size_bytes
+        && original.matched_raw_sha256 == nas.sha256
+        && !original.record_name.trim().is_empty()
+        && !original.record_change_tag.trim().is_empty()
+        && !original.record_type.trim().is_empty()
+        && !original.zone_name.trim().is_empty()
+}
+
+fn terminalize_failure_for_review(
+    manifest: &mut Manifest,
+    asset_id: &str,
+    kind: FailureKind,
+    reason_code: &'static str,
+    attempts_exhausted: u64,
+    applied_at_unix_seconds: u64,
+) -> Result<(), ManifestError> {
+    let failure =
+        manifest
+            .get(asset_id)?
+            .failures
+            .last()
+            .ok_or_else(|| ManifestError::UnknownAsset {
+                asset_id: asset_id.to_string(),
+            })?;
+    let proof = FailureReviewProof {
+        schema_version: FAILED_RETRY_POLICY_SCHEMA_VERSION,
+        reason_code: reason_code.to_string(),
+        policy_generation: FAILED_RETRY_POLICY_GENERATION.to_string(),
+        last_failure_stage: failure.stage.clone(),
+        last_failure_kind: kind,
+        last_failure_digest: failure_digest(failure),
+        attempts_exhausted,
+        current_attempt: attempts_exhausted,
+        applied_at_unix_seconds,
+    };
+    manifest.terminalize_failed_with_proof(
+        asset_id,
+        FAILURE_REVIEW_PROOF,
+        serde_json::to_value(proof)?,
+    )?;
+    Ok(())
+}
+
+fn failure_digest(failure: &FailureRecord) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(failure.stage.as_bytes());
+    hasher.update([0]);
+    hasher.update(failure.message.as_bytes());
+    hasher.update([0]);
+    hasher.update(
+        failure
+            .kind
+            .map(FailureKind::as_str)
+            .unwrap_or("legacy")
+            .as_bytes(),
+    );
+    format!("{:x}", hasher.finalize())
+}
+
+fn last_failure_kind(record: &AssetRecord) -> Option<FailureKind> {
+    let failure = record.failures.last()?;
+    failure
+        .kind
+        .or_else(|| legacy_failure_kind(record, failure))
+}
+
+fn legacy_failure_kind(record: &AssetRecord, failure: &FailureRecord) -> Option<FailureKind> {
+    match (failure.stage.as_str(), failure.message.as_str()) {
+        ("heic_verify", "HEIC verification failed: visual_content_ok") => {
+            Some(FailureKind::HeicVisualContent)
+        }
+        ("heic_verify", "HEIC verification failed: visual_match_ok") => {
+            Some(FailureKind::HeicVisualMatch)
+        }
+        ("conversion", "conversion command timed out after 120000 ms: heif-enc") => {
+            Some(FailureKind::ConversionTimedOut)
+        }
+        ("conversion", "raw_staging command timed out after 120000 ms: icloudpd-optimizer") => {
+            Some(FailureKind::RawStagingTimedOut)
+        }
+        ("conversion", "metadata command failed: exiftool exited with exit status: 1") => {
+            Some(FailureKind::ConversionMetadataFailed)
+        }
+        _ => legacy_path_bearing_failure_kind(record, failure),
+    }
+}
+
+fn legacy_path_bearing_failure_kind(
+    record: &AssetRecord,
+    failure: &FailureRecord,
+) -> Option<FailureKind> {
+    if failure.stage != "conversion" {
         return None;
     }
-    let failure = record.failures.last()?;
-    let message = failure.message.as_str();
-    if record.proofs.contains_key("conversion") {
-        return (message.contains("visual_match_ok")
-            && conversion_output_still_matches_proof(record))
-        .then_some("retryable_visual_match_verification");
-    }
-    if message.contains("conversion command timed out") {
-        Some("retryable_conversion_timeout")
-    } else if message.contains("raw_staging") && message.contains("timed out") {
-        Some("retryable_raw_staging_timeout")
-    } else if message.contains("converted output already exists")
-        || message.contains("failed to read verified HEIC")
-        || message.contains("verified HEIC is empty")
-        || message.contains("HEIC size mismatch")
-        || message.contains("HEIC SHA-256 mismatch")
+    let output_name = format!("{}.heic", record.asset_id);
+    let oriented_name = format!("{}.oriented-preview.jpg", record.asset_id);
+    let raw_extension = record.raw_path.extension()?.to_str()?;
+    let staged_name = format!("{}.staged-raw.{raw_extension}", record.asset_id);
+    if legacy_path_message_matches(
+        &failure.message,
+        "converted output is missing or unreadable at ",
+        &oriented_name,
+        ": ",
+    ) {
+        Some(FailureKind::ConversionOutputUnreadable)
+    } else if legacy_path_message_matches(
+        &failure.message,
+        "converted output already exists at ",
+        &output_name,
+        "; refusing to overwrite without an explicit overwrite policy",
+    ) {
+        Some(FailureKind::ConversionOutputAlreadyExists)
+    } else if legacy_path_message_matches(
+        &failure.message,
+        "staged RAW already exists at ",
+        &staged_name,
+        "; refusing to overwrite",
+    ) {
+        Some(FailureKind::StagedRawAlreadyExists)
+    } else if failure.message
+        == format!(
+            "RAW has neither PreviewImage nor JpgFromRaw embedded preview: {}",
+            record.raw_path.display()
+        )
     {
-        Some("retryable_stale_heic_output")
-    } else if message.contains("staged RAW already exists") {
-        Some("retryable_stale_staged_raw")
+        Some(FailureKind::EmbeddedPreviewUnavailable)
     } else {
         None
     }
 }
 
-fn retryable_failed_asset_recovery_state(bucket: &'static str) -> State {
-    match bucket {
-        "retryable_visual_match_verification" => State::Converted,
-        _ => State::NasVerified,
+fn legacy_path_message_matches(
+    message: &str,
+    prefix: &str,
+    expected_filename: &str,
+    suffix: &str,
+) -> bool {
+    let Some(path_and_suffix) = message.strip_prefix(prefix) else {
+        return false;
+    };
+    if suffix == ": " {
+        let Some((path, error_suffix)) = path_and_suffix.rsplit_once(suffix) else {
+            return false;
+        };
+        !error_suffix.is_empty()
+            && Path::new(path).file_name().and_then(OsStr::to_str) == Some(expected_filename)
+    } else {
+        path_and_suffix
+            .strip_suffix(suffix)
+            .and_then(|path| Path::new(path).file_name().and_then(OsStr::to_str))
+            == Some(expected_filename)
     }
+}
+
+fn increment_static_count(counts: &mut BTreeMap<&'static str, usize>, key: &'static str) {
+    *counts.entry(key).or_default() += 1;
 }
 
 fn conversion_output_still_matches_proof(record: &AssetRecord) -> bool {
@@ -8084,6 +8566,28 @@ esac
             error,
             MonitorError::InvalidConfig { message }
                 if message == "heic_verify_timeout_seconds must be greater than 0"
+        ));
+    }
+
+    #[test]
+    fn monitor_config_defaults_and_validates_failed_retry_admission_limits() {
+        let mut config = MonitorConfig::new("/download", "/manifest.json", "/heic");
+        assert_eq!(config.max_failed_retry_admissions_per_scan, 16);
+        assert_eq!(config.failed_retry_min_age_seconds, 300);
+
+        config.max_failed_retry_admissions_per_scan = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(MonitorError::InvalidConfig { message })
+                if message == "max_failed_retry_admissions_per_scan must be greater than 0"
+        ));
+
+        config.max_failed_retry_admissions_per_scan = 16;
+        config.failed_retry_min_age_seconds = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(MonitorError::InvalidConfig { message })
+                if message == "failed_retry_min_age_seconds must be greater than 0"
         ));
     }
 
@@ -11356,37 +11860,61 @@ esac
         }
     }
 
-    fn retryable_failed_conversion_record(asset_id: &str, message: &str) -> AssetRecord {
+    fn policy_failed_record(
+        asset_id: &str,
+        stage: &str,
+        message: &str,
+        kind: Option<FailureKind>,
+        recorded_at: &str,
+    ) -> AssetRecord {
         let mut record = lifecycle_record(asset_id, State::Failed);
-        add_original_resolution_proofs(&mut record, 1_700_000_000);
+        record.proofs.insert(
+            "nas".to_string(),
+            json!({
+                "canonical_path": record.raw_path,
+                "relative_path": format!("{asset_id}.DNG"),
+                "size_bytes": 9u64,
+                "modified_unix_seconds": 100u64,
+                "age_seconds": 2_592_000u64,
+                "sha256": "raw-sha",
+            }),
+        );
+        record.proofs.insert(
+            "source_age".to_string(),
+            json!({
+                "source_captured_unix_seconds": 100u64,
+                "verified_at_unix_seconds": 2_592_100u64,
+                "min_age_seconds": 2_592_000u64,
+            }),
+        );
         add_original_asset_proof(&mut record);
-        record
-            .failures
-            .push(crate::manifest::FailureRecord::new("conversion", message));
+        record.failures.push(crate::manifest::FailureRecord {
+            stage: stage.to_string(),
+            message: message.to_string(),
+            recorded_at: recorded_at.to_string(),
+            kind,
+        });
+        record.updated_at = recorded_at.to_string();
         record
     }
 
-    fn retryable_visual_match_record(
+    fn policy_failed_again(
+        manifest: &mut Manifest,
         asset_id: &str,
-        heic_path: &Path,
-        bytes: &[u8],
-    ) -> AssetRecord {
-        let mut record = lifecycle_record(asset_id, State::Failed);
-        add_original_resolution_proofs(&mut record, 1_700_000_000);
-        add_original_asset_proof(&mut record);
-        record.proofs.insert(
-            "conversion".to_string(),
-            json!({
-                "heic_path": heic_path,
-                "heic_sha256": format!("{:x}", Sha256::digest(bytes)),
-                "size_bytes": bytes.len() as u64,
-            }),
-        );
-        record.failures.push(crate::manifest::FailureRecord::new(
-            "heic_verify",
-            "HEIC verification failed: visual_match_ok",
-        ));
-        record
+        stage: &str,
+        message: &str,
+        kind: FailureKind,
+    ) {
+        let mut record = manifest.get(asset_id).expect("asset should exist").clone();
+        record.state = State::Failed;
+        record.failures.push(crate::manifest::FailureRecord {
+            stage: stage.to_string(),
+            message: message.to_string(),
+            recorded_at: "100.000000000Z".to_string(),
+            kind: Some(kind),
+        });
+        record.updated_at = "100.000000000Z".to_string();
+        manifest.upsert(record);
     }
 
     fn failed_original_asset_resolve_record(
@@ -11402,6 +11930,7 @@ esac
             stage: "original_asset_resolve".to_string(),
             message: "no exact RAW match".to_string(),
             recorded_at: failure_recorded_at.to_string(),
+            kind: None,
         });
         record.updated_at = failure_recorded_at.to_string();
         record
@@ -11427,6 +11956,7 @@ esac
                 stage: "original_asset_resolve".to_string(),
                 message: "older miss".to_string(),
                 recorded_at: "050.000000000Z".to_string(),
+                kind: None,
             },
         );
         manifest.upsert(repeated);
@@ -11437,6 +11967,7 @@ esac
             stage: "conversion".to_string(),
             message: "later conversion failure".to_string(),
             recorded_at: "200.000000000Z".to_string(),
+            kind: None,
         });
         wrong_latest.updated_at = "200.000000000Z".to_string();
         manifest.upsert(wrong_latest);
@@ -12036,12 +12567,16 @@ esac
         let object = value.as_object_mut().expect("config should be an object");
         object.remove("max_original_resolver_retries_per_scan");
         object.remove("original_resolver_retry_min_age_seconds");
+        object.remove("max_failed_retry_admissions_per_scan");
+        object.remove("failed_retry_min_age_seconds");
 
         let config: MonitorConfig =
             serde_json::from_value(value).expect("legacy config should deserialize");
 
         assert_eq!(config.max_original_resolver_retries_per_scan, 16);
         assert_eq!(config.original_resolver_retry_min_age_seconds, 86_400);
+        assert_eq!(config.max_failed_retry_admissions_per_scan, 16);
+        assert_eq!(config.failed_retry_min_age_seconds, 300);
     }
 
     #[test]
@@ -12064,83 +12599,312 @@ esac
     }
 
     #[test]
-    fn retryable_failed_assets_recover_to_nas_verified_for_conversion_retry() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let mut config = MonitorConfig::new(
-            tempdir.path().join("download"),
-            tempdir.path().join("manifest.json"),
-            tempdir.path().join("heic"),
-        );
-        config.full_lifecycle = true;
-        config.max_conversions_per_scan = 10;
+    fn visual_content_failure_terminalizes_with_a_durable_review_proof() {
         let mut manifest = Manifest::new();
-        for (asset_id, message) in [
-            (
-                "conversion-timeout",
-                "conversion command timed out after 120000 ms: heif-enc",
-            ),
-            (
-                "raw-staging-timeout",
-                "raw_staging command timed out after 120000 ms",
-            ),
-            (
-                "stale-heic",
-                "converted output already exists at /heic/stale-heic.heic; refusing to overwrite without an explicit overwrite policy",
-            ),
-            (
-                "stale-staged-raw",
-                "staged RAW already exists at /tmp/stale-staged-raw.DNG",
-            ),
-        ] {
-            manifest.upsert(retryable_failed_conversion_record(asset_id, message));
-        }
+        let record = policy_failed_record(
+            "visual-content",
+            "heic_verify",
+            "HEIC verification failed: visual_content_ok",
+            Some(FailureKind::HeicVisualContent),
+            "100.000000000Z",
+        );
+        manifest.upsert(record);
 
-        let buckets = recover_retryable_failed_assets(&mut manifest);
+        admit_failed_retryable_assets(&mut manifest, 0, 16, 300, 3_000_000)
+            .expect("visual-content failure should terminalize");
 
-        assert_eq!(buckets["retryable_conversion_timeout"], 1);
-        assert_eq!(buckets["retryable_raw_staging_timeout"], 1);
-        assert_eq!(buckets["retryable_stale_heic_output"], 1);
-        assert_eq!(buckets["retryable_stale_staged_raw"], 1);
-        for asset_id in [
-            "conversion-timeout",
-            "raw-staging-timeout",
-            "stale-heic",
-            "stale-staged-raw",
-        ] {
-            let record = manifest.get(asset_id).expect("asset should remain");
-            assert_eq!(record.state, State::NasVerified);
-            assert!(record.proofs.contains_key("original_asset"));
-            assert!(!record.failures.is_empty());
-        }
-
-        let active_ids = active_lifecycle_asset_ids(&manifest, 10);
-        let requests = conversion_requests(&manifest, &config, Some(&active_ids));
-        let request_ids = requests
-            .iter()
-            .map(|request| request.asset_id.as_str())
-            .collect::<Vec<_>>();
+        let record = manifest
+            .get("visual-content")
+            .expect("record should remain");
+        assert_eq!(record.state, State::NeedsReview);
         assert_eq!(
-            request_ids,
-            vec![
-                "conversion-timeout",
-                "raw-staging-timeout",
-                "stale-heic",
-                "stale-staged-raw",
-            ]
+            record.proofs["failure_review"]["reason_code"],
+            json!("heic_visual_content")
         );
     }
 
     #[test]
-    fn retryable_failed_asset_recovery_commits_newer_state_to_strict_store() {
+    fn visual_match_admits_once_for_the_policy_generation_then_terminalizes() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let heic_path = tempdir.path().join("visual-match.heic");
+        let bytes = b"verified heic";
+        fs::write(&heic_path, bytes).expect("HEIC should be written");
+        let mut record = policy_failed_record(
+            "visual-match",
+            "heic_verify",
+            "HEIC verification failed: visual_match_ok",
+            None,
+            "100.000000000Z",
+        );
+        for _ in 0..120 {
+            record.failures.insert(
+                0,
+                crate::manifest::FailureRecord::new("conversion", "historical failure"),
+            );
+        }
+        record.proofs.insert(
+            "conversion".to_string(),
+            json!({
+                "heic_path": heic_path,
+                "heic_sha256": format!("{:x}", Sha256::digest(bytes)),
+                "size_bytes": bytes.len() as u64,
+            }),
+        );
+        let mut manifest = Manifest::new();
+        manifest.upsert(record);
+
+        assert_eq!(
+            failed_retry_queue_counts(&manifest)["retryable_heic_visual_match"],
+            1,
+            "queue counts assets, not the 120 historical failure records"
+        );
+
+        let admission = admit_failed_retryable_assets(&mut manifest, 10, 16, 300, 3_000_000)
+            .expect("first visual-match retry should admit");
+        assert_eq!(
+            admission.admitted_by_category["retryable_heic_visual_match"],
+            1
+        );
+        let record = manifest.get("visual-match").expect("record should remain");
+        assert_eq!(record.state, State::Converted);
+        assert_eq!(record.proofs["failure_retry"]["attempt"], json!(1));
+
+        policy_failed_again(
+            &mut manifest,
+            "visual-match",
+            "heic_verify",
+            "HEIC verification failed: visual_match_ok",
+            FailureKind::HeicVisualMatch,
+        );
+        let exhausted = admit_failed_retryable_assets(&mut manifest, 10, 16, 300, 3_000_000)
+            .expect("exhausted retry should terminalize");
+        assert_eq!(exhausted.exhausted, 1);
+        let record = manifest.get("visual-match").expect("record should remain");
+        assert_eq!(record.state, State::NeedsReview);
+        assert_eq!(record.proofs["failure_review"]["current_attempt"], json!(1));
+    }
+
+    #[test]
+    fn conversion_retry_budgets_and_capacity_are_bounded_oldest_first() {
+        let mut manifest = Manifest::new();
+        for (asset_id, recorded_at) in [("oldest", "100.000000000Z"), ("newest", "200.000000000Z")]
+        {
+            manifest.upsert(policy_failed_record(
+                asset_id,
+                "conversion",
+                "conversion command timed out after 120000 ms: heif-enc",
+                Some(FailureKind::ConversionTimedOut),
+                recorded_at,
+            ));
+        }
+
+        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("oldest retry should admit");
+        assert_eq!(
+            admission.admitted_by_category["retryable_conversion_timed_out"],
+            1
+        );
+        assert_eq!(manifest.get("oldest").unwrap().state, State::NasVerified);
+        assert_eq!(manifest.get("newest").unwrap().state, State::Failed);
+
+        for expected_attempt in 2..=3 {
+            policy_failed_again(
+                &mut manifest,
+                "oldest",
+                "conversion",
+                "conversion command timed out after 120000 ms: heif-enc",
+                FailureKind::ConversionTimedOut,
+            );
+            admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+                .expect("retry should admit before budget exhaustion");
+            assert_eq!(manifest.get("oldest").unwrap().state, State::NasVerified);
+            assert_eq!(
+                manifest.get("oldest").unwrap().proofs["failure_retry"]["attempt"],
+                json!(expected_attempt)
+            );
+        }
+        policy_failed_again(
+            &mut manifest,
+            "oldest",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            FailureKind::ConversionTimedOut,
+        );
+        let exhausted = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("fourth failure should terminalize");
+        assert_eq!(exhausted.exhausted, 1);
+        assert_eq!(manifest.get("oldest").unwrap().state, State::NeedsReview);
+    }
+
+    #[test]
+    fn one_attempt_conversion_categories_terminalize_after_their_retry_fails_again() {
+        for (asset_id, kind, message) in [
+            (
+                "unreadable",
+                FailureKind::ConversionOutputUnreadable,
+                "converted output is missing or unreadable at /output/unreadable.oriented-preview.jpg: interrupted",
+            ),
+            (
+                "metadata",
+                FailureKind::ConversionMetadataFailed,
+                "metadata command failed: exiftool exited with exit status: 1",
+            ),
+        ] {
+            let mut manifest = Manifest::new();
+            manifest.upsert(policy_failed_record(
+                asset_id,
+                "conversion",
+                message,
+                Some(kind),
+                "100.000000000Z",
+            ));
+
+            admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+                .expect("first retry should admit");
+            assert_eq!(manifest.get(asset_id).unwrap().state, State::NasVerified);
+            assert_eq!(
+                manifest.get(asset_id).unwrap().proofs["failure_retry"]["attempt"],
+                json!(1)
+            );
+
+            policy_failed_again(&mut manifest, asset_id, "conversion", message, kind);
+            let exhausted = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+                .expect("failed retry should terminalize");
+            assert_eq!(exhausted.exhausted, 1);
+            assert_eq!(manifest.get(asset_id).unwrap().state, State::NeedsReview);
+        }
+    }
+
+    #[test]
+    fn retry_backoff_and_interrupted_admission_do_not_duplicate_attempts() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "recent",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            Some(FailureKind::ConversionTimedOut),
+            "2999900.000000000Z",
+        ));
+        manifest.upsert(policy_failed_record(
+            "admitted",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            Some(FailureKind::ConversionTimedOut),
+            "100.000000000Z",
+        ));
+
+        let first = admit_failed_retryable_assets(&mut manifest, 2, 2, 300, 3_000_000)
+            .expect("old retry should admit");
+        assert_eq!(first.backoff, 1);
+        assert_eq!(manifest.get("recent").unwrap().state, State::Failed);
+        assert_eq!(
+            manifest.get("admitted").unwrap().proofs["failure_retry"]["attempt"],
+            json!(1)
+        );
+
+        let resumed = admit_failed_retryable_assets(&mut manifest, 2, 2, 300, 3_000_000)
+            .expect("interrupted admitted state should continue without readmission");
+        assert!(resumed.admitted_by_category.is_empty());
+        assert_eq!(
+            manifest.get("admitted").unwrap().proofs["failure_retry"]["attempt"],
+            json!(1)
+        );
+    }
+
+    #[test]
+    fn retry_blocking_proofs_and_missing_preview_never_admit() {
+        let mut manifest = Manifest::new();
+        for proof_key in RETRY_BLOCKING_PROOFS {
+            let mut record = policy_failed_record(
+                proof_key,
+                "conversion",
+                "conversion command timed out after 120000 ms: heif-enc",
+                Some(FailureKind::ConversionTimedOut),
+                "100.000000000Z",
+            );
+            record
+                .proofs
+                .insert(proof_key.to_string(), json!({"present": true}));
+            manifest.upsert(record);
+        }
+        manifest.upsert(policy_failed_record(
+            "missing-preview",
+            "conversion",
+            "RAW has neither PreviewImage nor JpgFromRaw embedded preview: /raw/missing-preview.DNG",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        manifest.upsert(policy_failed_record(
+            "unknown",
+            "conversion",
+            "unclassified failure",
+            None,
+            "100.000000000Z",
+        ));
+
+        let admission = admit_failed_retryable_assets(&mut manifest, 16, 16, 300, 3_000_000)
+            .expect("blocked records should not fail policy evaluation");
+        assert_eq!(
+            admission.blocked_downstream_proof,
+            RETRY_BLOCKING_PROOFS.len()
+        );
+        assert_eq!(admission.blocked_missing_preview, 1);
+        assert_eq!(admission.unknown, 1);
+        for asset_id in RETRY_BLOCKING_PROOFS
+            .iter()
+            .copied()
+            .chain(["missing-preview", "unknown"])
+        {
+            assert_eq!(manifest.get(asset_id).unwrap().state, State::Failed);
+        }
+    }
+
+    #[test]
+    fn legacy_failure_classification_is_exact_and_asset_bound() {
+        let record = policy_failed_record(
+            "asset",
+            "conversion",
+            "converted output is missing or unreadable at /output/asset.oriented-preview.jpg: interrupted",
+            None,
+            "100.000000000Z",
+        );
+        assert_eq!(
+            last_failure_kind(&record),
+            Some(FailureKind::ConversionOutputUnreadable)
+        );
+        for (stage, message) in [
+            (
+                "upload",
+                "converted output is missing or unreadable at /output/asset.oriented-preview.jpg: interrupted",
+            ),
+            (
+                "conversion",
+                "converted output is missing or unreadable at /output/other.oriented-preview.jpg: interrupted",
+            ),
+            (
+                "conversion",
+                "converted output is missing or unreadable at /output/asset.oriented-preview.jpg unexpected",
+            ),
+        ] {
+            let record = policy_failed_record("asset", stage, message, None, "100.000000000Z");
+            assert_eq!(last_failure_kind(&record), None);
+        }
+    }
+
+    #[test]
+    fn failed_retry_admission_persists_proof_and_state_to_strict_store() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let manifest_path = tempdir.path().join("manifest.json");
         let store =
             AssetStateStore::open_writer(&manifest_path, "test-writer", Duration::from_secs(60))
                 .expect("state store should open");
         let mut manifest = Manifest::new();
-        let mut failed = retryable_failed_conversion_record(
+        let mut failed = policy_failed_record(
             "conversion-timeout",
+            "conversion",
             "conversion command timed out after 120000 ms: heif-enc",
+            Some(FailureKind::ConversionTimedOut),
+            "100.000000000Z",
         );
         failed.updated_at = "100.000000000Z".to_string();
         manifest.upsert(failed.clone());
@@ -12148,9 +12912,13 @@ esac
             .persist_manifest_records(&manifest)
             .expect("failed state should persist");
 
-        let buckets = recover_retryable_failed_assets(&mut manifest);
+        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("failed retry should admit");
 
-        assert_eq!(buckets["retryable_conversion_timeout"], 1);
+        assert_eq!(
+            admission.admitted_by_category["retryable_conversion_timed_out"],
+            1
+        );
         let recovered = manifest
             .get("conversion-timeout")
             .expect("asset should recover");
@@ -12165,96 +12933,7 @@ esac
             .expect("asset should reload");
         assert_eq!(reloaded_record.state, State::NasVerified);
         assert_eq!(reloaded_record.updated_at, recovered.updated_at);
-    }
-
-    #[test]
-    fn retryable_visual_match_failures_recover_to_converted_when_output_matches_proof() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let heic_path = tempdir.path().join("asset.heic");
-        let heic_bytes = b"verified converted heic bytes";
-        fs::write(&heic_path, heic_bytes).expect("heic output should be written");
-        let mut manifest = Manifest::new();
-        manifest.upsert(retryable_visual_match_record(
-            "visual-match",
-            &heic_path,
-            heic_bytes,
-        ));
-
-        let buckets = recover_retryable_failed_assets(&mut manifest);
-
-        assert_eq!(buckets["retryable_visual_match_verification"], 1);
-        assert_eq!(
-            manifest
-                .get("visual-match")
-                .expect("asset should remain")
-                .state,
-            State::Converted
-        );
-    }
-
-    #[test]
-    fn retryable_visual_match_failures_stay_failed_when_output_hash_does_not_match() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let heic_path = tempdir.path().join("asset.heic");
-        fs::write(&heic_path, b"mutated bytes").expect("heic output should be written");
-        let mut manifest = Manifest::new();
-        manifest.upsert(retryable_visual_match_record(
-            "visual-match",
-            &heic_path,
-            b"original bytes",
-        ));
-
-        let buckets = recover_retryable_failed_assets(&mut manifest);
-
-        assert!(buckets.is_empty());
-        assert_eq!(
-            manifest
-                .get("visual-match")
-                .expect("asset should remain")
-                .state,
-            State::Failed
-        );
-    }
-
-    #[test]
-    fn retryable_failed_asset_recovery_preserves_fail_closed_records() {
-        let mut manifest = Manifest::new();
-        let mut original_missing = lifecycle_record("original-missing", State::Failed);
-        add_original_resolution_proofs(&mut original_missing, 1_700_000_000);
-        original_missing.failures.push(crate::manifest::FailureRecord::new(
-            "original_asset_resolve",
-            "CloudKit original asset resolver found no exact RAW resource for this asset; delete remains blocked",
-        ));
-        manifest.upsert(original_missing);
-
-        let mut verified_bad_heic = retryable_failed_conversion_record(
-            "verified-bad-heic",
-            "conversion command timed out after 120000 ms: heif-enc",
-        );
-        verified_bad_heic
-            .proofs
-            .insert("heic".to_string(), json!({"heif_info_ok": true}));
-        manifest.upsert(verified_bad_heic);
-
-        let mut uploaded = retryable_failed_conversion_record(
-            "uploaded",
-            "conversion command timed out after 120000 ms: heif-enc",
-        );
-        uploaded.proofs.insert(
-            "upload".to_string(),
-            json!({"uploaded_heic_asset_id": "uploaded"}),
-        );
-        manifest.upsert(uploaded);
-
-        let buckets = recover_retryable_failed_assets(&mut manifest);
-
-        assert!(buckets.is_empty());
-        for asset_id in ["original-missing", "verified-bad-heic", "uploaded"] {
-            assert_eq!(
-                manifest.get(asset_id).expect("asset should remain").state,
-                State::Failed
-            );
-        }
+        assert_eq!(reloaded_record.proofs["failure_retry"]["attempt"], json!(1));
     }
 
     #[test]
@@ -12780,120 +13459,26 @@ esac
     }
 
     #[test]
-    fn retryable_upload_conflict_recovery_requires_verified_upload_inputs() {
+    fn upload_conflict_with_a_heic_proof_is_reported_blocked_and_not_recovered() {
         let mut manifest = Manifest::new();
-        let mut recoverable = lifecycle_record("recoverable", State::Failed);
-        recoverable.proofs.insert(
-            "heic".to_string(),
-            json!({
-                "heic_path": "/heic/recoverable.heic",
-                "heic_sha256": "heic-sha",
-                "size_bytes": 10u64,
-            }),
-        );
-        add_original_asset_proof(&mut recoverable);
-        recoverable
-            .failures
-            .push(crate::manifest::FailureRecord::new(
-                "upload",
-                RETRYABLE_UPLOAD_CONFLICT_MESSAGE,
-            ));
-        manifest.upsert(recoverable);
+        let mut record = lifecycle_record("upload-conflict", State::Failed);
+        record
+            .proofs
+            .insert("heic".to_string(), json!({"verified": true}));
+        record.failures.push(crate::manifest::FailureRecord::new(
+            "upload",
+            "iCloud Photos putAsset rejected the upload with status 409",
+        ));
+        manifest.upsert(record);
 
-        let mut missing_heic = lifecycle_record("missing-heic", State::Failed);
-        add_original_asset_proof(&mut missing_heic);
-        missing_heic
-            .failures
-            .push(crate::manifest::FailureRecord::new(
-                "upload",
-                RETRYABLE_UPLOAD_CONFLICT_MESSAGE,
-            ));
-        manifest.upsert(missing_heic);
+        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("blocked upload conflict should not fail policy evaluation");
 
-        let mut different_failure = lifecycle_record("different-failure", State::Failed);
-        different_failure.proofs.insert(
-            "heic".to_string(),
-            json!({
-                "heic_path": "/heic/different-failure.heic",
-                "heic_sha256": "heic-sha",
-                "size_bytes": 10u64,
-            }),
-        );
-        add_original_asset_proof(&mut different_failure);
-        different_failure
-            .failures
-            .push(crate::manifest::FailureRecord::new(
-                "upload",
-                "upload failed: nope",
-            ));
-        manifest.upsert(different_failure);
-
-        assert_eq!(recover_retryable_upload_conflicts(&mut manifest), 1);
+        assert_eq!(admission.blocked_downstream_proof, 1);
         assert_eq!(
-            manifest
-                .get("recoverable")
-                .expect("record should exist")
-                .state,
-            State::ConversionVerified
-        );
-        assert_eq!(
-            manifest
-                .get("missing-heic")
-                .expect("record should exist")
-                .state,
+            manifest.get("upload-conflict").unwrap().state,
             State::Failed
         );
-        assert_eq!(
-            manifest
-                .get("different-failure")
-                .expect("record should exist")
-                .state,
-            State::Failed
-        );
-    }
-
-    #[test]
-    fn retryable_upload_conflict_recovery_commits_newer_state_to_strict_store() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let manifest_path = tempdir.path().join("manifest.json");
-        let store =
-            AssetStateStore::open_writer(&manifest_path, "test-writer", Duration::from_secs(60))
-                .expect("state store should open");
-        let mut manifest = Manifest::new();
-        let mut recoverable = lifecycle_record("recoverable", State::Failed);
-        recoverable.updated_at = "100.000000000Z".to_string();
-        recoverable.proofs.insert(
-            "heic".to_string(),
-            json!({
-                "heic_path": "/heic/recoverable.heic",
-                "heic_sha256": "heic-sha",
-                "size_bytes": 10u64,
-            }),
-        );
-        add_original_asset_proof(&mut recoverable);
-        recoverable
-            .failures
-            .push(crate::manifest::FailureRecord::new(
-                "upload",
-                RETRYABLE_UPLOAD_CONFLICT_MESSAGE,
-            ));
-        manifest.upsert(recoverable.clone());
-        store
-            .persist_manifest_records(&manifest)
-            .expect("failed state should persist");
-
-        assert_eq!(recover_retryable_upload_conflicts(&mut manifest), 1);
-
-        let recovered = manifest.get("recoverable").expect("asset should recover");
-        assert_eq!(recovered.state, State::ConversionVerified);
-        assert!(recovered.updated_at > recoverable.updated_at);
-        store
-            .persist_manifest_records(&manifest)
-            .expect("recovered state should persist with a newer timestamp");
-        let reloaded = store.load().expect("state store should reload");
-        let reloaded_record = reloaded.get("recoverable").expect("asset should reload");
-        assert_eq!(reloaded_record.state, State::ConversionVerified);
-        assert_eq!(reloaded_record.updated_at, recovered.updated_at);
     }
 
     #[test]
@@ -13694,6 +14279,10 @@ esac
         assert!(!record.proofs.contains_key("heic"));
         assert_eq!(record.failures[0].stage, "heic_verify");
         assert!(record.failures[0].message.contains("visual_content_ok"));
+        assert_eq!(
+            record.failures[0].kind,
+            Some(FailureKind::HeicVisualContent)
+        );
     }
 
     #[cfg(unix)]

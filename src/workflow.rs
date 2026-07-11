@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
+use crate::manifest::{AssetRecord, FailureKind, Manifest, ManifestError, State};
 use crate::proof::{
     MIN_RAW_AGE_SECONDS, NasRawProof, ProofError, RawFileFingerprint, prove_nas_raw,
     prove_nas_raw_with_min_age_seconds_and_fingerprint,
@@ -1114,6 +1114,18 @@ pub fn record_stage_failure<'a>(
 ) -> Result<&'a AssetRecord, WorkflowError> {
     manifest
         .record_failure(asset_id, stage, message)
+        .map_err(WorkflowError::Manifest)
+}
+
+pub fn record_stage_failure_with_kind<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    stage: &str,
+    message: &str,
+    kind: FailureKind,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    manifest
+        .record_failure_with_kind(asset_id, stage, message, Some(kind))
         .map_err(WorkflowError::Manifest)
 }
 
