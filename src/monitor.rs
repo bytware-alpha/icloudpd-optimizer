@@ -10043,6 +10043,101 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct BlockingAdjustedSourceTransport {
+        response: Value,
+        bytes: Vec<u8>,
+        lookup_started_sender: mpsc::Sender<()>,
+        continue_receiver: mpsc::Receiver<()>,
+    }
+
+    #[cfg(unix)]
+    impl CloudKitAdjustedSourceTransport for BlockingAdjustedSourceTransport {
+        fn post_records_lookup(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _payload: Value,
+        ) -> Result<Value, AdjustedSourceError> {
+            self.lookup_started_sender
+                .send(())
+                .map_err(|_| AdjustedSourceError::LookupTransport)?;
+            self.continue_receiver
+                .recv()
+                .map_err(|_| AdjustedSourceError::LookupTransport)?;
+            Ok(self.response.clone())
+        }
+
+        fn download_resource_to_create_new(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _download_url: &Url,
+            _expected_size_bytes: u64,
+            temp_file: &mut File,
+        ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
+            temp_file
+                .write_all(&self.bytes)
+                .map_err(|_| AdjustedSourceError::DownloadTransport)?;
+            temp_file
+                .sync_all()
+                .map_err(|_| AdjustedSourceError::DownloadTransport)?;
+            Ok(CloudKitAdjustedSourceDownload {
+                size_bytes: self.bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&self.bytes)),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_rolling_conversion_tools() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tools = tempfile::tempdir().expect("tool tempdir should be created");
+        let write_tool = |name: &str, body: &str| {
+            let path = tools.path().join(name);
+            fs::write(&path, body).expect("fake conversion tool should be written");
+            let mut permissions = fs::metadata(&path)
+                .expect("fake conversion tool metadata should be readable")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions)
+                .expect("fake conversion tool should be executable");
+        };
+        write_tool(
+            "sips",
+            r#"#!/bin/sh
+out=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--out" ]; then
+    out="$arg"
+    break
+  fi
+  previous="$arg"
+done
+[ -n "$out" ] || exit 41
+printf 'fake-heic' > "$out"
+"#,
+        );
+        write_tool(
+            "heif-enc",
+            r#"#!/bin/sh
+out=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-o" ]; then
+    out="$arg"
+  fi
+  previous="$arg"
+done
+[ -n "$out" ] || exit 42
+printf 'fake-heic' > "$out"
+"#,
+        );
+        write_tool("exiftool", "#!/bin/sh\nexit 0\n");
+        write_tool("heif-info", "#!/bin/sh\nexit 1\n");
+        tools
+    }
+
+    #[cfg(unix)]
     const FAKE_NATIVE_VISUAL_VERIFIER_TIMEOUT_SECONDS: u64 = 5;
 
     #[cfg(unix)]
@@ -11094,6 +11189,217 @@ esac
                 .expect("summary should not be poisoned")
                 .conversions_attempted,
             1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rolling_resolve_retains_its_reserved_conversion_slot_until_immediate_convert() {
+        const CHILD_ENV: &str = "ICLOUDPD_OPTIMIZER_ROLLING_SLOT_TEST_CHILD";
+        if env::var_os(CHILD_ENV).is_none() {
+            let tools = fake_rolling_conversion_tools();
+            let status = Command::new(env::current_exe().expect("test binary path should resolve"))
+                .args([
+                    "--exact",
+                    "monitor::tests::rolling_resolve_retains_its_reserved_conversion_slot_until_immediate_convert",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("PATH", tools.path())
+                .status()
+                .expect("isolated lifecycle test should run");
+            assert!(status.success(), "isolated lifecycle test should pass");
+            return;
+        }
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        fs::create_dir_all(&config.download_root).expect("download root should be created");
+        fs::create_dir_all(&config.heic_output_dir).expect("HEIC root should be created");
+        config.heic_output_dir =
+            fs::canonicalize(&config.heic_output_dir).expect("HEIC root should canonicalize");
+        config.full_lifecycle = true;
+        config.rolling_lifecycle = true;
+        config.auto_delete = false;
+        config.max_conversions_per_scan = 1;
+        let raw_path = config.download_root.join("resolver.DNG");
+        let raw_bytes = vec![b'r'; 64 * 1024];
+        fs::write(&raw_path, &raw_bytes).expect("RAW should be written");
+        let raw_path = fs::canonicalize(&raw_path).expect("RAW should canonicalize");
+        let raw_sha256 = format!("{:x}", Sha256::digest(&raw_bytes));
+
+        let mut manifest = Manifest::new();
+        let mut resolver_record = policy_failed_record(
+            "resolver-slot",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        );
+        resolver_record.raw_path = raw_path.clone();
+        resolver_record.proofs.insert(
+            "nas".to_string(),
+            json!({
+                "canonical_path": raw_path,
+                "relative_path": "resolver.DNG",
+                "size_bytes": raw_bytes.len() as u64,
+                "modified_unix_seconds": 100u64,
+                "age_seconds": 2_592_000u64,
+                "sha256": raw_sha256,
+            }),
+        );
+        resolver_record
+            .proofs
+            .get_mut("original_asset")
+            .expect("original proof")["size_bytes"] = json!(raw_bytes.len() as u64);
+        resolver_record
+            .proofs
+            .get_mut("original_asset")
+            .expect("original proof")["filename"] = json!("resolver.DNG");
+        resolver_record
+            .proofs
+            .get_mut("original_asset")
+            .expect("original proof")["matched_raw_sha256"] = json!(raw_sha256);
+        manifest.upsert(resolver_record);
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("resolver marker should be admitted");
+        let mut direct_record = lifecycle_record("direct-conversion", State::NasVerified);
+        add_original_asset_proof(&mut direct_record);
+        manifest.upsert(direct_record);
+
+        let original = adjusted_source_recovery_original_proof(
+            manifest
+                .get("resolver-slot")
+                .expect("marked resolver record"),
+        )
+        .expect("resolver source identity should be valid");
+        let jpeg = test_adjusted_source_jpeg();
+        let state_store = Arc::new(
+            AssetStateStore::open_writer(
+                &config.manifest_path,
+                "test-writer",
+                Duration::from_secs(60),
+            )
+            .expect("state store should open"),
+        );
+        state_store
+            .persist_manifest_records(&manifest)
+            .expect("initial records should persist");
+        let shared_manifest = Arc::new(Mutex::new(manifest));
+        let summary = Arc::new(Mutex::new(MonitorScanSummary {
+            started_unix_seconds: 1_000,
+            ..MonitorScanSummary::default()
+        }));
+        let reservations = Arc::new(RollingConversionReservations::new([
+            "resolver-slot".to_string()
+        ]));
+        let stage_permits = Arc::new(RollingStagePermits::new(1, 1, 1));
+        let (lookup_started_sender, lookup_started_receiver) = mpsc::channel();
+        let (continue_sender, continue_receiver) = mpsc::channel();
+        let worker_config = config.clone();
+        let worker_state_store = Arc::clone(&state_store);
+        let worker_manifest = Arc::clone(&shared_manifest);
+        let worker_summary = Arc::clone(&summary);
+        let worker_reservations = Arc::clone(&reservations);
+        let worker_stage_permits = Arc::clone(&stage_permits);
+        let worker_original = original.clone();
+        let worker_jpeg = jpeg.clone();
+        let worker = thread::spawn(move || {
+            let base_read_session = test_delete_session();
+            let mut resolver =
+                CloudKitAdjustedSourceResolver::new(BlockingAdjustedSourceTransport {
+                    response: test_adjusted_source_lookup_response(&worker_original, &worker_jpeg),
+                    bytes: worker_jpeg,
+                    lookup_started_sender,
+                    continue_receiver,
+                });
+            let mut execution = RollingAssetExecutionContext {
+                config: &worker_config,
+                state_store: &worker_state_store,
+                worker_id: 1,
+                manifest: &worker_manifest,
+                summary: &worker_summary,
+                conversion_reservations: &worker_reservations,
+                base_read_session: Some(&base_read_session),
+                adjusted_source_resolver: Some(&mut resolver),
+            };
+            run_rolling_asset_lifecycle("resolver-slot", &worker_stage_permits, &mut execution)
+        });
+
+        match lookup_started_receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let error = worker
+                    .join()
+                    .expect("resolver worker should not panic")
+                    .expect_err("resolver worker should fail before lookup");
+                panic!("resolver worker exited before lookup: {error}");
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("resolver should pause before it completes");
+            }
+        }
+        assert!(
+            reservations
+                .is_reserved("resolver-slot")
+                .expect("reservation check should succeed")
+        );
+        assert_eq!(
+            run_rolling_asset_conversion(
+                &config,
+                &state_store,
+                "direct-conversion",
+                &shared_manifest,
+                &summary,
+                &reservations,
+            )
+            .expect("direct conversion capacity check should succeed"),
+            RollingAssetStepOutcome::skipped(),
+            "a queued direct conversion must not steal the resolver's reserved slot"
+        );
+        assert_eq!(
+            summary
+                .lock()
+                .expect("summary should not be poisoned")
+                .conversions_attempted,
+            0
+        );
+        continue_sender
+            .send(())
+            .expect("resolver should still be waiting");
+
+        let delta = worker
+            .join()
+            .expect("resolver worker should not panic")
+            .expect("resolver lifecycle should complete through conversion");
+        assert_eq!(delta.adjusted_sources_resolved, 1);
+        assert_eq!(delta.conversions_completed, 1);
+        assert!(
+            !reservations
+                .is_reserved("resolver-slot")
+                .expect("reservation check should succeed")
+        );
+        let summary = summary.lock().expect("summary should not be poisoned");
+        assert_eq!(summary.conversions_attempted, 1);
+        assert_eq!(summary.conversions_completed, 1);
+        drop(summary);
+        let manifest = shared_manifest
+            .lock()
+            .expect("manifest should not be poisoned");
+        let resolved = manifest.get("resolver-slot").expect("resolved record");
+        assert_eq!(resolved.state, State::Converted);
+        assert!(!resolved.proofs.contains_key("upload"));
+        assert!(!resolved.proofs.contains_key("delete"));
+        assert_eq!(
+            manifest
+                .get("direct-conversion")
+                .expect("direct record")
+                .state,
+            State::NasVerified
         );
     }
 
