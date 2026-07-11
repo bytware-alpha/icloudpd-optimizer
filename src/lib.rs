@@ -1,3 +1,4 @@
+pub mod adjusted_source;
 pub mod cli;
 pub mod conversion;
 pub mod conversion_backend;

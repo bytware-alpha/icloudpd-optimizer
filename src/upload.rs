@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::File;
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
@@ -15,6 +15,9 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
+use crate::adjusted_source::{
+    AdjustedSourceError, CloudKitAdjustedSourceDownload, CloudKitAdjustedSourceTransport,
+};
 use crate::workflow::{HeicVerificationProof, OriginalAssetProof, UploadProof};
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
@@ -1625,6 +1628,77 @@ impl ReqwestCloudKitTransport {
             size_bytes,
         })
     }
+
+    fn download_resource_to_create_new(
+        &self,
+        session: &CloudKitDeleteSession,
+        download_url: &Url,
+        expected_size_bytes: u64,
+        temp_path: &Path,
+    ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
+        if expected_size_bytes == 0 {
+            return Err(AdjustedSourceError::DownloadedSizeMismatch);
+        }
+        validate_cloudkit_resource_download_url(download_url)
+            .map_err(|_| AdjustedSourceError::InvalidResourceUrl)?;
+        session
+            .validate()
+            .map_err(|_| AdjustedSourceError::DownloadTransport)?;
+        let mut response = self
+            .client
+            .get(download_url.clone())
+            .headers(
+                cloudkit_resource_download_headers(session)
+                    .map_err(|_| AdjustedSourceError::DownloadTransport)?,
+            )
+            .send()
+            .map_err(|_| AdjustedSourceError::DownloadTransport)?;
+        if !response.status().is_success() {
+            return Err(AdjustedSourceError::DownloadTransport);
+        }
+        let mut created = false;
+        let result = (|| -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(temp_path)
+                .map_err(|_| AdjustedSourceError::Filesystem)?;
+            created = true;
+            let mut hasher = Sha256::new();
+            let mut size_bytes = 0_u64;
+            let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+            loop {
+                let bytes_read = response
+                    .read(&mut buffer)
+                    .map_err(|_| AdjustedSourceError::DownloadTransport)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                size_bytes = size_bytes
+                    .checked_add(bytes_read as u64)
+                    .ok_or(AdjustedSourceError::DownloadedSizeMismatch)?;
+                if size_bytes > expected_size_bytes {
+                    return Err(AdjustedSourceError::DownloadedSizeMismatch);
+                }
+                file.write_all(&buffer[..bytes_read])
+                    .map_err(|_| AdjustedSourceError::Filesystem)?;
+                hasher.update(&buffer[..bytes_read]);
+            }
+            if size_bytes != expected_size_bytes {
+                return Err(AdjustedSourceError::DownloadedSizeMismatch);
+            }
+            file.sync_all()
+                .map_err(|_| AdjustedSourceError::Filesystem)?;
+            Ok(CloudKitAdjustedSourceDownload {
+                sha256: format!("{:x}", hasher.finalize()),
+                size_bytes,
+            })
+        })();
+        if result.is_err() && created {
+            let _ = fs::remove_file(temp_path);
+        }
+        result
+    }
 }
 
 pub struct ReqwestCloudKitDeleteTransport {
@@ -1741,6 +1815,22 @@ impl ReqwestCloudKitReadTransport {
         }
         cloudkit_records_query_url(session, database_scope)
     }
+
+    fn records_lookup_url(
+        &self,
+        session: &CloudKitDeleteSession,
+        database_scope: CloudKitDatabaseScope,
+    ) -> Result<Url, UploadError> {
+        #[cfg(test)]
+        if let Some(endpoint) = &self.endpoint_override {
+            return cloudkit_records_lookup_url_with_base(
+                session,
+                endpoint.clone(),
+                database_scope,
+            );
+        }
+        cloudkit_records_lookup_url(session, database_scope)
+    }
 }
 
 impl CloudKitOriginalAssetReadTransport for ReqwestCloudKitReadTransport {
@@ -1767,6 +1857,42 @@ impl CloudKitOriginalAssetReadTransport for ReqwestCloudKitReadTransport {
     ) -> Result<CloudKitResourceDownload, UploadError> {
         self.transport
             .download_resource(session, download_url, expected_size_bytes)
+    }
+}
+
+impl CloudKitAdjustedSourceTransport for ReqwestCloudKitReadTransport {
+    fn post_records_lookup(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, AdjustedSourceError> {
+        let url = self
+            .records_lookup_url(session, payload_database_scope(&payload, session))
+            .map_err(|_| AdjustedSourceError::LookupTransport)?;
+        self.transport
+            .post_records_json(
+                session,
+                url,
+                payload,
+                "records_lookup",
+                read_cloudkit_json_response,
+            )
+            .map_err(|_| AdjustedSourceError::LookupTransport)
+    }
+
+    fn download_resource_to_create_new(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        download_url: &Url,
+        expected_size_bytes: u64,
+        temp_path: &Path,
+    ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
+        self.transport.download_resource_to_create_new(
+            session,
+            download_url,
+            expected_size_bytes,
+            temp_path,
+        )
     }
 }
 
@@ -3688,6 +3814,26 @@ fn cloudkit_records_lookup_url(
     Ok(base)
 }
 
+#[cfg(test)]
+fn cloudkit_records_lookup_url_with_base(
+    session: &CloudKitDeleteSession,
+    mut base: Url,
+    database_scope: CloudKitDatabaseScope,
+) -> Result<Url, UploadError> {
+    base.set_path(&format!(
+        "/database/1/com.apple.photos.cloud/production/{}/records/lookup",
+        database_scope.as_str()
+    ));
+    {
+        let mut query = base.query_pairs_mut();
+        query.clear();
+        for param in &session.cloudkit_query_params {
+            query.append_pair(&param.name, &param.value);
+        }
+    }
+    Ok(base)
+}
+
 fn validate_signed_upload_url(url: &Url) -> Result<(), UploadError> {
     if url.scheme() != "https" {
         return Err(UploadError::InvalidPhotosUploadResponse(
@@ -3735,7 +3881,7 @@ fn validate_loopback_test_endpoint(url: &Url) -> Result<(), UploadError> {
     Ok(())
 }
 
-fn validate_cloudkit_resource_download_url(url: &Url) -> Result<(), UploadError> {
+pub(crate) fn validate_cloudkit_resource_download_url(url: &Url) -> Result<(), UploadError> {
     #[cfg(test)]
     let loopback_test_url =
         url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && url.port().is_some();
@@ -4836,7 +4982,10 @@ fn validate_candidate_heic(path: &Path) -> Result<(), UploadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adjusted_source::{AdjustedSourceError, CloudKitAdjustedSourceTransport};
     use serde_json::json;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
 
     #[test]
     fn hashing_file_hashes_exact_streamed_bytes_with_small_reads() {
@@ -4890,6 +5039,180 @@ mod tests {
             .to_string(),
         )
         .expect("session should load")
+    }
+
+    fn read_loopback_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let header_end = loop {
+            let read = stream
+                .read(&mut buffer)
+                .expect("loopback request should read");
+            assert_ne!(read, 0, "loopback request must include headers");
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let header = std::str::from_utf8(&request[..header_end]).expect("request headers UTF-8");
+        let content_length = header
+            .lines()
+            .find_map(|line| {
+                line.split_once(':')
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            })
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let read = stream
+                .read(&mut buffer)
+                .expect("loopback request body should read");
+            assert_ne!(read, 0, "loopback request must include declared body");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        request
+    }
+
+    fn write_loopback_response(stream: &mut TcpStream, status: &str, body: &[u8], extra: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n",
+            body.len()
+        )
+        .expect("loopback response header should write");
+        stream
+            .write_all(body)
+            .expect("loopback response body should write");
+    }
+
+    #[test]
+    fn adjusted_source_reqwest_transport_uses_lookup_scope_headers_and_streams_create_new_download()
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let port = listener.local_addr().expect("loopback address").port();
+        let endpoint = Url::parse(&format!("http://127.0.0.1:{port}")).expect("loopback endpoint");
+        let resource_url = Url::parse(&format!("http://127.0.0.1:{port}/resource"))
+            .expect("loopback resource URL");
+        let resource_bytes = b"streamed adjusted bytes".to_vec();
+        let expected_bytes = resource_bytes.clone();
+        let server = thread::spawn(move || {
+            let (mut lookup, _) = listener.accept().expect("lookup connection");
+            let request = String::from_utf8(read_loopback_request(&mut lookup))
+                .expect("lookup request UTF-8");
+            let request_lower = request.to_ascii_lowercase();
+            assert!(request_lower.starts_with(
+                "post /database/1/com.apple.photos.cloud/production/private/records/lookup?"
+            ));
+            assert!(request.contains("clientBuildNumber=2522Project44"));
+            assert!(request_lower.contains("content-type: text/plain;charset=utf-8"));
+            assert!(request_lower.contains("origin: https://www.icloud.com"));
+            assert!(request_lower.contains("referer: https://www.icloud.com/"));
+            assert!(
+                request_lower
+                    .contains("cookie: x-apple-webauth-token=web-auth-token; session=abc123")
+            );
+            assert!(request.ends_with("{\"records\":[{\"recordName\":\"asset-record\"}],\"zoneID\":{\"zoneName\":\"PrimarySync\"}}"));
+            write_loopback_response(
+                &mut lookup,
+                "200 OK",
+                br#"{"records":[]}"#,
+                "Content-Type: application/json\r\n",
+            );
+
+            let (mut resource, _) = listener.accept().expect("resource connection");
+            let request = String::from_utf8(read_loopback_request(&mut resource))
+                .expect("resource request UTF-8");
+            let request_lower = request.to_ascii_lowercase();
+            assert!(request_lower.starts_with("get /resource http/1.1"));
+            assert!(
+                request_lower
+                    .contains("cookie: x-apple-webauth-token=web-auth-token; session=abc123")
+            );
+            write_loopback_response(&mut resource, "200 OK", &expected_bytes, "");
+        });
+        let session = valid_delete_session();
+        let mut transport = ReqwestCloudKitReadTransport::new_for_loopback_test(endpoint)
+            .expect("loopback read transport");
+
+        let response = CloudKitAdjustedSourceTransport::post_records_lookup(
+            &mut transport,
+            &session,
+            json!({
+                "records": [{"recordName": "asset-record"}],
+                "zoneID": {"zoneName": "PrimarySync"}
+            }),
+        )
+        .expect("loopback lookup should succeed");
+        assert_eq!(response, json!({"records": []}));
+        let directory = tempfile::tempdir().expect("test directory");
+        let temp_path = directory.path().join("resource.tmp");
+        let download = CloudKitAdjustedSourceTransport::download_resource_to_create_new(
+            &mut transport,
+            &session,
+            &resource_url,
+            resource_bytes.len() as u64,
+            &temp_path,
+        )
+        .expect("loopback resource should stream");
+        assert_eq!(download.size_bytes, resource_bytes.len() as u64);
+        assert_eq!(
+            download.sha256,
+            format!("{:x}", Sha256::digest(&resource_bytes))
+        );
+        assert_eq!(
+            std::fs::read(&temp_path).expect("streamed temp artifact"),
+            resource_bytes
+        );
+        server.join().expect("loopback assertions should pass");
+    }
+
+    #[test]
+    fn adjusted_source_reqwest_transport_rejects_redirects_and_bad_hosts_without_temp_files() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let port = listener.local_addr().expect("loopback address").port();
+        let endpoint = Url::parse(&format!("http://127.0.0.1:{port}")).expect("loopback endpoint");
+        let resource_url = Url::parse(&format!("http://127.0.0.1:{port}/redirect"))
+            .expect("loopback resource URL");
+        let server = thread::spawn(move || {
+            let (mut resource, _) = listener.accept().expect("resource connection");
+            let request = String::from_utf8(read_loopback_request(&mut resource))
+                .expect("resource request UTF-8");
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .starts_with("get /redirect http/1.1")
+            );
+            write_loopback_response(&mut resource, "302 Found", b"", "Location: /other\r\n");
+        });
+        let session = valid_delete_session();
+        let mut transport = ReqwestCloudKitReadTransport::new_for_loopback_test(endpoint)
+            .expect("loopback read transport");
+        let directory = tempfile::tempdir().expect("test directory");
+        let redirected_temp = directory.path().join("redirected.tmp");
+        let error = CloudKitAdjustedSourceTransport::download_resource_to_create_new(
+            &mut transport,
+            &session,
+            &resource_url,
+            1,
+            &redirected_temp,
+        )
+        .expect_err("redirect must be rejected");
+        assert!(matches!(error, AdjustedSourceError::DownloadTransport));
+        assert!(!redirected_temp.exists());
+        server.join().expect("loopback assertions should pass");
+
+        let bad_host_temp = directory.path().join("bad-host.tmp");
+        let bad_host = Url::parse("https://example.invalid/adjusted.jpg").expect("bad host URL");
+        let error = CloudKitAdjustedSourceTransport::download_resource_to_create_new(
+            &mut transport,
+            &session,
+            &bad_host,
+            1,
+            &bad_host_temp,
+        )
+        .expect_err("bad host must be rejected before I/O");
+        assert!(matches!(error, AdjustedSourceError::InvalidResourceUrl));
+        assert!(!bad_host_temp.exists());
     }
 
     #[test]
