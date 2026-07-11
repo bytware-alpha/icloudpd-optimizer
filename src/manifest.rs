@@ -87,6 +87,7 @@ pub enum FailureKind {
     StagedRawAlreadyExists,
     ConversionMetadataFailed,
     EmbeddedPreviewUnavailable,
+    AdjustedSourceResolveFailed,
 }
 
 impl FailureKind {
@@ -101,6 +102,7 @@ impl FailureKind {
             Self::StagedRawAlreadyExists => "staged_raw_already_exists",
             Self::ConversionMetadataFailed => "conversion_metadata_failed",
             Self::EmbeddedPreviewUnavailable => "embedded_preview_unavailable",
+            Self::AdjustedSourceResolveFailed => "adjusted_source_resolve_failed",
         }
     }
 }
@@ -588,6 +590,36 @@ mod tests {
             serde_json::to_string(&typed_record).expect("typed record should serialize"),
             typed
         );
+
+        let adjusted = r#"{"stage":"adjusted_source_resolve","message":"resolver failed","recorded_at":"102.000000000Z","kind":"adjusted_source_resolve_failed"}"#;
+        let adjusted_record: FailureRecord =
+            serde_json::from_str(adjusted).expect("adjusted resolver failure should deserialize");
+        assert_eq!(
+            adjusted_record.kind,
+            Some(FailureKind::AdjustedSourceResolveFailed)
+        );
+        assert_eq!(
+            adjusted_record.kind.unwrap().as_str(),
+            "adjusted_source_resolve_failed"
+        );
+
+        let legacy_manifest = r#"{
+            "records": [{
+                "asset_id": "legacy",
+                "raw_path": "/raw/legacy.DNG",
+                "state": "failed",
+                "proofs": {},
+                "failures": [{
+                    "stage": "conversion",
+                    "message": "legacy missing preview",
+                    "recorded_at": "100.000000000Z"
+                }],
+                "updated_at": "100.000000000Z"
+            }]
+        }"#;
+        let legacy_payload: ManifestFile = serde_json::from_str(legacy_manifest)
+            .expect("old manifest payload should remain readable");
+        assert_eq!(legacy_payload.records[0].failures[0].kind, None);
     }
 
     #[test]

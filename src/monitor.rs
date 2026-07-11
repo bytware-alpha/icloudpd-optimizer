@@ -21,7 +21,10 @@ use crate::conversion_execution::{
     ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversion,
 };
 use crate::local_mirror::{IcloudpdLocalMirrorRequest, LocalMirrorError};
-use crate::manifest::{AssetRecord, FailureKind, FailureRecord, Manifest, ManifestError, State};
+use crate::manifest::{
+    AssetRecord, FAILURE_QUARANTINE_PROOF_NAME, FailureKind, FailureRecord, Manifest,
+    ManifestError, State,
+};
 use crate::manifest_lock::{
     ManifestLockError, ManifestLockGuard, acquire_manifest_lock, manifest_lock_path,
 };
@@ -32,7 +35,7 @@ use crate::reconciliation::{
 };
 use crate::state_store::{AssetStateStore, AssetStateStoreError};
 use crate::upload::{
-    CLOUDKIT_RECORDS_MODIFY_MAX_OPERATIONS, CloudKitDeleteBatchRequest,
+    CLOUDKIT_RECORDS_MODIFY_MAX_OPERATIONS, CloudKitDatabaseScope, CloudKitDeleteBatchRequest,
     CloudKitDeleteBatchSendError, CloudKitDeleteClient, CloudKitDeleteOutcome,
     CloudKitDeleteSession, CloudKitDeleteTransport, CloudKitLibraryDestination,
     CloudKitOriginalAssetBatchResolveOutcome, CloudKitOriginalAssetBatchResolveRequest,
@@ -73,6 +76,11 @@ const FAILED_RETRY_POLICY_SCHEMA_VERSION: u64 = 2;
 const FAILED_RETRY_POLICY_GENERATION: &str = "codec_normalized_v1";
 const FAILURE_RETRY_PROOF: &str = "failure_retry";
 const FAILURE_REVIEW_PROOF: &str = "failure_review";
+pub const ADJUSTED_SOURCE_REQUIRED_PROOF: &str = "adjusted_source_required";
+pub const ADJUSTED_SOURCE_REQUIRED_SCHEMA_VERSION: u64 = 1;
+pub const ADJUSTED_SOURCE_REQUIRED_POLICY_GENERATION: &str = "adjusted_source_required_v1";
+const ADJUSTED_SOURCE_RESOLVE_RETRY_MIN_AGE_SECONDS: u64 = 300;
+const ADJUSTED_SOURCE_RESOLVE_MAX_ATTEMPTS: u64 = 3;
 const LEGACY_OUTPUT_UNREADABLE_SUFFIX: &str = ": No such file or directory (os error 2)";
 #[cfg(not(test))]
 const MONITOR_STATE_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -649,6 +657,16 @@ pub fn run_monitor_once(
         config.failed_retry_min_age_seconds,
         started,
     )?;
+    let adjusted_source_required_admission = admit_adjusted_source_required_assets(
+        &mut manifest,
+        if config.full_lifecycle {
+            config.max_lifecycle_per_scan
+        } else {
+            0
+        },
+        config.max_failed_retry_admissions_per_scan,
+        started,
+    )?;
     let original_asset_resolver_retry_admission = recover_original_asset_resolver_retries(
         &mut manifest,
         if config.full_lifecycle {
@@ -661,6 +679,7 @@ pub fn run_monitor_once(
         started,
     )?;
     if failed_retry_admission.manifest_changed()
+        || adjusted_source_required_admission.manifest_changed()
         || original_asset_resolver_retry_admission.manifest_changed()
     {
         checkpoint_manifest_state(&state_store, &manifest)?;
@@ -669,6 +688,11 @@ pub fn run_monitor_once(
         "failed_retry_policy_admission",
         started,
         failed_retry_policy_admission_fields(&failed_retry_admission),
+    );
+    log_monitor_event(
+        "adjusted_source_required_admission",
+        started,
+        adjusted_source_required_admission_fields(&adjusted_source_required_admission),
     );
     log_monitor_event(
         "original_asset_resolver_retry_admission",
@@ -6136,6 +6160,130 @@ impl FailedRetryPolicyAdmission {
     }
 }
 
+/// Immutable durable authorization for the later adjusted-source resolver.
+///
+/// The resolver is deliberately not run by this admission policy. A record
+/// remains `Failed` until the future resolver stage validates this marker and
+/// performs its own exact compare-and-swap recovery.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AdjustedSourceRequiredProof {
+    schema_version: u64,
+    policy_generation: String,
+    asset_id: String,
+    attempt: u64,
+    trigger_failure_stage: String,
+    trigger_failure_kind: FailureKind,
+    trigger_failure_recorded_at: String,
+    trigger_failure_digest: String,
+    failure_count_at_admission: usize,
+    failure_history_digest: String,
+    nas_proof_digest: String,
+    original_asset_proof_digest: String,
+    original_record_name: String,
+    original_record_change_tag: String,
+    original_database_scope: CloudKitDatabaseScope,
+    original_zone_name: String,
+    failure_retry_proof_digest: Option<String>,
+    admitted_at_unix_seconds: u64,
+    required_retry_state: State,
+    adjusted_source_relative_path: PathBuf,
+}
+
+impl AdjustedSourceRequiredProof {
+    pub fn asset_id(&self) -> &str {
+        &self.asset_id
+    }
+
+    pub fn attempt(&self) -> u64 {
+        self.attempt
+    }
+
+    pub fn admitted_at_unix_seconds(&self) -> u64 {
+        self.admitted_at_unix_seconds
+    }
+
+    pub fn required_retry_state(&self) -> State {
+        self.required_retry_state
+    }
+
+    pub fn adjusted_source_relative_path(&self) -> &Path {
+        &self.adjusted_source_relative_path
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum AdjustedSourceRequiredProofError {
+    #[error("adjusted-source-required marker is missing")]
+    Missing,
+    #[error("adjusted-source-required marker is malformed or stale")]
+    Malformed,
+    #[error("adjusted-source-required marker has invalid source proofs")]
+    SourceProof,
+    #[error("adjusted-source-required marker has a blocking downstream proof")]
+    DownstreamProof,
+}
+
+/// A manifest-only outcome for adjusted-source admission. The fields describe
+/// queue state, while `manifest_changed` indicates that a marker was written
+/// or replaced in this pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AdjustedSourceRequiredAdmission {
+    pub first_ready: usize,
+    pub resolver_retry_ready: usize,
+    pub backoff: usize,
+    pub exhausted: usize,
+    pub malformed_or_unknown: usize,
+    pub source_proof_blocked: usize,
+    pub downstream_proof_blocked: usize,
+    manifest_changed: bool,
+}
+
+impl AdjustedSourceRequiredAdmission {
+    pub fn manifest_changed(&self) -> bool {
+        self.manifest_changed
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AdjustedSourceRequiredCandidate {
+    asset_id: String,
+    failure_timestamp: (u64, u32),
+    proof: AdjustedSourceRequiredProof,
+    kind: AdjustedSourceAdmissionKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdjustedSourceAdmissionKind {
+    First,
+    ResolverRetry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdjustedSourceQueueStatus {
+    FirstReady,
+    ResolverRetryReady,
+    Backoff,
+    Exhausted,
+    MalformedOrUnknown,
+    SourceProofBlocked,
+    DownstreamProofBlocked,
+}
+
+const ADJUSTED_SOURCE_RECOVERY_BLOCKING_PROOFS: [&str; 12] = [
+    "adjusted_source",
+    "conversion",
+    "conversion_performance",
+    "heic",
+    "upload",
+    "icloudpd_local_mirror",
+    "delete_eligibility",
+    "delete_approval",
+    "delete",
+    "uploaded_heic_delete",
+    FAILURE_REVIEW_PROOF,
+    FAILURE_QUARANTINE_PROOF_NAME,
+];
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct FailureRetryProof {
     schema_version: u64,
@@ -6236,6 +6384,12 @@ fn admit_failed_retryable_assets(
             admission.unknown = admission.unknown.saturating_add(1);
             continue;
         };
+        if record.proofs.contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF)
+            || kind == FailureKind::AdjustedSourceResolveFailed
+        {
+            admission.unknown = admission.unknown.saturating_add(1);
+            continue;
+        }
         if kind == FailureKind::EmbeddedPreviewUnavailable {
             admission.blocked_missing_preview = admission.blocked_missing_preview.saturating_add(1);
             continue;
@@ -6331,6 +6485,20 @@ fn failed_retry_policy_admission_fields(
     })
 }
 
+fn adjusted_source_required_admission_fields(
+    admission: &AdjustedSourceRequiredAdmission,
+) -> serde_json::Value {
+    json!({
+        "first_ready": admission.first_ready,
+        "resolver_retry_ready": admission.resolver_retry_ready,
+        "backoff": admission.backoff,
+        "exhausted": admission.exhausted,
+        "malformed_or_unknown": admission.malformed_or_unknown,
+        "source_proof_blocked": admission.source_proof_blocked,
+        "downstream_proof_blocked": admission.downstream_proof_blocked,
+    })
+}
+
 fn failed_retry_policy(kind: FailureKind) -> Option<FailedRetryPolicy> {
     match kind {
         FailureKind::HeicVisualMatch => Some(FailedRetryPolicy {
@@ -6368,14 +6536,707 @@ fn failed_retry_policy(kind: FailureKind) -> Option<FailedRetryPolicy> {
             retry_state: State::NasVerified,
             max_attempts: 3,
         }),
-        FailureKind::HeicVisualContent | FailureKind::EmbeddedPreviewUnavailable => None,
+        FailureKind::HeicVisualContent
+        | FailureKind::EmbeddedPreviewUnavailable
+        | FailureKind::AdjustedSourceResolveFailed => None,
     }
 }
 
-pub fn failed_retry_queue_counts(manifest: &Manifest) -> BTreeMap<String, u64> {
-    let mut counts = BTreeMap::new();
+/// Decodes and validates a marker that is ready for the future resolver stage.
+/// It accepts only an exact current marker; a resolver failure appended after a
+/// marker is deliberately a retry-admission concern instead.
+pub fn adjusted_source_required_proof(
+    record: &AssetRecord,
+) -> Result<AdjustedSourceRequiredProof, AdjustedSourceRequiredProofError> {
+    let value = record
+        .proofs
+        .get(ADJUSTED_SOURCE_REQUIRED_PROOF)
+        .ok_or(AdjustedSourceRequiredProofError::Missing)?;
+    let proof = serde_json::from_value::<AdjustedSourceRequiredProof>(value.clone())
+        .map_err(|_| AdjustedSourceRequiredProofError::Malformed)?;
+    validate_adjusted_source_required_current(record, &proof)?;
+    Ok(proof)
+}
+
+/// Reserves bounded lifecycle capacity for typed missing-preview failures. The
+/// only mutation is an adjusted-source marker replacement; records remain in
+/// `Failed` for the resolver worker introduced in the next task.
+pub fn admit_adjusted_source_required_assets(
+    manifest: &mut Manifest,
+    max_lifecycle_per_scan: usize,
+    max_admissions_per_scan: usize,
+    current_unix_seconds: u64,
+) -> Result<AdjustedSourceRequiredAdmission, ManifestError> {
+    let mut admission = AdjustedSourceRequiredAdmission::default();
+    let mut first_candidates = Vec::new();
+    let mut retry_candidates = Vec::new();
+    let mut reserved_markers = 0usize;
+
     for record in manifest.records().values() {
         if record.state != State::Failed {
+            continue;
+        }
+
+        if record.proofs.contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF) {
+            match adjusted_source_required_proof(record) {
+                Ok(marker) => {
+                    reserved_markers = reserved_markers.saturating_add(1);
+                    match marker.attempt {
+                        1 => admission.first_ready = admission.first_ready.saturating_add(1),
+                        _ => {
+                            admission.resolver_retry_ready =
+                                admission.resolver_retry_ready.saturating_add(1)
+                        }
+                    }
+                    continue;
+                }
+                Err(AdjustedSourceRequiredProofError::SourceProof) => {
+                    admission.source_proof_blocked =
+                        admission.source_proof_blocked.saturating_add(1);
+                    continue;
+                }
+                Err(AdjustedSourceRequiredProofError::DownstreamProof) => {
+                    admission.downstream_proof_blocked =
+                        admission.downstream_proof_blocked.saturating_add(1);
+                    continue;
+                }
+                Err(AdjustedSourceRequiredProofError::Missing) => unreachable!(),
+                Err(AdjustedSourceRequiredProofError::Malformed) => {}
+            };
+
+            let raw_marker = match record.proofs.get(ADJUSTED_SOURCE_REQUIRED_PROOF) {
+                Some(value) => serde_json::from_value::<AdjustedSourceRequiredProof>(value.clone())
+                    .map_err(|_| AdjustedSourceRequiredProofError::Malformed),
+                None => Err(AdjustedSourceRequiredProofError::Missing),
+            };
+            let Ok(marker) = raw_marker else {
+                admission.malformed_or_unknown = admission.malformed_or_unknown.saturating_add(1);
+                continue;
+            };
+            match validate_adjusted_source_required_retry(record, &marker) {
+                Ok(()) if marker.attempt >= ADJUSTED_SOURCE_RESOLVE_MAX_ATTEMPTS => {
+                    reserved_markers = reserved_markers.saturating_add(1);
+                    admission.exhausted = admission.exhausted.saturating_add(1);
+                }
+                Ok(()) => {
+                    reserved_markers = reserved_markers.saturating_add(1);
+                    let Some(failure_timestamp) = record
+                        .failures
+                        .last()
+                        .and_then(|failure| parse_monitor_timestamp(&failure.recorded_at))
+                    else {
+                        admission.malformed_or_unknown =
+                            admission.malformed_or_unknown.saturating_add(1);
+                        continue;
+                    };
+                    if !monitor_timestamp_is_at_least_age(
+                        failure_timestamp,
+                        ADJUSTED_SOURCE_RESOLVE_RETRY_MIN_AGE_SECONDS,
+                        current_unix_seconds,
+                    ) {
+                        admission.backoff = admission.backoff.saturating_add(1);
+                        continue;
+                    }
+                    let Some(failure) = record.failures.last() else {
+                        admission.malformed_or_unknown =
+                            admission.malformed_or_unknown.saturating_add(1);
+                        continue;
+                    };
+                    match build_adjusted_source_required_proof(
+                        record,
+                        failure,
+                        marker.attempt.saturating_add(1),
+                        current_unix_seconds,
+                    ) {
+                        Ok(proof) => retry_candidates.push(AdjustedSourceRequiredCandidate {
+                            asset_id: record.asset_id.clone(),
+                            failure_timestamp,
+                            proof,
+                            kind: AdjustedSourceAdmissionKind::ResolverRetry,
+                        }),
+                        Err(error) => increment_adjusted_source_error(&mut admission, error),
+                    }
+                }
+                Err(error) => increment_adjusted_source_error(&mut admission, error),
+            }
+            continue;
+        }
+
+        if typed_last_failure_kind(record) != Some(FailureKind::EmbeddedPreviewUnavailable) {
+            continue;
+        }
+        let Some(failure) = record.failures.last() else {
+            admission.malformed_or_unknown = admission.malformed_or_unknown.saturating_add(1);
+            continue;
+        };
+        let Some(failure_timestamp) = parse_monitor_timestamp(&failure.recorded_at) else {
+            admission.malformed_or_unknown = admission.malformed_or_unknown.saturating_add(1);
+            continue;
+        };
+        match build_adjusted_source_required_proof(record, failure, 1, current_unix_seconds) {
+            Ok(proof) => first_candidates.push(AdjustedSourceRequiredCandidate {
+                asset_id: record.asset_id.clone(),
+                failure_timestamp,
+                proof,
+                kind: AdjustedSourceAdmissionKind::First,
+            }),
+            Err(error) => increment_adjusted_source_error(&mut admission, error),
+        }
+    }
+
+    let available_lifecycle_capacity = max_lifecycle_per_scan
+        .saturating_sub(pending_lifecycle_count(manifest))
+        .saturating_sub(reserved_markers);
+    first_candidates.sort_by(|left, right| {
+        left.failure_timestamp
+            .cmp(&right.failure_timestamp)
+            .then_with(|| left.asset_id.cmp(&right.asset_id))
+    });
+    let first_limit = available_lifecycle_capacity.min(max_admissions_per_scan);
+    let mut selected = first_candidates
+        .into_iter()
+        .take(first_limit)
+        .collect::<Vec<_>>();
+    selected.extend(retry_candidates);
+
+    let values = selected
+        .iter()
+        .map(|candidate| {
+            serde_json::to_value(&candidate.proof)
+                .map(|value| (candidate.asset_id.clone(), candidate.kind, value))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() {
+        return Ok(admission);
+    }
+
+    let mut staged = manifest.clone();
+    for (asset_id, kind, value) in values {
+        staged.record_proof(&asset_id, ADJUSTED_SOURCE_REQUIRED_PROOF, value)?;
+        match kind {
+            AdjustedSourceAdmissionKind::First => {
+                admission.first_ready = admission.first_ready.saturating_add(1)
+            }
+            AdjustedSourceAdmissionKind::ResolverRetry => {
+                admission.resolver_retry_ready = admission.resolver_retry_ready.saturating_add(1)
+            }
+        }
+    }
+    *manifest = staged;
+    admission.manifest_changed = true;
+    Ok(admission)
+}
+
+/// Returns only adjusted-source queue categories and performs no filesystem,
+/// hashing, or network work. Callers supply time so retry backoff is testable.
+pub fn adjusted_source_required_queue_counts(
+    manifest: &Manifest,
+    current_unix_seconds: u64,
+) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for record in manifest.records().values() {
+        let Some(status) = adjusted_source_queue_status(record, current_unix_seconds) else {
+            continue;
+        };
+        let key = match status {
+            AdjustedSourceQueueStatus::FirstReady => "adjusted_source_first_ready",
+            AdjustedSourceQueueStatus::ResolverRetryReady => "adjusted_source_resolver_retry_ready",
+            AdjustedSourceQueueStatus::Backoff => "adjusted_source_resolver_backoff",
+            AdjustedSourceQueueStatus::Exhausted => "adjusted_source_resolver_exhausted",
+            AdjustedSourceQueueStatus::MalformedOrUnknown => "adjusted_source_malformed_or_unknown",
+            AdjustedSourceQueueStatus::SourceProofBlocked => "adjusted_source_source_proof_blocked",
+            AdjustedSourceQueueStatus::DownstreamProofBlocked => {
+                "adjusted_source_downstream_proof_blocked"
+            }
+        };
+        *counts.entry(key.to_string()).or_default() += 1;
+    }
+    counts
+}
+
+/// Terminalizes an exhausted resolver lineage using the ordinary durable
+/// failure-review proof. The worker can call this before attempting a fourth
+/// resolver execution.
+pub fn terminalize_adjusted_source_required_exhaustion(
+    manifest: &mut Manifest,
+    asset_id: &str,
+    applied_at_unix_seconds: u64,
+) -> Result<(), ManifestError> {
+    let record = manifest.get(asset_id)?;
+    let marker = record
+        .proofs
+        .get(ADJUSTED_SOURCE_REQUIRED_PROOF)
+        .ok_or_else(|| ManifestError::UnknownAsset {
+            asset_id: asset_id.to_string(),
+        })
+        .and_then(|value| {
+            serde_json::from_value::<AdjustedSourceRequiredProof>(value.clone())
+                .map_err(ManifestError::from)
+        })?;
+    if marker.attempt < ADJUSTED_SOURCE_RESOLVE_MAX_ATTEMPTS
+        || validate_adjusted_source_required_retry(record, &marker).is_err()
+    {
+        return Err(ManifestError::InvalidTransition {
+            asset_id: asset_id.to_string(),
+            from: record.state,
+            to: State::NeedsReview,
+        });
+    }
+
+    let mut staged = manifest.clone();
+    terminalize_failure_for_review(
+        &mut staged,
+        asset_id,
+        FailureKind::AdjustedSourceResolveFailed,
+        "adjusted_source_resolve_attempts_exhausted",
+        ADJUSTED_SOURCE_RESOLVE_MAX_ATTEMPTS,
+        applied_at_unix_seconds,
+    )?;
+    *manifest = staged;
+    Ok(())
+}
+
+fn adjusted_source_queue_status(
+    record: &AssetRecord,
+    current_unix_seconds: u64,
+) -> Option<AdjustedSourceQueueStatus> {
+    if record.state != State::Failed {
+        return None;
+    }
+    if record.proofs.contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF) {
+        let marker = match record
+            .proofs
+            .get(ADJUSTED_SOURCE_REQUIRED_PROOF)
+            .and_then(|value| {
+                serde_json::from_value::<AdjustedSourceRequiredProof>(value.clone()).ok()
+            }) {
+            Some(marker) => marker,
+            None => return Some(AdjustedSourceQueueStatus::MalformedOrUnknown),
+        };
+        match validate_adjusted_source_required_queue_current(record, &marker) {
+            Ok(()) => {
+                return Some(if marker.attempt == 1 {
+                    AdjustedSourceQueueStatus::FirstReady
+                } else {
+                    AdjustedSourceQueueStatus::ResolverRetryReady
+                });
+            }
+            Err(AdjustedSourceRequiredProofError::SourceProof) => {
+                return Some(AdjustedSourceQueueStatus::SourceProofBlocked);
+            }
+            Err(AdjustedSourceRequiredProofError::DownstreamProof) => {
+                return Some(AdjustedSourceQueueStatus::DownstreamProofBlocked);
+            }
+            Err(AdjustedSourceRequiredProofError::Missing) => return None,
+            Err(AdjustedSourceRequiredProofError::Malformed) => {}
+        }
+        return Some(
+            match validate_adjusted_source_required_queue_retry(record, &marker) {
+                Ok(()) if marker.attempt >= ADJUSTED_SOURCE_RESOLVE_MAX_ATTEMPTS => {
+                    AdjustedSourceQueueStatus::Exhausted
+                }
+                Ok(()) => match record
+                    .failures
+                    .last()
+                    .and_then(|failure| parse_monitor_timestamp(&failure.recorded_at))
+                {
+                    Some(timestamp)
+                        if monitor_timestamp_is_at_least_age(
+                            timestamp,
+                            ADJUSTED_SOURCE_RESOLVE_RETRY_MIN_AGE_SECONDS,
+                            current_unix_seconds,
+                        ) =>
+                    {
+                        AdjustedSourceQueueStatus::ResolverRetryReady
+                    }
+                    Some(_) => AdjustedSourceQueueStatus::Backoff,
+                    None => AdjustedSourceQueueStatus::MalformedOrUnknown,
+                },
+                Err(AdjustedSourceRequiredProofError::SourceProof) => {
+                    AdjustedSourceQueueStatus::SourceProofBlocked
+                }
+                Err(AdjustedSourceRequiredProofError::DownstreamProof) => {
+                    AdjustedSourceQueueStatus::DownstreamProofBlocked
+                }
+                Err(AdjustedSourceRequiredProofError::Missing)
+                | Err(AdjustedSourceRequiredProofError::Malformed) => {
+                    AdjustedSourceQueueStatus::MalformedOrUnknown
+                }
+            },
+        );
+    }
+
+    if typed_last_failure_kind(record) != Some(FailureKind::EmbeddedPreviewUnavailable) {
+        return (typed_last_failure_kind(record) == Some(FailureKind::AdjustedSourceResolveFailed))
+            .then_some(AdjustedSourceQueueStatus::MalformedOrUnknown);
+    }
+    let Some(failure) = record.failures.last() else {
+        return Some(AdjustedSourceQueueStatus::MalformedOrUnknown);
+    };
+    if parse_monitor_timestamp(&failure.recorded_at).is_none()
+        || has_adjusted_source_recovery_blocking_proof(record)
+    {
+        return Some(if has_adjusted_source_recovery_blocking_proof(record) {
+            AdjustedSourceQueueStatus::DownstreamProofBlocked
+        } else {
+            AdjustedSourceQueueStatus::MalformedOrUnknown
+        });
+    }
+    if adjusted_source_recovery_original_proof(record).is_err() {
+        return Some(AdjustedSourceQueueStatus::SourceProofBlocked);
+    }
+    if failure.kind != Some(FailureKind::EmbeddedPreviewUnavailable) {
+        return Some(AdjustedSourceQueueStatus::MalformedOrUnknown);
+    }
+    Some(AdjustedSourceQueueStatus::FirstReady)
+}
+
+fn increment_adjusted_source_error(
+    admission: &mut AdjustedSourceRequiredAdmission,
+    error: AdjustedSourceRequiredProofError,
+) {
+    match error {
+        AdjustedSourceRequiredProofError::SourceProof => {
+            admission.source_proof_blocked = admission.source_proof_blocked.saturating_add(1)
+        }
+        AdjustedSourceRequiredProofError::DownstreamProof => {
+            admission.downstream_proof_blocked =
+                admission.downstream_proof_blocked.saturating_add(1)
+        }
+        AdjustedSourceRequiredProofError::Missing | AdjustedSourceRequiredProofError::Malformed => {
+            admission.malformed_or_unknown = admission.malformed_or_unknown.saturating_add(1)
+        }
+    }
+}
+
+fn typed_last_failure_kind(record: &AssetRecord) -> Option<FailureKind> {
+    record.failures.last().and_then(|failure| failure.kind)
+}
+
+fn validate_adjusted_source_required_queue_current(
+    record: &AssetRecord,
+    marker: &AdjustedSourceRequiredProof,
+) -> Result<(), AdjustedSourceRequiredProofError> {
+    validate_adjusted_source_required_queue_common(record, marker)?;
+    if record.failures.len() != marker.failure_count_at_admission {
+        return Err(AdjustedSourceRequiredProofError::Malformed);
+    }
+    let failure = record
+        .failures
+        .last()
+        .ok_or(AdjustedSourceRequiredProofError::Malformed)?;
+    queue_marker_trigger_matches(marker, failure)
+}
+
+fn validate_adjusted_source_required_queue_retry(
+    record: &AssetRecord,
+    marker: &AdjustedSourceRequiredProof,
+) -> Result<(), AdjustedSourceRequiredProofError> {
+    validate_adjusted_source_required_queue_common(record, marker)?;
+    if record.failures.len()
+        != marker
+            .failure_count_at_admission
+            .checked_add(1)
+            .ok_or(AdjustedSourceRequiredProofError::Malformed)?
+        || marker.failure_count_at_admission == 0
+    {
+        return Err(AdjustedSourceRequiredProofError::Malformed);
+    }
+    let trigger = record
+        .failures
+        .get(marker.failure_count_at_admission.saturating_sub(1))
+        .ok_or(AdjustedSourceRequiredProofError::Malformed)?;
+    queue_marker_trigger_matches(marker, trigger)?;
+    (record.failures.last().and_then(|failure| failure.kind)
+        == Some(FailureKind::AdjustedSourceResolveFailed))
+    .then_some(())
+    .ok_or(AdjustedSourceRequiredProofError::Malformed)
+}
+
+fn validate_adjusted_source_required_queue_common(
+    record: &AssetRecord,
+    marker: &AdjustedSourceRequiredProof,
+) -> Result<(), AdjustedSourceRequiredProofError> {
+    if marker.schema_version != ADJUSTED_SOURCE_REQUIRED_SCHEMA_VERSION
+        || marker.policy_generation != ADJUSTED_SOURCE_REQUIRED_POLICY_GENERATION
+        || marker.asset_id != record.asset_id
+        || !(1..=ADJUSTED_SOURCE_RESOLVE_MAX_ATTEMPTS).contains(&marker.attempt)
+        || marker.failure_count_at_admission == 0
+        || marker.required_retry_state != State::NasVerified
+        || marker.adjusted_source_relative_path != adjusted_source_relative_path(&record.asset_id)
+        || record.state != State::Failed
+    {
+        return Err(AdjustedSourceRequiredProofError::Malformed);
+    }
+    if has_adjusted_source_recovery_blocking_proof(record) {
+        return Err(AdjustedSourceRequiredProofError::DownstreamProof);
+    }
+    let original = adjusted_source_recovery_original_proof(record)?;
+    if marker.original_record_name != original.record_name
+        || marker.original_record_change_tag != original.record_change_tag
+        || marker.original_database_scope != original.database_scope
+        || marker.original_zone_name != original.zone_name
+        || marker.failure_retry_proof_digest.is_some()
+            != record.proofs.contains_key(FAILURE_RETRY_PROOF)
+    {
+        return Err(AdjustedSourceRequiredProofError::SourceProof);
+    }
+    Ok(())
+}
+
+fn queue_marker_trigger_matches(
+    marker: &AdjustedSourceRequiredProof,
+    failure: &FailureRecord,
+) -> Result<(), AdjustedSourceRequiredProofError> {
+    let expected_kind = if marker.attempt == 1 {
+        FailureKind::EmbeddedPreviewUnavailable
+    } else {
+        FailureKind::AdjustedSourceResolveFailed
+    };
+    if failure.kind != Some(expected_kind)
+        || marker.trigger_failure_kind != expected_kind
+        || marker.trigger_failure_stage != failure.stage
+        || marker.trigger_failure_recorded_at != failure.recorded_at
+    {
+        return Err(AdjustedSourceRequiredProofError::Malformed);
+    }
+    Ok(())
+}
+
+fn validate_adjusted_source_required_current(
+    record: &AssetRecord,
+    marker: &AdjustedSourceRequiredProof,
+) -> Result<(), AdjustedSourceRequiredProofError> {
+    validate_adjusted_source_required_common(record, marker)?;
+    if record.failures.len() != marker.failure_count_at_admission
+        || failure_history_digest(&record.failures) != marker.failure_history_digest
+    {
+        return Err(AdjustedSourceRequiredProofError::Malformed);
+    }
+    let failure = record
+        .failures
+        .last()
+        .ok_or(AdjustedSourceRequiredProofError::Malformed)?;
+    validate_adjusted_source_marker_trigger(marker, failure)
+}
+
+fn validate_adjusted_source_required_retry(
+    record: &AssetRecord,
+    marker: &AdjustedSourceRequiredProof,
+) -> Result<(), AdjustedSourceRequiredProofError> {
+    validate_adjusted_source_required_common(record, marker)?;
+    let expected_failure_count = marker
+        .failure_count_at_admission
+        .checked_add(1)
+        .ok_or(AdjustedSourceRequiredProofError::Malformed)?;
+    if record.failures.len() != expected_failure_count
+        || marker.failure_count_at_admission == 0
+        || failure_history_digest(&record.failures[..marker.failure_count_at_admission])
+            != marker.failure_history_digest
+    {
+        return Err(AdjustedSourceRequiredProofError::Malformed);
+    }
+    let trigger = record
+        .failures
+        .get(marker.failure_count_at_admission.saturating_sub(1))
+        .ok_or(AdjustedSourceRequiredProofError::Malformed)?;
+    validate_adjusted_source_marker_trigger(marker, trigger)?;
+    let resolver_failure = record
+        .failures
+        .last()
+        .ok_or(AdjustedSourceRequiredProofError::Malformed)?;
+    (resolver_failure.kind == Some(FailureKind::AdjustedSourceResolveFailed))
+        .then_some(())
+        .ok_or(AdjustedSourceRequiredProofError::Malformed)
+}
+
+fn validate_adjusted_source_required_common(
+    record: &AssetRecord,
+    marker: &AdjustedSourceRequiredProof,
+) -> Result<(), AdjustedSourceRequiredProofError> {
+    if marker.schema_version != ADJUSTED_SOURCE_REQUIRED_SCHEMA_VERSION
+        || marker.policy_generation != ADJUSTED_SOURCE_REQUIRED_POLICY_GENERATION
+        || marker.asset_id != record.asset_id
+        || !(1..=ADJUSTED_SOURCE_RESOLVE_MAX_ATTEMPTS).contains(&marker.attempt)
+        || marker.failure_count_at_admission == 0
+        || marker.required_retry_state != State::NasVerified
+        || marker.adjusted_source_relative_path != adjusted_source_relative_path(&record.asset_id)
+        || record.state != State::Failed
+    {
+        return Err(AdjustedSourceRequiredProofError::Malformed);
+    }
+    if has_adjusted_source_recovery_blocking_proof(record) {
+        return Err(AdjustedSourceRequiredProofError::DownstreamProof);
+    }
+    let source = adjusted_source_recovery_source_context(record)?;
+    if marker.nas_proof_digest != source.nas_proof_digest
+        || marker.original_asset_proof_digest != source.original_asset_proof_digest
+        || marker.original_record_name != source.original.record_name
+        || marker.original_record_change_tag != source.original.record_change_tag
+        || marker.original_database_scope != source.original.database_scope
+        || marker.original_zone_name != source.original.zone_name
+        || marker.failure_retry_proof_digest != source.failure_retry_proof_digest
+    {
+        return Err(AdjustedSourceRequiredProofError::SourceProof);
+    }
+    Ok(())
+}
+
+fn validate_adjusted_source_marker_trigger(
+    marker: &AdjustedSourceRequiredProof,
+    failure: &FailureRecord,
+) -> Result<(), AdjustedSourceRequiredProofError> {
+    let expected_kind = if marker.attempt == 1 {
+        FailureKind::EmbeddedPreviewUnavailable
+    } else {
+        FailureKind::AdjustedSourceResolveFailed
+    };
+    if failure.kind != Some(expected_kind)
+        || marker.trigger_failure_kind != expected_kind
+        || marker.trigger_failure_stage != failure.stage
+        || marker.trigger_failure_recorded_at != failure.recorded_at
+        || marker.trigger_failure_digest != failure_digest(failure)
+    {
+        return Err(AdjustedSourceRequiredProofError::Malformed);
+    }
+    Ok(())
+}
+
+struct AdjustedSourceRecoverySourceContext {
+    nas_proof_digest: String,
+    original_asset_proof_digest: String,
+    original: OriginalAssetProof,
+    failure_retry_proof_digest: Option<String>,
+}
+
+fn adjusted_source_recovery_source_context(
+    record: &AssetRecord,
+) -> Result<AdjustedSourceRecoverySourceContext, AdjustedSourceRequiredProofError> {
+    let original = adjusted_source_recovery_original_proof(record)?;
+    let nas = record
+        .proofs
+        .get("nas")
+        .ok_or(AdjustedSourceRequiredProofError::SourceProof)?;
+    let original_value = record
+        .proofs
+        .get("original_asset")
+        .ok_or(AdjustedSourceRequiredProofError::SourceProof)?;
+    Ok(AdjustedSourceRecoverySourceContext {
+        nas_proof_digest: value_digest(nas)?,
+        original_asset_proof_digest: value_digest(original_value)?,
+        original,
+        failure_retry_proof_digest: record
+            .proofs
+            .get(FAILURE_RETRY_PROOF)
+            .map(value_digest)
+            .transpose()?,
+    })
+}
+
+fn adjusted_source_recovery_original_proof(
+    record: &AssetRecord,
+) -> Result<OriginalAssetProof, AdjustedSourceRequiredProofError> {
+    if !failed_retry_source_proofs_are_valid(record) {
+        return Err(AdjustedSourceRequiredProofError::SourceProof);
+    }
+    record
+        .proofs
+        .get("original_asset")
+        .ok_or(AdjustedSourceRequiredProofError::SourceProof)
+        .and_then(|value| {
+            serde_json::from_value::<OriginalAssetProof>(value.clone())
+                .map_err(|_| AdjustedSourceRequiredProofError::SourceProof)
+        })
+}
+
+fn build_adjusted_source_required_proof(
+    record: &AssetRecord,
+    failure: &FailureRecord,
+    attempt: u64,
+    admitted_at_unix_seconds: u64,
+) -> Result<AdjustedSourceRequiredProof, AdjustedSourceRequiredProofError> {
+    let expected_kind = if attempt == 1 {
+        FailureKind::EmbeddedPreviewUnavailable
+    } else {
+        FailureKind::AdjustedSourceResolveFailed
+    };
+    if !(1..=ADJUSTED_SOURCE_RESOLVE_MAX_ATTEMPTS).contains(&attempt)
+        || failure.kind != Some(expected_kind)
+        || has_adjusted_source_recovery_blocking_proof(record)
+    {
+        return if has_adjusted_source_recovery_blocking_proof(record) {
+            Err(AdjustedSourceRequiredProofError::DownstreamProof)
+        } else {
+            Err(AdjustedSourceRequiredProofError::Malformed)
+        };
+    }
+    let source = adjusted_source_recovery_source_context(record)?;
+    Ok(AdjustedSourceRequiredProof {
+        schema_version: ADJUSTED_SOURCE_REQUIRED_SCHEMA_VERSION,
+        policy_generation: ADJUSTED_SOURCE_REQUIRED_POLICY_GENERATION.to_string(),
+        asset_id: record.asset_id.clone(),
+        attempt,
+        trigger_failure_stage: failure.stage.clone(),
+        trigger_failure_kind: expected_kind,
+        trigger_failure_recorded_at: failure.recorded_at.clone(),
+        trigger_failure_digest: failure_digest(failure),
+        failure_count_at_admission: record.failures.len(),
+        failure_history_digest: failure_history_digest(&record.failures),
+        nas_proof_digest: source.nas_proof_digest,
+        original_asset_proof_digest: source.original_asset_proof_digest,
+        original_record_name: source.original.record_name,
+        original_record_change_tag: source.original.record_change_tag,
+        original_database_scope: source.original.database_scope,
+        original_zone_name: source.original.zone_name,
+        failure_retry_proof_digest: source.failure_retry_proof_digest,
+        admitted_at_unix_seconds,
+        required_retry_state: State::NasVerified,
+        adjusted_source_relative_path: adjusted_source_relative_path(&record.asset_id),
+    })
+}
+
+fn has_adjusted_source_recovery_blocking_proof(record: &AssetRecord) -> bool {
+    ADJUSTED_SOURCE_RECOVERY_BLOCKING_PROOFS
+        .iter()
+        .any(|proof_key| record.proofs.contains_key(*proof_key))
+}
+
+fn adjusted_source_relative_path(asset_id: &str) -> PathBuf {
+    PathBuf::from(format!("{asset_id}.adjusted-source.jpg"))
+}
+
+fn value_digest(value: &Value) -> Result<String, AdjustedSourceRequiredProofError> {
+    let encoded =
+        serde_json::to_vec(value).map_err(|_| AdjustedSourceRequiredProofError::Malformed)?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn failure_history_digest(failures: &[FailureRecord]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"adjusted_source_failure_history_v1");
+    for failure in failures {
+        hasher.update(failure_digest(failure).as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn failed_retry_queue_counts(manifest: &Manifest) -> BTreeMap<String, u64> {
+    failed_retry_queue_counts_at(manifest, current_unix_seconds())
+}
+
+/// Returns manifest-only retry queue categories at a caller-supplied time.
+/// The injected timestamp keeps adjusted-source backoff deterministic in tests.
+pub fn failed_retry_queue_counts_at(
+    manifest: &Manifest,
+    current_unix_seconds: u64,
+) -> BTreeMap<String, u64> {
+    let mut counts = adjusted_source_required_queue_counts(manifest, current_unix_seconds);
+    for record in manifest.records().values() {
+        if record.state != State::Failed {
+            continue;
+        }
+        if adjusted_source_queue_status(record, current_unix_seconds).is_some() {
             continue;
         }
         let bucket = if has_retry_blocking_proof(record) {
@@ -13282,6 +14143,483 @@ esac
         {
             assert_eq!(manifest.get(asset_id).unwrap().state, State::Failed);
         }
+    }
+
+    #[test]
+    fn adjusted_source_first_admission_keeps_failed_and_records_exact_marker() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "adjusted-first",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+
+        let admission = admit_adjusted_source_required_assets(&mut manifest, 1, 1, 3_000_000)
+            .expect("typed missing-preview failure should receive an adjusted-source marker");
+
+        assert_eq!(admission.first_ready, 1);
+        assert_eq!(admission.resolver_retry_ready, 0);
+        let record = manifest
+            .get("adjusted-first")
+            .expect("record should remain");
+        assert_eq!(record.state, State::Failed);
+        let marker = &record.proofs[ADJUSTED_SOURCE_REQUIRED_PROOF];
+        assert_eq!(marker["schema_version"], json!(1));
+        assert_eq!(
+            marker["policy_generation"],
+            json!("adjusted_source_required_v1")
+        );
+        assert_eq!(marker["asset_id"], json!("adjusted-first"));
+        assert_eq!(marker["attempt"], json!(1));
+        assert_eq!(
+            marker["trigger_failure_kind"],
+            json!("embedded_preview_unavailable")
+        );
+        assert_eq!(marker["failure_count_at_admission"], json!(1));
+        assert_eq!(
+            marker["trigger_failure_digest"],
+            json!(failure_digest(record.failures.last().unwrap()))
+        );
+        assert_eq!(
+            marker["failure_history_digest"],
+            json!(failure_history_digest(&record.failures))
+        );
+        assert_eq!(marker["required_retry_state"], json!("nas_verified"));
+        assert_eq!(
+            marker["adjusted_source_relative_path"],
+            json!("adjusted-first.adjusted-source.jpg")
+        );
+        assert_eq!(marker["failure_retry_proof_digest"], Value::Null);
+        assert!(adjusted_source_required_proof(record).is_ok());
+    }
+
+    #[test]
+    fn adjusted_source_marker_survives_restart_and_retries_once_after_backoff() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "adjusted-retry",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("first admission should write the marker");
+        let marker_before_restart = manifest
+            .get("adjusted-retry")
+            .expect("marker record should exist")
+            .proofs[ADJUSTED_SOURCE_REQUIRED_PROOF]
+            .clone();
+
+        let resumed = admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_001)
+            .expect("restart should reuse the durable marker");
+        assert_eq!(resumed.first_ready, 1);
+        assert!(!resumed.manifest_changed());
+        assert_eq!(
+            manifest.get("adjusted-retry").unwrap().proofs[ADJUSTED_SOURCE_REQUIRED_PROOF],
+            marker_before_restart
+        );
+
+        policy_failed_again_at(
+            &mut manifest,
+            "adjusted-retry",
+            "adjusted_source_resolve",
+            "CloudKit adjusted source lookup failed",
+            FailureKind::AdjustedSourceResolveFailed,
+            "400.000000000Z",
+        );
+        let retry = admit_adjusted_source_required_assets(&mut manifest, 1, 1, 700)
+            .expect("one resolver failure should admit retry attempt two after backoff");
+        assert_eq!(retry.resolver_retry_ready, 1);
+        let record = manifest.get("adjusted-retry").unwrap();
+        assert_eq!(record.state, State::Failed);
+        assert_eq!(
+            record.proofs[ADJUSTED_SOURCE_REQUIRED_PROOF]["attempt"],
+            json!(2)
+        );
+        assert_eq!(
+            record.proofs[ADJUSTED_SOURCE_REQUIRED_PROOF]["failure_count_at_admission"],
+            json!(2)
+        );
+        assert_eq!(
+            record.proofs[ADJUSTED_SOURCE_REQUIRED_PROOF]["failure_history_digest"],
+            json!(failure_history_digest(&record.failures))
+        );
+        assert!(adjusted_source_required_proof(record).is_ok());
+    }
+
+    #[test]
+    fn adjusted_source_retry_backoff_and_attempt_exhaustion_are_bounded() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "adjusted-exhausted",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("first admission should succeed");
+        policy_failed_again_at(
+            &mut manifest,
+            "adjusted-exhausted",
+            "adjusted_source_resolve",
+            "resolver failure one",
+            FailureKind::AdjustedSourceResolveFailed,
+            "400.000000000Z",
+        );
+
+        let too_young = admit_adjusted_source_required_assets(&mut manifest, 1, 1, 699)
+            .expect("young resolver failure should be deferred");
+        assert_eq!(too_young.backoff, 1);
+        assert_eq!(
+            manifest.get("adjusted-exhausted").unwrap().proofs[ADJUSTED_SOURCE_REQUIRED_PROOF]["attempt"],
+            json!(1)
+        );
+        assert_eq!(
+            adjusted_source_required_queue_counts(&manifest, 699)["adjusted_source_resolver_backoff"],
+            1
+        );
+
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 700)
+            .expect("second resolver attempt should be admitted");
+        policy_failed_again_at(
+            &mut manifest,
+            "adjusted-exhausted",
+            "adjusted_source_resolve",
+            "resolver failure two",
+            FailureKind::AdjustedSourceResolveFailed,
+            "1000.000000000Z",
+        );
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_300)
+            .expect("third resolver attempt should be admitted");
+        policy_failed_again_at(
+            &mut manifest,
+            "adjusted-exhausted",
+            "adjusted_source_resolve",
+            "resolver failure three",
+            FailureKind::AdjustedSourceResolveFailed,
+            "1_600.000000000Z",
+        );
+
+        let exhausted = admit_adjusted_source_required_assets(&mut manifest, 1, 1, 2_000)
+            .expect("a fourth resolver execution must not be admitted");
+        assert_eq!(exhausted.exhausted, 1);
+        assert_eq!(
+            adjusted_source_required_queue_counts(&manifest, 2_000)["adjusted_source_resolver_exhausted"],
+            1
+        );
+        assert_eq!(
+            manifest.get("adjusted-exhausted").unwrap().state,
+            State::Failed
+        );
+
+        terminalize_adjusted_source_required_exhaustion(&mut manifest, "adjusted-exhausted", 2_000)
+            .expect("exhausted resolver lineage should terminalize with failure-review evidence");
+        let record = manifest.get("adjusted-exhausted").unwrap();
+        assert_eq!(record.state, State::NeedsReview);
+        assert_eq!(
+            record.proofs[FAILURE_REVIEW_PROOF]["reason_code"],
+            json!("adjusted_source_resolve_attempts_exhausted")
+        );
+    }
+
+    #[test]
+    fn adjusted_source_policy_rejects_forged_lineage_without_mutation() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "forged-adjusted",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("first admission should succeed");
+        policy_failed_again_at(
+            &mut manifest,
+            "forged-adjusted",
+            "adjusted_source_resolve",
+            "resolver failure",
+            FailureKind::AdjustedSourceResolveFailed,
+            "400.000000000Z",
+        );
+        let base = manifest.clone();
+        for (name, mutate) in [
+            (
+                "history",
+                Box::new(|record: &mut AssetRecord| {
+                    record.failures[0].message = "forged historical failure".to_string();
+                }) as Box<dyn Fn(&mut AssetRecord)>,
+            ),
+            (
+                "original",
+                Box::new(|record: &mut AssetRecord| {
+                    record.proofs.get_mut("original_asset").unwrap()["record_name"] =
+                        json!("forged");
+                }),
+            ),
+            (
+                "nas",
+                Box::new(|record: &mut AssetRecord| {
+                    record.proofs.get_mut("nas").unwrap()["sha256"] = json!("forged");
+                }),
+            ),
+            (
+                "failure-retry",
+                Box::new(|record: &mut AssetRecord| {
+                    record
+                        .proofs
+                        .insert("failure_retry".to_string(), json!({"forged": true}));
+                }),
+            ),
+            (
+                "marker",
+                Box::new(|record: &mut AssetRecord| {
+                    record
+                        .proofs
+                        .get_mut(ADJUSTED_SOURCE_REQUIRED_PROOF)
+                        .unwrap()["attempt"] = json!(2);
+                }),
+            ),
+            (
+                "extra-failure",
+                Box::new(|record: &mut AssetRecord| {
+                    record.failures.push(crate::manifest::FailureRecord {
+                        stage: "adjusted_source_resolve".to_string(),
+                        message: "extra resolver failure".to_string(),
+                        recorded_at: "401.000000000Z".to_string(),
+                        kind: Some(FailureKind::AdjustedSourceResolveFailed),
+                    });
+                }),
+            ),
+        ] {
+            let mut forged = base.clone();
+            let mut record = forged.get("forged-adjusted").unwrap().clone();
+            mutate(&mut record);
+            forged.upsert(record);
+            let before_admission = forged.clone();
+
+            let admission = admit_adjusted_source_required_assets(&mut forged, 1, 1, 1_000)
+                .unwrap_or_else(|error| panic!("{name} must fail closed: {error}"));
+            assert_eq!(forged, before_admission, "{name} must not partially mutate");
+            assert_eq!(forged.get("forged-adjusted").unwrap().state, State::Failed);
+            assert_eq!(
+                admission.source_proof_blocked + admission.malformed_or_unknown,
+                1,
+                "{name} must be rejected by admission"
+            );
+        }
+    }
+
+    #[test]
+    fn adjusted_source_marker_binds_existing_failure_retry_and_rejects_kind_reset() {
+        let mut manifest = admitted_timeout_manifest("retry-bound-adjusted");
+        policy_failed_again_at(
+            &mut manifest,
+            "retry-bound-adjusted",
+            "conversion",
+            "RAW has no usable embedded preview",
+            FailureKind::EmbeddedPreviewUnavailable,
+            "400.000000000Z",
+        );
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("missing-preview marker should bind the existing generic retry proof");
+        let marker = manifest.get("retry-bound-adjusted").unwrap().proofs
+            [ADJUSTED_SOURCE_REQUIRED_PROOF]
+            .clone();
+        assert!(marker["failure_retry_proof_digest"].is_string());
+
+        policy_failed_again_at(
+            &mut manifest,
+            "retry-bound-adjusted",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            FailureKind::ConversionTimedOut,
+            "500.000000000Z",
+        );
+        let before = manifest.clone();
+        let admission = admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("a changed failure kind must not reset adjusted-source attempts");
+        assert_eq!(admission.malformed_or_unknown, 1);
+        assert_eq!(manifest, before);
+    }
+
+    #[test]
+    fn adjusted_source_admission_rejects_legacy_missing_preview_without_inference() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "legacy-missing-preview",
+            "conversion",
+            "RAW has neither PreviewImage nor JpgFromRaw embedded preview: /staging/legacy-missing-preview.staged-raw.DNG",
+            None,
+            "100.000000000Z",
+        ));
+
+        let admission = admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("legacy records should remain untouched");
+        assert_eq!(admission.first_ready, 0);
+        let record = manifest.get("legacy-missing-preview").unwrap();
+        assert_eq!(record.state, State::Failed);
+        assert!(!record.proofs.contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF));
+        assert!(adjusted_source_required_queue_counts(&manifest, 1_000).is_empty());
+    }
+
+    #[test]
+    fn adjusted_source_queue_counts_are_manifest_only_and_time_injected() {
+        let mut manifest = Manifest::new();
+        for asset_id in ["first", "source", "downstream"] {
+            manifest.upsert(policy_failed_record(
+                asset_id,
+                "conversion",
+                "RAW has no usable embedded preview",
+                Some(FailureKind::EmbeddedPreviewUnavailable),
+                "100.000000000Z",
+            ));
+        }
+        let mut source = manifest.get("source").unwrap().clone();
+        source.proofs.remove("nas");
+        manifest.upsert(source);
+        let mut downstream = manifest.get("downstream").unwrap().clone();
+        downstream
+            .proofs
+            .insert("conversion".to_string(), json!({"present": true}));
+        manifest.upsert(downstream);
+        manifest.upsert(policy_failed_record(
+            "unknown",
+            "adjusted_source_resolve",
+            "resolver failure without an admission marker",
+            Some(FailureKind::AdjustedSourceResolveFailed),
+            "100.000000000Z",
+        ));
+
+        admit_adjusted_source_required_assets(&mut manifest, 4, 4, 1_000)
+            .expect("the first record should receive a marker");
+        policy_failed_again_at(
+            &mut manifest,
+            "first",
+            "adjusted_source_resolve",
+            "resolver failure",
+            FailureKind::AdjustedSourceResolveFailed,
+            "400.000000000Z",
+        );
+
+        let backoff = failed_retry_queue_counts_at(&manifest, 699);
+        assert_eq!(backoff["adjusted_source_resolver_backoff"], 1);
+        assert_eq!(backoff["adjusted_source_source_proof_blocked"], 1);
+        assert_eq!(backoff["adjusted_source_downstream_proof_blocked"], 1);
+        assert_eq!(backoff["adjusted_source_malformed_or_unknown"], 1);
+
+        let ready = failed_retry_queue_counts_at(&manifest, 700);
+        assert_eq!(ready["adjusted_source_resolver_retry_ready"], 1);
+        assert_eq!(ready["adjusted_source_source_proof_blocked"], 1);
+        assert_eq!(ready["adjusted_source_downstream_proof_blocked"], 1);
+        assert_eq!(ready["adjusted_source_malformed_or_unknown"], 1);
+    }
+
+    #[test]
+    fn adjusted_source_policy_blocks_downstream_proofs_and_generic_recovery() {
+        let mut manifest = Manifest::new();
+        let mut downstream = policy_failed_record(
+            "downstream-adjusted",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        );
+        downstream
+            .proofs
+            .insert("conversion".to_string(), json!({"present": true}));
+        manifest.upsert(downstream);
+        let downstream_admission =
+            admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+                .expect("downstream evidence should block adjusted-source admission");
+        assert_eq!(downstream_admission.downstream_proof_blocked, 1);
+        assert_eq!(
+            adjusted_source_required_queue_counts(&manifest, 1_000)["adjusted_source_downstream_proof_blocked"],
+            1
+        );
+
+        manifest.upsert(policy_failed_record(
+            "generic-adjusted",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 2, 2, 1_000)
+            .expect("marker should be written before generic exclusion check");
+        policy_failed_again_at(
+            &mut manifest,
+            "generic-adjusted",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            FailureKind::ConversionTimedOut,
+            "400.000000000Z",
+        );
+        let generic = admit_failed_retryable_assets(&mut manifest, 2, 2, 300, 1_000)
+            .expect("generic retry evaluation should not recover adjusted-source work");
+        assert_eq!(generic.unknown, 1);
+        assert_eq!(
+            manifest.get("generic-adjusted").unwrap().state,
+            State::Failed
+        );
+        assert_eq!(
+            manifest.get("generic-adjusted").unwrap().proofs[ADJUSTED_SOURCE_REQUIRED_PROOF]["attempt"],
+            json!(1)
+        );
+    }
+
+    #[test]
+    fn adjusted_source_admission_is_ordered_capacity_bounded_and_duplicate_free() {
+        let mut manifest = Manifest::new();
+        for (asset_id, recorded_at) in [
+            ("middle", "200.000000000Z"),
+            ("newest", "300.000000000Z"),
+            ("oldest", "100.000000000Z"),
+        ] {
+            manifest.upsert(policy_failed_record(
+                asset_id,
+                "conversion",
+                "RAW has no usable embedded preview",
+                Some(FailureKind::EmbeddedPreviewUnavailable),
+                recorded_at,
+            ));
+        }
+
+        let first = admit_adjusted_source_required_assets(&mut manifest, 2, 2, 1_000)
+            .expect("oldest candidates should consume bounded marker capacity");
+        assert_eq!(first.first_ready, 2);
+        for asset_id in ["oldest", "middle"] {
+            assert!(
+                manifest
+                    .get(asset_id)
+                    .unwrap()
+                    .proofs
+                    .contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF)
+            );
+        }
+        assert!(
+            !manifest
+                .get("newest")
+                .unwrap()
+                .proofs
+                .contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF)
+        );
+
+        let restart = admit_adjusted_source_required_assets(&mut manifest, 2, 2, 1_001)
+            .expect("existing markers should reserve capacity without duplicating admission");
+        assert_eq!(restart.first_ready, 2);
+        assert!(!restart.manifest_changed());
+        assert!(
+            !manifest
+                .get("newest")
+                .unwrap()
+                .proofs
+                .contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF)
+        );
     }
 
     #[test]
