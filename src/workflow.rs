@@ -1980,14 +1980,13 @@ fn uploaded_heic_delete_inputs(
     require_positive_u64(HEIC_PROOF, "size_bytes", heic.size_bytes)?;
     if let Ok(original) =
         stored_proof::<OriginalAssetProof>(manifest, asset_id, ORIGINAL_ASSET_PROOF)
+        && original.record_name == upload.uploaded_heic_asset_id
     {
-        if original.record_name == upload.uploaded_heic_asset_id {
-            return Err(WorkflowError::InvalidProofField {
-                proof_key: UPLOAD_PROOF,
-                field: "uploaded_heic_asset_id",
-                reason: "uploaded HEIC asset id must not match the original RAW asset record",
-            });
-        }
+        return Err(WorkflowError::InvalidProofField {
+            proof_key: UPLOAD_PROOF,
+            field: "uploaded_heic_asset_id",
+            reason: "uploaded HEIC asset id must not match the original RAW asset record",
+        });
     }
     Ok((upload, heic))
 }

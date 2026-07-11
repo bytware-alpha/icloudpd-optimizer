@@ -2780,10 +2780,10 @@ fn run_rolling_asset_lifecycle<T: CloudKitAdjustedSourceTransport>(
             }),
         );
         let outcome = run_rolling_asset_step(asset_id, step, execution)?;
-        if outcome.completed {
-            if let Some(reservation) = resolver_reservation.as_mut() {
-                reservation.retain_for_conversion();
-            }
+        if outcome.completed
+            && let Some(reservation) = resolver_reservation.as_mut()
+        {
+            reservation.retain_for_conversion();
         }
         delta.record(step, &outcome);
         let state_after = shared_asset_state_name(execution.manifest, asset_id)?;

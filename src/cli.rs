@@ -1234,11 +1234,11 @@ fn prime_access_inner(
         prime_read_root(&config.nas_root)?;
         read_roots.push(config.nas_root.clone());
     }
-    if let Some(mirror_root) = &config.mirror_root {
-        if !read_roots.iter().any(|path| path == mirror_root) {
-            prime_read_root(mirror_root)?;
-            read_roots.push(mirror_root.clone());
-        }
+    if let Some(mirror_root) = &config.mirror_root
+        && !read_roots.iter().any(|path| path == mirror_root)
+    {
+        prime_read_root(mirror_root)?;
+        read_roots.push(mirror_root.clone());
     }
 
     let write_dir = write_canary_dir

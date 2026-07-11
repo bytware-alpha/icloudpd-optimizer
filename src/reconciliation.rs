@@ -412,12 +412,12 @@ fn validate_target(
     if !is_sha256(&target.matched_raw_sha256) {
         return Err(invalid("RAW SHA-256 must be 64 hexadecimal characters"));
     }
-    if let Some(replacement) = &target.replacement_candidate {
-        if replacement.size_bytes == 0 || !is_sha256(&replacement.sha256) {
-            return Err(invalid(
-                "replacement candidate must have a positive size and 64-character SHA-256",
-            ));
-        }
+    if let Some(replacement) = &target.replacement_candidate
+        && (replacement.size_bytes == 0 || !is_sha256(&replacement.sha256))
+    {
+        return Err(invalid(
+            "replacement candidate must have a positive size and 64-character SHA-256",
+        ));
     }
     Ok(())
 }

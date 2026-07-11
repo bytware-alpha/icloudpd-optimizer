@@ -2254,7 +2254,7 @@ fn verify_jpeg(file: &File, width: u32, height: u32) -> Result<(), AdjustedSourc
 }
 
 fn rgb_standard_deviation(decoded: &[u8], channels: usize) -> Result<f64, AdjustedSourceError> {
-    if channels == 0 || decoded.is_empty() || decoded.len() % channels != 0 {
+    if channels == 0 || decoded.is_empty() || !decoded.len().is_multiple_of(channels) {
         return Err(AdjustedSourceError::InvalidJpeg);
     }
     let count = decoded.len() as f64;
