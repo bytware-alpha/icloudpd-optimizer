@@ -73,6 +73,47 @@ pub struct FailureRecord {
     pub recorded_at: String,
 }
 
+pub const FAILURE_QUARANTINE_PROOF_NAME: &str = "failure_quarantine";
+pub const FAILURE_QUARANTINE_SCHEMA_VERSION: u64 = 1;
+const HISTORICAL_REMOTE_SIDE_EFFECT_REASON_CODE: &str = "historical_remote_side_effect";
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FailureQuarantineProof {
+    schema_version: u64,
+    reason_code: &'static str,
+    evidence_sha256: String,
+    target_set_sha256: String,
+    successful_uploads: u64,
+    delete_attempts: u64,
+    deleted_finishes: u64,
+    mirror_successes: u64,
+    applied_at_unix_seconds: u64,
+}
+
+impl FailureQuarantineProof {
+    pub fn historical_remote_side_effect(
+        evidence_sha256: impl Into<String>,
+        target_set_sha256: impl Into<String>,
+        successful_uploads: u64,
+        delete_attempts: u64,
+        deleted_finishes: u64,
+        mirror_successes: u64,
+        applied_at_unix_seconds: u64,
+    ) -> Self {
+        Self {
+            schema_version: FAILURE_QUARANTINE_SCHEMA_VERSION,
+            reason_code: HISTORICAL_REMOTE_SIDE_EFFECT_REASON_CODE,
+            evidence_sha256: evidence_sha256.into(),
+            target_set_sha256: target_set_sha256.into(),
+            successful_uploads,
+            delete_attempts,
+            deleted_finishes,
+            mirror_successes,
+            applied_at_unix_seconds,
+        }
+    }
+}
+
 impl FailureRecord {
     pub fn new(stage: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
@@ -226,6 +267,36 @@ impl Manifest {
                 asset_id: asset_id.to_string(),
             })?;
         record.state = retry_state;
+        record.updated_at = updated_at;
+        Ok(record)
+    }
+
+    pub fn quarantine_failed_for_historical_remote_side_effect(
+        &mut self,
+        asset_id: &str,
+        proof: FailureQuarantineProof,
+    ) -> Result<&AssetRecord, ManifestError> {
+        let current_state = self.get(asset_id)?.state;
+        if current_state != State::Failed {
+            return Err(ManifestError::InvalidTransition {
+                asset_id: asset_id.to_string(),
+                from: current_state,
+                to: State::NeedsReview,
+            });
+        }
+
+        let updated_at = current_timestamp();
+        let record = self
+            .records
+            .get_mut(asset_id)
+            .ok_or_else(|| ManifestError::UnknownAsset {
+                asset_id: asset_id.to_string(),
+            })?;
+        record.state = State::NeedsReview;
+        record.proofs.insert(
+            FAILURE_QUARANTINE_PROOF_NAME.to_string(),
+            serde_json::to_value(proof)?,
+        );
         record.updated_at = updated_at;
         Ok(record)
     }

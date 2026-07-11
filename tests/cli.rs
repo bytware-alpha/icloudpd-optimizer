@@ -26,6 +26,148 @@ fn binary() -> Command {
     Command::cargo_bin("icloudpd-optimizer").expect("binary should build")
 }
 
+struct FailedAssetsQuarantineFixture {
+    config_path: PathBuf,
+    evidence_path: PathBuf,
+    evidence_sha256: String,
+    manifest_path: PathBuf,
+}
+
+fn quarantine_evidence_entry(asset_id: &str, successful_uploads: u64) -> Value {
+    json!({
+        "asset_id": asset_id,
+        "successful_uploads": successful_uploads,
+        "delete_attempts": 0,
+        "deleted_finishes": 0,
+        "mirror_successes": 1,
+    })
+}
+
+fn write_failed_assets_quarantine_fixture(
+    tempdir: &tempfile::TempDir,
+    records: &[(&str, State)],
+    evidence: Value,
+) -> FailedAssetsQuarantineFixture {
+    let library_root = tempdir.path().join("library");
+    let state_root = tempdir.path().join("state");
+    let config_path = tempdir.path().join("monitor.json");
+    let manifest_path = state_root.join("manifest.json");
+    fs::create_dir_all(&library_root).expect("library root should be created");
+    fs::create_dir_all(&state_root).expect("state root should be created");
+
+    let mut manifest = Manifest::new();
+    for (asset_id, state) in records {
+        let mut record = AssetRecord::new(asset_id.to_string(), library_root.join("source.raw"));
+        record.state = *state;
+        record
+            .proofs
+            .insert("preserved_proof".to_string(), json!({"verified": true}));
+        record
+            .failures
+            .push(icloudpd_optimizer::manifest::FailureRecord::new(
+                "generic_failure",
+                "preserve this failure",
+            ));
+        manifest.upsert(record);
+    }
+    manifest
+        .save_atomic(&manifest_path)
+        .expect("fixture manifest should save");
+    let state_store =
+        AssetStateStore::open_writer(&manifest_path, "fixture", Duration::from_secs(1))
+            .expect("fixture state store should open");
+    state_store
+        .load_or_import()
+        .expect("fixture manifest should import");
+    drop(state_store);
+
+    let config = MonitorConfig::new(&library_root, &manifest_path, tempdir.path().join("heic"));
+    config
+        .save_atomic(&config_path)
+        .expect("fixture config should save");
+    let evidence_path = tempdir.path().join("evidence.json");
+    fs::write(
+        &evidence_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&evidence).expect("evidence should serialize")
+        ),
+    )
+    .expect("fixture evidence should save");
+    let evidence_sha256 = format!(
+        "{:x}",
+        Sha256::digest(fs::read(&evidence_path).expect("evidence should read"))
+    );
+
+    FailedAssetsQuarantineFixture {
+        config_path,
+        evidence_path,
+        evidence_sha256,
+        manifest_path,
+    }
+}
+
+fn failed_assets_quarantine_args<'a>(
+    fixture: &'a FailedAssetsQuarantineFixture,
+    expected_failed_asset_count: &'a str,
+    expected_side_effect_asset_count: &'a str,
+) -> Vec<&'a str> {
+    vec![
+        "monitor",
+        "failed-assets-quarantine",
+        "--config",
+        fixture
+            .config_path
+            .to_str()
+            .expect("config path should be utf8"),
+        "--evidence",
+        fixture
+            .evidence_path
+            .to_str()
+            .expect("evidence path should be utf8"),
+        "--expected-evidence-sha256",
+        &fixture.evidence_sha256,
+        "--expected-failed-asset-count",
+        expected_failed_asset_count,
+        "--expected-side-effect-asset-count",
+        expected_side_effect_asset_count,
+    ]
+}
+
+fn failed_assets_quarantine_args_owned(
+    fixture: &FailedAssetsQuarantineFixture,
+    expected_failed_asset_count: &str,
+    expected_side_effect_asset_count: &str,
+) -> Vec<String> {
+    failed_assets_quarantine_args(
+        fixture,
+        expected_failed_asset_count,
+        expected_side_effect_asset_count,
+    )
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
+fn failed_assets_quarantine_dry_run(
+    fixture: &FailedAssetsQuarantineFixture,
+    expected_failed_asset_count: &str,
+    expected_side_effect_asset_count: &str,
+) -> Value {
+    let output = binary()
+        .args(failed_assets_quarantine_args(
+            fixture,
+            expected_failed_asset_count,
+            expected_side_effect_asset_count,
+        ))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).expect("dry-run report should be JSON")
+}
+
 fn current_target_platform() -> TargetPlatform {
     TargetPlatform::new(std::env::consts::OS, std::env::consts::ARCH)
 }
@@ -2288,6 +2430,533 @@ fn monitor_original_assets_reconcile_requires_explicit_reconciliation_gates() {
             "--expected-incomplete-transient-count",
         ))
         .stdout(predicate::str::contains("--apply"));
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_requires_explicit_safety_arguments() {
+    binary()
+        .args(["monitor", "failed-assets-quarantine", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--config"))
+        .stdout(predicate::str::contains("--evidence"))
+        .stdout(predicate::str::contains("--expected-evidence-sha256"))
+        .stdout(predicate::str::contains("--expected-failed-asset-count"))
+        .stdout(predicate::str::contains(
+            "--expected-side-effect-asset-count",
+        ))
+        .stdout(predicate::str::contains("--expected-target-set-sha256"))
+        .stdout(predicate::str::contains("--apply"));
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_dry_run_reports_verified_immutable_target_set() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let evidence = json!({
+        "failed_assets": [
+            quarantine_evidence_entry("asset-alpha", 1),
+            quarantine_evidence_entry("asset-beta", 2),
+        ],
+        "with_upload_or_delete_side_effects": [
+            quarantine_evidence_entry("asset-alpha", 1),
+            quarantine_evidence_entry("asset-beta", 2),
+        ],
+        "clean_of_recorded_remote_side_effects": [],
+        "side_effect_assets": [
+            quarantine_evidence_entry("asset-alpha", 1),
+            quarantine_evidence_entry("asset-beta", 2),
+        ],
+    });
+    let fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[
+            ("asset-alpha", State::Failed),
+            ("asset-beta", State::Failed),
+        ],
+        evidence,
+    );
+    let manifest_before = fs::read(&fixture.manifest_path).expect("manifest should read");
+    let db_path = AssetStateStore::db_path_for_manifest(&fixture.manifest_path);
+    let database_before = fs::read(&db_path).expect("state database should read");
+
+    let output = binary()
+        .args(failed_assets_quarantine_args(&fixture, "2", "2"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("report should be JSON");
+
+    assert_eq!(report["evidence_sha256"], fixture.evidence_sha256);
+    assert!(
+        report["target_set_sha256"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64)
+    );
+    assert_eq!(report["counts"]["failed_assets"], 2);
+    assert_eq!(report["counts"]["side_effect_assets"], 2);
+    assert_eq!(report["verified"], true);
+    assert_eq!(report["applied"], false);
+    assert_eq!(report["changed_count"], 0);
+    assert_eq!(
+        fs::read(&fixture.manifest_path).expect("manifest should read"),
+        manifest_before
+    );
+    assert_eq!(
+        fs::read(&db_path).expect("state database should read"),
+        database_before
+    );
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_rejects_mismatched_or_invalid_evidence_hashes() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let evidence = json!({
+        "failed_assets": [quarantine_evidence_entry("asset-alpha", 1)],
+        "with_upload_or_delete_side_effects": [quarantine_evidence_entry("asset-alpha", 1)],
+        "clean_of_recorded_remote_side_effects": [],
+        "side_effect_assets": [quarantine_evidence_entry("asset-alpha", 1)],
+    });
+    let fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[("asset-alpha", State::Failed)],
+        evidence,
+    );
+
+    for invalid_hash in ["0".repeat(64), "not-a-sha256".to_string()] {
+        let mut args = failed_assets_quarantine_args_owned(&fixture, "1", "1");
+        let hash_index = args
+            .iter()
+            .position(|argument| argument == "--expected-evidence-sha256")
+            .expect("evidence hash argument should exist")
+            + 1;
+        args[hash_index] = invalid_hash;
+        binary()
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "failed-assets-quarantine gate failed",
+            ));
+    }
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_rejects_count_and_arithmetic_mismatches() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let consistent = json!({
+        "failed_assets": [
+            quarantine_evidence_entry("asset-alpha", 1),
+            quarantine_evidence_entry("asset-beta", 1),
+        ],
+        "with_upload_or_delete_side_effects": [
+            quarantine_evidence_entry("asset-alpha", 1),
+            quarantine_evidence_entry("asset-beta", 1),
+        ],
+        "clean_of_recorded_remote_side_effects": [],
+        "side_effect_assets": [
+            quarantine_evidence_entry("asset-alpha", 1),
+            quarantine_evidence_entry("asset-beta", 1),
+        ],
+    });
+    let count_fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[
+            ("asset-alpha", State::Failed),
+            ("asset-beta", State::Failed),
+        ],
+        consistent,
+    );
+    binary()
+        .args(failed_assets_quarantine_args(&count_fixture, "1", "2"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed-asset count did not match"));
+
+    let arithmetic_evidence = json!({
+        "failed_assets": [
+            quarantine_evidence_entry("asset-alpha", 1),
+            quarantine_evidence_entry("asset-beta", 1),
+        ],
+        "with_upload_or_delete_side_effects": [quarantine_evidence_entry("asset-alpha", 1)],
+        "clean_of_recorded_remote_side_effects": [],
+        "side_effect_assets": [quarantine_evidence_entry("asset-alpha", 1)],
+    });
+    let arithmetic_fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[
+            ("asset-alpha", State::Failed),
+            ("asset-beta", State::Failed),
+        ],
+        arithmetic_evidence,
+    );
+    binary()
+        .args(failed_assets_quarantine_args(&arithmetic_fixture, "2", "1"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "failed-asset arithmetic did not match",
+        ));
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_rejects_duplicate_or_empty_asset_ids() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    for asset_id in ["asset-alpha", ""] {
+        let failed_assets = if asset_id.is_empty() {
+            vec![quarantine_evidence_entry("", 1)]
+        } else {
+            vec![
+                quarantine_evidence_entry("asset-alpha", 1),
+                quarantine_evidence_entry("asset-alpha", 1),
+            ]
+        };
+        let evidence = json!({
+            "failed_assets": failed_assets,
+            "with_upload_or_delete_side_effects": [quarantine_evidence_entry(asset_id, 1)],
+            "clean_of_recorded_remote_side_effects": [],
+            "side_effect_assets": [quarantine_evidence_entry(asset_id, 1)],
+        });
+        let fixture = write_failed_assets_quarantine_fixture(
+            &tempdir,
+            &[("asset-alpha", State::Failed)],
+            evidence,
+        );
+        binary()
+            .args(failed_assets_quarantine_args(&fixture, "1", "1"))
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("empty or duplicate asset ID"));
+    }
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_rejects_empty_targets_and_zero_remote_side_effects() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let empty_evidence = json!({
+        "failed_assets": [],
+        "with_upload_or_delete_side_effects": [],
+        "clean_of_recorded_remote_side_effects": [],
+        "side_effect_assets": [],
+    });
+    let empty_fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[("asset-alpha", State::Failed)],
+        empty_evidence,
+    );
+    binary()
+        .args(failed_assets_quarantine_args(&empty_fixture, "0", "0"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("target set must be nonempty"));
+
+    let zero_side_effect_evidence = json!({
+        "failed_assets": [quarantine_evidence_entry("asset-alpha", 0)],
+        "with_upload_or_delete_side_effects": [quarantine_evidence_entry("asset-alpha", 0)],
+        "clean_of_recorded_remote_side_effects": [],
+        "side_effect_assets": [quarantine_evidence_entry("asset-alpha", 0)],
+    });
+    let zero_side_effect_fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[("asset-alpha", State::Failed)],
+        zero_side_effect_evidence,
+    );
+    binary()
+        .args(failed_assets_quarantine_args(
+            &zero_side_effect_fixture,
+            "1",
+            "1",
+        ))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("positive upload or delete count"));
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_target_set_is_deterministic_across_evidence_order() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let first_evidence = json!({
+        "failed_assets": [
+            quarantine_evidence_entry("asset-alpha", 1),
+            quarantine_evidence_entry("asset-beta", 2),
+        ],
+        "with_upload_or_delete_side_effects": [
+            quarantine_evidence_entry("asset-alpha", 1),
+            quarantine_evidence_entry("asset-beta", 2),
+        ],
+        "clean_of_recorded_remote_side_effects": [],
+        "side_effect_assets": [
+            quarantine_evidence_entry("asset-alpha", 1),
+            quarantine_evidence_entry("asset-beta", 2),
+        ],
+    });
+    let mut fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[
+            ("asset-beta", State::Failed),
+            ("asset-alpha", State::Failed),
+        ],
+        first_evidence,
+    );
+    let first_report = failed_assets_quarantine_dry_run(&fixture, "2", "2");
+    let reversed_evidence = json!({
+        "failed_assets": [
+            quarantine_evidence_entry("asset-beta", 2),
+            quarantine_evidence_entry("asset-alpha", 1),
+        ],
+        "with_upload_or_delete_side_effects": [
+            quarantine_evidence_entry("asset-beta", 2),
+            quarantine_evidence_entry("asset-alpha", 1),
+        ],
+        "clean_of_recorded_remote_side_effects": [],
+        "side_effect_assets": [
+            quarantine_evidence_entry("asset-beta", 2),
+            quarantine_evidence_entry("asset-alpha", 1),
+        ],
+    });
+    fs::write(
+        &fixture.evidence_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&reversed_evidence).expect("evidence should serialize")
+        ),
+    )
+    .expect("reversed evidence should save");
+    fixture.evidence_sha256 = format!(
+        "{:x}",
+        Sha256::digest(fs::read(&fixture.evidence_path).expect("evidence should read"))
+    );
+    let second_report = failed_assets_quarantine_dry_run(&fixture, "2", "2");
+
+    assert_eq!(
+        first_report["target_set_sha256"],
+        second_report["target_set_sha256"]
+    );
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_apply_requires_matching_target_set_hash() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let evidence = json!({
+        "failed_assets": [quarantine_evidence_entry("asset-alpha", 1)],
+        "with_upload_or_delete_side_effects": [quarantine_evidence_entry("asset-alpha", 1)],
+        "clean_of_recorded_remote_side_effects": [],
+        "side_effect_assets": [quarantine_evidence_entry("asset-alpha", 1)],
+    });
+    let fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[("asset-alpha", State::Failed)],
+        evidence,
+    );
+    let mut missing_hash_args = failed_assets_quarantine_args_owned(&fixture, "1", "1");
+    missing_hash_args.push("--apply".to_string());
+    binary()
+        .args(missing_hash_args)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "apply requires an expected target-set SHA-256",
+        ));
+
+    let mut mismatched_hash_args = failed_assets_quarantine_args_owned(&fixture, "1", "1");
+    mismatched_hash_args.extend([
+        "--expected-target-set-sha256".to_string(),
+        "0".repeat(64),
+        "--apply".to_string(),
+    ]);
+    binary()
+        .args(mismatched_hash_args)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("target set did not match"));
+    let manifest = Manifest::load(&fixture.manifest_path).expect("manifest should load");
+    assert_eq!(
+        manifest
+            .get("asset-alpha")
+            .expect("asset should exist")
+            .state,
+        State::Failed
+    );
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_rejects_non_failed_target_without_batch_changes() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let evidence = json!({
+        "failed_assets": [
+            quarantine_evidence_entry("asset-alpha", 1),
+            quarantine_evidence_entry("asset-beta", 1),
+        ],
+        "with_upload_or_delete_side_effects": [
+            quarantine_evidence_entry("asset-alpha", 1),
+            quarantine_evidence_entry("asset-beta", 1),
+        ],
+        "clean_of_recorded_remote_side_effects": [],
+        "side_effect_assets": [
+            quarantine_evidence_entry("asset-alpha", 1),
+            quarantine_evidence_entry("asset-beta", 1),
+        ],
+    });
+    let fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[
+            ("asset-alpha", State::Failed),
+            ("asset-beta", State::Converted),
+        ],
+        evidence,
+    );
+    let report = failed_assets_quarantine_dry_run(&fixture, "2", "2");
+    let mut apply_args = failed_assets_quarantine_args_owned(&fixture, "2", "2");
+    apply_args.extend([
+        "--expected-target-set-sha256".to_string(),
+        report["target_set_sha256"]
+            .as_str()
+            .expect("target hash should be a string")
+            .to_string(),
+        "--apply".to_string(),
+    ]);
+    binary()
+        .args(apply_args)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "every target must remain exactly Failed",
+        ));
+    let manifest = Manifest::load(&fixture.manifest_path).expect("manifest should load");
+    assert_eq!(
+        manifest
+            .get("asset-alpha")
+            .expect("asset should exist")
+            .state,
+        State::Failed
+    );
+    assert_eq!(
+        manifest
+            .get("asset-beta")
+            .expect("asset should exist")
+            .state,
+        State::Converted
+    );
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_applies_atomically_preserves_history_and_rejects_second_apply()
+{
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let evidence = json!({
+        "failed_assets": [
+            quarantine_evidence_entry("asset-alpha", 3),
+            quarantine_evidence_entry("asset-beta", 1),
+        ],
+        "with_upload_or_delete_side_effects": [
+            quarantine_evidence_entry("asset-alpha", 3),
+            quarantine_evidence_entry("asset-beta", 1),
+        ],
+        "clean_of_recorded_remote_side_effects": [],
+        "side_effect_assets": [
+            quarantine_evidence_entry("asset-alpha", 3),
+            quarantine_evidence_entry("asset-beta", 1),
+        ],
+    });
+    let fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[
+            ("asset-alpha", State::Failed),
+            ("asset-beta", State::Failed),
+        ],
+        evidence,
+    );
+    let dry_report = failed_assets_quarantine_dry_run(&fixture, "2", "2");
+    let target_set_sha256 = dry_report["target_set_sha256"]
+        .as_str()
+        .expect("target hash should be a string")
+        .to_string();
+    let mut apply_args = failed_assets_quarantine_args_owned(&fixture, "2", "2");
+    apply_args.extend([
+        "--expected-target-set-sha256".to_string(),
+        target_set_sha256.clone(),
+        "--apply".to_string(),
+    ]);
+    let output = binary()
+        .args(apply_args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("apply report should be JSON");
+    assert_eq!(report["applied"], true);
+    assert_eq!(report["changed_count"], 2);
+    let rendered_report = String::from_utf8(output).expect("report should be utf8");
+    assert!(!rendered_report.contains(tempdir.path().to_str().expect("temp path should be utf8")));
+    assert!(
+        !rendered_report.contains(
+            fixture
+                .evidence_path
+                .to_str()
+                .expect("evidence path should be utf8")
+        )
+    );
+
+    let manifest = Manifest::load(&fixture.manifest_path).expect("manifest should load");
+    for (asset_id, uploads) in [("asset-alpha", 3), ("asset-beta", 1)] {
+        let record = manifest.get(asset_id).expect("asset should exist");
+        assert_eq!(record.state, State::NeedsReview);
+        assert_eq!(record.failures.len(), 1);
+        assert_eq!(record.proofs["preserved_proof"], json!({"verified": true}));
+        assert_eq!(
+            record.proofs["failure_quarantine"]["schema_version"],
+            json!(1)
+        );
+        assert_eq!(
+            record.proofs["failure_quarantine"]["reason_code"],
+            json!("historical_remote_side_effect")
+        );
+        assert_eq!(
+            record.proofs["failure_quarantine"]["evidence_sha256"],
+            json!(fixture.evidence_sha256)
+        );
+        assert_eq!(
+            record.proofs["failure_quarantine"]["target_set_sha256"],
+            json!(target_set_sha256)
+        );
+        assert_eq!(
+            record.proofs["failure_quarantine"]["successful_uploads"],
+            json!(uploads)
+        );
+        assert_eq!(record.proofs["failure_quarantine"]["delete_attempts"], 0);
+        assert_eq!(record.proofs["failure_quarantine"]["deleted_finishes"], 0);
+        assert_eq!(record.proofs["failure_quarantine"]["mirror_successes"], 1);
+        assert!(
+            record.proofs["failure_quarantine"]["applied_at_unix_seconds"]
+                .as_u64()
+                .is_some_and(|timestamp| timestamp > 0)
+        );
+        assert!(
+            record.proofs["failure_quarantine"]
+                .get("evidence_path")
+                .is_none()
+        );
+    }
+
+    let second_dry_report = failed_assets_quarantine_dry_run(&fixture, "2", "2");
+    let mut second_apply_args = failed_assets_quarantine_args_owned(&fixture, "2", "2");
+    second_apply_args.extend([
+        "--expected-target-set-sha256".to_string(),
+        second_dry_report["target_set_sha256"]
+            .as_str()
+            .expect("target hash should be a string")
+            .to_string(),
+        "--apply".to_string(),
+    ]);
+    binary()
+        .args(second_apply_args)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "every target must remain exactly Failed",
+        ));
 }
 
 #[cfg(unix)]

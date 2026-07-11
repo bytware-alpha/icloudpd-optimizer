@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -27,7 +27,7 @@ use crate::conversion_execution::{
 use crate::local_mirror::{
     IcloudpdLocalMirrorRequest, LocalMirrorError, ensure_icloudpd_local_mirror,
 };
-use crate::manifest::{AssetRecord, Manifest, ManifestError, State};
+use crate::manifest::{AssetRecord, FailureQuarantineProof, Manifest, ManifestError, State};
 use crate::metrics::VerifiedMetrics;
 use crate::monitor::{
     MonitorConfig, MonitorError, MonitorScanSummary, MonitorStats, acquire_monitor_run_guard,
@@ -64,6 +64,8 @@ use crate::workflow::{
 
 const DAY_SECONDS: u64 = 24 * 60 * 60;
 const ORIGINAL_ASSETS_TARGET_SET_FINGERPRINT_VERSION: &[u8] = b"original-assets-target-set-v1";
+const FAILED_ASSETS_QUARANTINE_TARGET_SET_FINGERPRINT_VERSION: &[u8] =
+    b"failed-assets-quarantine-target-set-v1";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -194,6 +196,11 @@ enum MonitorCommand {
         about = "Query and optionally atomically reconcile one CloudKit original-assets destination"
     )]
     OriginalAssetsReconcile(MonitorOriginalAssetsReconcileArgs),
+    #[command(
+        name = "failed-assets-quarantine",
+        about = "Atomically quarantine audited failed assets with historical remote side effects"
+    )]
+    FailedAssetsQuarantine(MonitorFailedAssetsQuarantineArgs),
     #[command(
         name = "launchd-plist",
         about = "Print or write a macOS user LaunchAgent plist"
@@ -363,6 +370,24 @@ struct MonitorOriginalAssetsReconcileArgs {
     expected_ambiguous_count: u64,
     #[arg(long)]
     expected_incomplete_transient_count: u64,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    apply: bool,
+}
+
+#[derive(Debug, Args)]
+struct MonitorFailedAssetsQuarantineArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    evidence: PathBuf,
+    #[arg(long, value_name = "HEX")]
+    expected_evidence_sha256: String,
+    #[arg(long, value_name = "N")]
+    expected_failed_asset_count: u64,
+    #[arg(long, value_name = "N")]
+    expected_side_effect_asset_count: u64,
+    #[arg(long, value_name = "HEX")]
+    expected_target_set_sha256: Option<String>,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     apply: bool,
 }
@@ -867,6 +892,10 @@ pub enum CliError {
     OriginalAssetResolution(#[from] OriginalAssetResolutionError),
     #[error("original-assets-reconcile database commit succeeded but the JSON checkpoint is stale")]
     OriginalAssetsReconcileCheckpointStale,
+    #[error("failed-assets-quarantine gate failed: {message}")]
+    FailedAssetsQuarantineGate { message: String },
+    #[error("failed-assets-quarantine database commit succeeded but the JSON checkpoint is stale")]
+    FailedAssetsQuarantineCheckpointStale,
     #[error("macOS app bundle does not contain a monitor config path resource")]
     MissingAppConfigResource,
     #[error("macOS access prime failed at {path}: {source}")]
@@ -1051,6 +1080,9 @@ fn run_monitor<W: Write>(args: MonitorArgs, writer: &mut W) -> Result<(), CliErr
         MonitorCommand::OriginalAssetsAudit(args) => monitor_original_assets_audit(args, writer),
         MonitorCommand::OriginalAssetsReconcile(args) => {
             monitor_original_assets_reconcile(args, writer)
+        }
+        MonitorCommand::FailedAssetsQuarantine(args) => {
+            monitor_failed_assets_quarantine(args, writer)
         }
         MonitorCommand::LaunchdPlist(args) => monitor_launchd_plist(args, writer),
         MonitorCommand::ScanRootPreflight(args) => monitor_scan_root_preflight(args),
@@ -1651,6 +1683,481 @@ fn monitor_original_assets_reconcile<W: Write>(
     monitor_original_assets_reconcile_with_transport(args, writer, transport)
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct FailedAssetsQuarantineEvidenceAsset {
+    asset_id: String,
+    successful_uploads: u64,
+    delete_attempts: u64,
+    deleted_finishes: u64,
+    mirror_successes: u64,
+}
+
+impl FailedAssetsQuarantineEvidenceAsset {
+    fn has_remote_side_effect(&self) -> bool {
+        self.successful_uploads > 0 || self.delete_attempts > 0 || self.deleted_finishes > 0
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FailedAssetsQuarantineEvidence {
+    failed_assets: Vec<FailedAssetsQuarantineEvidenceAsset>,
+    with_upload_or_delete_side_effects: Vec<FailedAssetsQuarantineEvidenceAsset>,
+    clean_of_recorded_remote_side_effects: Vec<FailedAssetsQuarantineEvidenceAsset>,
+    side_effect_assets: Vec<FailedAssetsQuarantineEvidenceAsset>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FailedAssetsQuarantineCounts {
+    failed_assets: u64,
+    with_upload_or_delete_side_effects: u64,
+    clean_of_recorded_remote_side_effects: u64,
+    side_effect_assets: u64,
+}
+
+#[derive(Debug)]
+struct VerifiedFailedAssetsQuarantineEvidence {
+    evidence_sha256: String,
+    side_effect_assets: BTreeMap<String, FailedAssetsQuarantineEvidenceAsset>,
+    counts: FailedAssetsQuarantineCounts,
+}
+
+#[derive(Serialize)]
+struct FailedAssetsQuarantineReport {
+    evidence_sha256: String,
+    target_set_sha256: String,
+    counts: FailedAssetsQuarantineCounts,
+    verified: bool,
+    applied: bool,
+    changed_count: u64,
+}
+
+fn monitor_failed_assets_quarantine<W: Write>(
+    args: MonitorFailedAssetsQuarantineArgs,
+    writer: &mut W,
+) -> Result<(), CliError> {
+    let evidence = load_failed_assets_quarantine_evidence(&args)?;
+    let expected_target_set_sha256 = validate_failed_assets_quarantine_target_set_preflight(&args)?;
+    let config = MonitorConfig::load(&args.config)
+        .map_err(|_| failed_assets_quarantine_gate("monitor configuration could not be loaded"))?;
+    config.validate().map_err(|_| {
+        failed_assets_quarantine_gate("monitor configuration did not pass validation")
+    })?;
+
+    let (target_set_sha256, applied, changed_count) = if args.apply {
+        let expected_target_set_sha256 = expected_target_set_sha256.ok_or_else(|| {
+            failed_assets_quarantine_gate("apply requires an expected target-set SHA-256")
+        })?;
+        let mut guard = acquire_monitor_run_guard(&config).map_err(|_| {
+            failed_assets_quarantine_gate(
+                "monitor process lock or writer lease could not be acquired",
+            )
+        })?;
+        let state_store = guard
+            .state_store(&config.manifest_path)
+            .map_err(|_| failed_assets_quarantine_gate("writer lease could not be acquired"))?;
+        let mut manifest = state_store.load().map_err(|_| {
+            failed_assets_quarantine_gate(
+                "current state could not be loaded under the writer lease",
+            )
+        })?;
+        let target_set_sha256 =
+            failed_assets_quarantine_target_set_sha256(&manifest, &evidence.side_effect_assets)?;
+        validate_failed_assets_quarantine_target_set_match(
+            expected_target_set_sha256,
+            &target_set_sha256,
+        )?;
+        let expected_records =
+            failed_assets_quarantine_expected_records(&manifest, &evidence.side_effect_assets)?;
+        let changed_records = apply_failed_assets_quarantine(
+            &mut manifest,
+            &evidence,
+            &target_set_sha256,
+            current_unix_seconds_for_cli(),
+        )?;
+        let changed_count = u64::try_from(changed_records.len()).map_err(|_| {
+            failed_assets_quarantine_gate("quarantine update count exceeded the supported range")
+        })?;
+        persist_failed_assets_quarantine_updates(
+            state_store,
+            &expected_records,
+            &changed_records,
+            evidence.counts.side_effect_assets,
+        )?;
+        ensure_failed_assets_quarantine_checkpoint(|| state_store.export_json())?;
+        (target_set_sha256, true, changed_count)
+    } else {
+        let state_store = AssetStateStore::open_immutable_read_only(&config.manifest_path)
+            .map_err(|_| {
+                failed_assets_quarantine_gate("immutable state snapshot could not be opened")
+            })?;
+        let manifest = state_store.load().map_err(|_| {
+            failed_assets_quarantine_gate("immutable state snapshot could not be loaded")
+        })?;
+        let target_set_sha256 =
+            failed_assets_quarantine_target_set_sha256(&manifest, &evidence.side_effect_assets)?;
+        if let Some(expected_target_set_sha256) = expected_target_set_sha256 {
+            validate_failed_assets_quarantine_target_set_match(
+                expected_target_set_sha256,
+                &target_set_sha256,
+            )?;
+        }
+        state_store
+            .revalidate_immutable_read_snapshot()
+            .map_err(|_| {
+                failed_assets_quarantine_gate(
+                    "immutable state changed while the dry-run was verifying",
+                )
+            })?;
+        (target_set_sha256, false, 0)
+    };
+
+    let report = FailedAssetsQuarantineReport {
+        evidence_sha256: evidence.evidence_sha256,
+        target_set_sha256,
+        counts: evidence.counts,
+        verified: true,
+        applied,
+        changed_count,
+    };
+    serde_json::to_writer_pretty(&mut *writer, &report)?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn load_failed_assets_quarantine_evidence(
+    args: &MonitorFailedAssetsQuarantineArgs,
+) -> Result<VerifiedFailedAssetsQuarantineEvidence, CliError> {
+    if !is_sha256_fingerprint(&args.expected_evidence_sha256) {
+        return Err(failed_assets_quarantine_gate(
+            "expected evidence SHA-256 must be 64 hexadecimal characters",
+        ));
+    }
+    let bytes = fs::read(&args.evidence)
+        .map_err(|_| failed_assets_quarantine_gate("evidence file could not be read"))?;
+    let actual_evidence_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if actual_evidence_sha256 != args.expected_evidence_sha256 {
+        return Err(failed_assets_quarantine_gate(
+            "evidence SHA-256 did not match the expected fingerprint",
+        ));
+    }
+    let evidence: FailedAssetsQuarantineEvidence =
+        serde_json::from_slice(&bytes).map_err(|_| {
+            failed_assets_quarantine_gate("evidence JSON did not match the quarantine schema")
+        })?;
+    validate_failed_assets_quarantine_evidence(evidence, actual_evidence_sha256, args)
+}
+
+fn validate_failed_assets_quarantine_evidence(
+    evidence: FailedAssetsQuarantineEvidence,
+    evidence_sha256: String,
+    args: &MonitorFailedAssetsQuarantineArgs,
+) -> Result<VerifiedFailedAssetsQuarantineEvidence, CliError> {
+    let failed_assets = failed_assets_quarantine_asset_map(
+        evidence.failed_assets,
+        "failed-assets contains an empty or duplicate asset ID",
+    )?;
+    let with_side_effects = failed_assets_quarantine_asset_map(
+        evidence.with_upload_or_delete_side_effects,
+        "with-upload-or-delete-side-effects contains an empty or duplicate asset ID",
+    )?;
+    let clean_assets = failed_assets_quarantine_asset_map(
+        evidence.clean_of_recorded_remote_side_effects,
+        "clean-of-recorded-remote-side-effects contains an empty or duplicate asset ID",
+    )?;
+    let side_effect_assets = failed_assets_quarantine_asset_map(
+        evidence.side_effect_assets,
+        "side-effect-assets contains an empty or duplicate asset ID",
+    )?;
+    let counts = FailedAssetsQuarantineCounts {
+        failed_assets: u64::try_from(failed_assets.len()).map_err(|_| {
+            failed_assets_quarantine_gate("failed-asset count exceeded the supported range")
+        })?,
+        with_upload_or_delete_side_effects: u64::try_from(with_side_effects.len()).map_err(
+            |_| failed_assets_quarantine_gate("side-effect count exceeded the supported range"),
+        )?,
+        clean_of_recorded_remote_side_effects: u64::try_from(clean_assets.len()).map_err(|_| {
+            failed_assets_quarantine_gate("clean-asset count exceeded the supported range")
+        })?,
+        side_effect_assets: u64::try_from(side_effect_assets.len()).map_err(|_| {
+            failed_assets_quarantine_gate("target count exceeded the supported range")
+        })?,
+    };
+    if counts.failed_assets == 0 || counts.side_effect_assets == 0 {
+        return Err(failed_assets_quarantine_gate(
+            "evidence target set must be nonempty",
+        ));
+    }
+    if counts.failed_assets != args.expected_failed_asset_count {
+        return Err(failed_assets_quarantine_gate(
+            "failed-asset count did not match the expected value",
+        ));
+    }
+    if counts.side_effect_assets != args.expected_side_effect_asset_count {
+        return Err(failed_assets_quarantine_gate(
+            "side-effect target count did not match the expected value",
+        ));
+    }
+    let partition_count = counts
+        .with_upload_or_delete_side_effects
+        .checked_add(counts.clean_of_recorded_remote_side_effects)
+        .ok_or_else(|| {
+            failed_assets_quarantine_gate("failed-asset subset counts exceeded the supported range")
+        })?;
+    if counts.failed_assets != partition_count {
+        return Err(failed_assets_quarantine_gate(
+            "failed-asset arithmetic did not match the side-effect and clean subsets",
+        ));
+    }
+    if !with_side_effects.keys().eq(side_effect_assets.keys())
+        || with_side_effects != side_effect_assets
+    {
+        return Err(failed_assets_quarantine_gate(
+            "side-effect targets did not exactly match the audited side-effect subset",
+        ));
+    }
+    if !with_side_effects.values().all(|asset| {
+        failed_assets
+            .get(&asset.asset_id)
+            .is_some_and(|failed| failed == asset)
+    }) || !clean_assets.values().all(|asset| {
+        failed_assets
+            .get(&asset.asset_id)
+            .is_some_and(|failed| failed == asset)
+    }) {
+        return Err(failed_assets_quarantine_gate(
+            "failed-asset subset evidence did not exactly match the audited entries",
+        ));
+    }
+    if !with_side_effects
+        .keys()
+        .all(|asset_id| failed_assets.contains_key(asset_id))
+        || !clean_assets
+            .keys()
+            .all(|asset_id| failed_assets.contains_key(asset_id))
+        || with_side_effects
+            .keys()
+            .any(|asset_id| clean_assets.contains_key(asset_id))
+    {
+        return Err(failed_assets_quarantine_gate(
+            "failed-asset subsets did not form an exact disjoint partition",
+        ));
+    }
+    if !failed_assets.keys().all(|asset_id| {
+        with_side_effects.contains_key(asset_id) || clean_assets.contains_key(asset_id)
+    }) {
+        return Err(failed_assets_quarantine_gate(
+            "failed-asset subsets did not cover every failed asset",
+        ));
+    }
+    if !side_effect_assets
+        .values()
+        .all(FailedAssetsQuarantineEvidenceAsset::has_remote_side_effect)
+    {
+        return Err(failed_assets_quarantine_gate(
+            "every side-effect target must have a positive upload or delete count",
+        ));
+    }
+    if !clean_assets
+        .values()
+        .all(|asset| !asset.has_remote_side_effect())
+    {
+        return Err(failed_assets_quarantine_gate(
+            "clean evidence entries must not have upload or delete counts",
+        ));
+    }
+    Ok(VerifiedFailedAssetsQuarantineEvidence {
+        evidence_sha256,
+        side_effect_assets,
+        counts,
+    })
+}
+
+fn failed_assets_quarantine_asset_map(
+    assets: Vec<FailedAssetsQuarantineEvidenceAsset>,
+    error: &'static str,
+) -> Result<BTreeMap<String, FailedAssetsQuarantineEvidenceAsset>, CliError> {
+    let mut by_asset_id = BTreeMap::new();
+    for asset in assets {
+        if asset.asset_id.trim().is_empty()
+            || by_asset_id.insert(asset.asset_id.clone(), asset).is_some()
+        {
+            return Err(failed_assets_quarantine_gate(error));
+        }
+    }
+    Ok(by_asset_id)
+}
+
+fn validate_failed_assets_quarantine_target_set_preflight(
+    args: &MonitorFailedAssetsQuarantineArgs,
+) -> Result<Option<&str>, CliError> {
+    let expected_target_set_sha256 = args.expected_target_set_sha256.as_deref();
+    if args.apply && expected_target_set_sha256.is_none() {
+        return Err(failed_assets_quarantine_gate(
+            "apply requires an expected target-set SHA-256",
+        ));
+    }
+    if expected_target_set_sha256.is_some_and(|value| !is_sha256_fingerprint(value)) {
+        return Err(failed_assets_quarantine_gate(
+            "expected target-set SHA-256 must be 64 hexadecimal characters",
+        ));
+    }
+    Ok(expected_target_set_sha256)
+}
+
+fn failed_assets_quarantine_target_set_sha256(
+    manifest: &Manifest,
+    targets: &BTreeMap<String, FailedAssetsQuarantineEvidenceAsset>,
+) -> Result<String, CliError> {
+    let mut encoded = Vec::new();
+    failed_assets_quarantine_target_set_append_field(
+        &mut encoded,
+        FAILED_ASSETS_QUARANTINE_TARGET_SET_FINGERPRINT_VERSION,
+    );
+    failed_assets_quarantine_target_set_append_field(
+        &mut encoded,
+        &u64::try_from(targets.len())
+            .map_err(|_| {
+                failed_assets_quarantine_gate("target count exceeded the supported range")
+            })?
+            .to_be_bytes(),
+    );
+    for asset_id in targets.keys() {
+        let record = manifest.records().get(asset_id).ok_or_else(|| {
+            failed_assets_quarantine_gate("a target was missing from the current state")
+        })?;
+        let exact_record = serde_json::to_vec(record).map_err(|_| {
+            failed_assets_quarantine_gate("a target record could not be fingerprinted")
+        })?;
+        failed_assets_quarantine_target_set_append_field(&mut encoded, asset_id.as_bytes());
+        failed_assets_quarantine_target_set_append_field(
+            &mut encoded,
+            Sha256::digest(exact_record).as_slice(),
+        );
+    }
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn failed_assets_quarantine_target_set_append_field(encoded: &mut Vec<u8>, value: &[u8]) {
+    encoded.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(value);
+}
+
+fn validate_failed_assets_quarantine_target_set_match(
+    expected_target_set_sha256: &str,
+    target_set_sha256: &str,
+) -> Result<(), CliError> {
+    if expected_target_set_sha256 != target_set_sha256 {
+        return Err(failed_assets_quarantine_gate(
+            "target set did not match the expected fingerprint",
+        ));
+    }
+    Ok(())
+}
+
+fn failed_assets_quarantine_expected_records(
+    manifest: &Manifest,
+    targets: &BTreeMap<String, FailedAssetsQuarantineEvidenceAsset>,
+) -> Result<BTreeMap<String, AssetRecord>, CliError> {
+    targets
+        .keys()
+        .map(|asset_id| {
+            let record = manifest.records().get(asset_id).ok_or_else(|| {
+                failed_assets_quarantine_gate("a target was missing from the current state")
+            })?;
+            if record.state != State::Failed {
+                return Err(failed_assets_quarantine_gate(
+                    "every target must remain exactly Failed before apply",
+                ));
+            }
+            Ok((asset_id.clone(), record.clone()))
+        })
+        .collect()
+}
+
+fn apply_failed_assets_quarantine(
+    manifest: &mut Manifest,
+    evidence: &VerifiedFailedAssetsQuarantineEvidence,
+    target_set_sha256: &str,
+    applied_at_unix_seconds: u64,
+) -> Result<Vec<AssetRecord>, CliError> {
+    evidence
+        .side_effect_assets
+        .values()
+        .map(|asset| {
+            manifest
+                .quarantine_failed_for_historical_remote_side_effect(
+                    &asset.asset_id,
+                    FailureQuarantineProof::historical_remote_side_effect(
+                        evidence.evidence_sha256.clone(),
+                        target_set_sha256.to_string(),
+                        asset.successful_uploads,
+                        asset.delete_attempts,
+                        asset.deleted_finishes,
+                        asset.mirror_successes,
+                        applied_at_unix_seconds,
+                    ),
+                )
+                .cloned()
+                .map_err(|_| {
+                    failed_assets_quarantine_gate(
+                        "a target could not transition from Failed to NeedsReview",
+                    )
+                })
+        })
+        .collect()
+}
+
+fn persist_failed_assets_quarantine_updates(
+    state_store: &AssetStateStore,
+    expected_records: &BTreeMap<String, AssetRecord>,
+    changed_records: &[AssetRecord],
+    expected_changed_count: u64,
+) -> Result<(), CliError> {
+    if u64::try_from(changed_records.len()).map_err(|_| {
+        failed_assets_quarantine_gate("quarantine update count exceeded the supported range")
+    })? != expected_changed_count
+    {
+        return Err(failed_assets_quarantine_gate(
+            "quarantine updates did not match the complete target set",
+        ));
+    }
+    state_store
+        .persist_records_exact_cas_atomic(
+            changed_records
+                .iter()
+                .map(|updated| {
+                    let expected = expected_records.get(&updated.asset_id).ok_or_else(|| {
+                        failed_assets_quarantine_gate(
+                            "quarantine update did not have a pre-update state snapshot",
+                        )
+                    })?;
+                    Ok(AssetRecordExactCasUpdate { expected, updated })
+                })
+                .collect::<Result<Vec<_>, CliError>>()?,
+        )
+        .map(|_| ())
+        .map_err(failed_assets_quarantine_persistence_error)
+}
+
+fn failed_assets_quarantine_persistence_error(error: AssetStateStoreError) -> CliError {
+    match error {
+        AssetStateStoreError::ExactCasMismatch { .. } => failed_assets_quarantine_gate(
+            "current state changed before the atomic quarantine commit",
+        ),
+        _ => failed_assets_quarantine_gate("atomic quarantine state commit did not complete"),
+    }
+}
+
+fn ensure_failed_assets_quarantine_checkpoint(
+    export: impl FnOnce() -> Result<Manifest, AssetStateStoreError>,
+) -> Result<(), CliError> {
+    export()
+        .map(|_| ())
+        .map_err(|_| CliError::FailedAssetsQuarantineCheckpointStale)
+}
+
 fn monitor_original_assets_reconcile_with_transport<
     W: Write,
     T: CloudKitOriginalAssetReadTransport,
@@ -1970,6 +2477,12 @@ fn apply_verified_original_assets_reconcile(
 
 fn original_assets_reconcile_gate(message: impl Into<String>) -> CliError {
     CliError::OriginalAssetsReconcileGate {
+        message: message.into(),
+    }
+}
+
+fn failed_assets_quarantine_gate(message: impl Into<String>) -> CliError {
+    CliError::FailedAssetsQuarantineGate {
         message: message.into(),
     }
 }
@@ -3795,6 +4308,108 @@ struct DoctorConversionBackendReport {
 struct ToolReport {
     name: &'static str,
     present: bool,
+}
+
+#[cfg(test)]
+mod failed_assets_quarantine_tests {
+    use super::*;
+
+    #[test]
+    fn exact_cas_conflict_keeps_the_entire_quarantine_batch_unapplied() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let mut initial_manifest = Manifest::new();
+        for asset_id in ["asset-alpha", "asset-beta"] {
+            let mut record = AssetRecord::new(asset_id, tempdir.path().join("source.raw"));
+            record.state = State::Failed;
+            initial_manifest.upsert(record);
+        }
+        initial_manifest
+            .save_atomic(&manifest_path)
+            .expect("manifest should save");
+        let state_store = AssetStateStore::open_writer(
+            &manifest_path,
+            "failed-assets-quarantine-test",
+            Duration::from_secs(1),
+        )
+        .expect("state store should open");
+        let snapshot = state_store
+            .load_or_import()
+            .expect("manifest should import");
+        let targets = BTreeMap::from([
+            (
+                "asset-alpha".to_string(),
+                FailedAssetsQuarantineEvidenceAsset {
+                    asset_id: "asset-alpha".to_string(),
+                    successful_uploads: 1,
+                    delete_attempts: 0,
+                    deleted_finishes: 0,
+                    mirror_successes: 0,
+                },
+            ),
+            (
+                "asset-beta".to_string(),
+                FailedAssetsQuarantineEvidenceAsset {
+                    asset_id: "asset-beta".to_string(),
+                    successful_uploads: 1,
+                    delete_attempts: 0,
+                    deleted_finishes: 0,
+                    mirror_successes: 0,
+                },
+            ),
+        ]);
+        let evidence = VerifiedFailedAssetsQuarantineEvidence {
+            evidence_sha256: "a".repeat(64),
+            side_effect_assets: targets.clone(),
+            counts: FailedAssetsQuarantineCounts {
+                failed_assets: 2,
+                with_upload_or_delete_side_effects: 2,
+                clean_of_recorded_remote_side_effects: 0,
+                side_effect_assets: 2,
+            },
+        };
+        let expected_records =
+            failed_assets_quarantine_expected_records(&snapshot, &targets).expect("snapshots");
+        let target_set_sha256 =
+            failed_assets_quarantine_target_set_sha256(&snapshot, &targets).expect("fingerprint");
+        let mut updated_manifest = snapshot.clone();
+        let changed_records = apply_failed_assets_quarantine(
+            &mut updated_manifest,
+            &evidence,
+            &target_set_sha256,
+            1_700_000_000,
+        )
+        .expect("updates should prepare");
+
+        let mut stale_record = expected_records["asset-alpha"].clone();
+        stale_record.proofs.insert(
+            "concurrent_change".to_string(),
+            serde_json::json!({"changed": true}),
+        );
+        stale_record.updated_at = "9999999999.000000000Z".to_string();
+        state_store
+            .persist_record(&stale_record)
+            .expect("concurrent record should persist");
+
+        let error = persist_failed_assets_quarantine_updates(
+            &state_store,
+            &expected_records,
+            &changed_records,
+            2,
+        )
+        .expect_err("stale snapshot must reject the whole batch");
+        assert!(
+            error
+                .to_string()
+                .contains("current state changed before the atomic quarantine commit")
+        );
+        let after = state_store.load().expect("state should load");
+        for asset_id in ["asset-alpha", "asset-beta"] {
+            let record = after.get(asset_id).expect("asset should exist");
+            assert_eq!(record.state, State::Failed);
+            assert!(!record.proofs.contains_key("failure_quarantine"));
+        }
+    }
 }
 
 #[cfg(test)]
