@@ -6292,6 +6292,28 @@ struct AdjustedSourceRequiredCandidate {
     kind: AdjustedSourceAdmissionKind,
 }
 
+impl PartialEq for AdjustedSourceRequiredCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.failure_timestamp == other.failure_timestamp && self.asset_id == other.asset_id
+    }
+}
+
+impl Eq for AdjustedSourceRequiredCandidate {}
+
+impl PartialOrd for AdjustedSourceRequiredCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AdjustedSourceRequiredCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.failure_timestamp
+            .cmp(&other.failure_timestamp)
+            .then_with(|| self.asset_id.cmp(&other.asset_id))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AdjustedSourceAdmissionKind {
     First,
@@ -6658,8 +6680,33 @@ fn admit_adjusted_source_required_assets_with_budget(
     max_admissions_per_scan: usize,
     current_unix_seconds: u64,
 ) -> Result<AdjustedSourceRequiredAdmission, ManifestError> {
+    admit_adjusted_source_required_assets_with_budget_and_stager(
+        manifest,
+        lifecycle_budget,
+        max_admissions_per_scan,
+        current_unix_seconds,
+        |staged, asset_id, value| {
+            staged
+                .record_proof(asset_id, ADJUSTED_SOURCE_REQUIRED_PROOF, value)
+                .map(|_| ())
+        },
+    )
+}
+
+fn admit_adjusted_source_required_assets_with_budget_and_stager<F>(
+    manifest: &mut Manifest,
+    lifecycle_budget: &mut LifecycleAdmissionBudget,
+    max_admissions_per_scan: usize,
+    current_unix_seconds: u64,
+    mut stage_proof: F,
+) -> Result<AdjustedSourceRequiredAdmission, ManifestError>
+where
+    F: FnMut(&mut Manifest, &str, Value) -> Result<(), ManifestError>,
+{
     let mut admission = AdjustedSourceRequiredAdmission::default();
-    let mut candidates = Vec::new();
+    let first_capacity = max_admissions_per_scan.min(lifecycle_budget.remaining_slots());
+    let mut first_candidates = BoundedOldest::new(first_capacity);
+    let mut retry_candidates = BoundedOldest::new(max_admissions_per_scan);
 
     for record in manifest.records().values() {
         if record.state != State::Failed {
@@ -6734,7 +6781,7 @@ fn admit_adjusted_source_required_assets_with_budget(
                         marker.attempt.saturating_add(1),
                         current_unix_seconds,
                     ) {
-                        Ok(proof) => candidates.push(AdjustedSourceRequiredCandidate {
+                        Ok(proof) => retry_candidates.consider(AdjustedSourceRequiredCandidate {
                             asset_id: record.asset_id.clone(),
                             failure_timestamp,
                             proof,
@@ -6760,7 +6807,7 @@ fn admit_adjusted_source_required_assets_with_budget(
             continue;
         };
         match build_adjusted_source_required_proof(record, failure, 1, current_unix_seconds) {
-            Ok(proof) => candidates.push(AdjustedSourceRequiredCandidate {
+            Ok(proof) => first_candidates.consider(AdjustedSourceRequiredCandidate {
                 asset_id: record.asset_id.clone(),
                 failure_timestamp,
                 proof,
@@ -6770,11 +6817,9 @@ fn admit_adjusted_source_required_assets_with_budget(
         }
     }
 
-    candidates.sort_by(|left, right| {
-        left.failure_timestamp
-            .cmp(&right.failure_timestamp)
-            .then_with(|| left.asset_id.cmp(&right.asset_id))
-    });
+    let mut candidates = first_candidates.into_oldest();
+    candidates.extend(retry_candidates.into_oldest());
+    candidates.sort();
     let mut staged_budget = *lifecycle_budget;
     let mut selected = Vec::new();
     for candidate in candidates {
@@ -6798,22 +6843,43 @@ fn admit_adjusted_source_required_assets_with_budget(
         return Ok(admission);
     }
 
-    let mut staged = manifest.clone();
-    for (asset_id, kind, value) in values {
-        staged.record_proof(&asset_id, ADJUSTED_SOURCE_REQUIRED_PROOF, value)?;
+    let staged_records =
+        stage_adjusted_source_required_updates(manifest, values, &mut stage_proof)?;
+    let mut committed_admission = admission;
+    for (kind, _) in &staged_records {
         match kind {
             AdjustedSourceAdmissionKind::First => {
-                admission.first_ready = admission.first_ready.saturating_add(1)
+                committed_admission.first_ready = committed_admission.first_ready.saturating_add(1)
             }
             AdjustedSourceAdmissionKind::ResolverRetry => {
-                admission.resolver_retry_ready = admission.resolver_retry_ready.saturating_add(1)
+                committed_admission.resolver_retry_ready =
+                    committed_admission.resolver_retry_ready.saturating_add(1)
             }
         }
     }
-    *manifest = staged;
+    for (_, record) in staged_records {
+        manifest.upsert(record);
+    }
     *lifecycle_budget = staged_budget;
-    admission.manifest_changed = true;
-    Ok(admission)
+    committed_admission.manifest_changed = true;
+    Ok(committed_admission)
+}
+
+fn stage_adjusted_source_required_updates<F>(
+    manifest: &Manifest,
+    values: Vec<(String, AdjustedSourceAdmissionKind, Value)>,
+    stage_proof: &mut F,
+) -> Result<Vec<(AdjustedSourceAdmissionKind, AssetRecord)>, ManifestError>
+where
+    F: FnMut(&mut Manifest, &str, Value) -> Result<(), ManifestError>,
+{
+    let mut staged_records = Vec::with_capacity(values.len());
+    for (asset_id, kind, value) in values {
+        let mut staged = manifest.snapshot_record(&asset_id)?;
+        stage_proof(&mut staged, &asset_id, value)?;
+        staged_records.push((kind, staged.get(&asset_id)?.clone()));
+    }
+    Ok(staged_records)
 }
 
 struct ScanRetryAdmissions {
@@ -14806,6 +14872,141 @@ esac
         assert_eq!(admission.first_ready, 0);
         assert_eq!(admission.resolver_retry_ready, 0);
         assert_eq!(cap_zero, before);
+    }
+
+    #[test]
+    fn adjusted_source_bounded_selector_keeps_a_later_retry_when_first_slots_are_exhausted() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "retry-later",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "010.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 2, 2, 1_000)
+            .expect("first marker should reserve one of two lifecycle slots");
+        policy_failed_again_at(
+            &mut manifest,
+            "retry-later",
+            "adjusted_source_resolve",
+            "resolver failure",
+            FailureKind::AdjustedSourceResolveFailed,
+            "400.000000000Z",
+        );
+        for (asset_id, recorded_at) in [
+            ("first-oldest", "100.000000000Z"),
+            ("first-skipped", "200.000000000Z"),
+        ] {
+            manifest.upsert(policy_failed_record(
+                asset_id,
+                "conversion",
+                "RAW has no usable embedded preview",
+                Some(FailureKind::EmbeddedPreviewUnavailable),
+                recorded_at,
+            ));
+        }
+
+        let mut budget = LifecycleAdmissionBudget::for_scan(&manifest, 2);
+        assert_eq!(budget.remaining_slots(), 1);
+        let admission =
+            admit_adjusted_source_required_assets_with_budget(&mut manifest, &mut budget, 2, 1_000)
+                .expect("the later retry must remain selectable after first slots are exhausted");
+
+        assert_eq!(admission.first_ready, 1);
+        assert_eq!(admission.resolver_retry_ready, 1);
+        assert!(
+            manifest
+                .get("first-oldest")
+                .unwrap()
+                .proofs
+                .contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF)
+        );
+        assert!(
+            !manifest
+                .get("first-skipped")
+                .unwrap()
+                .proofs
+                .contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF)
+        );
+        assert_eq!(
+            manifest.get("retry-later").unwrap().proofs[ADJUSTED_SOURCE_REQUIRED_PROOF]["attempt"],
+            json!(2)
+        );
+    }
+
+    #[test]
+    fn adjusted_source_bounded_selection_updates_only_the_oldest_selected_records() {
+        let mut manifest = Manifest::new();
+        for index in 0..256 {
+            let asset_id = format!("candidate-{index:03}");
+            let recorded_at = format!("{index:03}.000000000Z");
+            manifest.upsert(policy_failed_record(
+                &asset_id,
+                "conversion",
+                "RAW has no usable embedded preview",
+                Some(FailureKind::EmbeddedPreviewUnavailable),
+                &recorded_at,
+            ));
+        }
+        let before = manifest.clone();
+
+        let admission = admit_adjusted_source_required_assets(&mut manifest, 4, 4, 1_000)
+            .expect("bounded selection should admit exactly the four oldest candidates");
+
+        assert_eq!(admission.first_ready, 4);
+        for index in 0..256 {
+            let asset_id = format!("candidate-{index:03}");
+            let record = manifest.get(&asset_id).unwrap();
+            if index < 4 {
+                assert!(
+                    record.proofs.contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF),
+                    "{asset_id} should be selected"
+                );
+                assert_ne!(record, before.get(&asset_id).unwrap());
+            } else {
+                assert_eq!(record, before.get(&asset_id).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn adjusted_source_staging_error_rolls_back_selected_records_and_budget() {
+        let mut manifest = Manifest::new();
+        for (asset_id, recorded_at) in [("first", "100.000000000Z"), ("second", "200.000000000Z")] {
+            manifest.upsert(policy_failed_record(
+                asset_id,
+                "conversion",
+                "RAW has no usable embedded preview",
+                Some(FailureKind::EmbeddedPreviewUnavailable),
+                recorded_at,
+            ));
+        }
+        let before_manifest = manifest.clone();
+        let mut budget = LifecycleAdmissionBudget::for_scan(&manifest, 2);
+        let before_budget = budget;
+
+        let error = admit_adjusted_source_required_assets_with_budget_and_stager(
+            &mut manifest,
+            &mut budget,
+            2,
+            1_000,
+            |staged, asset_id, value| {
+                if asset_id == "second" {
+                    return Err(ManifestError::UnknownAsset {
+                        asset_id: "injected-staging-error".to_string(),
+                    });
+                }
+                staged
+                    .record_proof(asset_id, ADJUSTED_SOURCE_REQUIRED_PROOF, value)
+                    .map(|_| ())
+            },
+        )
+        .expect_err("an injected selected-record staging failure must abort the whole admission");
+
+        assert!(matches!(error, ManifestError::UnknownAsset { .. }));
+        assert_eq!(manifest, before_manifest);
+        assert_eq!(budget, before_budget);
     }
 
     #[test]
