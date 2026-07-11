@@ -7457,6 +7457,9 @@ mod tests {
     use serde_json::json;
 
     #[cfg(unix)]
+    const FAKE_NATIVE_VISUAL_VERIFIER_TIMEOUT_SECONDS: u64 = 5;
+
+    #[cfg(unix)]
     struct FakeNativeVisualVerifier {
         _tempdir: tempfile::TempDir,
         program: PathBuf,
@@ -13264,7 +13267,7 @@ esac
         let metrics = visual_metrics_for_conversion_with_sips(
             &fake.reference,
             &fake.candidate,
-            1,
+            FAKE_NATIVE_VISUAL_VERIFIER_TIMEOUT_SECONDS,
             &fake.program,
         )
         .expect("directly matching previews should verify");
@@ -13307,7 +13310,7 @@ esac
         let metrics = visual_metrics_for_conversion_with_sips(
             &fake.reference,
             &fake.candidate,
-            1,
+            FAKE_NATIVE_VISUAL_VERIFIER_TIMEOUT_SECONDS,
             &fake.program,
         )
         .expect("blank candidate should remain a verification result");
@@ -13352,7 +13355,7 @@ esac
         let metrics = visual_metrics_for_conversion_with_sips(
             &fake.reference,
             &fake.candidate,
-            1,
+            FAKE_NATIVE_VISUAL_VERIFIER_TIMEOUT_SECONDS,
             &fake.program,
         )
         .expect("codec-normalized preview should verify");
@@ -13405,7 +13408,7 @@ esac
         let metrics = visual_metrics_for_conversion_with_sips(
             &fake.reference,
             &fake.candidate,
-            1,
+            FAKE_NATIVE_VISUAL_VERIFIER_TIMEOUT_SECONDS,
             &fake.program,
         )
         .expect("failed normalized metrics should remain a verification result");
@@ -13448,7 +13451,7 @@ esac
         let error = visual_metrics_for_conversion_with_sips(
             &fake.reference,
             &fake.candidate,
-            1,
+            FAKE_NATIVE_VISUAL_VERIFIER_TIMEOUT_SECONDS,
             &fake.program,
         )
         .expect_err("normalized preview render failure must fail verification");
@@ -13492,7 +13495,7 @@ esac
         let error = visual_metrics_for_conversion_with_sips(
             &fake.reference,
             &fake.candidate,
-            1,
+            FAKE_NATIVE_VISUAL_VERIFIER_TIMEOUT_SECONDS,
             &fake.program,
         )
         .expect_err("partial baseline encode failure must fail verification");
