@@ -8418,6 +8418,40 @@ fn failure_kind_for(record: &AssetRecord, failure: &FailureRecord) -> Option<Fai
         .or_else(|| legacy_failure_kind(record, failure))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LegacyEmbeddedPreviewMigrationClassification {
+    Candidate,
+    NonFailed,
+    MissingLastFailure,
+    AlreadyTypedLastFailure,
+    DownstreamProofAmbiguity,
+    ClassifierMismatch,
+}
+
+pub(crate) fn classify_legacy_embedded_preview_migration(
+    record: &AssetRecord,
+) -> LegacyEmbeddedPreviewMigrationClassification {
+    if record.state != State::Failed {
+        return LegacyEmbeddedPreviewMigrationClassification::NonFailed;
+    }
+    let Some(failure) = record.failures.last() else {
+        return LegacyEmbeddedPreviewMigrationClassification::MissingLastFailure;
+    };
+    if failure.kind.is_some() {
+        return LegacyEmbeddedPreviewMigrationClassification::AlreadyTypedLastFailure;
+    }
+    if record.proofs.contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF)
+        || has_adjusted_source_recovery_blocking_proof(record)
+    {
+        return LegacyEmbeddedPreviewMigrationClassification::DownstreamProofAmbiguity;
+    }
+    if legacy_failure_kind(record, failure) == Some(FailureKind::EmbeddedPreviewUnavailable) {
+        LegacyEmbeddedPreviewMigrationClassification::Candidate
+    } else {
+        LegacyEmbeddedPreviewMigrationClassification::ClassifierMismatch
+    }
+}
+
 fn legacy_failure_kind(record: &AssetRecord, failure: &FailureRecord) -> Option<FailureKind> {
     match (failure.stage.as_str(), failure.message.as_str()) {
         ("heic_verify", "HEIC verification failed: visual_content_ok") => {

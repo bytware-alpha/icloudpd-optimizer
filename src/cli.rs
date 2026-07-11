@@ -27,10 +27,13 @@ use crate::conversion_execution::{
 use crate::local_mirror::{
     IcloudpdLocalMirrorRequest, LocalMirrorError, ensure_icloudpd_local_mirror,
 };
-use crate::manifest::{AssetRecord, FailureQuarantineProof, Manifest, ManifestError, State};
+use crate::manifest::{
+    AssetRecord, FailureKind, FailureQuarantineProof, Manifest, ManifestError, State,
+};
 use crate::metrics::VerifiedMetrics;
 use crate::monitor::{
-    MonitorConfig, MonitorError, MonitorScanSummary, MonitorStats, acquire_monitor_run_guard,
+    LegacyEmbeddedPreviewMigrationClassification, MonitorConfig, MonitorError, MonitorScanSummary,
+    MonitorStats, acquire_monitor_run_guard, classify_legacy_embedded_preview_migration,
     launchd_plist, log_monitor_failure_event, render_tui, run_monitor_once,
     run_scan_root_preflight_probe, write_launchd_plist,
 };
@@ -67,6 +70,8 @@ const DAY_SECONDS: u64 = 24 * 60 * 60;
 const ORIGINAL_ASSETS_TARGET_SET_FINGERPRINT_VERSION: &[u8] = b"original-assets-target-set-v1";
 const FAILED_ASSETS_QUARANTINE_TARGET_SET_FINGERPRINT_VERSION: &[u8] =
     b"failed-assets-quarantine-target-set-v2";
+const LEGACY_FAILURES_CLASSIFY_TARGET_SET_FINGERPRINT_VERSION: &[u8] =
+    b"legacy-failures-classify-target-set-v1";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -202,6 +207,11 @@ enum MonitorCommand {
         about = "Atomically quarantine audited failed assets with historical remote side effects"
     )]
     FailedAssetsQuarantine(MonitorFailedAssetsQuarantineArgs),
+    #[command(
+        name = "legacy-failures-classify",
+        about = "Offline audited migration for exact legacy missing-preview failures"
+    )]
+    LegacyFailuresClassify(MonitorLegacyFailuresClassifyArgs),
     #[command(
         name = "launchd-plist",
         about = "Print or write a macOS user LaunchAgent plist"
@@ -397,6 +407,26 @@ struct MonitorFailedAssetsQuarantineArgs {
         help = "SHA-256 of the exact side-effect target and Failed cohort snapshot"
     )]
     expected_target_set_sha256: Option<String>,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    apply: bool,
+}
+
+#[derive(Debug, Args)]
+struct MonitorLegacyFailuresClassifyArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(
+        long,
+        value_name = "HEX",
+        help = "SHA-256 of the exact legacy missing-preview candidate snapshot"
+    )]
+    expected_target_set_sha256: Option<String>,
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Candidate count reported by a prior dry-run"
+    )]
+    expected_candidate_count: Option<u64>,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     apply: bool,
 }
@@ -905,6 +935,10 @@ pub enum CliError {
     FailedAssetsQuarantineGate { message: String },
     #[error("failed-assets-quarantine database commit succeeded but the JSON checkpoint is stale")]
     FailedAssetsQuarantineCheckpointStale,
+    #[error("legacy-failures-classify gate failed: {message}")]
+    LegacyFailuresClassifyGate { message: String },
+    #[error("legacy-failures-classify database commit succeeded but the JSON checkpoint is stale")]
+    LegacyFailuresClassifyCheckpointStale,
     #[error("macOS app bundle does not contain a monitor config path resource")]
     MissingAppConfigResource,
     #[error("macOS access prime failed at {path}: {source}")]
@@ -1092,6 +1126,9 @@ fn run_monitor<W: Write>(args: MonitorArgs, writer: &mut W) -> Result<(), CliErr
         }
         MonitorCommand::FailedAssetsQuarantine(args) => {
             monitor_failed_assets_quarantine(args, writer)
+        }
+        MonitorCommand::LegacyFailuresClassify(args) => {
+            monitor_legacy_failures_classify(args, writer)
         }
         MonitorCommand::LaunchdPlist(args) => monitor_launchd_plist(args, writer),
         MonitorCommand::ScanRootPreflight(args) => monitor_scan_root_preflight(args),
@@ -2156,6 +2193,297 @@ fn ensure_failed_assets_quarantine_checkpoint(
         .map_err(|_| CliError::FailedAssetsQuarantineCheckpointStale)
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+struct LegacyFailuresClassifyCounts {
+    records_scanned: u64,
+    candidates: u64,
+    non_failed: u64,
+    missing_last_failure: u64,
+    already_typed_last_failure: u64,
+    downstream_proof_ambiguity: u64,
+    classifier_mismatch: u64,
+}
+
+#[derive(Debug)]
+struct LegacyFailuresClassifyCandidates {
+    targets: BTreeMap<String, AssetRecord>,
+    counts: LegacyFailuresClassifyCounts,
+}
+
+#[derive(Serialize)]
+struct LegacyFailuresClassifyReport {
+    target_set_sha256: String,
+    counts: LegacyFailuresClassifyCounts,
+    verified: bool,
+    applied: bool,
+    changed_count: u64,
+}
+
+fn monitor_legacy_failures_classify<W: Write>(
+    args: MonitorLegacyFailuresClassifyArgs,
+    writer: &mut W,
+) -> Result<(), CliError> {
+    let (expected_target_set_sha256, expected_candidate_count) =
+        validate_legacy_failures_classify_preflight(&args)?;
+    let config = MonitorConfig::load(&args.config)
+        .map_err(|_| legacy_failures_classify_gate("monitor configuration could not be loaded"))?;
+    config.validate().map_err(|_| {
+        legacy_failures_classify_gate("monitor configuration did not pass validation")
+    })?;
+
+    let (target_set_sha256, counts, applied, changed_count) = if args.apply {
+        let mut guard = acquire_monitor_run_guard(&config).map_err(|_| {
+            legacy_failures_classify_gate(
+                "monitor process lock or writer lease could not be acquired",
+            )
+        })?;
+        let state_store = guard
+            .state_store(&config.manifest_path)
+            .map_err(|_| legacy_failures_classify_gate("writer lease could not be acquired"))?;
+        let mut manifest = state_store.load().map_err(|_| {
+            legacy_failures_classify_gate(
+                "current state could not be loaded under the writer lease",
+            )
+        })?;
+        let candidates = legacy_failures_classify_candidates(&manifest);
+        let target_set_sha256 = legacy_failures_classify_target_set_sha256(&candidates.targets)?;
+        validate_legacy_failures_classify_expectations(
+            expected_target_set_sha256,
+            expected_candidate_count,
+            &target_set_sha256,
+            candidates.counts.candidates,
+        )?;
+        let expected_records = candidates.targets;
+        let changed_records =
+            type_legacy_missing_preview_failures(&mut manifest, &expected_records)?;
+        let changed_count = u64::try_from(changed_records.len()).map_err(|_| {
+            legacy_failures_classify_gate("migration update count exceeded the supported range")
+        })?;
+        persist_legacy_failures_classify_updates(
+            state_store,
+            &expected_records,
+            &changed_records,
+            candidates.counts.candidates,
+        )?;
+        ensure_legacy_failures_classify_checkpoint(|| state_store.export_json())?;
+        (target_set_sha256, candidates.counts, true, changed_count)
+    } else {
+        let state_store = AssetStateStore::open_immutable_read_only(&config.manifest_path)
+            .map_err(|_| {
+                legacy_failures_classify_gate("immutable state snapshot could not be opened")
+            })?;
+        let manifest = state_store.load().map_err(|_| {
+            legacy_failures_classify_gate("immutable state snapshot could not be loaded")
+        })?;
+        let candidates = legacy_failures_classify_candidates(&manifest);
+        let target_set_sha256 = legacy_failures_classify_target_set_sha256(&candidates.targets)?;
+        validate_legacy_failures_classify_expectations(
+            expected_target_set_sha256,
+            expected_candidate_count,
+            &target_set_sha256,
+            candidates.counts.candidates,
+        )?;
+        state_store
+            .revalidate_immutable_read_snapshot()
+            .map_err(|_| {
+                legacy_failures_classify_gate(
+                    "immutable state changed while the dry-run was verifying",
+                )
+            })?;
+        (target_set_sha256, candidates.counts, false, 0)
+    };
+
+    let report = LegacyFailuresClassifyReport {
+        target_set_sha256,
+        counts,
+        verified: true,
+        applied,
+        changed_count,
+    };
+    serde_json::to_writer_pretty(&mut *writer, &report)?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn validate_legacy_failures_classify_preflight(
+    args: &MonitorLegacyFailuresClassifyArgs,
+) -> Result<(Option<&str>, Option<u64>), CliError> {
+    let expected_target_set_sha256 = args.expected_target_set_sha256.as_deref();
+    if args.apply && expected_target_set_sha256.is_none() {
+        return Err(legacy_failures_classify_gate(
+            "apply requires an expected target-set SHA-256",
+        ));
+    }
+    if expected_target_set_sha256.is_some_and(|value| !is_sha256_fingerprint(value)) {
+        return Err(legacy_failures_classify_gate(
+            "expected target-set SHA-256 must be 64 hexadecimal characters",
+        ));
+    }
+    if args.apply && args.expected_candidate_count.is_none() {
+        return Err(legacy_failures_classify_gate(
+            "apply requires an expected candidate count",
+        ));
+    }
+    Ok((expected_target_set_sha256, args.expected_candidate_count))
+}
+
+fn legacy_failures_classify_candidates(manifest: &Manifest) -> LegacyFailuresClassifyCandidates {
+    let mut targets = BTreeMap::new();
+    let mut counts = LegacyFailuresClassifyCounts::default();
+    for (asset_id, record) in manifest.records() {
+        counts.records_scanned = counts.records_scanned.saturating_add(1);
+        match classify_legacy_embedded_preview_migration(record) {
+            LegacyEmbeddedPreviewMigrationClassification::Candidate => {
+                counts.candidates = counts.candidates.saturating_add(1);
+                targets.insert(asset_id.clone(), record.clone());
+            }
+            LegacyEmbeddedPreviewMigrationClassification::NonFailed => {
+                counts.non_failed = counts.non_failed.saturating_add(1);
+            }
+            LegacyEmbeddedPreviewMigrationClassification::MissingLastFailure => {
+                counts.missing_last_failure = counts.missing_last_failure.saturating_add(1);
+            }
+            LegacyEmbeddedPreviewMigrationClassification::AlreadyTypedLastFailure => {
+                counts.already_typed_last_failure =
+                    counts.already_typed_last_failure.saturating_add(1);
+            }
+            LegacyEmbeddedPreviewMigrationClassification::DownstreamProofAmbiguity => {
+                counts.downstream_proof_ambiguity =
+                    counts.downstream_proof_ambiguity.saturating_add(1);
+            }
+            LegacyEmbeddedPreviewMigrationClassification::ClassifierMismatch => {
+                counts.classifier_mismatch = counts.classifier_mismatch.saturating_add(1);
+            }
+        }
+    }
+    LegacyFailuresClassifyCandidates { targets, counts }
+}
+
+fn legacy_failures_classify_target_set_sha256(
+    targets: &BTreeMap<String, AssetRecord>,
+) -> Result<String, CliError> {
+    let mut encoded = Vec::new();
+    legacy_failures_classify_target_set_append_field(
+        &mut encoded,
+        LEGACY_FAILURES_CLASSIFY_TARGET_SET_FINGERPRINT_VERSION,
+    );
+    let target_count = u64::try_from(targets.len()).map_err(|_| {
+        legacy_failures_classify_gate("candidate count exceeded the supported range")
+    })?;
+    legacy_failures_classify_target_set_append_field(&mut encoded, &target_count.to_be_bytes());
+    for (asset_id, record) in targets {
+        let exact_record = serde_json::to_vec(record).map_err(|_| {
+            legacy_failures_classify_gate("a candidate record could not be fingerprinted")
+        })?;
+        legacy_failures_classify_target_set_append_field(&mut encoded, asset_id.as_bytes());
+        legacy_failures_classify_target_set_append_field(
+            &mut encoded,
+            Sha256::digest(exact_record).as_slice(),
+        );
+    }
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn legacy_failures_classify_target_set_append_field(encoded: &mut Vec<u8>, value: &[u8]) {
+    encoded.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(value);
+}
+
+fn validate_legacy_failures_classify_expectations(
+    expected_target_set_sha256: Option<&str>,
+    expected_candidate_count: Option<u64>,
+    target_set_sha256: &str,
+    candidate_count: u64,
+) -> Result<(), CliError> {
+    if expected_candidate_count.is_some_and(|expected| expected != candidate_count) {
+        return Err(legacy_failures_classify_gate(
+            "candidate count did not match the expected value",
+        ));
+    }
+    if expected_target_set_sha256.is_some_and(|expected| expected != target_set_sha256) {
+        return Err(legacy_failures_classify_gate(
+            "target set did not match the expected fingerprint",
+        ));
+    }
+    Ok(())
+}
+
+fn type_legacy_missing_preview_failures(
+    manifest: &mut Manifest,
+    expected_records: &BTreeMap<String, AssetRecord>,
+) -> Result<Vec<AssetRecord>, CliError> {
+    expected_records
+        .keys()
+        .map(|asset_id| {
+            let mut updated = manifest.records().get(asset_id).cloned().ok_or_else(|| {
+                legacy_failures_classify_gate("a candidate was missing from the current state")
+            })?;
+            if classify_legacy_embedded_preview_migration(&updated)
+                != LegacyEmbeddedPreviewMigrationClassification::Candidate
+            {
+                return Err(legacy_failures_classify_gate(
+                    "a candidate no longer matched the exact legacy classification",
+                ));
+            }
+            let last_failure = updated.failures.last_mut().ok_or_else(|| {
+                legacy_failures_classify_gate("a candidate no longer had a final failure")
+            })?;
+            last_failure.kind = Some(FailureKind::EmbeddedPreviewUnavailable);
+            manifest.upsert(updated.clone());
+            Ok(updated)
+        })
+        .collect()
+}
+
+fn persist_legacy_failures_classify_updates(
+    state_store: &AssetStateStore,
+    expected_records: &BTreeMap<String, AssetRecord>,
+    changed_records: &[AssetRecord],
+    expected_changed_count: u64,
+) -> Result<(), CliError> {
+    if u64::try_from(changed_records.len()).map_err(|_| {
+        legacy_failures_classify_gate("migration update count exceeded the supported range")
+    })? != expected_changed_count
+    {
+        return Err(legacy_failures_classify_gate(
+            "migration updates did not match the complete candidate set",
+        ));
+    }
+    state_store
+        .persist_records_exact_cas_atomic(
+            changed_records
+                .iter()
+                .map(|updated| {
+                    let expected = expected_records.get(&updated.asset_id).ok_or_else(|| {
+                        legacy_failures_classify_gate(
+                            "migration update did not have a pre-update state snapshot",
+                        )
+                    })?;
+                    Ok(AssetRecordExactCasUpdate { expected, updated })
+                })
+                .collect::<Result<Vec<_>, CliError>>()?,
+        )
+        .map(|_| ())
+        .map_err(legacy_failures_classify_persistence_error)
+}
+
+fn legacy_failures_classify_persistence_error(error: AssetStateStoreError) -> CliError {
+    match error {
+        AssetStateStoreError::ExactCasMismatch { .. } => legacy_failures_classify_gate(
+            "current state changed before the atomic migration commit",
+        ),
+        _ => legacy_failures_classify_gate("atomic migration state commit did not complete"),
+    }
+}
+
+fn ensure_legacy_failures_classify_checkpoint(
+    export: impl FnOnce() -> Result<Manifest, AssetStateStoreError>,
+) -> Result<(), CliError> {
+    export()
+        .map(|_| ())
+        .map_err(|_| CliError::LegacyFailuresClassifyCheckpointStale)
+}
+
 fn monitor_original_assets_reconcile_with_transport<
     W: Write,
     T: CloudKitOriginalAssetReadTransport,
@@ -2481,6 +2809,12 @@ fn original_assets_reconcile_gate(message: impl Into<String>) -> CliError {
 
 fn failed_assets_quarantine_gate(message: impl Into<String>) -> CliError {
     CliError::FailedAssetsQuarantineGate {
+        message: message.into(),
+    }
+}
+
+fn legacy_failures_classify_gate(message: impl Into<String>) -> CliError {
+    CliError::LegacyFailuresClassifyGate {
         message: message.into(),
     }
 }
@@ -4381,6 +4715,150 @@ mod failed_assets_quarantine_tests {
             assert_eq!(record.state, State::Failed);
             assert!(!record.proofs.contains_key("failure_quarantine"));
         }
+    }
+}
+
+#[cfg(test)]
+mod legacy_failures_classify_tests {
+    use super::*;
+
+    fn legacy_missing_preview_record(asset_id: &str, raw_path: PathBuf) -> AssetRecord {
+        let mut record = AssetRecord::new(asset_id, raw_path);
+        record.state = State::Failed;
+        record.failures.push(crate::manifest::FailureRecord {
+            stage: "conversion".to_string(),
+            message: format!(
+                "RAW has neither PreviewImage nor JpgFromRaw embedded preview: /staging/{asset_id}.staged-raw.DNG"
+            ),
+            recorded_at: "100.000000000Z".to_string(),
+            kind: None,
+        });
+        record.updated_at = "100.000000000Z".to_string();
+        record
+    }
+
+    fn persisted_legacy_candidates() -> (
+        tempfile::TempDir,
+        AssetStateStore,
+        BTreeMap<String, AssetRecord>,
+    ) {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let mut manifest = Manifest::new();
+        for asset_id in ["asset-alpha", "asset-beta"] {
+            manifest.upsert(legacy_missing_preview_record(
+                asset_id,
+                tempdir.path().join(format!("{asset_id}.DNG")),
+            ));
+        }
+        manifest
+            .save_atomic(&manifest_path)
+            .expect("manifest should save");
+        let state_store = AssetStateStore::open_writer(
+            &manifest_path,
+            "legacy-failures-classify-test",
+            Duration::from_secs(1),
+        )
+        .expect("state store should open");
+        let snapshot = state_store
+            .load_or_import()
+            .expect("manifest should import");
+        let candidates = legacy_failures_classify_candidates(&snapshot);
+        assert_eq!(candidates.counts.candidates, 2);
+        (tempdir, state_store, candidates.targets)
+    }
+
+    #[test]
+    fn exact_cas_conflict_keeps_the_entire_legacy_classification_batch_unapplied() {
+        let (_tempdir, state_store, expected_records) = persisted_legacy_candidates();
+        let mut updated_manifest = state_store.load().expect("state should load");
+        let changed_records =
+            type_legacy_missing_preview_failures(&mut updated_manifest, &expected_records)
+                .expect("updates should prepare");
+
+        let mut stale_record = expected_records["asset-alpha"].clone();
+        stale_record.proofs.insert(
+            "concurrent_change".to_string(),
+            serde_json::json!({"changed": true}),
+        );
+        stale_record.updated_at = "9999999999.000000000Z".to_string();
+        state_store
+            .persist_record(&stale_record)
+            .expect("concurrent record should persist");
+
+        let error = persist_legacy_failures_classify_updates(
+            &state_store,
+            &expected_records,
+            &changed_records,
+            2,
+        )
+        .expect_err("stale snapshot must reject the whole batch");
+        assert!(
+            error
+                .to_string()
+                .contains("current state changed before the atomic migration commit")
+        );
+        let after = state_store.load().expect("state should load");
+        for asset_id in ["asset-alpha", "asset-beta"] {
+            assert_eq!(
+                after
+                    .get(asset_id)
+                    .expect("record should exist")
+                    .failures
+                    .last()
+                    .expect("failure should exist")
+                    .kind,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_failure_is_reported_after_legacy_classification_db_commit() {
+        let (tempdir, state_store, expected_records) = persisted_legacy_candidates();
+        let mut updated_manifest = state_store.load().expect("state should load");
+        let changed_records =
+            type_legacy_missing_preview_failures(&mut updated_manifest, &expected_records)
+                .expect("updates should prepare");
+        persist_legacy_failures_classify_updates(
+            &state_store,
+            &expected_records,
+            &changed_records,
+            2,
+        )
+        .expect("SQLite commit should succeed");
+
+        let error = ensure_legacy_failures_classify_checkpoint(|| {
+            Err(AssetStateStoreError::WriterLeaseRequired)
+        })
+        .expect_err("failed JSON checkpoint must be surfaced after commit");
+        assert!(matches!(
+            error,
+            CliError::LegacyFailuresClassifyCheckpointStale
+        ));
+        let sqlite_manifest = state_store.load().expect("SQLite state should load");
+        assert_eq!(
+            sqlite_manifest
+                .get("asset-alpha")
+                .expect("record should exist")
+                .failures
+                .last()
+                .expect("failure should exist")
+                .kind,
+            Some(FailureKind::EmbeddedPreviewUnavailable)
+        );
+        let checkpoint_manifest =
+            Manifest::load(tempdir.path().join("manifest.json")).expect("checkpoint should load");
+        assert_eq!(
+            checkpoint_manifest
+                .get("asset-alpha")
+                .expect("record should exist")
+                .failures
+                .last()
+                .expect("failure should exist")
+                .kind,
+            None
+        );
     }
 }
 

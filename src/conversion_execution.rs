@@ -2716,7 +2716,7 @@ printf 'partial-stage' > "$3"
 "#,
         );
         let _copy_guard = RawStageCopyCommandGuard::install(copy_script.path());
-        let _timeout_guard = CommandTimeoutGuard::install(Duration::from_millis(500));
+        let _timeout_guard = CommandTimeoutGuard::install(Duration::from_secs(2));
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let output_dir = tempdir
             .path()
@@ -4052,6 +4052,7 @@ exit 67
     fn macos_real_sips_accepts_a_sealed_lexical_jpeg_when_available() {
         use std::os::unix::fs::symlink;
 
+        let mut path_guard = PathGuard::preserve();
         let Some(sips) = executable_on_path("sips") else {
             eprintln!("skipping real sips sealed lexical-source smoke: sips is unavailable");
             return;
@@ -4071,7 +4072,7 @@ fi
 exit 67
 "#,
         );
-        let _path_guard = PathGuard::install(tool_dir.path());
+        path_guard.replace(tool_dir.path());
         let tempdir = tempfile::tempdir().expect("test tempdir should be created");
         let output_dir = tempdir
             .path()
@@ -4364,16 +4365,25 @@ exit 49
     #[cfg(unix)]
     impl PathGuard {
         fn install(path: &Path) -> Self {
+            let mut guard = Self::preserve();
+            guard.replace(path);
+            guard
+        }
+
+        fn preserve() -> Self {
             let lock = PATH_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let previous = env::var_os("PATH");
-            unsafe {
-                env::set_var("PATH", path);
-            }
             Self {
                 previous,
                 _lock: lock,
+            }
+        }
+
+        fn replace(&mut self, path: &Path) {
+            unsafe {
+                env::set_var("PATH", path);
             }
         }
     }

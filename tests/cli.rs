@@ -7,8 +7,8 @@ use filetime::{FileTime, set_file_mtime};
 use icloudpd_optimizer::conversion_backend::{
     TargetPlatform, backend_report_for_target, required_tools_for_target,
 };
-use icloudpd_optimizer::manifest::{AssetRecord, Manifest, State};
-use icloudpd_optimizer::monitor::MonitorConfig;
+use icloudpd_optimizer::manifest::{AssetRecord, FailureKind, FailureRecord, Manifest, State};
+use icloudpd_optimizer::monitor::{MonitorConfig, admit_adjusted_source_required_assets};
 use icloudpd_optimizer::proof::NasRawProof;
 use icloudpd_optimizer::state_store::AssetStateStore;
 use icloudpd_optimizer::workflow::{
@@ -185,6 +185,94 @@ fn failed_assets_quarantine_dry_run(
             expected_failed_asset_count,
             expected_side_effect_asset_count,
         ))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).expect("dry-run report should be JSON")
+}
+
+struct LegacyFailuresClassifyFixture {
+    config_path: PathBuf,
+    manifest_path: PathBuf,
+}
+
+fn legacy_missing_preview_record(
+    library_root: &std::path::Path,
+    asset_id: &str,
+    state: State,
+    stage: &str,
+    staged_filename: &str,
+    message_suffix: &str,
+    kind: Option<FailureKind>,
+) -> AssetRecord {
+    let mut record = AssetRecord::new(asset_id, library_root.join(format!("{asset_id}.DNG")));
+    record.state = state;
+    record.failures.push(FailureRecord {
+        stage: stage.to_string(),
+        message: format!(
+            "RAW has neither PreviewImage nor JpgFromRaw embedded preview: /staging/{staged_filename}{message_suffix}"
+        ),
+        recorded_at: "100.000000000Z".to_string(),
+        kind,
+    });
+    record.updated_at = "100.000000000Z".to_string();
+    record
+}
+
+fn write_legacy_failures_classify_fixture(
+    tempdir: &tempfile::TempDir,
+    records: Vec<AssetRecord>,
+) -> LegacyFailuresClassifyFixture {
+    let library_root = tempdir.path().join("library");
+    let state_root = tempdir.path().join("state");
+    let config_path = tempdir.path().join("monitor.json");
+    let manifest_path = state_root.join("manifest.json");
+    fs::create_dir_all(&library_root).expect("library root should be created");
+    fs::create_dir_all(&state_root).expect("state root should be created");
+
+    let mut manifest = Manifest::new();
+    for record in records {
+        manifest.upsert(record);
+    }
+    manifest
+        .save_atomic(&manifest_path)
+        .expect("fixture manifest should save");
+    let state_store =
+        AssetStateStore::open_writer(&manifest_path, "fixture", Duration::from_secs(1))
+            .expect("fixture state store should open");
+    state_store
+        .load_or_import()
+        .expect("fixture manifest should import");
+    drop(state_store);
+
+    MonitorConfig::new(&library_root, &manifest_path, tempdir.path().join("heic"))
+        .save_atomic(&config_path)
+        .expect("fixture config should save");
+
+    LegacyFailuresClassifyFixture {
+        config_path,
+        manifest_path,
+    }
+}
+
+fn legacy_failures_classify_args(fixture: &LegacyFailuresClassifyFixture) -> Vec<String> {
+    vec![
+        "monitor".to_string(),
+        "legacy-failures-classify".to_string(),
+        "--config".to_string(),
+        fixture
+            .config_path
+            .to_str()
+            .expect("config path should be utf8")
+            .to_string(),
+    ]
+}
+
+fn legacy_failures_classify_dry_run(fixture: &LegacyFailuresClassifyFixture) -> Value {
+    let output = binary()
+        .args(legacy_failures_classify_args(fixture))
         .assert()
         .success()
         .get_output()
@@ -3149,6 +3237,437 @@ fn monitor_failed_assets_quarantine_applies_atomically_preserves_history_and_rej
         .stderr(predicate::str::contains(
             "current Failed asset IDs did not exactly match the evidence asset IDs",
         ));
+}
+
+fn add_adjusted_source_admission_proofs(record: &mut AssetRecord) {
+    record.proofs.insert(
+        "nas".to_string(),
+        json!({
+            "canonical_path": record.raw_path,
+            "relative_path": format!("{}.DNG", record.asset_id),
+            "size_bytes": 9u64,
+            "modified_unix_seconds": 100u64,
+            "age_seconds": 2_592_000u64,
+            "sha256": "raw-sha",
+        }),
+    );
+    record.proofs.insert(
+        "source_age".to_string(),
+        json!({
+            "source_captured_unix_seconds": 100u64,
+            "verified_at_unix_seconds": 2_592_100u64,
+            "min_age_seconds": 2_592_000u64,
+        }),
+    );
+    record.proofs.insert(
+        "original_asset".to_string(),
+        json!({
+            "record_name": format!("CPLAsset-{}", record.asset_id),
+            "record_change_tag": "tag",
+            "record_type": "CPLAsset",
+            "filename": format!("{}.DNG", record.asset_id),
+            "size_bytes": 9u64,
+            "matched_raw_sha256": "raw-sha",
+        }),
+    );
+}
+
+#[test]
+fn monitor_legacy_failures_classify_dry_run_is_exact_and_immutable() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let library_root = tempdir.path().join("library");
+    let mut downstream = legacy_missing_preview_record(
+        &library_root,
+        "downstream",
+        State::Failed,
+        "conversion",
+        "downstream.staged-raw.DNG",
+        "",
+        None,
+    );
+    downstream
+        .proofs
+        .insert("upload".to_string(), json!({"ambiguous": true}));
+    let mut malformed_raw = legacy_missing_preview_record(
+        &library_root,
+        "malformed",
+        State::Failed,
+        "conversion",
+        "malformed.staged-raw.DNG",
+        "",
+        None,
+    );
+    malformed_raw.raw_path = library_root.join("malformed");
+    let fixture = write_legacy_failures_classify_fixture(
+        &tempdir,
+        vec![
+            legacy_missing_preview_record(
+                &library_root,
+                "exact",
+                State::Failed,
+                "conversion",
+                "exact.staged-raw.DNG",
+                "",
+                None,
+            ),
+            legacy_missing_preview_record(
+                &library_root,
+                "wrong-stage",
+                State::Failed,
+                "upload",
+                "wrong-stage.staged-raw.DNG",
+                "",
+                None,
+            ),
+            legacy_missing_preview_record(
+                &library_root,
+                "wrong-asset",
+                State::Failed,
+                "conversion",
+                "other.staged-raw.DNG",
+                "",
+                None,
+            ),
+            legacy_missing_preview_record(
+                &library_root,
+                "extra-suffix",
+                State::Failed,
+                "conversion",
+                "extra-suffix.staged-raw.DNG",
+                " interrupted",
+                None,
+            ),
+            legacy_missing_preview_record(
+                &library_root,
+                "wrong-state",
+                State::Converted,
+                "conversion",
+                "wrong-state.staged-raw.DNG",
+                "",
+                None,
+            ),
+            legacy_missing_preview_record(
+                &library_root,
+                "typed",
+                State::Failed,
+                "conversion",
+                "typed.staged-raw.DNG",
+                "",
+                Some(FailureKind::EmbeddedPreviewUnavailable),
+            ),
+            downstream,
+            malformed_raw,
+        ],
+    );
+    let manifest_before = fs::read(&fixture.manifest_path).expect("manifest should read");
+    let database_path = AssetStateStore::db_path_for_manifest(&fixture.manifest_path);
+    let database_before = fs::read(&database_path).expect("database should read");
+
+    let report = legacy_failures_classify_dry_run(&fixture);
+
+    assert_eq!(report["counts"]["records_scanned"], 8);
+    assert_eq!(report["counts"]["candidates"], 1);
+    assert_eq!(report["counts"]["non_failed"], 1);
+    assert_eq!(report["counts"]["already_typed_last_failure"], 1);
+    assert_eq!(report["counts"]["downstream_proof_ambiguity"], 1);
+    assert_eq!(report["counts"]["classifier_mismatch"], 4);
+    assert!(
+        report["target_set_sha256"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64)
+    );
+    assert_eq!(report["applied"], false);
+    assert_eq!(report["changed_count"], 0);
+    assert_eq!(
+        fs::read(&fixture.manifest_path).expect("manifest should read"),
+        manifest_before
+    );
+    assert_eq!(
+        fs::read(&database_path).expect("database should read"),
+        database_before
+    );
+}
+
+#[test]
+fn monitor_legacy_failures_classify_apply_requires_both_dry_run_expectations() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let library_root = tempdir.path().join("library");
+    let fixture = write_legacy_failures_classify_fixture(
+        &tempdir,
+        vec![legacy_missing_preview_record(
+            &library_root,
+            "exact",
+            State::Failed,
+            "conversion",
+            "exact.staged-raw.DNG",
+            "",
+            None,
+        )],
+    );
+
+    let mut missing_both = legacy_failures_classify_args(&fixture);
+    missing_both.push("--apply".to_string());
+    binary()
+        .args(missing_both)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "apply requires an expected target-set SHA-256",
+        ));
+
+    let mut missing_count = legacy_failures_classify_args(&fixture);
+    missing_count.extend([
+        "--expected-target-set-sha256".to_string(),
+        "0".repeat(64),
+        "--apply".to_string(),
+    ]);
+    binary()
+        .args(missing_count)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "apply requires an expected candidate count",
+        ));
+}
+
+#[test]
+fn monitor_legacy_failures_classify_types_only_last_failure_and_admits_it_to_adjusted_source() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let library_root = tempdir.path().join("library");
+    let mut alpha = legacy_missing_preview_record(
+        &library_root,
+        "alpha",
+        State::Failed,
+        "conversion",
+        "alpha.staged-raw.DNG",
+        "",
+        None,
+    );
+    let mut beta = legacy_missing_preview_record(
+        &library_root,
+        "beta",
+        State::Failed,
+        "conversion",
+        "beta.staged-raw.DNG",
+        "",
+        None,
+    );
+    for record in [&mut alpha, &mut beta] {
+        add_adjusted_source_admission_proofs(record);
+        record.failures.insert(
+            0,
+            FailureRecord {
+                stage: "historical".to_string(),
+                message: "preserved prior failure".to_string(),
+                recorded_at: "99.000000000Z".to_string(),
+                kind: None,
+            },
+        );
+    }
+    let fixture = write_legacy_failures_classify_fixture(&tempdir, vec![alpha, beta]);
+    let before = Manifest::load(&fixture.manifest_path).expect("manifest should load");
+    let dry_run = legacy_failures_classify_dry_run(&fixture);
+    let target_set_sha256 = dry_run["target_set_sha256"]
+        .as_str()
+        .expect("target set should be a string")
+        .to_string();
+    let mut apply_args = legacy_failures_classify_args(&fixture);
+    apply_args.extend([
+        "--expected-target-set-sha256".to_string(),
+        target_set_sha256.clone(),
+        "--expected-candidate-count".to_string(),
+        "2".to_string(),
+        "--apply".to_string(),
+    ]);
+    let output = binary()
+        .args(apply_args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("report should be JSON");
+    assert_eq!(report["applied"], true);
+    assert_eq!(report["changed_count"], 2);
+    assert!(
+        !String::from_utf8(output)
+            .expect("report should be UTF-8")
+            .contains(tempdir.path().to_str().expect("temp path should be utf8"))
+    );
+
+    let after = Manifest::load(&fixture.manifest_path).expect("manifest should load");
+    for asset_id in ["alpha", "beta"] {
+        let original = before.get(asset_id).expect("original should exist");
+        let updated = after.get(asset_id).expect("updated should exist");
+        assert_eq!(updated.asset_id, original.asset_id);
+        assert_eq!(updated.raw_path, original.raw_path);
+        assert_eq!(updated.state, original.state);
+        assert_eq!(updated.proofs, original.proofs);
+        assert_eq!(updated.updated_at, original.updated_at);
+        assert_eq!(updated.failures.len(), original.failures.len());
+        assert_eq!(updated.failures[..1], original.failures[..1]);
+        assert_eq!(updated.failures[1].stage, original.failures[1].stage);
+        assert_eq!(updated.failures[1].message, original.failures[1].message);
+        assert_eq!(
+            updated.failures[1].recorded_at,
+            original.failures[1].recorded_at
+        );
+        assert_eq!(
+            updated.failures[1].kind,
+            Some(FailureKind::EmbeddedPreviewUnavailable)
+        );
+    }
+
+    let mut typed_manifest = Manifest::new();
+    typed_manifest.upsert(
+        after
+            .get("alpha")
+            .expect("typed record should exist")
+            .clone(),
+    );
+    let typed_admission = admit_adjusted_source_required_assets(&mut typed_manifest, 1, 1, 1_000)
+        .expect("typed record should be admitted");
+    assert!(typed_admission.manifest_changed());
+    assert_eq!(typed_admission.first_ready, 1);
+
+    let mut untyped_manifest = Manifest::new();
+    untyped_manifest.upsert(
+        before
+            .get("alpha")
+            .expect("legacy record should exist")
+            .clone(),
+    );
+    let untyped_admission =
+        admit_adjusted_source_required_assets(&mut untyped_manifest, 1, 1, 1_000)
+            .expect("legacy record should remain blocked");
+    assert!(!untyped_admission.manifest_changed());
+    assert_eq!(untyped_admission.first_ready, 0);
+
+    let second_dry_run = legacy_failures_classify_dry_run(&fixture);
+    assert_eq!(second_dry_run["counts"]["candidates"], 0);
+    let mut stale_apply = legacy_failures_classify_args(&fixture);
+    stale_apply.extend([
+        "--expected-target-set-sha256".to_string(),
+        target_set_sha256,
+        "--expected-candidate-count".to_string(),
+        "2".to_string(),
+        "--apply".to_string(),
+    ]);
+    binary()
+        .args(stale_apply)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "candidate count did not match the expected value",
+        ));
+}
+
+#[test]
+fn monitor_legacy_failures_classify_rejects_stale_hash_count_and_current_records_without_mutation()
+{
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let library_root = tempdir.path().join("library");
+    let fixture = write_legacy_failures_classify_fixture(
+        &tempdir,
+        vec![legacy_missing_preview_record(
+            &library_root,
+            "exact",
+            State::Failed,
+            "conversion",
+            "exact.staged-raw.DNG",
+            "",
+            None,
+        )],
+    );
+    let dry_run = legacy_failures_classify_dry_run(&fixture);
+    let target_set_sha256 = dry_run["target_set_sha256"]
+        .as_str()
+        .expect("target set should be a string")
+        .to_string();
+
+    let mut wrong_count = legacy_failures_classify_args(&fixture);
+    wrong_count.extend([
+        "--expected-target-set-sha256".to_string(),
+        target_set_sha256.clone(),
+        "--expected-candidate-count".to_string(),
+        "2".to_string(),
+        "--apply".to_string(),
+    ]);
+    binary()
+        .args(wrong_count)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "candidate count did not match the expected value",
+        ));
+
+    let mut wrong_hash = legacy_failures_classify_args(&fixture);
+    wrong_hash.extend([
+        "--expected-target-set-sha256".to_string(),
+        "0".repeat(64),
+        "--expected-candidate-count".to_string(),
+        "1".to_string(),
+        "--apply".to_string(),
+    ]);
+    binary()
+        .args(wrong_hash)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("target set did not match"));
+
+    let state_store = AssetStateStore::open_writer(
+        &fixture.manifest_path,
+        "concurrent-current-record-test",
+        Duration::from_secs(1),
+    )
+    .expect("state store should open");
+    let mut current = state_store
+        .load()
+        .expect("state should load")
+        .get("exact")
+        .expect("record should exist")
+        .clone();
+    current
+        .proofs
+        .insert("concurrent_change".to_string(), json!({"changed": true}));
+    current.updated_at = "9999999999.000000000Z".to_string();
+    state_store
+        .persist_record(&current)
+        .expect("current record mutation should persist");
+    state_store
+        .export_json()
+        .expect("current record should export");
+    drop(state_store);
+    let manifest_before_stale_apply =
+        fs::read(&fixture.manifest_path).expect("manifest should read before stale apply");
+
+    let mut stale_current = legacy_failures_classify_args(&fixture);
+    stale_current.extend([
+        "--expected-target-set-sha256".to_string(),
+        target_set_sha256,
+        "--expected-candidate-count".to_string(),
+        "1".to_string(),
+        "--apply".to_string(),
+    ]);
+    binary()
+        .args(stale_current)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("target set did not match"));
+    assert_eq!(
+        fs::read(&fixture.manifest_path).expect("manifest should read after stale apply"),
+        manifest_before_stale_apply
+    );
+    let after = AssetStateStore::open_read_only(&fixture.manifest_path)
+        .expect("state store should open")
+        .load()
+        .expect("state should load");
+    let record = after.get("exact").expect("record should exist");
+    assert_eq!(
+        record.failures.last().expect("failure should exist").kind,
+        None
+    );
+    assert_eq!(record.proofs["concurrent_change"], json!({"changed": true}));
 }
 
 #[cfg(unix)]
