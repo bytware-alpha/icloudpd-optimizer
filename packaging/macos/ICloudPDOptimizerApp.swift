@@ -33,6 +33,17 @@ struct MonitorAccessPlan {
     let suggestedRoot: String?
 }
 
+struct NASAuthorization {
+    let plan: MonitorAccessPlan
+    let scopedAccess: [URL]
+
+    func stopAccessingSecurityScopedResources() {
+        for url in scopedAccess {
+            url.stopAccessingSecurityScopedResource()
+        }
+    }
+}
+
 struct StoredBookmarks: Codable {
     let version: Int
     let bookmarks: [Data]
@@ -902,8 +913,16 @@ final class DashboardController: NSObject {
     private let model: DashboardViewModel
     private var window: NSWindow?
 
-    init(configPath: String, authorizeAccess: @escaping () throws -> Void) {
-        self.model = DashboardViewModel(configPath: configPath, authorizeAccess: authorizeAccess)
+    init(
+        configPath: String,
+        prepareNASAuthorization: @escaping () throws -> NASAuthorization,
+        primeNASAuthorization: @escaping (MonitorAccessPlan) throws -> PrimeStatus
+    ) {
+        self.model = DashboardViewModel(
+            configPath: configPath,
+            prepareNASAuthorization: prepareNASAuthorization,
+            primeNASAuthorization: primeNASAuthorization
+        )
     }
 
     func show() {
@@ -1025,22 +1044,30 @@ final class DashboardController: NSObject {
 final class DashboardViewModel: ObservableObject {
     let configPath: String
     @Published var refreshInFlight = false
+    @Published private(set) var nasAuthorizationInFlight = false
     let service = DashboardStream<ServiceSnapshot>("service")
     let stats = DashboardStream<MonitorStatsEnvelope>("stats")
     let queue = DashboardStream<MonitorQueuePayload>("queue")
     let scans = DashboardStream<[ScanSummary]>("scans")
     let logs = DashboardStream<DashboardLogState>("logs")
 
-    private let authorizeAccess: () throws -> Void
+    private let prepareNASAuthorization: () throws -> NASAuthorization
+    private let primeNASAuthorization: (MonitorAccessPlan) throws -> PrimeStatus
     private let workQueue = DispatchQueue(label: "com.icloudpd-optimizer.dashboard-refresh", qos: .utility, attributes: .concurrent)
     private let queueReportHelperQueue = DispatchQueue(label: "com.icloudpd-optimizer.dashboard-queue-report-helper", qos: .utility)
+    private let nasAuthorizationQueue = DispatchQueue(label: "com.icloudpd-optimizer.nas-authorization", qos: .userInitiated)
     private var timers: [Timer] = []
     private var queueReportInFlight = false
     private var queueReportRefreshedAt: Date?
 
-    init(configPath: String, authorizeAccess: @escaping () throws -> Void) {
+    init(
+        configPath: String,
+        prepareNASAuthorization: @escaping () throws -> NASAuthorization,
+        primeNASAuthorization: @escaping (MonitorAccessPlan) throws -> PrimeStatus
+    ) {
         self.configPath = configPath
-        self.authorizeAccess = authorizeAccess
+        self.prepareNASAuthorization = prepareNASAuthorization
+        self.primeNASAuthorization = primeNASAuthorization
     }
 
     deinit {
@@ -1113,17 +1140,54 @@ final class DashboardViewModel: ObservableObject {
     }
 
     func authorizeNAS() {
-        DispatchQueue.main.async {
-            do {
-                AppLogger.log("nas_authorization_started")
-                try self.authorizeAccess()
-                AppLogger.log("nas_authorization_succeeded")
-                self.showAlert(title: "NAS Access Verified", message: "The app can read and write the configured NAS paths.")
-                self.refreshNow()
-            } catch {
-                AppLogger.log("nas_authorization_failed", fields: ["error": String(describing: error)])
-                self.showAlert(title: "NAS Access Failed", message: String(describing: error))
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.authorizeNAS()
             }
+            return
+        }
+        guard !nasAuthorizationInFlight else {
+            return
+        }
+
+        nasAuthorizationInFlight = true
+        AppLogger.log("nas_authorization_started")
+        do {
+            let authorization = try self.prepareNASAuthorization()
+            nasAuthorizationQueue.async {
+                let result = Result {
+                    try self.primeNASAuthorization(authorization.plan)
+                }
+                DispatchQueue.main.async {
+                    self.completeNASAuthorization(result, authorization: authorization)
+                }
+            }
+        } catch {
+            completeNASAuthorization(.failure(error), authorization: nil)
+        }
+    }
+
+    private func completeNASAuthorization(
+        _ result: Result<PrimeStatus, Error>,
+        authorization: NASAuthorization?
+    ) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.completeNASAuthorization(result, authorization: authorization)
+            }
+            return
+        }
+        authorization?.stopAccessingSecurityScopedResources()
+        nasAuthorizationInFlight = false
+
+        switch result {
+        case .success:
+            AppLogger.log("nas_authorization_succeeded")
+            showAlert(title: "NAS Access Verified", message: "The app can read and write the configured NAS paths.")
+            refreshNow()
+        case .failure(let error):
+            AppLogger.log("nas_authorization_failed", fields: ["error": String(describing: error)])
+            showAlert(title: "NAS Access Failed", message: String(describing: error))
         }
     }
 
@@ -1771,6 +1835,7 @@ struct HeaderView: View {
             } label: {
                 Label("Authorize NAS", systemImage: "externaldrive.badge.checkmark")
             }
+            .disabled(model.nasAuthorizationInFlight)
             Button {
                 model.refreshNow()
             } label: {
@@ -2831,6 +2896,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var serviceScopedAccess: [URL] = []
     private var serviceSignalSources: [DispatchSourceSignal] = []
     private let serviceSignalQueue = DispatchQueue(label: "icloudpd-optimizer.app-service-signals")
+    private let primeAccessQueue = DispatchQueue(label: "com.icloudpd-optimizer.prime-access", qos: .userInitiated)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let args = Array(CommandLine.arguments.dropFirst())
@@ -2895,24 +2961,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
         dashboard = DashboardController(
             configPath: configPath,
-            authorizeAccess: { [weak self] in
-                try self?.authorizeAccess(configPath: configPath)
+            prepareNASAuthorization: { [weak self] in
+                guard let self else {
+                    throw PrimeError("app delegate is unavailable")
+                }
+                return try self.prepareNASAuthorization(configPath: configPath)
+            },
+            primeNASAuthorization: { [weak self] plan in
+                guard let self else {
+                    throw PrimeError("app delegate is unavailable")
+                }
+                return try self.primeNASAuthorization(plan: plan)
             }
         )
         dashboard?.show()
     }
 
-    private func authorizeAccess(configPath: String) throws {
+    private func prepareNASAuthorization(configPath: String) throws -> NASAuthorization {
         let plan = try loadAccessPlan(configPath: configPath, writeCanaryOverride: nil)
-        let selectedURLs = try requestFolderAccess(for: plan)
-        let scopedAccess = selectedURLs.filter { $0.startAccessingSecurityScopedResource() }
-        defer {
-            for url in scopedAccess {
-                url.stopAccessingSecurityScopedResource()
-            }
-        }
-        try saveFolderBookmarks(selectedURLs)
-        _ = try primeAccess(plan: plan)
+        return try requestNASAuthorization(for: plan)
+    }
+
+    private func primeNASAuthorization(plan: MonitorAccessPlan) throws -> PrimeStatus {
+        return try primeAccess(plan: plan)
     }
 
     private func runHelper(args: [String]) {
@@ -2989,6 +3060,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func runPrimeAccess(args: [String]) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.runPrimeAccess(args: args)
+            }
+            return
+        }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
 
@@ -3000,7 +3077,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let statusFile = argumentValue("--status-file", in: args)
         let writeCanaryOverride = argumentValue("--write-canary-dir", in: args)
 
-        let result: Result<PrimeStatus, Error> = Result {
+        do {
             guard let configPath, !configPath.isEmpty else {
                 throw PrimeError("missing monitor config path")
             }
@@ -3012,20 +3089,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 configPath: configPath,
                 writeCanaryOverride: writeCanaryOverride
             )
-            let selectedURLs = shouldRequestFolderAccess(args: args)
-                ? try requestFolderAccess(for: plan)
-                : []
-            let scopedAccess = selectedURLs.filter { $0.startAccessingSecurityScopedResource() }
-            defer {
-                for url in scopedAccess {
-                    url.stopAccessingSecurityScopedResource()
+            let authorization = shouldRequestFolderAccess(args: args)
+                ? try requestNASAuthorization(for: plan)
+                : NASAuthorization(plan: plan, scopedAccess: [])
+            primeAccessQueue.async {
+                let result = Result {
+                    try self.primeNASAuthorization(plan: authorization.plan)
+                }
+                DispatchQueue.main.async {
+                    self.finishPrimeAccess(
+                        result,
+                        authorization: authorization,
+                        configPath: configPath,
+                        statusFile: statusFile,
+                        shouldShowResult: args.isEmpty
+                    )
                 }
             }
-            if !selectedURLs.isEmpty {
-                try saveFolderBookmarks(selectedURLs)
-            }
-            return try primeAccess(plan: plan)
+        } catch {
+            finishPrimeAccess(
+                .failure(error),
+                authorization: nil,
+                configPath: configPath ?? "",
+                statusFile: statusFile,
+                shouldShowResult: args.isEmpty
+            )
         }
+    }
+
+    private func finishPrimeAccess(
+        _ result: Result<PrimeStatus, Error>,
+        authorization: NASAuthorization?,
+        configPath: String,
+        statusFile: String?,
+        shouldShowResult: Bool
+    ) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.finishPrimeAccess(
+                    result,
+                    authorization: authorization,
+                    configPath: configPath,
+                    statusFile: statusFile,
+                    shouldShowResult: shouldShowResult
+                )
+            }
+            return
+        }
+        authorization?.stopAccessingSecurityScopedResources()
 
         let status: PrimeStatus
         switch result {
@@ -3038,7 +3149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .failure(let error):
             status = PrimeStatus(
                 ok: false,
-                configPath: configPath ?? "",
+                configPath: configPath,
                 readRoots: [],
                 writeCanaryDir: nil,
                 error: String(describing: error)
@@ -3050,21 +3161,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             writeStatus(status, to: statusFile)
         }
 
-        if args.isEmpty || !status.ok {
+        if shouldShowResult || !status.ok {
             showResult(status)
         }
         NSApp.terminate(nil)
-    }
-
-    private func primeAccess(
-        configPath: String,
-        writeCanaryOverride: String?
-    ) throws -> PrimeStatus {
-        let plan = try loadAccessPlan(
-            configPath: configPath,
-            writeCanaryOverride: writeCanaryOverride
-        )
-        return try primeAccess(plan: plan)
     }
 
     private func loadAccessPlan(
@@ -3163,7 +3263,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return selectedURLs
     }
 
+    private func requestNASAuthorization(for plan: MonitorAccessPlan) throws -> NASAuthorization {
+        guard Thread.isMainThread else {
+            throw PrimeError("NAS authorization must run on the main thread")
+        }
+        let selectedURLs = try requestFolderAccess(for: plan)
+        let authorization = NASAuthorization(
+            plan: plan,
+            scopedAccess: selectedURLs.filter { $0.startAccessingSecurityScopedResource() }
+        )
+        do {
+            try saveFolderBookmarks(selectedURLs)
+            return authorization
+        } catch {
+            authorization.stopAccessingSecurityScopedResources()
+            throw error
+        }
+    }
+
     private func saveFolderBookmarks(_ urls: [URL]) throws {
+        guard Thread.isMainThread else {
+            throw PrimeError("folder bookmark saving must run on the main thread")
+        }
         let bookmarks = try urls.map { url in
             try url.bookmarkData(
                 options: [.withSecurityScope],

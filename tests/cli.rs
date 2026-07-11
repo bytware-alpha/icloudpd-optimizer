@@ -26,30 +26,137 @@ fn binary() -> Command {
     Command::cargo_bin("icloudpd-optimizer").expect("binary should build")
 }
 
-fn swift_function_body<'a>(source: &'a str, signature: &str) -> &'a str {
-    let signature_start = source
-        .find(signature)
-        .unwrap_or_else(|| panic!("Swift function {signature:?} should exist"));
-    let body_start = source[signature_start..]
-        .find('{')
-        .map(|offset| signature_start + offset)
-        .unwrap_or_else(|| panic!("Swift function {signature:?} should have a body"));
+fn swift_code_mask(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut mask = bytes.to_vec();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"//") {
+            let start = index;
+            index = bytes[index..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|offset| index + offset)
+                .unwrap_or(bytes.len());
+            mask[start..index].fill(b' ');
+        } else if bytes[index..].starts_with(b"/*") {
+            let start = index;
+            let mut depth = 1;
+            index += 2;
+            while index < bytes.len() && depth > 0 {
+                if bytes[index..].starts_with(b"/*") {
+                    depth += 1;
+                    index += 2;
+                } else if bytes[index..].starts_with(b"*/") {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            mask[start..index].fill(b' ');
+        } else if bytes[index] == b'"' {
+            let start = index;
+            let multiline = bytes[index..].starts_with(b"\"\"\"");
+            index += if multiline { 3 } else { 1 };
+            while index < bytes.len() {
+                if multiline && bytes[index..].starts_with(b"\"\"\"") {
+                    index += 3;
+                    break;
+                }
+                if !multiline && bytes[index] == b'"' {
+                    index += 1;
+                    break;
+                }
+                if !multiline && bytes[index] == b'\\' {
+                    index = (index + 2).min(bytes.len());
+                } else {
+                    index += 1;
+                }
+            }
+            mask[start..index].fill(b' ');
+        } else {
+            index += 1;
+        }
+    }
+
+    String::from_utf8(mask).expect("mask should preserve UTF-8")
+}
+
+fn swift_braced_body<'a>(source: &'a str, code_mask: &str, body_start: usize) -> &'a str {
     let mut depth = 0usize;
 
-    for (offset, character) in source[body_start..].char_indices() {
+    for (offset, character) in code_mask[body_start..].char_indices() {
         match character {
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return &source[signature_start..=body_start + offset];
+                    return &source[body_start..=body_start + offset];
                 }
             }
             _ => {}
         }
     }
 
-    panic!("Swift function {signature:?} should have a closing brace");
+    panic!("Swift body should have a closing brace");
+}
+
+fn swift_function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let code_mask = swift_code_mask(source);
+    let signature_start = code_mask
+        .find(signature)
+        .unwrap_or_else(|| panic!("Swift function {signature:?} should exist"));
+    let body_start = code_mask[signature_start..]
+        .find('{')
+        .map(|offset| signature_start + offset)
+        .unwrap_or_else(|| panic!("Swift function {signature:?} should have a body"));
+    swift_braced_body(source, &code_mask, body_start)
+}
+
+fn swift_closure_body_after<'a>(source: &'a str, marker: &str) -> &'a str {
+    let code_mask = swift_code_mask(source);
+    let marker_start = code_mask
+        .find(marker)
+        .unwrap_or_else(|| panic!("Swift marker {marker:?} should exist"));
+    let body_start = code_mask[marker_start + marker.len()..]
+        .find('{')
+        .map(|offset| marker_start + marker.len() + offset)
+        .unwrap_or_else(|| panic!("Swift marker {marker:?} should open a closure"));
+    swift_braced_body(source, &code_mask, body_start)
+}
+
+fn assert_swift_code_order(source: &str, before: &str, after: &str) {
+    let code_mask = swift_code_mask(source);
+    let before_index = code_mask
+        .find(before)
+        .unwrap_or_else(|| panic!("Swift code should contain {before:?}"));
+    let after_index = code_mask
+        .find(after)
+        .unwrap_or_else(|| panic!("Swift code should contain {after:?}"));
+    assert!(
+        before_index < after_index,
+        "Swift code should place {before:?} before {after:?}"
+    );
+}
+
+#[test]
+fn swift_function_body_ignores_braces_in_comments_and_strings() {
+    let source = r#"
+func target() {
+    let quoted = "}"
+    // }
+    /* { /* } */ */
+    let multiline = """
+    }
+    """
+    let nested = { value in value }
+}
+"#;
+
+    let body = swift_function_body(source, "func target()");
+    assert!(body.contains("let nested"));
 }
 
 struct FailedAssetsQuarantineFixture {
@@ -4555,22 +4662,64 @@ fn macos_app_packaging_surface_is_documented() {
 }
 
 #[test]
-fn macos_nas_authorization_keeps_appkit_on_the_main_thread() {
+fn macos_nas_authorization_keeps_ui_on_main_and_primes_in_background() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let app_source =
         fs::read_to_string(repo_root.join("packaging/macos/ICloudPDOptimizerApp.swift"))
             .expect("macOS app source should be readable");
 
     let authorize_nas = swift_function_body(&app_source, "func authorizeNAS()");
-    assert!(authorize_nas.contains("DispatchQueue.main.async"));
     assert!(!authorize_nas.contains("DispatchQueue.global"));
-    assert!(authorize_nas.contains("AppLogger.log(\"nas_authorization_started\")"));
-    assert!(authorize_nas.contains("try self.authorizeAccess()"));
-    assert!(authorize_nas.contains("AppLogger.log(\"nas_authorization_succeeded\")"));
-    assert!(authorize_nas.contains("AppLogger.log(\"nas_authorization_failed\""));
-    assert!(authorize_nas.contains("NAS Access Verified"));
-    assert!(authorize_nas.contains("NAS Access Failed"));
-    assert!(authorize_nas.contains("self.refreshNow()"));
+    assert_swift_code_order(
+        authorize_nas,
+        "guard Thread.isMainThread else",
+        "guard !nasAuthorizationInFlight else",
+    );
+    assert_swift_code_order(
+        authorize_nas,
+        "guard !nasAuthorizationInFlight else",
+        "nasAuthorizationInFlight = true",
+    );
+    assert_swift_code_order(
+        authorize_nas,
+        "nasAuthorizationInFlight = true",
+        "try self.prepareNASAuthorization()",
+    );
+    assert_swift_code_order(
+        authorize_nas,
+        "try self.prepareNASAuthorization()",
+        "nasAuthorizationQueue.async",
+    );
+
+    let authorization_background =
+        swift_closure_body_after(authorize_nas, "nasAuthorizationQueue.async");
+    assert!(
+        authorization_background.contains("try self.primeNASAuthorization(authorization.plan)")
+    );
+    assert_swift_code_order(
+        authorization_background,
+        "let result = Result",
+        "DispatchQueue.main.async",
+    );
+    let authorization_completion =
+        swift_closure_body_after(authorization_background, "DispatchQueue.main.async");
+    assert!(
+        authorization_completion
+            .contains("self.completeNASAuthorization(result, authorization: authorization)")
+    );
+
+    let complete_authorization =
+        swift_function_body(&app_source, "private func completeNASAuthorization(");
+    assert_swift_code_order(
+        complete_authorization,
+        "guard Thread.isMainThread else",
+        "nasAuthorizationInFlight = false",
+    );
+    assert!(complete_authorization.contains("AppLogger.log(\"nas_authorization_succeeded\")"));
+    assert!(complete_authorization.contains("AppLogger.log(\"nas_authorization_failed\""));
+    assert!(complete_authorization.contains("NAS Access Verified"));
+    assert!(complete_authorization.contains("NAS Access Failed"));
+    assert!(complete_authorization.contains("refreshNow()"));
 
     let request_folder_access = swift_function_body(
         &app_source,
@@ -4587,6 +4736,28 @@ fn macos_nas_authorization_keeps_appkit_on_the_main_thread() {
         "folder authorization must check the main thread before creating NSOpenPanel"
     );
     assert!(request_folder_access.contains("folder authorization must run on the main thread"));
+
+    let request_nas_authorization = swift_function_body(
+        &app_source,
+        "private func requestNASAuthorization(for plan: MonitorAccessPlan) throws -> NASAuthorization",
+    );
+    assert_swift_code_order(
+        request_nas_authorization,
+        "try requestFolderAccess(for: plan)",
+        "startAccessingSecurityScopedResource",
+    );
+    assert_swift_code_order(
+        request_nas_authorization,
+        "startAccessingSecurityScopedResource",
+        "try saveFolderBookmarks(selectedURLs)",
+    );
+    assert!(!request_nas_authorization.contains("primeAccess("));
+
+    let prime_nas_authorization = swift_function_body(
+        &app_source,
+        "private func primeNASAuthorization(plan: MonitorAccessPlan) throws -> PrimeStatus",
+    );
+    assert!(prime_nas_authorization.contains("return try primeAccess(plan: plan)"));
 
     let show_alert = swift_function_body(
         &app_source,
@@ -4619,6 +4790,24 @@ fn macos_nas_authorization_keeps_appkit_on_the_main_thread() {
         "prime-access result presentation must check the main thread before constructing NSAlert"
     );
     assert!(show_result.contains("DispatchQueue.main.async"));
+
+    assert!(app_source.contains(".disabled(model.nasAuthorizationInFlight)"));
+
+    let run_prime_access =
+        swift_function_body(&app_source, "private func runPrimeAccess(args: [String])");
+    assert_swift_code_order(
+        run_prime_access,
+        "guard Thread.isMainThread else",
+        "NSApp.setActivationPolicy(.regular)",
+    );
+    let command_background = swift_closure_body_after(run_prime_access, "primeAccessQueue.async");
+    assert!(
+        command_background.contains("try self.primeNASAuthorization(plan: authorization.plan)")
+    );
+    let command_completion =
+        swift_closure_body_after(command_background, "DispatchQueue.main.async");
+    assert!(command_completion.contains("self.finishPrimeAccess("));
+    assert!(command_completion.contains("result,"));
 }
 
 #[test]
