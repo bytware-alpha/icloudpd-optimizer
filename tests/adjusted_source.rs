@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -8,9 +8,7 @@ use icloudpd_optimizer::adjusted_source::{
     CloudKitAdjustedSourceResolveRequest, CloudKitAdjustedSourceResolver,
     CloudKitAdjustedSourceTransport,
 };
-use icloudpd_optimizer::upload::{
-    CloudKitDatabaseScope, CloudKitDeleteSession, CloudKitLibraryDestination,
-};
+use icloudpd_optimizer::upload::{CloudKitDatabaseScope, CloudKitDeleteSession};
 use icloudpd_optimizer::workflow::OriginalAssetProof;
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, GrayImage, Luma, Rgb, RgbImage};
@@ -42,8 +40,8 @@ fn nonblank_jpeg(width: u32, height: u32) -> Vec<u8> {
     bytes
 }
 
-fn uniform_jpeg(width: u32, height: u32) -> Vec<u8> {
-    let image = GrayImage::from_pixel(width, height, Luma([0]));
+fn uniform_jpeg(width: u32, height: u32, value: u8) -> Vec<u8> {
+    let image = GrayImage::from_pixel(width, height, Luma([value]));
     let mut bytes = Vec::new();
     JpegEncoder::new_with_quality(&mut bytes, 100)
         .encode_image(&DynamicImage::ImageLuma8(image))
@@ -100,14 +98,51 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn session() -> CloudKitDeleteSession {
-    CloudKitDeleteSession {
-        dsid: "test-account".to_string(),
-        ckdatabasews_url: Url::parse("https://example.invalid").expect("test URL"),
-        cloudkit_query_params: Vec::new(),
-        cookies: Vec::new(),
-        database_scope: CloudKitDatabaseScope::Private,
-        zone: CloudKitLibraryDestination::primary_sync(),
+    CloudKitDeleteSession::from_json(
+        &json!({
+            "dsid": "123456789",
+            "ckdatabasews_url": "https://ckdatabasews.icloud.com",
+            "cloudkit_query_params": [
+                {"name": "clientBuildNumber", "value": "test-build"},
+                {"name": "clientMasteringNumber", "value": "test-mastering"},
+                {"name": "clientId", "value": "test-client"},
+                {"name": "dsid", "value": "123456789"},
+                {"name": "remapEnums", "value": "True"},
+                {"name": "getCurrentSyncToken", "value": "True"}
+            ],
+            "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "test-token"}]
+        })
+        .to_string(),
+    )
+    .expect("production-valid test session")
+}
+
+fn low_detail_jpeg(width: u32, height: u32) -> Vec<u8> {
+    let mut image = GrayImage::from_pixel(width, height, Luma([128]));
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        if x < width / 2 && y < height / 2 {
+            *pixel = Luma([129]);
+        }
     }
+    let mut bytes = Vec::new();
+    JpegEncoder::new_with_quality(&mut bytes, 100)
+        .encode_image(&DynamicImage::ImageLuma8(image))
+        .expect("low-detail JPEG should encode");
+    bytes
+}
+
+fn near_blank_jpeg() -> Vec<u8> {
+    let mut image = GrayImage::from_pixel(64, 64, Luma([20]));
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        if x < 8 && y < 8 {
+            *pixel = Luma([21]);
+        }
+    }
+    let mut bytes = Vec::new();
+    JpegEncoder::new_with_quality(&mut bytes, 100)
+        .encode_image(&DynamicImage::ImageLuma8(image))
+        .expect("near-blank JPEG should encode");
+    bytes
 }
 
 fn original_proof() -> OriginalAssetProof {
@@ -129,6 +164,14 @@ fn resolve_request(output_path: PathBuf) -> CloudKitAdjustedSourceResolveRequest
         original_asset: original_proof(),
         output_path,
     }
+}
+
+fn safe_path(directory: &tempfile::TempDir, name: &str) -> PathBuf {
+    directory
+        .path()
+        .canonicalize()
+        .expect("test directory canonical path")
+        .join(name)
 }
 
 fn zone() -> Value {
@@ -226,21 +269,19 @@ impl CloudKitAdjustedSourceTransport for FakeTransport {
         _session: &CloudKitDeleteSession,
         _download_url: &Url,
         _expected_size_bytes: u64,
-        temp_path: &Path,
+        temp_file: &mut File,
     ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
         self.download_calls += 1;
         let bytes = self
             .downloads
             .pop_front()
             .expect("download bytes should exist");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(temp_path)
-            .expect("fake transport should create temp");
-        file.write_all(&bytes)
+        temp_file
+            .write_all(&bytes)
             .expect("fake transport should write temp");
-        file.sync_all().expect("fake transport should sync temp");
+        temp_file
+            .sync_all()
+            .expect("fake transport should sync temp");
         Ok(CloudKitAdjustedSourceDownload {
             size_bytes: bytes.len() as u64,
             sha256: sha256_hex(&bytes),
@@ -250,7 +291,7 @@ impl CloudKitAdjustedSourceTransport for FakeTransport {
 
 struct FailingAfterTempTransport {
     lookup: Value,
-    temp_paths: Vec<PathBuf>,
+    writes: usize,
 }
 
 impl CloudKitAdjustedSourceTransport for FailingAfterTempTransport {
@@ -267,15 +308,11 @@ impl CloudKitAdjustedSourceTransport for FailingAfterTempTransport {
         _session: &CloudKitDeleteSession,
         _download_url: &Url,
         _expected_size_bytes: u64,
-        temp_path: &Path,
+        temp_file: &mut File,
     ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
-        self.temp_paths.push(temp_path.to_path_buf());
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(temp_path)
-            .expect("fake transport should create temp");
-        file.write_all(b"partial")
+        self.writes += 1;
+        temp_file
+            .write_all(b"partial")
             .expect("fake transport should write partial bytes");
         Err(AdjustedSourceError::Filesystem)
     }
@@ -302,7 +339,7 @@ fn resolve_error(record: Value) -> (AdjustedSourceError, FakeTransport, tempfile
     let error = CloudKitAdjustedSourceResolver::new(&mut transport)
         .resolve(
             &session(),
-            &resolve_request(directory.path().join("adjusted.jpg")),
+            &resolve_request(safe_path(&directory, "adjusted.jpg")),
         )
         .expect_err("invalid response must fail closed");
     (error, transport, directory)
@@ -317,7 +354,7 @@ fn resolves_direct_asset_with_exact_adjusted_contract_and_redacted_proof() {
         ..Default::default()
     };
     let directory = tempdir().expect("test directory");
-    let output_path = directory.path().join("adjusted.jpg");
+    let output_path = safe_path(&directory, "adjusted.jpg");
 
     let proof = CloudKitAdjustedSourceResolver::new(&mut transport)
         .resolve(&session(), &resolve_request(output_path.clone()))
@@ -383,7 +420,7 @@ fn resolves_exact_master_fallback_only_when_asset_has_no_adjusted_fields() {
     let proof = CloudKitAdjustedSourceResolver::new(&mut transport)
         .resolve(
             &session(),
-            &resolve_request(directory.path().join("adjusted.jpg")),
+            &resolve_request(safe_path(&directory, "adjusted.jpg")),
         )
         .expect("exact master fallback should resolve");
 
@@ -409,7 +446,7 @@ fn direct_asset_precedence_never_parses_or_looks_up_master() {
     let proof = CloudKitAdjustedSourceResolver::new(&mut transport)
         .resolve(
             &session(),
-            &resolve_request(directory.path().join("adjusted.jpg")),
+            &resolve_request(safe_path(&directory, "adjusted.jpg")),
         )
         .expect("complete direct asset must take precedence");
 
@@ -445,7 +482,7 @@ fn partial_or_malformed_asset_adjusted_fields_fail_without_master_fallback() {
         let error = CloudKitAdjustedSourceResolver::new(&mut transport)
             .resolve(
                 &session(),
-                &resolve_request(directory.path().join("adjusted.jpg")),
+                &resolve_request(safe_path(&directory, "adjusted.jpg")),
             )
             .expect_err("partial adjusted metadata must not fall back");
         assert!(matches!(error, AdjustedSourceError::InvalidResponse(_)));
@@ -492,7 +529,7 @@ fn rejects_lookup_cardinality_identity_deletion_and_required_zone_failures() {
         let error = CloudKitAdjustedSourceResolver::new(&mut transport)
             .resolve(
                 &session(),
-                &resolve_request(directory.path().join("adjusted.jpg")),
+                &resolve_request(safe_path(&directory, "adjusted.jpg")),
             )
             .expect_err("invalid lookup record must fail closed");
         assert!(matches!(error, AdjustedSourceError::InvalidResponse(_)));
@@ -536,7 +573,7 @@ fn rejects_master_reference_type_action_name_or_zone_failures_before_lookup() {
         let error = CloudKitAdjustedSourceResolver::new(&mut transport)
             .resolve(
                 &session(),
-                &resolve_request(directory.path().join("adjusted.jpg")),
+                &resolve_request(safe_path(&directory, "adjusted.jpg")),
             )
             .expect_err("invalid master reference must fail closed");
         assert!(matches!(error, AdjustedSourceError::InvalidResponse(_)));
@@ -625,12 +662,12 @@ fn rejects_short_or_oversize_streams_and_cleans_temp() {
         let error = CloudKitAdjustedSourceResolver::new(&mut transport)
             .resolve(
                 &session(),
-                &resolve_request(directory.path().join("adjusted.jpg")),
+                &resolve_request(safe_path(&directory, "adjusted.jpg")),
             )
             .expect_err("size mismatch must fail closed");
         assert!(matches!(error, AdjustedSourceError::DownloadedSizeMismatch));
         assert!(no_temp_files(directory.path()));
-        assert!(!directory.path().join("adjusted.jpg").exists());
+        assert!(!safe_path(&directory, "adjusted.jpg").exists());
     }
 }
 
@@ -641,7 +678,8 @@ fn rejects_corrupt_wrong_dimension_oriented_and_blank_jpegs() {
         (b"not-a-jpeg".to_vec(), 4, 3),
         (valid.clone(), 3, 4),
         (jpeg_with_exif_orientation(4, 3, 6), 4, 3),
-        (uniform_jpeg(4, 3), 4, 3),
+        (uniform_jpeg(4, 3, 0), 4, 3),
+        (uniform_jpeg(4, 3, 255), 4, 3),
     ];
     for (bytes, width, height) in cases {
         let mut transport = FakeTransport {
@@ -655,7 +693,7 @@ fn rejects_corrupt_wrong_dimension_oriented_and_blank_jpegs() {
         let error = CloudKitAdjustedSourceResolver::new(&mut transport)
             .resolve(
                 &session(),
-                &resolve_request(directory.path().join("adjusted.jpg")),
+                &resolve_request(safe_path(&directory, "adjusted.jpg")),
             )
             .expect_err("invalid rendered JPEG must fail closed");
         assert!(matches!(error, AdjustedSourceError::InvalidJpeg));
@@ -664,22 +702,106 @@ fn rejects_corrupt_wrong_dimension_oriented_and_blank_jpegs() {
 }
 
 #[test]
+fn rejects_near_blank_jpeg_but_accepts_low_detail_nonuniform_content() {
+    let near_blank = near_blank_jpeg();
+    let mut transport = FakeTransport {
+        lookups: VecDeque::from([json!({"records": [direct_asset_record(&near_blank, 64, 64)]})]),
+        downloads: VecDeque::from([near_blank]),
+        ..Default::default()
+    };
+    let directory = tempdir().expect("test directory");
+    let error = CloudKitAdjustedSourceResolver::new(&mut transport)
+        .resolve(
+            &session(),
+            &resolve_request(safe_path(&directory, "near-blank.jpg")),
+        )
+        .expect_err("near-blank JPEG must fail the native visual threshold");
+    assert!(matches!(error, AdjustedSourceError::InvalidJpeg));
+
+    let low_detail = low_detail_jpeg(64, 64);
+    let mut transport = FakeTransport {
+        lookups: VecDeque::from([json!({"records": [direct_asset_record(&low_detail, 64, 64)]})]),
+        downloads: VecDeque::from([low_detail]),
+        ..Default::default()
+    };
+    let output = safe_path(&directory, "low-detail.jpg");
+    CloudKitAdjustedSourceResolver::new(&mut transport)
+        .resolve(&session(), &resolve_request(output))
+        .expect("nonuniform low-detail JPEG above the visual threshold should pass");
+}
+
+#[test]
+fn rejects_oversize_declaration_before_temp_creation_or_download() {
+    let bytes = nonblank_jpeg(4, 3);
+    let mut asset = direct_asset_record(&bytes, 4, 3);
+    asset["fields"]["resJPEGFullRes"]["value"]["size"] = json!(128_u64 * 1024 * 1024 + 1);
+    let mut transport = FakeTransport {
+        lookups: VecDeque::from([json!({"records": [asset]})]),
+        downloads: VecDeque::from([bytes]),
+        ..Default::default()
+    };
+    let directory = tempdir().expect("test directory");
+    let error = CloudKitAdjustedSourceResolver::new(&mut transport)
+        .resolve(
+            &session(),
+            &resolve_request(safe_path(&directory, "oversize.jpg")),
+        )
+        .expect_err("declared oversize must fail before download");
+    assert!(matches!(
+        error,
+        AdjustedSourceError::DeclaredResourceTooLarge
+    ));
+    assert_eq!(transport.download_calls, 0);
+    assert!(no_temp_files(directory.path()));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_output_through_an_ancestor_symlink_before_transport() {
+    use std::os::unix::fs::symlink;
+
+    let bytes = nonblank_jpeg(4, 3);
+    let root = tempdir().expect("root directory");
+    let root_path = root.path().canonicalize().expect("stable root directory");
+    let real_parent = root_path.join("real");
+    let nested = real_parent.join("nested");
+    std::fs::create_dir_all(&nested).expect("real nested directory");
+    let linked_parent = root_path.join("linked");
+    symlink(&real_parent, &linked_parent).expect("ancestor symlink");
+    let mut transport = FakeTransport {
+        lookups: VecDeque::from([json!({"records": [direct_asset_record(&bytes, 4, 3)]})]),
+        downloads: VecDeque::from([bytes]),
+        ..Default::default()
+    };
+
+    let error = CloudKitAdjustedSourceResolver::new(&mut transport)
+        .resolve(
+            &session(),
+            &resolve_request(linked_parent.join("nested/adjusted.jpg")),
+        )
+        .expect_err("ancestor symlink must be rejected before lookup or download");
+    assert!(matches!(error, AdjustedSourceError::UnsafeOutputPath));
+    assert!(transport.lookup_payloads.is_empty());
+    assert_eq!(transport.download_calls, 0);
+}
+
+#[test]
 fn cleans_temp_after_transport_failure_and_never_uses_original_resource_fallback() {
     let bytes = nonblank_jpeg(4, 3);
     let mut failing = FailingAfterTempTransport {
         lookup: json!({"records": [direct_asset_record(&bytes, 4, 3)]}),
-        temp_paths: Vec::new(),
+        writes: 0,
     };
     let directory = tempdir().expect("test directory");
     let error = CloudKitAdjustedSourceResolver::new(&mut failing)
         .resolve(
             &session(),
-            &resolve_request(directory.path().join("adjusted.jpg")),
+            &resolve_request(safe_path(&directory, "adjusted.jpg")),
         )
         .expect_err("transport failure must clean temp");
     assert!(matches!(error, AdjustedSourceError::Filesystem));
-    assert_eq!(failing.temp_paths.len(), 1);
-    assert!(!failing.temp_paths[0].exists());
+    assert_eq!(failing.writes, 1);
+    assert!(no_temp_files(directory.path()));
 
     let asset = record(
         ASSET_RECORD,
@@ -703,7 +825,7 @@ fn cleans_temp_after_transport_failure_and_never_uses_original_resource_fallback
     let error = CloudKitAdjustedSourceResolver::new(&mut transport)
         .resolve(
             &session(),
-            &resolve_request(directory.path().join("adjusted.jpg")),
+            &resolve_request(safe_path(&directory, "adjusted.jpg")),
         )
         .expect_err("original resource must never be selected");
     assert!(matches!(error, AdjustedSourceError::InvalidResponse(_)));
@@ -714,7 +836,7 @@ fn cleans_temp_after_transport_failure_and_never_uses_original_resource_fallback
 fn accepts_only_exact_existing_regular_jpeg_and_rejects_mismatch_symlink_or_directory() {
     let bytes = nonblank_jpeg(4, 3);
     let directory = tempdir().expect("test directory");
-    let output_path = directory.path().join("adjusted.jpg");
+    let output_path = safe_path(&directory, "adjusted.jpg");
     std::fs::write(&output_path, &bytes).expect("existing exact JPEG");
     let mut transport = FakeTransport {
         lookups: VecDeque::from([json!({"records": [direct_asset_record(&bytes, 4, 3)]})]),
@@ -745,8 +867,8 @@ fn accepts_only_exact_existing_regular_jpeg_and_rejects_mismatch_symlink_or_dire
     {
         use std::os::unix::fs::symlink;
 
-        let symlink_path = directory.path().join("symlink.jpg");
-        let target = directory.path().join("target.jpg");
+        let symlink_path = safe_path(&directory, "symlink.jpg");
+        let target = safe_path(&directory, "target.jpg");
         std::fs::write(&target, &bytes).expect("target");
         symlink(&target, &symlink_path).expect("symlink");
         let mut transport = FakeTransport {
@@ -766,7 +888,7 @@ fn accepts_only_exact_existing_regular_jpeg_and_rejects_mismatch_symlink_or_dire
         );
     }
 
-    let directory_path = directory.path().join("directory.jpg");
+    let directory_path = safe_path(&directory, "directory.jpg");
     std::fs::create_dir(&directory_path).expect("directory");
     let mut transport = FakeTransport {
         lookups: VecDeque::from([json!({"records": [direct_asset_record(&bytes, 4, 3)]})]),

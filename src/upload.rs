@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::adjusted_source::{
     AdjustedSourceError, CloudKitAdjustedSourceDownload, CloudKitAdjustedSourceTransport,
+    MAX_ADJUSTED_SOURCE_ENCODED_BYTES,
 };
 use crate::workflow::{HeicVerificationProof, OriginalAssetProof, UploadProof};
 
@@ -1634,10 +1635,13 @@ impl ReqwestCloudKitTransport {
         session: &CloudKitDeleteSession,
         download_url: &Url,
         expected_size_bytes: u64,
-        temp_path: &Path,
+        temp_file: &mut File,
     ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
         if expected_size_bytes == 0 {
             return Err(AdjustedSourceError::DownloadedSizeMismatch);
+        }
+        if expected_size_bytes > MAX_ADJUSTED_SOURCE_ENCODED_BYTES {
+            return Err(AdjustedSourceError::DeclaredResourceTooLarge);
         }
         validate_cloudkit_resource_download_url(download_url)
             .map_err(|_| AdjustedSourceError::InvalidResourceUrl)?;
@@ -1647,57 +1651,53 @@ impl ReqwestCloudKitTransport {
         let mut response = self
             .client
             .get(download_url.clone())
-            .headers(
-                cloudkit_resource_download_headers(session)
-                    .map_err(|_| AdjustedSourceError::DownloadTransport)?,
-            )
+            .headers(cloudkit_adjusted_resource_download_headers())
             .send()
             .map_err(|_| AdjustedSourceError::DownloadTransport)?;
         if !response.status().is_success() {
             return Err(AdjustedSourceError::DownloadTransport);
         }
-        let mut created = false;
-        let result = (|| -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(temp_path)
-                .map_err(|_| AdjustedSourceError::Filesystem)?;
-            created = true;
-            let mut hasher = Sha256::new();
-            let mut size_bytes = 0_u64;
-            let mut buffer = [0_u8; HASH_BUFFER_BYTES];
-            loop {
-                let bytes_read = response
-                    .read(&mut buffer)
-                    .map_err(|_| AdjustedSourceError::DownloadTransport)?;
-                if bytes_read == 0 {
-                    break;
-                }
-                size_bytes = size_bytes
-                    .checked_add(bytes_read as u64)
-                    .ok_or(AdjustedSourceError::DownloadedSizeMismatch)?;
-                if size_bytes > expected_size_bytes {
-                    return Err(AdjustedSourceError::DownloadedSizeMismatch);
-                }
-                file.write_all(&buffer[..bytes_read])
-                    .map_err(|_| AdjustedSourceError::Filesystem)?;
-                hasher.update(&buffer[..bytes_read]);
+        if response.content_length().is_some_and(|length| {
+            length > MAX_ADJUSTED_SOURCE_ENCODED_BYTES || length != expected_size_bytes
+        }) {
+            return Err(AdjustedSourceError::DownloadedSizeMismatch);
+        }
+        let hard_limit = expected_size_bytes
+            .min(MAX_ADJUSTED_SOURCE_ENCODED_BYTES)
+            .checked_add(1)
+            .ok_or(AdjustedSourceError::DownloadedSizeMismatch)?;
+        let mut limited = response.by_ref().take(hard_limit);
+        let mut hasher = Sha256::new();
+        let mut size_bytes = 0_u64;
+        let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+        loop {
+            let bytes_read = limited
+                .read(&mut buffer)
+                .map_err(|_| AdjustedSourceError::DownloadTransport)?;
+            if bytes_read == 0 {
+                break;
             }
-            if size_bytes != expected_size_bytes {
+            size_bytes = size_bytes
+                .checked_add(bytes_read as u64)
+                .ok_or(AdjustedSourceError::DownloadedSizeMismatch)?;
+            if size_bytes > expected_size_bytes || size_bytes > MAX_ADJUSTED_SOURCE_ENCODED_BYTES {
                 return Err(AdjustedSourceError::DownloadedSizeMismatch);
             }
-            file.sync_all()
+            temp_file
+                .write_all(&buffer[..bytes_read])
                 .map_err(|_| AdjustedSourceError::Filesystem)?;
-            Ok(CloudKitAdjustedSourceDownload {
-                sha256: format!("{:x}", hasher.finalize()),
-                size_bytes,
-            })
-        })();
-        if result.is_err() && created {
-            let _ = fs::remove_file(temp_path);
+            hasher.update(&buffer[..bytes_read]);
         }
-        result
+        if size_bytes != expected_size_bytes {
+            return Err(AdjustedSourceError::DownloadedSizeMismatch);
+        }
+        temp_file
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        Ok(CloudKitAdjustedSourceDownload {
+            sha256: format!("{:x}", hasher.finalize()),
+            size_bytes,
+        })
     }
 }
 
@@ -1885,13 +1885,13 @@ impl CloudKitAdjustedSourceTransport for ReqwestCloudKitReadTransport {
         session: &CloudKitDeleteSession,
         download_url: &Url,
         expected_size_bytes: u64,
-        temp_path: &Path,
+        temp_file: &mut File,
     ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
         self.transport.download_resource_to_create_new(
             session,
             download_url,
             expected_size_bytes,
-            temp_path,
+            temp_file,
         )
     }
 }
@@ -3944,6 +3944,15 @@ fn cloudkit_resource_download_headers(
     cloudkit_authenticated_headers(session)
 }
 
+fn cloudkit_adjusted_resource_download_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static(CLOUDKIT_BROWSER_USER_AGENT),
+    );
+    headers
+}
+
 fn cloudkit_authenticated_headers(
     session: &CloudKitDeleteSession,
 ) -> Result<reqwest::header::HeaderMap, UploadError> {
@@ -5124,10 +5133,8 @@ mod tests {
                 .expect("resource request UTF-8");
             let request_lower = request.to_ascii_lowercase();
             assert!(request_lower.starts_with("get /resource http/1.1"));
-            assert!(
-                request_lower
-                    .contains("cookie: x-apple-webauth-token=web-auth-token; session=abc123")
-            );
+            assert!(!request_lower.contains("cookie:"));
+            assert!(!request_lower.contains("authorization:"));
             write_loopback_response(&mut resource, "200 OK", &expected_bytes, "");
         });
         let session = valid_delete_session();
@@ -5146,14 +5153,16 @@ mod tests {
         assert_eq!(response, json!({"records": []}));
         let directory = tempfile::tempdir().expect("test directory");
         let temp_path = directory.path().join("resource.tmp");
+        let mut temp_file = File::create(&temp_path).expect("caller-created temp artifact");
         let download = CloudKitAdjustedSourceTransport::download_resource_to_create_new(
             &mut transport,
             &session,
             &resource_url,
             resource_bytes.len() as u64,
-            &temp_path,
+            &mut temp_file,
         )
         .expect("loopback resource should stream");
+        drop(temp_file);
         assert_eq!(download.size_bytes, resource_bytes.len() as u64);
         assert_eq!(
             download.sha256,
@@ -5161,6 +5170,119 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(&temp_path).expect("streamed temp artifact"),
+            resource_bytes
+        );
+        server.join().expect("loopback assertions should pass");
+    }
+
+    #[test]
+    fn adjusted_source_resolver_uses_production_read_transport_without_signed_url_credentials() {
+        use crate::adjusted_source::{
+            CloudKitAdjustedSourceResolveRequest, CloudKitAdjustedSourceResolver,
+        };
+        use crate::workflow::OriginalAssetProof;
+        use image::codecs::jpeg::JpegEncoder;
+        use image::{DynamicImage, Rgb, RgbImage};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let port = listener.local_addr().expect("loopback address").port();
+        let endpoint = Url::parse(&format!("http://127.0.0.1:{port}")).expect("loopback endpoint");
+        let resource_url = Url::parse(&format!("http://127.0.0.1:{port}/adjusted.jpg"))
+            .expect("loopback resource URL");
+        let mut image = RgbImage::new(4, 3);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = Rgb([
+                ((x * 61 + y * 17) % 255) as u8,
+                ((x * 11 + y * 71 + 13) % 255) as u8,
+                ((x * 43 + y * 29 + 31) % 255) as u8,
+            ]);
+        }
+        let mut resource_bytes = Vec::new();
+        JpegEncoder::new_with_quality(&mut resource_bytes, 100)
+            .encode_image(&DynamicImage::ImageRgb8(image))
+            .expect("nonblank fixture JPEG");
+        let response_bytes = resource_bytes.clone();
+        let response_url = resource_url.clone();
+        let server = thread::spawn(move || {
+            let (mut lookup, _) = listener.accept().expect("lookup connection");
+            let request = String::from_utf8(read_loopback_request(&mut lookup))
+                .expect("lookup request UTF-8");
+            let request_lower = request.to_ascii_lowercase();
+            assert!(request_lower.starts_with(
+                "post /database/1/com.apple.photos.cloud/production/private/records/lookup?"
+            ));
+            assert!(request_lower.contains("cookie: x-apple-webauth-token=web-auth-token"));
+            assert!(request.contains("\"resJPEGFullRes\""));
+            assert!(request.contains("\"resJPEGFullFingerprint\""));
+            let record = json!({
+                "recordName": "asset-record",
+                "recordType": "CPLAsset",
+                "recordChangeTag": "asset-tag",
+                "zoneID": {"zoneName": "PrimarySync"},
+                "fields": {
+                    "isDeleted": {"type": "INT64", "value": 0},
+                    "resJPEGFullRes": {"type": "ASSETID", "value": {
+                        "downloadURL": response_url.as_str(),
+                        "size": response_bytes.len(),
+                        "fileChecksum": "opaque-checksum",
+                        "referenceChecksum": "opaque-reference",
+                        "wrappingKey": "opaque-wrapping-key"
+                    }},
+                    "resJPEGFullWidth": {"type": "INT64", "value": 4},
+                    "resJPEGFullHeight": {"type": "INT64", "value": 3},
+                    "resJPEGFullFileType": {"type": "STRING", "value": "public.jpeg"},
+                    "resJPEGFullFingerprint": {"type": "STRING", "value": "opaque-checksum"}
+                }
+            });
+            write_loopback_response(
+                &mut lookup,
+                "200 OK",
+                json!({"records": [record]}).to_string().as_bytes(),
+                "Content-Type: application/json\r\n",
+            );
+
+            let (mut resource, _) = listener.accept().expect("resource connection");
+            let request = String::from_utf8(read_loopback_request(&mut resource))
+                .expect("resource request UTF-8");
+            let request_lower = request.to_ascii_lowercase();
+            assert!(request_lower.starts_with("get /adjusted.jpg http/1.1"));
+            assert!(!request_lower.contains("cookie:"));
+            assert!(!request_lower.contains("authorization:"));
+            write_loopback_response(&mut resource, "200 OK", &response_bytes, "");
+        });
+
+        let directory = tempfile::tempdir().expect("test directory");
+        let output_path = directory
+            .path()
+            .canonicalize()
+            .expect("stable test directory")
+            .join("adjusted.jpg");
+        let request = CloudKitAdjustedSourceResolveRequest {
+            asset_id: "local-asset".to_string(),
+            original_asset: OriginalAssetProof {
+                record_name: "asset-record".to_string(),
+                record_change_tag: "asset-tag".to_string(),
+                record_type: "CPLAsset".to_string(),
+                database_scope: CloudKitDatabaseScope::Private,
+                zone_name: "PrimarySync".to_string(),
+                filename: "source.dng".to_string(),
+                size_bytes: 1,
+                matched_raw_sha256: "raw-sha256".to_string(),
+            },
+            output_path: output_path.clone(),
+        };
+        let mut resolver = CloudKitAdjustedSourceResolver::new(
+            ReqwestCloudKitReadTransport::new_for_loopback_test(endpoint)
+                .expect("loopback read transport"),
+        );
+        let proof = resolver
+            .resolve(&valid_delete_session(), &request)
+            .expect("resolver should use exact loopback adjusted JPEG");
+
+        assert_eq!(proof.local_path, output_path);
+        assert_eq!(proof.downloaded_size_bytes, resource_bytes.len() as u64);
+        assert_eq!(
+            std::fs::read(&output_path).expect("resolved JPEG"),
             resource_bytes
         );
         server.join().expect("loopback assertions should pass");
@@ -5189,30 +5311,86 @@ mod tests {
             .expect("loopback read transport");
         let directory = tempfile::tempdir().expect("test directory");
         let redirected_temp = directory.path().join("redirected.tmp");
+        let mut redirected_file = File::create(&redirected_temp).expect("caller-created temp");
         let error = CloudKitAdjustedSourceTransport::download_resource_to_create_new(
             &mut transport,
             &session,
             &resource_url,
             1,
-            &redirected_temp,
+            &mut redirected_file,
         )
         .expect_err("redirect must be rejected");
         assert!(matches!(error, AdjustedSourceError::DownloadTransport));
-        assert!(!redirected_temp.exists());
+        drop(redirected_file);
+        assert!(
+            std::fs::read(&redirected_temp)
+                .expect("redirect temp bytes")
+                .is_empty()
+        );
         server.join().expect("loopback assertions should pass");
 
         let bad_host_temp = directory.path().join("bad-host.tmp");
+        let mut bad_host_file = File::create(&bad_host_temp).expect("caller-created temp");
         let bad_host = Url::parse("https://example.invalid/adjusted.jpg").expect("bad host URL");
         let error = CloudKitAdjustedSourceTransport::download_resource_to_create_new(
             &mut transport,
             &session,
             &bad_host,
             1,
-            &bad_host_temp,
+            &mut bad_host_file,
         )
         .expect_err("bad host must be rejected before I/O");
         assert!(matches!(error, AdjustedSourceError::InvalidResourceUrl));
-        assert!(!bad_host_temp.exists());
+        drop(bad_host_file);
+        assert!(
+            std::fs::read(&bad_host_temp)
+                .expect("bad-host temp bytes")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn adjusted_source_reqwest_transport_rejects_mismatched_or_oversize_content_lengths() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let port = listener.local_addr().expect("loopback address").port();
+        let endpoint = Url::parse(&format!("http://127.0.0.1:{port}")).expect("loopback endpoint");
+        let server = thread::spawn(move || {
+            for content_length in [2_u64, MAX_ADJUSTED_SOURCE_ENCODED_BYTES + 1] {
+                let (mut resource, _) = listener.accept().expect("resource connection");
+                let request = String::from_utf8(read_loopback_request(&mut resource))
+                    .expect("resource request UTF-8");
+                let request_lower = request.to_ascii_lowercase();
+                assert!(!request_lower.contains("cookie:"));
+                assert!(!request_lower.contains("authorization:"));
+                write!(
+                    resource,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+                )
+                .expect("loopback response header");
+            }
+        });
+        let session = valid_delete_session();
+        let mut transport = ReqwestCloudKitReadTransport::new_for_loopback_test(endpoint)
+            .expect("loopback read transport");
+        let directory = tempfile::tempdir().expect("test directory");
+        for (index, path) in ["mismatch.tmp", "oversize.tmp"].iter().enumerate() {
+            let path = directory.path().join(path);
+            let mut file = File::create(&path).expect("caller-created temp");
+            let url = Url::parse(&format!("http://127.0.0.1:{port}/resource-{index}"))
+                .expect("loopback resource URL");
+            let error = CloudKitAdjustedSourceTransport::download_resource_to_create_new(
+                &mut transport,
+                &session,
+                &url,
+                1,
+                &mut file,
+            )
+            .expect_err("invalid Content-Length must fail before streaming");
+            assert!(matches!(error, AdjustedSourceError::DownloadedSizeMismatch));
+            drop(file);
+            assert!(std::fs::read(&path).expect("untouched temp").is_empty());
+        }
+        server.join().expect("loopback assertions should pass");
     }
 
     #[test]

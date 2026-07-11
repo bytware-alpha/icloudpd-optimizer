@@ -1,7 +1,7 @@
-use std::ffi::CString;
-use std::fs::{self, File};
-use std::io::{self, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::ffi::{CStr, CString};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use image::ImageDecoder;
@@ -27,7 +27,9 @@ const ADJUSTED_WIDTH_FIELD: &str = "resJPEGFullWidth";
 const ADJUSTED_HEIGHT_FIELD: &str = "resJPEGFullHeight";
 const ADJUSTED_FILE_TYPE_FIELD: &str = "resJPEGFullFileType";
 const ADJUSTED_FINGERPRINT_FIELD: &str = "resJPEGFullFingerprint";
+pub const MAX_ADJUSTED_SOURCE_ENCODED_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_DECODED_JPEG_BYTES: u64 = 256 * 1024 * 1024;
+const MIN_VISUAL_STDEV: f64 = 0.001;
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,13 +61,13 @@ pub trait CloudKitAdjustedSourceTransport {
         payload: Value,
     ) -> Result<Value, AdjustedSourceError>;
 
-    /// Streams a resource into `temp_path`, which must be created with create-new semantics.
+    /// Streams a resource into the caller-created, create-new destination-directory temp file.
     fn download_resource_to_create_new(
         &mut self,
         session: &CloudKitDeleteSession,
         download_url: &Url,
         expected_size_bytes: u64,
-        temp_path: &Path,
+        temp_file: &mut File,
     ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError>;
 }
 
@@ -83,13 +85,13 @@ impl<T: CloudKitAdjustedSourceTransport + ?Sized> CloudKitAdjustedSourceTranspor
         session: &CloudKitDeleteSession,
         download_url: &Url,
         expected_size_bytes: u64,
-        temp_path: &Path,
+        temp_file: &mut File,
     ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
         (**self).download_resource_to_create_new(
             session,
             download_url,
             expected_size_bytes,
-            temp_path,
+            temp_file,
         )
     }
 }
@@ -108,6 +110,7 @@ impl<T> CloudKitAdjustedSourceResolver<T> {
     }
 }
 
+#[cfg(unix)]
 impl<T: CloudKitAdjustedSourceTransport> CloudKitAdjustedSourceResolver<T> {
     pub fn resolve(
         &mut self,
@@ -115,6 +118,7 @@ impl<T: CloudKitAdjustedSourceTransport> CloudKitAdjustedSourceResolver<T> {
         request: &CloudKitAdjustedSourceResolveRequest,
     ) -> Result<CloudKitAdjustedSourceProof, AdjustedSourceError> {
         let destination = validate_request(session, request)?;
+        let output = AnchoredOutput::open(&request.output_path)?;
         let asset = lookup_exact_record(
             &mut self.transport,
             session,
@@ -160,15 +164,19 @@ impl<T: CloudKitAdjustedSourceTransport> CloudKitAdjustedSourceResolver<T> {
                 )?
             }
         };
-        let temp_path = unique_temp_path(&request.output_path)?;
-        let mut temp = TempCleanup::new(temp_path.clone());
+        if source.size_bytes > MAX_ADJUSTED_SOURCE_ENCODED_BYTES {
+            return Err(AdjustedSourceError::DeclaredResourceTooLarge);
+        }
+        let mut temp = output.create_temp()?;
         let download = self.transport.download_resource_to_create_new(
             session,
             &source.download_url,
             source.size_bytes,
-            &temp_path,
+            temp.file_mut()?,
         )?;
-        let temp_identity = inspect_regular_file(&temp_path)?;
+        temp.sync_and_close()?;
+        let temp_artifact = output.open_regular(temp.name())?;
+        let temp_identity = temp_artifact.identity.clone();
         if temp_identity.size_bytes != source.size_bytes || download.size_bytes != source.size_bytes
         {
             return Err(AdjustedSourceError::DownloadedSizeMismatch);
@@ -176,20 +184,36 @@ impl<T: CloudKitAdjustedSourceTransport> CloudKitAdjustedSourceResolver<T> {
         if !is_sha256(&download.sha256) || temp_identity.sha256 != download.sha256 {
             return Err(AdjustedSourceError::DownloadedHashMismatch);
         }
-        sync_file(&temp_path)?;
-        verify_jpeg(&temp_path, source.width, source.height)?;
+        verify_jpeg(&temp_artifact.file, source.width, source.height)?;
 
-        match inspect_existing_output(&request.output_path)? {
-            Some(existing) if existing == temp_identity => {}
-            Some(_) => return Err(AdjustedSourceError::ExistingOutputMismatch),
-            None => install_without_overwrite(&temp_path, &request.output_path)?,
-        }
-        sync_file(&request.output_path)?;
-        let final_identity = inspect_regular_file(&request.output_path)?;
-        if final_identity != temp_identity {
-            return Err(AdjustedSourceError::InstalledOutputMismatch);
-        }
-        verify_jpeg(&request.output_path, source.width, source.height)?;
+        let final_artifact = match output.open_final()? {
+            Some(existing) => {
+                if !existing.identity.matches_bytes(&temp_identity) {
+                    return Err(AdjustedSourceError::ExistingOutputMismatch);
+                }
+                existing
+            }
+            None => {
+                match output.install_exclusive(temp.name(), &temp_identity)? {
+                    InstallResult::Installed => temp.disarm(),
+                    InstallResult::AlreadyExists => {}
+                }
+                let final_artifact = output
+                    .open_final()?
+                    .ok_or(AdjustedSourceError::InstalledOutputMismatch)?;
+                if final_artifact.identity != temp_identity {
+                    return Err(AdjustedSourceError::InstalledOutputMismatch);
+                }
+                final_artifact
+            }
+        };
+        verify_jpeg(&final_artifact.file, source.width, source.height)?;
+        final_artifact
+            .file
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        output.fsync_parent()?;
+        output.ensure_final_identity(&final_artifact.identity)?;
         temp.remove();
 
         Ok(CloudKitAdjustedSourceProof {
@@ -212,11 +236,22 @@ impl<T: CloudKitAdjustedSourceTransport> CloudKitAdjustedSourceResolver<T> {
             width: source.width,
             height: source.height,
             local_path: request.output_path.clone(),
-            downloaded_size_bytes: final_identity.size_bytes,
-            downloaded_sha256: final_identity.sha256,
+            downloaded_size_bytes: final_artifact.identity.size_bytes,
+            downloaded_sha256: final_artifact.identity.sha256.clone(),
             orientation: 1,
             verified_at_unix_seconds: verified_timestamp()?,
         })
+    }
+}
+
+#[cfg(not(unix))]
+impl<T: CloudKitAdjustedSourceTransport> CloudKitAdjustedSourceResolver<T> {
+    pub fn resolve(
+        &mut self,
+        _session: &CloudKitDeleteSession,
+        _request: &CloudKitAdjustedSourceResolveRequest,
+    ) -> Result<CloudKitAdjustedSourceProof, AdjustedSourceError> {
+        Err(AdjustedSourceError::Filesystem)
     }
 }
 
@@ -269,6 +304,8 @@ pub enum AdjustedSourceError {
     ExistingOutputMismatch,
     #[error("adjusted source download size did not match the declared resource")]
     DownloadedSizeMismatch,
+    #[error("adjusted source declared resource exceeds the encoded JPEG limit")]
+    DeclaredResourceTooLarge,
     #[error("adjusted source download hash did not match the streamed artifact")]
     DownloadedHashMismatch,
     #[error("adjusted source installed output did not match the verified temporary artifact")]
@@ -285,6 +322,23 @@ pub enum AdjustedSourceError {
 struct FileIdentity {
     size_bytes: u64,
     sha256: String,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn matches_bytes(&self, other: &Self) -> bool {
+        self.size_bytes == other.size_bytes && self.sha256 == other.sha256
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileToken {
+    device: u64,
+    inode: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -301,27 +355,233 @@ struct AdjustedResource {
     fingerprint: String,
 }
 
-struct TempCleanup {
-    path: PathBuf,
+#[cfg(unix)]
+struct AnchoredOutput {
+    parent: File,
+    final_name: CString,
+}
+
+#[cfg(unix)]
+struct OpenArtifact {
+    file: File,
+    identity: FileIdentity,
+}
+
+#[cfg(unix)]
+enum InstallResult {
+    Installed,
+    AlreadyExists,
+}
+
+#[cfg(unix)]
+struct AnchoredTemp<'a> {
+    output: &'a AnchoredOutput,
+    name: CString,
+    file: Option<File>,
+    token: Option<FileToken>,
     active: bool,
 }
 
-impl TempCleanup {
-    fn new(path: PathBuf) -> Self {
-        Self { path, active: true }
+#[cfg(unix)]
+impl AnchoredOutput {
+    fn open(path: &Path) -> Result<Self, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        let file_name = path
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .filter(|_name| path.extension() == Some(std::ffi::OsStr::new("jpg")))
+            .ok_or(AdjustedSourceError::UnsafeOutputPath)?;
+        let final_name = CString::new(file_name.as_bytes())
+            .map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
+        let mut parent = if path.is_absolute() {
+            open_directory_at(libc::AT_FDCWD, c"/")?
+        } else {
+            open_directory_at(libc::AT_FDCWD, c".")?
+        };
+        let components = path.components().collect::<Vec<_>>();
+        let final_position = components
+            .iter()
+            .rposition(|component| matches!(component, Component::Normal(_)))
+            .ok_or(AdjustedSourceError::UnsafeOutputPath)?;
+        if final_position != components.len().saturating_sub(1) {
+            return Err(AdjustedSourceError::UnsafeOutputPath);
+        }
+        for component in &components[..final_position] {
+            match component {
+                Component::RootDir => {
+                    if !path.is_absolute() {
+                        return Err(AdjustedSourceError::UnsafeOutputPath);
+                    }
+                }
+                Component::Normal(name) => {
+                    let name = CString::new(name.as_bytes())
+                        .map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
+                    parent = open_directory_at(parent.as_raw_fd(), &name)?;
+                }
+                Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                    return Err(AdjustedSourceError::UnsafeOutputPath);
+                }
+            }
+        }
+        let metadata = parent
+            .metadata()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        if !metadata.is_dir() {
+            return Err(AdjustedSourceError::UnsafeOutputPath);
+        }
+        Ok(Self { parent, final_name })
+    }
+
+    fn create_temp(&self) -> Result<AnchoredTemp<'_>, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        let prefix = std::str::from_utf8(self.final_name.to_bytes())
+            .map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
+        for _ in 0..16 {
+            let name = CString::new(format!(".{prefix}.adjusted-{}.tmp", Uuid::new_v4()))
+                .map_err(|_| AdjustedSourceError::Filesystem)?;
+            match open_temp_at(self.parent.as_raw_fd(), &name) {
+                Ok(file) => return AnchoredTemp::new(self, name, file),
+                Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
+                Err(_) => return Err(AdjustedSourceError::Filesystem),
+            }
+        }
+        Err(AdjustedSourceError::Filesystem)
+    }
+
+    fn open_regular(&self, name: &CStr) -> Result<OpenArtifact, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        let file = open_regular_at(self.parent.as_raw_fd(), name)?;
+        inspect_open_file(file)
+    }
+
+    fn open_final(&self) -> Result<Option<OpenArtifact>, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        open_optional_regular_at(self.parent.as_raw_fd(), &self.final_name)?
+            .map(inspect_open_file)
+            .transpose()
+    }
+
+    fn install_exclusive(
+        &self,
+        temp_name: &CStr,
+        expected: &FileIdentity,
+    ) -> Result<InstallResult, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        let current = self.open_regular(temp_name)?;
+        if current.identity != *expected {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        match rename_without_overwrite_at(self.parent.as_raw_fd(), temp_name, &self.final_name) {
+            Ok(()) => Ok(InstallResult::Installed),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Ok(InstallResult::AlreadyExists)
+            }
+            Err(_) => Err(AdjustedSourceError::Filesystem),
+        }
+    }
+
+    fn fsync_parent(&self) -> Result<(), AdjustedSourceError> {
+        self.parent
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)
+    }
+
+    fn ensure_final_identity(&self, expected: &FileIdentity) -> Result<(), AdjustedSourceError> {
+        let current = self
+            .open_final()?
+            .ok_or(AdjustedSourceError::InstalledOutputMismatch)?;
+        if current.identity != *expected {
+            return Err(AdjustedSourceError::InstalledOutputMismatch);
+        }
+        Ok(())
+    }
+
+    fn unlink_temp_if_matches(&self, name: &CStr, token: FileToken) {
+        use std::os::fd::AsRawFd;
+
+        let Ok(current) = self.open_regular(name) else {
+            return;
+        };
+        if FileToken::from_identity(&current.identity) != token {
+            return;
+        }
+        let _ = unsafe { libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), 0) };
+    }
+}
+
+#[cfg(unix)]
+impl<'a> AnchoredTemp<'a> {
+    fn new(
+        output: &'a AnchoredOutput,
+        name: CString,
+        file: File,
+    ) -> Result<Self, AdjustedSourceError> {
+        let token = file_token(&file)?;
+        Ok(Self {
+            output,
+            name,
+            file: Some(file),
+            token: Some(token),
+            active: true,
+        })
+    }
+
+    fn file_mut(&mut self) -> Result<&mut File, AdjustedSourceError> {
+        self.file
+            .as_mut()
+            .ok_or(AdjustedSourceError::InvalidTemporaryFile)
+    }
+
+    fn name(&self) -> &CStr {
+        &self.name
+    }
+
+    fn sync_and_close(&mut self) -> Result<(), AdjustedSourceError> {
+        let file = self
+            .file
+            .as_ref()
+            .ok_or(AdjustedSourceError::InvalidTemporaryFile)?;
+        file.sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        self.token = Some(file_token(file)?);
+        self.file.take();
+        Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
     }
 
     fn remove(&mut self) {
         if self.active {
-            let _ = fs::remove_file(&self.path);
+            if let Some(token) = self.token {
+                self.output.unlink_temp_if_matches(&self.name, token);
+            }
             self.active = false;
         }
     }
 }
 
-impl Drop for TempCleanup {
+#[cfg(unix)]
+impl Drop for AnchoredTemp<'_> {
     fn drop(&mut self) {
         self.remove();
+    }
+}
+
+#[cfg(not(unix))]
+struct AnchoredOutput;
+
+#[cfg(not(unix))]
+impl AnchoredOutput {
+    fn open(_path: &Path) -> Result<Self, AdjustedSourceError> {
+        Err(AdjustedSourceError::Filesystem)
     }
 }
 
@@ -350,27 +610,7 @@ fn validate_request(
             "session destination differs from original asset proof",
         ));
     }
-    validate_output_path(&request.output_path)?;
     Ok(destination)
-}
-
-fn validate_output_path(path: &Path) -> Result<(), AdjustedSourceError> {
-    if path.as_os_str().is_empty()
-        || path.extension().and_then(|extension| extension.to_str()) != Some("jpg")
-        || path.file_name().is_none()
-    {
-        return Err(AdjustedSourceError::UnsafeOutputPath);
-    }
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let parent_metadata =
-        fs::symlink_metadata(parent).map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
-    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
-        return Err(AdjustedSourceError::UnsafeOutputPath);
-    }
-    Ok(())
 }
 
 fn lookup_exact_record<T: CloudKitAdjustedSourceTransport>(
@@ -660,47 +900,125 @@ fn required_nonempty_object_string<'a>(
         ))
 }
 
-fn unique_temp_path(output_path: &Path) -> Result<PathBuf, AdjustedSourceError> {
-    let parent = output_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let file_name = output_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or(AdjustedSourceError::UnsafeOutputPath)?;
-    Ok(parent.join(format!(".{file_name}.adjusted-{}.tmp", Uuid::new_v4())))
-}
+#[cfg(unix)]
+fn open_directory_at(dirfd: libc::c_int, name: &CStr) -> Result<File, AdjustedSourceError> {
+    use std::os::fd::FromRawFd;
 
-fn inspect_existing_output(path: &Path) -> Result<Option<FileIdentity>, AdjustedSourceError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => inspect_metadata(path, metadata).map(Some),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(AdjustedSourceError::Filesystem),
-    }
-}
-
-fn inspect_regular_file(path: &Path) -> Result<FileIdentity, AdjustedSourceError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| AdjustedSourceError::Filesystem)?;
-    inspect_metadata(path, metadata)
-}
-
-fn inspect_metadata(
-    path: &Path,
-    metadata: fs::Metadata,
-) -> Result<FileIdentity, AdjustedSourceError> {
-    let kind = metadata.file_type();
-    if kind.is_symlink() || kind.is_dir() || !kind.is_file() {
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
         return Err(AdjustedSourceError::UnsafeOutputPath);
     }
-    Ok(FileIdentity {
-        size_bytes: metadata.len(),
-        sha256: hash_file(path)?,
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_temp_at(dirfd: libc::c_int, name: &CStr) -> io::Result<File> {
+    use std::os::fd::FromRawFd;
+
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn open_regular_at(dirfd: libc::c_int, name: &CStr) -> Result<File, AdjustedSourceError> {
+    open_optional_regular_at(dirfd, name)?.ok_or(AdjustedSourceError::Filesystem)
+}
+
+#[cfg(unix)]
+fn open_optional_regular_at(
+    dirfd: libc::c_int,
+    name: &CStr,
+) -> Result<Option<File>, AdjustedSourceError> {
+    use std::os::fd::FromRawFd;
+
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOENT) => Ok(None),
+            Some(libc::ELOOP) => Err(AdjustedSourceError::UnsafeOutputPath),
+            _ => Err(AdjustedSourceError::Filesystem),
+        };
+    }
+    Ok(Some(unsafe { File::from_raw_fd(fd) }))
+}
+
+#[cfg(unix)]
+fn file_token(file: &File) -> Result<FileToken, AdjustedSourceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    if !metadata.file_type().is_file() {
+        return Err(AdjustedSourceError::UnsafeOutputPath);
+    }
+    Ok(FileToken {
+        device: metadata.dev(),
+        inode: metadata.ino(),
     })
 }
 
-fn hash_file(path: &Path) -> Result<String, AdjustedSourceError> {
-    let mut file = File::open(path).map_err(|_| AdjustedSourceError::Filesystem)?;
+#[cfg(unix)]
+impl FileToken {
+    fn from_identity(identity: &FileIdentity) -> Self {
+        Self {
+            device: identity.device,
+            inode: identity.inode,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn inspect_open_file(file: File) -> Result<OpenArtifact, AdjustedSourceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    if !metadata.file_type().is_file() {
+        return Err(AdjustedSourceError::UnsafeOutputPath);
+    }
+    Ok(OpenArtifact {
+        identity: FileIdentity {
+            size_bytes: metadata.len(),
+            sha256: hash_open_file(&file)?,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+        file,
+    })
+}
+
+fn hash_open_file(file: &File) -> Result<String, AdjustedSourceError> {
+    let mut file = file
+        .try_clone()
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; HASH_BUFFER_BYTES];
     loop {
@@ -715,14 +1033,12 @@ fn hash_file(path: &Path) -> Result<String, AdjustedSourceError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn sync_file(path: &Path) -> Result<(), AdjustedSourceError> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|_| AdjustedSourceError::Filesystem)
-}
-
-fn verify_jpeg(path: &Path, width: u32, height: u32) -> Result<(), AdjustedSourceError> {
-    let file = File::open(path).map_err(|_| AdjustedSourceError::InvalidJpeg)?;
+fn verify_jpeg(file: &File, width: u32, height: u32) -> Result<(), AdjustedSourceError> {
+    let mut file = file
+        .try_clone()
+        .map_err(|_| AdjustedSourceError::InvalidJpeg)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| AdjustedSourceError::InvalidJpeg)?;
     let mut decoder =
         JpegDecoder::new(BufReader::new(file)).map_err(|_| AdjustedSourceError::InvalidJpeg)?;
     if decoder.dimensions() != (width, height)
@@ -744,53 +1060,38 @@ fn verify_jpeg(path: &Path, width: u32, height: u32) -> Result<(), AdjustedSourc
     decoder
         .read_image(&mut decoded)
         .map_err(|_| AdjustedSourceError::InvalidJpeg)?;
-    let first_pixel = decoded
-        .get(..channels)
-        .ok_or(AdjustedSourceError::InvalidJpeg)?;
-    if decoded
-        .chunks_exact(channels)
-        .all(|pixel| pixel == first_pixel)
-    {
+    let standard_deviation = rgb_standard_deviation(&decoded, channels)?;
+    if standard_deviation < MIN_VISUAL_STDEV {
         return Err(AdjustedSourceError::InvalidJpeg);
     }
     Ok(())
 }
 
-fn install_without_overwrite(
-    temp_path: &Path,
-    output_path: &Path,
-) -> Result<(), AdjustedSourceError> {
-    install_without_overwrite_with(temp_path, output_path, rename_without_overwrite)
-}
-
-fn install_without_overwrite_with<F>(
-    temp_path: &Path,
-    output_path: &Path,
-    rename: F,
-) -> Result<(), AdjustedSourceError>
-where
-    F: FnOnce(&Path, &Path) -> io::Result<()>,
-{
-    match rename(temp_path, output_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(_) => Err(AdjustedSourceError::Filesystem),
+fn rgb_standard_deviation(decoded: &[u8], channels: usize) -> Result<f64, AdjustedSourceError> {
+    if channels == 0 || decoded.is_empty() || decoded.len() % channels != 0 {
+        return Err(AdjustedSourceError::InvalidJpeg);
     }
+    let count = decoded.len() as f64;
+    let mean = decoded
+        .iter()
+        .map(|value| f64::from(*value) / 255.0)
+        .sum::<f64>()
+        / count;
+    let variance = decoded
+        .iter()
+        .map(|value| {
+            let delta = f64::from(*value) / 255.0 - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / count;
+    Ok(variance.sqrt())
 }
 
 #[cfg(target_os = "macos")]
-fn rename_without_overwrite(from: &Path, to: &Path) -> io::Result<()> {
-    let from = path_cstring(from)?;
-    let to = path_cstring(to)?;
-    let result = unsafe {
-        libc::renameatx_np(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
+fn rename_without_overwrite_at(dirfd: libc::c_int, from: &CStr, to: &CStr) -> io::Result<()> {
+    let result =
+        unsafe { libc::renameatx_np(dirfd, from.as_ptr(), dirfd, to.as_ptr(), libc::RENAME_EXCL) };
     if result == 0 {
         Ok(())
     } else {
@@ -799,15 +1100,13 @@ fn rename_without_overwrite(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn rename_without_overwrite(from: &Path, to: &Path) -> io::Result<()> {
-    let from = path_cstring(from)?;
-    let to = path_cstring(to)?;
+fn rename_without_overwrite_at(dirfd: libc::c_int, from: &CStr, to: &CStr) -> io::Result<()> {
     let result = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
-            libc::AT_FDCWD,
+            dirfd,
             from.as_ptr(),
-            libc::AT_FDCWD,
+            dirfd,
             to.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
@@ -820,26 +1119,10 @@ fn rename_without_overwrite(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn rename_without_overwrite(_from: &Path, _to: &Path) -> io::Result<()> {
+fn rename_without_overwrite_at(_dirfd: libc::c_int, _from: &CStr, _to: &CStr) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "rename unsupported",
-    ))
-}
-
-#[cfg(unix)]
-fn path_cstring(path: &Path) -> io::Result<CString> {
-    use std::os::unix::ffi::OsStrExt;
-
-    CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has NUL"))
-}
-
-#[cfg(not(unix))]
-fn path_cstring(_path: &Path) -> io::Result<CString> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "path encoding unsupported",
     ))
 }
 
@@ -857,27 +1140,38 @@ fn verified_timestamp() -> Result<u64, AdjustedSourceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
+    #[cfg(unix)]
     #[test]
-    fn no_overwrite_install_fails_without_copy_when_rename_is_unavailable() {
+    fn exclusive_rename_never_overwrites_an_existing_destination() {
         let directory = tempfile::tempdir().expect("test directory");
-        let temp_path = directory.path().join("source.tmp");
-        let output_path = directory.path().join("adjusted.jpg");
-        fs::write(&temp_path, b"verified JPEG bytes").expect("temporary artifact");
+        let output_path = directory
+            .path()
+            .canonicalize()
+            .expect("stable test directory")
+            .join("adjusted.jpg");
+        let output = AnchoredOutput::open(&output_path).expect("anchored output");
+        let mut temp = output.create_temp().expect("create-new temp");
+        temp.file_mut()
+            .expect("open temp")
+            .write_all(b"verified JPEG bytes")
+            .expect("write temp");
+        temp.sync_and_close().expect("sync temp");
+        let expected = output
+            .open_regular(temp.name())
+            .expect("reopen temp")
+            .identity;
+        std::fs::write(&output_path, b"existing output").expect("existing destination");
 
-        let error = install_without_overwrite_with(&temp_path, &output_path, |_, _| {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "test rename unavailable",
-            ))
-        })
-        .expect_err("copy fallback must not weaken atomic installation");
+        let result = output
+            .install_exclusive(temp.name(), &expected)
+            .expect("occupied destination is a normal race outcome");
 
-        assert!(matches!(error, AdjustedSourceError::Filesystem));
-        assert!(!output_path.exists(), "no final output may be copied");
-        assert!(
-            temp_path.exists(),
-            "caller cleanup retains ownership of temp"
+        assert!(matches!(result, InstallResult::AlreadyExists));
+        assert_eq!(
+            std::fs::read(&output_path).expect("existing output bytes"),
+            b"existing output"
         );
     }
 }
