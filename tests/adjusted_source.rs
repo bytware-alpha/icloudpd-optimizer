@@ -742,6 +742,28 @@ fn materialized_adjusted_source_rejects_replaced_symlinked_hardlinked_and_wrong_
         &original_proof(),
         &output_path,
     )
+    .expect("source should materialize with a fresh staged inode");
+    let staged_path = materialized.path().to_path_buf();
+    let same_byte_replacement = staged_path.with_extension("same-byte-replacement.jpg");
+    fs::write(&same_byte_replacement, &bytes)
+        .expect("same-byte replacement should be written as a distinct file");
+    fs::rename(&same_byte_replacement, &staged_path)
+        .expect("same-byte replacement should atomically replace the staged path");
+    assert!(
+        matches!(
+            materialized.revalidate_for_command(),
+            Err(AdjustedSourceError::ProofLocalFileMismatch)
+        ),
+        "same bytes at a different staged inode must fail identity validation"
+    );
+    drop(materialized);
+
+    let materialized = materialize_adjusted_source_for_conversion(
+        &proof,
+        "local-asset",
+        &original_proof(),
+        &output_path,
+    )
     .expect("source should materialize again");
     let staged_path = materialized.path().to_path_buf();
     fs::remove_file(&staged_path).expect("staged file should be removable in test");

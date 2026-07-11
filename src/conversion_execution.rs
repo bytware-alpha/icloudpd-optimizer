@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::adjusted_source::MaterializedAdjustedSource;
 use crate::conversion::{
     CommandPlan, ConversionError, EmbeddedPreviewTag, ExifOrientation,
     plan_adjusted_source_conversion_for_target, plan_conversion_for_target,
@@ -81,6 +82,15 @@ impl Drop for RawStageCopySlotGuard {
 static TEST_CHILD_COMMAND_TIMEOUT: std::sync::Mutex<Option<Duration>> = std::sync::Mutex::new(None);
 #[cfg(test)]
 static TEST_RAW_STAGE_COPY_COMMAND: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_ADJUSTED_ENCODER_STAGING_SWAP: std::sync::Mutex<Option<Vec<u8>>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_ADJUSTED_ENCODER_STAGING_SWAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+static TEST_ADJUSTED_DESCRIPTOR_LEAK_CHECK: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+#[cfg(test)]
+static TEST_ADJUSTED_DESCRIPTOR_LEAK_CHECK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversionExecutionRequest {
@@ -296,22 +306,15 @@ fn execute_measured_conversion_for_target(
     let conversion_result = (|| {
         let total_started = Instant::now();
         let convert_started = Instant::now();
-        if let Some(materialized_source) = &materialized_adjusted_source {
-            materialized_source
-                .revalidate_for_command()
-                .map_err(|error| {
-                    ConversionExecutionError::Workflow(WorkflowError::AdjustedSource(error))
-                })?;
-        }
-        let convert_outcome = run_planned_commands("conversion", &plan.conversion_commands)?;
+        let convert_outcome = match &materialized_adjusted_source {
+            Some(materialized_source) => run_planned_adjusted_source_commands(
+                "conversion",
+                &plan.conversion_commands,
+                materialized_source,
+            )?,
+            None => run_planned_commands("conversion", &plan.conversion_commands)?,
+        };
         let convert_wall_time_millis = positive_millis(convert_started.elapsed());
-        if let Some(materialized_source) = &materialized_adjusted_source {
-            materialized_source
-                .revalidate_for_command()
-                .map_err(|error| {
-                    ConversionExecutionError::Workflow(WorkflowError::AdjustedSource(error))
-                })?;
-        }
         let metadata_usage = run_planned_command("metadata", &plan.metadata)?;
         let output = inspect_output(&request.output_path)?;
         let total_wall_time_millis = positive_millis(total_started.elapsed());
@@ -976,6 +979,227 @@ fn run_planned_commands(
     })
 }
 
+fn run_planned_adjusted_source_commands(
+    stage: &'static str,
+    plans: &[CommandPlan],
+    source: &MaterializedAdjustedSource,
+) -> Result<PlannedCommandsOutcome, ConversionExecutionError> {
+    let [plan] = plans else {
+        return Err(ConversionExecutionError::AdjustedSourceCommandPlan);
+    };
+    let started = Instant::now();
+    let resource_usage = run_planned_adjusted_source_command(stage, plan, source)?;
+    Ok(PlannedCommandsOutcome {
+        resource_usage,
+        command_timings: vec![ConversionCommandTiming {
+            program: plan.program.clone(),
+            wall_time_millis: positive_millis(started.elapsed()),
+        }],
+    })
+}
+
+#[cfg(unix)]
+fn run_planned_adjusted_source_command(
+    stage: &'static str,
+    plan: &CommandPlan,
+    source: &MaterializedAdjustedSource,
+) -> Result<ChildResourceUsage, ConversionExecutionError> {
+    use std::os::unix::process::CommandExt;
+
+    source.revalidate_for_command().map_err(|error| {
+        ConversionExecutionError::Workflow(WorkflowError::AdjustedSource(error))
+    })?;
+    if let Some(path) = &plan.checked_output_path {
+        refuse_preexisting_output(path)?;
+    }
+    if !fs::metadata("/dev/fd").is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(ConversionExecutionError::AdjustedSourceDescriptorUnavailable);
+    }
+    let descriptor = source.duplicate_for_encoder().map_err(|error| {
+        ConversionExecutionError::Workflow(WorkflowError::AdjustedSource(error))
+    })?;
+    let descriptor_fd = descriptor.raw_fd();
+    let descriptor_input = OsString::from(format!("/dev/fd/{descriptor_fd}"));
+    let matching_input_positions = plan
+        .args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| (argument == source.path().as_os_str()).then_some(index))
+        .collect::<Vec<_>>();
+    let [input_position] = matching_input_positions.as_slice() else {
+        return Err(ConversionExecutionError::AdjustedSourceCommandPlan);
+    };
+    let mut args = plan.args.clone();
+    args[*input_position] = descriptor_input;
+
+    #[cfg(test)]
+    test_assert_unrelated_child_does_not_inherit_adjusted_descriptor(descriptor_fd)?;
+    #[cfg(test)]
+    test_replace_staging_path_after_validation(source.path())?;
+
+    let resolved_program = resolve_sanitized_path_tool(&plan.program)?;
+    let mut command = Command::new(resolved_program);
+    let stdout = match &plan.stdout_path {
+        Some(path) => Stdio::from(create_new_stdout_file(path)?),
+        None => Stdio::null(),
+    };
+    unsafe {
+        command.pre_exec(move || clear_close_on_exec(descriptor_fd));
+    }
+    command.args(&args).stdin(Stdio::null()).stdout(stdout);
+    let outcome = wait_for_command_with_usage(stage, &plan.program, command)?;
+    if !outcome.status.success() {
+        return Err(ConversionExecutionError::CommandFailed {
+            stage,
+            program: plan.program.clone(),
+            status: outcome.status.to_string(),
+        });
+    }
+    if let Some(path) = &plan.stdout_path {
+        inspect_required_intermediate_output(path)?;
+    }
+    if let Some(path) = &plan.checked_output_path {
+        inspect_required_intermediate_output(path)?;
+    }
+    Ok(outcome.resource_usage)
+}
+
+#[cfg(unix)]
+fn clear_close_on_exec(descriptor_fd: libc::c_int) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(descriptor_fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(descriptor_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) struct TestAdjustedEncoderStagingSwapGuard {
+    previous: Option<Vec<u8>>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TestAdjustedEncoderStagingSwapGuard {
+    pub(crate) fn install(replacement: Vec<u8>) -> Self {
+        let lock = TEST_ADJUSTED_ENCODER_STAGING_SWAP_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut configured = TEST_ADJUSTED_ENCODER_STAGING_SWAP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = configured.replace(replacement);
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestAdjustedEncoderStagingSwapGuard {
+    fn drop(&mut self) {
+        let mut configured = TEST_ADJUSTED_ENCODER_STAGING_SWAP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *configured = self.previous.take();
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestAdjustedDescriptorLeakCheckGuard {
+    previous: bool,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TestAdjustedDescriptorLeakCheckGuard {
+    pub(crate) fn install() -> Self {
+        let lock = TEST_ADJUSTED_DESCRIPTOR_LEAK_CHECK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut configured = TEST_ADJUSTED_DESCRIPTOR_LEAK_CHECK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::mem::replace(&mut *configured, true);
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestAdjustedDescriptorLeakCheckGuard {
+    fn drop(&mut self) {
+        let mut configured = TEST_ADJUSTED_DESCRIPTOR_LEAK_CHECK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *configured = self.previous;
+    }
+}
+
+#[cfg(test)]
+fn test_assert_unrelated_child_does_not_inherit_adjusted_descriptor(
+    descriptor_fd: libc::c_int,
+) -> Result<(), ConversionExecutionError> {
+    let enabled = *TEST_ADJUSTED_DESCRIPTOR_LEAK_CHECK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(target_os = "linux")]
+    if enabled {
+        let status = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "test ! -e /proc/self/fd/$1",
+                "adjusted-source-fd-leak-check",
+                &descriptor_fd.to_string(),
+            ])
+            .status()?;
+        if !status.success() {
+            return Err(ConversionExecutionError::Io(io::Error::other(
+                "unrelated child inherited adjusted source descriptor",
+            )));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (enabled, descriptor_fd);
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_replace_staging_path_after_validation(
+    staged_path: &Path,
+) -> Result<(), ConversionExecutionError> {
+    let replacement = TEST_ADJUSTED_ENCODER_STAGING_SWAP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(replacement) = replacement else {
+        return Ok(());
+    };
+    let staging_directory = staged_path.parent().ok_or_else(|| {
+        ConversionExecutionError::Io(io::Error::other("staged source has no parent directory"))
+    })?;
+    let displaced_directory = staging_directory.with_extension("displaced-by-test");
+    fs::rename(staging_directory, &displaced_directory)?;
+    fs::create_dir(staging_directory)?;
+    fs::write(staging_directory.join("source.jpg"), replacement)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn run_planned_adjusted_source_command(
+    _stage: &'static str,
+    _plan: &CommandPlan,
+    _source: &MaterializedAdjustedSource,
+) -> Result<ChildResourceUsage, ConversionExecutionError> {
+    Err(ConversionExecutionError::AdjustedSourceDescriptorUnavailable)
+}
+
 fn resolve_sanitized_path_tool(program: &str) -> Result<PathBuf, ConversionExecutionError> {
     let Some(paths) = env::var_os("PATH") else {
         return Err(ConversionExecutionError::ToolNotFound {
@@ -1479,6 +1703,12 @@ pub enum ConversionExecutionError {
     },
     #[error("conversion tool not found on sanitized PATH: {program}")]
     ToolNotFound { program: String },
+    #[error(
+        "adjusted conversion plan must contain exactly one encoder command with one staged input"
+    )]
+    AdjustedSourceCommandPlan,
+    #[error("this platform cannot pass the validated adjusted JPEG descriptor to the encoder")]
+    AdjustedSourceDescriptorUnavailable,
     #[error("{stage} command failed: {program} exited with {status}")]
     CommandFailed {
         stage: &'static str,
@@ -1889,6 +2119,10 @@ exit 67
         record_adjusted_source_proof(&mut manifest, "asset-1", &output_path, adjusted.clone())
             .expect("adjusted proof should record");
         let _swap_guard = TestMaterializationSwapGuard::install(&replacement_path);
+        let _staging_swap_guard = TestAdjustedEncoderStagingSwapGuard::install(
+            b"untrusted lexical staging replacement".to_vec(),
+        );
+        let _descriptor_leak_guard = TestAdjustedDescriptorLeakCheckGuard::install();
 
         let updated = execute_measured_conversion_for_target(
             &manifest,
@@ -1904,7 +2138,11 @@ exit 67
 
         let command_log = fs::read_to_string(&log_path).expect("command log should be readable");
         assert!(command_log.starts_with("heif-enc\nheif-input="));
-        assert!(command_log.contains(".conversion-"));
+        assert!(command_log.contains("/dev/fd/"));
+        assert!(
+            !command_log.contains(".conversion-"),
+            "the encoder must not receive the lexical staged pathname"
+        );
         assert!(
             !command_log.contains(adjusted_path.to_string_lossy().as_ref()),
             "encoder input must be the private materialization, not the proof pathname"
@@ -2019,7 +2257,11 @@ exit 67
 
         let command_log = fs::read_to_string(&log_path).expect("command log should be readable");
         assert!(command_log.starts_with("sips\nsips-input="));
-        assert!(command_log.contains(".conversion-"));
+        assert!(command_log.contains("/dev/fd/"));
+        assert!(
+            !command_log.contains(".conversion-"),
+            "the encoder must not receive the lexical staged pathname"
+        );
         assert!(!command_log.contains(adjusted_path.to_string_lossy().as_ref()));
         assert!(command_log.ends_with("exiftool-metadata\n"));
         assert_eq!(

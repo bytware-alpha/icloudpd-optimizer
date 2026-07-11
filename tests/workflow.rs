@@ -643,6 +643,20 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
     };
     record_original_asset_proof(&mut manifest, "asset-1", original.clone())
         .expect("original asset proof should record");
+    let wrong_asset = adjusted_source_proof(
+        "other-asset",
+        &original,
+        adjusted_path.clone(),
+        &adjusted_bytes,
+    );
+    let before_wrong_asset = manifest.clone();
+    let error = record_adjusted_source_proof(&mut manifest, "asset-1", &output_path, wrong_asset)
+        .expect_err("a well-formed proof for a different asset must be rejected");
+    assert!(matches!(error, WorkflowError::AdjustedSource(_)));
+    assert_eq!(
+        manifest, before_wrong_asset,
+        "wrong-asset proof must not mutate the manifest"
+    );
     let adjusted =
         adjusted_source_proof("asset-1", &original, adjusted_path.clone(), &adjusted_bytes);
     record_adjusted_source_proof(&mut manifest, "asset-1", &output_path, adjusted.clone())

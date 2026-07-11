@@ -316,7 +316,14 @@ pub struct MaterializedAdjustedSource {
     staging: ConversionSourceStaging,
     width: u32,
     height: u32,
-    expected: FileIdentity,
+    staged: OpenArtifact,
+}
+
+/// A CLOEXEC duplicate of the immutable staged JPEG, intended solely for the
+/// encoder child that explicitly opts into inheriting it.
+#[cfg(unix)]
+pub(crate) struct AdjustedSourceEncoderDescriptor {
+    file: File,
 }
 
 #[cfg(not(unix))]
@@ -377,11 +384,55 @@ impl MaterializedAdjustedSource {
         &self.staging.path
     }
 
-    /// Reopens the staged path through its held directory descriptors and
-    /// verifies the descriptor/path identity immediately before command launch.
+    /// Validates both the held staged descriptor and its anchored pathname
+    /// immediately before the encoder is launched. The encoder must use the
+    /// descriptor returned by `duplicate_for_encoder`, never this pathname.
     pub fn revalidate_for_command(&self) -> Result<(), AdjustedSourceError> {
+        self.validate_held_descriptor()?;
         self.staging
-            .validate_file(&self.expected, self.width, self.height)
+            .validate_file(&self.staged.identity, self.width, self.height)
+    }
+
+    pub(crate) fn duplicate_for_encoder(
+        &self,
+    ) -> Result<AdjustedSourceEncoderDescriptor, AdjustedSourceError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        self.validate_held_descriptor()?;
+        let descriptor =
+            unsafe { libc::fcntl(self.staged.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
+        if descriptor < 0 {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        if unsafe { libc::lseek(descriptor, 0, libc::SEEK_SET) } < 0 {
+            let _ = unsafe { libc::close(descriptor) };
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        Ok(AdjustedSourceEncoderDescriptor {
+            file: unsafe { File::from_raw_fd(descriptor) },
+        })
+    }
+
+    fn validate_held_descriptor(&self) -> Result<(), AdjustedSourceError> {
+        let copy = self
+            .staged
+            .file
+            .try_clone()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        let current = inspect_open_file(copy)?;
+        if current.identity != self.staged.identity {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        verify_jpeg(&current.file, self.width, self.height)
+    }
+}
+
+#[cfg(unix)]
+impl AdjustedSourceEncoderDescriptor {
+    pub(crate) fn raw_fd(&self) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+
+        self.file.as_raw_fd()
     }
 }
 
@@ -398,17 +449,17 @@ pub fn materialize_adjusted_source_for_conversion(
     let expected_path = adjusted_source_path_for_output(output_path);
     let (output, source) =
         open_validated_adjusted_source(proof, asset_id, original_asset, &expected_path)?;
-    let expected = source.identity.clone();
+    let source_identity = source.identity.clone();
     let mut staging = ConversionSourceStaging::create(&output, &expected_path)?;
-    staging.copy_from_descriptor(&source.file, &expected)?;
-    staging.validate_file(&expected, proof.width, proof.height)?;
+    staging.copy_from_descriptor(&source.file, &source_identity)?;
+    let staged = staging.capture_file(&source_identity, proof.width, proof.height)?;
     #[cfg(test)]
     test_swap_original_after_materialization(&proof.local_path)?;
     Ok(MaterializedAdjustedSource {
         staging,
         width: proof.width,
         height: proof.height,
-        expected,
+        staged,
     })
 }
 
@@ -809,6 +860,30 @@ impl ConversionSourceStaging {
         Ok(())
     }
 
+    fn capture_file(
+        &self,
+        source_identity: &FileIdentity,
+        width: u32,
+        height: u32,
+    ) -> Result<OpenArtifact, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        self.validate_named_staging()?;
+        let artifact =
+            inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
+        if !has_single_link(&artifact.file)? || !artifact.identity.matches_bytes(source_identity) {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        verify_jpeg(&artifact.file, width, height)?;
+        let named_staging = open_directory_at(self.parent.as_raw_fd(), &self.staging_name)?;
+        let named =
+            inspect_open_file(open_regular_at(named_staging.as_raw_fd(), &self.file_name)?)?;
+        if named.identity != artifact.identity {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        Ok(artifact)
+    }
+
     fn validate_file(
         &self,
         expected: &FileIdentity,
@@ -820,14 +895,14 @@ impl ConversionSourceStaging {
         self.validate_named_staging()?;
         let artifact =
             inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
-        if !has_single_link(&artifact.file)? || !artifact.identity.matches_bytes(expected) {
+        if !has_single_link(&artifact.file)? || artifact.identity != *expected {
             return Err(AdjustedSourceError::ProofLocalFileMismatch);
         }
         verify_jpeg(&artifact.file, width, height)?;
         let named_staging = open_directory_at(self.parent.as_raw_fd(), &self.staging_name)?;
         let named =
             inspect_open_file(open_regular_at(named_staging.as_raw_fd(), &self.file_name)?)?;
-        if !named.identity.matches_bytes(expected) {
+        if named.identity != *expected {
             return Err(AdjustedSourceError::ProofLocalFileMismatch);
         }
         Ok(())
