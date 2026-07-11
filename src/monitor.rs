@@ -646,7 +646,7 @@ pub fn run_monitor_once(
         started_unix_seconds: started,
         ..MonitorScanSummary::default()
     };
-    let failed_retry_admission = admit_failed_retryable_assets(
+    let retry_admissions = admit_scan_retry_policies(
         &mut manifest,
         if config.full_lifecycle {
             config.max_lifecycle_per_scan
@@ -655,29 +655,13 @@ pub fn run_monitor_once(
         },
         config.max_failed_retry_admissions_per_scan,
         config.failed_retry_min_age_seconds,
-        started,
-    )?;
-    let adjusted_source_required_admission = admit_adjusted_source_required_assets(
-        &mut manifest,
-        if config.full_lifecycle {
-            config.max_lifecycle_per_scan
-        } else {
-            0
-        },
-        config.max_failed_retry_admissions_per_scan,
-        started,
-    )?;
-    let original_asset_resolver_retry_admission = recover_original_asset_resolver_retries(
-        &mut manifest,
-        if config.full_lifecycle {
-            config.max_lifecycle_per_scan
-        } else {
-            0
-        },
         config.max_original_resolver_retries_per_scan,
         config.original_resolver_retry_min_age_seconds,
         started,
     )?;
+    let failed_retry_admission = retry_admissions.failed_retry;
+    let adjusted_source_required_admission = retry_admissions.adjusted_source_required;
+    let original_asset_resolver_retry_admission = retry_admissions.original_asset_resolver;
     if failed_retry_admission.manifest_changed()
         || adjusted_source_required_admission.manifest_changed()
         || original_asset_resolver_retry_admission.manifest_changed()
@@ -5589,6 +5573,46 @@ fn pending_lifecycle_count(manifest: &Manifest) -> usize {
         .count()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LifecycleAdmissionBudget {
+    max_slots: usize,
+    remaining_slots: usize,
+}
+
+impl LifecycleAdmissionBudget {
+    fn for_scan(manifest: &Manifest, max_lifecycle_per_scan: usize) -> Self {
+        let marker_reservations = manifest
+            .records()
+            .values()
+            .filter(|record| valid_adjusted_source_marker_reservation(record))
+            .count();
+        let max_slots = max_lifecycle_per_scan.saturating_sub(marker_reservations);
+        Self {
+            max_slots,
+            remaining_slots: max_slots.saturating_sub(pending_lifecycle_count(manifest)),
+        }
+    }
+
+    fn remaining_slots(self) -> usize {
+        self.remaining_slots
+    }
+
+    fn consume(&mut self) -> bool {
+        let Some(remaining_slots) = self.remaining_slots.checked_sub(1) else {
+            return false;
+        };
+        self.remaining_slots = remaining_slots;
+        true
+    }
+
+    fn release(&mut self, slots: usize) {
+        self.remaining_slots = self
+            .remaining_slots
+            .saturating_add(slots)
+            .min(self.max_slots);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct StartupDeleteAudit {
     upload_verified_missing_mirror: usize,
@@ -5936,6 +5960,7 @@ impl Ord for OriginalAssetResolverRetryCandidate<'_> {
     }
 }
 
+#[cfg(test)]
 fn recover_original_asset_resolver_retries(
     manifest: &mut Manifest,
     max_lifecycle_per_scan: usize,
@@ -5943,10 +5968,27 @@ fn recover_original_asset_resolver_retries(
     original_resolver_retry_min_age_seconds: u64,
     current_unix_seconds: u64,
 ) -> Result<OriginalAssetResolverRetryAdmission, ManifestError> {
+    let mut lifecycle_budget = LifecycleAdmissionBudget::for_scan(manifest, max_lifecycle_per_scan);
+    recover_original_asset_resolver_retries_with_budget(
+        manifest,
+        &mut lifecycle_budget,
+        max_original_resolver_retries_per_scan,
+        original_resolver_retry_min_age_seconds,
+        current_unix_seconds,
+    )
+}
+
+fn recover_original_asset_resolver_retries_with_budget(
+    manifest: &mut Manifest,
+    lifecycle_budget: &mut LifecycleAdmissionBudget,
+    max_original_resolver_retries_per_scan: usize,
+    original_resolver_retry_min_age_seconds: u64,
+    current_unix_seconds: u64,
+) -> Result<OriginalAssetResolverRetryAdmission, ManifestError> {
     let interrupted_retries_requeued = manifest
         .requeue_interrupted_retries_as_failed(interrupted_original_asset_resolver_retry_record);
-    let available_lifecycle_capacity =
-        max_lifecycle_per_scan.saturating_sub(pending_lifecycle_count(manifest));
+    lifecycle_budget.release(interrupted_retries_requeued);
+    let available_lifecycle_capacity = lifecycle_budget.remaining_slots();
     let retry_admission_limit =
         available_lifecycle_capacity.min(max_original_resolver_retries_per_scan);
     let mut total_failed_resolver_backlog = 0;
@@ -6002,6 +6044,8 @@ fn recover_original_asset_resolver_retries(
     let mut recovered_now = 0;
     for (asset_id, retry_state) in selected {
         manifest.recover_failed_for_retry(&asset_id, retry_state)?;
+        let consumed = lifecycle_budget.consume();
+        debug_assert!(consumed, "selected retry must have a lifecycle slot");
         recovered_now += 1;
     }
 
@@ -6339,9 +6383,27 @@ const RETRY_BLOCKING_PROOFS: [&str; 7] = [
     "uploaded_heic_delete",
 ];
 
+#[cfg(test)]
 fn admit_failed_retryable_assets(
     manifest: &mut Manifest,
     max_lifecycle_per_scan: usize,
+    max_failed_retry_admissions_per_scan: usize,
+    retry_min_age_seconds: u64,
+    current_unix_seconds: u64,
+) -> Result<FailedRetryPolicyAdmission, ManifestError> {
+    let mut lifecycle_budget = LifecycleAdmissionBudget::for_scan(manifest, max_lifecycle_per_scan);
+    admit_failed_retryable_assets_with_budget(
+        manifest,
+        &mut lifecycle_budget,
+        max_failed_retry_admissions_per_scan,
+        retry_min_age_seconds,
+        current_unix_seconds,
+    )
+}
+
+fn admit_failed_retryable_assets_with_budget(
+    manifest: &mut Manifest,
+    lifecycle_budget: &mut LifecycleAdmissionBudget,
     max_failed_retry_admissions_per_scan: usize,
     retry_min_age_seconds: u64,
     current_unix_seconds: u64,
@@ -6455,9 +6517,9 @@ fn admit_failed_retryable_assets(
         );
     }
 
-    let available_lifecycle_capacity =
-        max_lifecycle_per_scan.saturating_sub(pending_lifecycle_count(manifest));
-    let admission_limit = available_lifecycle_capacity.min(max_failed_retry_admissions_per_scan);
+    let admission_limit = lifecycle_budget
+        .remaining_slots()
+        .min(max_failed_retry_admissions_per_scan);
     candidates.sort_by(|left, right| {
         left.failure_timestamp
             .cmp(&right.failure_timestamp)
@@ -6465,6 +6527,8 @@ fn admit_failed_retryable_assets(
     });
     for candidate in candidates.into_iter().take(admission_limit) {
         admit_failed_retry(manifest, &candidate, current_unix_seconds)?;
+        let consumed = lifecycle_budget.consume();
+        debug_assert!(consumed, "selected retry must have a lifecycle slot");
         increment_static_count(&mut admission.admitted_by_category, candidate.policy.bucket);
     }
     Ok(admission)
@@ -6558,6 +6622,22 @@ pub fn adjusted_source_required_proof(
     Ok(proof)
 }
 
+fn valid_adjusted_source_marker_reservation(record: &AssetRecord) -> bool {
+    if record.state != State::Failed {
+        return false;
+    }
+    if adjusted_source_required_proof(record).is_ok() {
+        return true;
+    }
+    let Some(value) = record.proofs.get(ADJUSTED_SOURCE_REQUIRED_PROOF) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_value::<AdjustedSourceRequiredProof>(value.clone()) else {
+        return false;
+    };
+    validate_adjusted_source_required_retry(record, &marker).is_ok()
+}
+
 /// Reserves bounded lifecycle capacity for typed missing-preview failures. The
 /// only mutation is an adjusted-source marker replacement; records remain in
 /// `Failed` for the resolver worker introduced in the next task.
@@ -6567,10 +6647,23 @@ pub fn admit_adjusted_source_required_assets(
     max_admissions_per_scan: usize,
     current_unix_seconds: u64,
 ) -> Result<AdjustedSourceRequiredAdmission, ManifestError> {
+    let mut lifecycle_budget = LifecycleAdmissionBudget::for_scan(manifest, max_lifecycle_per_scan);
+    admit_adjusted_source_required_assets_with_budget(
+        manifest,
+        &mut lifecycle_budget,
+        max_admissions_per_scan,
+        current_unix_seconds,
+    )
+}
+
+fn admit_adjusted_source_required_assets_with_budget(
+    manifest: &mut Manifest,
+    lifecycle_budget: &mut LifecycleAdmissionBudget,
+    max_admissions_per_scan: usize,
+    current_unix_seconds: u64,
+) -> Result<AdjustedSourceRequiredAdmission, ManifestError> {
     let mut admission = AdjustedSourceRequiredAdmission::default();
-    let mut first_candidates = Vec::new();
-    let mut retry_candidates = Vec::new();
-    let mut reserved_markers = 0usize;
+    let mut candidates = Vec::new();
 
     for record in manifest.records().values() {
         if record.state != State::Failed {
@@ -6580,7 +6673,6 @@ pub fn admit_adjusted_source_required_assets(
         if record.proofs.contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF) {
             match adjusted_source_required_proof(record) {
                 Ok(marker) => {
-                    reserved_markers = reserved_markers.saturating_add(1);
                     match marker.attempt {
                         1 => admission.first_ready = admission.first_ready.saturating_add(1),
                         _ => {
@@ -6615,11 +6707,9 @@ pub fn admit_adjusted_source_required_assets(
             };
             match validate_adjusted_source_required_retry(record, &marker) {
                 Ok(()) if marker.attempt >= ADJUSTED_SOURCE_RESOLVE_MAX_ATTEMPTS => {
-                    reserved_markers = reserved_markers.saturating_add(1);
                     admission.exhausted = admission.exhausted.saturating_add(1);
                 }
                 Ok(()) => {
-                    reserved_markers = reserved_markers.saturating_add(1);
                     let Some(failure_timestamp) = record
                         .failures
                         .last()
@@ -6648,7 +6738,7 @@ pub fn admit_adjusted_source_required_assets(
                         marker.attempt.saturating_add(1),
                         current_unix_seconds,
                     ) {
-                        Ok(proof) => retry_candidates.push(AdjustedSourceRequiredCandidate {
+                        Ok(proof) => candidates.push(AdjustedSourceRequiredCandidate {
                             asset_id: record.asset_id.clone(),
                             failure_timestamp,
                             proof,
@@ -6674,7 +6764,7 @@ pub fn admit_adjusted_source_required_assets(
             continue;
         };
         match build_adjusted_source_required_proof(record, failure, 1, current_unix_seconds) {
-            Ok(proof) => first_candidates.push(AdjustedSourceRequiredCandidate {
+            Ok(proof) => candidates.push(AdjustedSourceRequiredCandidate {
                 asset_id: record.asset_id.clone(),
                 failure_timestamp,
                 proof,
@@ -6684,20 +6774,22 @@ pub fn admit_adjusted_source_required_assets(
         }
     }
 
-    let available_lifecycle_capacity = max_lifecycle_per_scan
-        .saturating_sub(pending_lifecycle_count(manifest))
-        .saturating_sub(reserved_markers);
-    first_candidates.sort_by(|left, right| {
+    candidates.sort_by(|left, right| {
         left.failure_timestamp
             .cmp(&right.failure_timestamp)
             .then_with(|| left.asset_id.cmp(&right.asset_id))
     });
-    let first_limit = available_lifecycle_capacity.min(max_admissions_per_scan);
-    let mut selected = first_candidates
-        .into_iter()
-        .take(first_limit)
-        .collect::<Vec<_>>();
-    selected.extend(retry_candidates);
+    let mut staged_budget = *lifecycle_budget;
+    let mut selected = Vec::new();
+    for candidate in candidates {
+        if selected.len() >= max_admissions_per_scan {
+            break;
+        }
+        if candidate.kind == AdjustedSourceAdmissionKind::First && !staged_budget.consume() {
+            continue;
+        }
+        selected.push(candidate);
+    }
 
     let values = selected
         .iter()
@@ -6723,8 +6815,52 @@ pub fn admit_adjusted_source_required_assets(
         }
     }
     *manifest = staged;
+    *lifecycle_budget = staged_budget;
     admission.manifest_changed = true;
     Ok(admission)
+}
+
+struct ScanRetryAdmissions {
+    failed_retry: FailedRetryPolicyAdmission,
+    adjusted_source_required: AdjustedSourceRequiredAdmission,
+    original_asset_resolver: OriginalAssetResolverRetryAdmission,
+}
+
+fn admit_scan_retry_policies(
+    manifest: &mut Manifest,
+    max_lifecycle_per_scan: usize,
+    max_failed_retry_admissions_per_scan: usize,
+    failed_retry_min_age_seconds: u64,
+    max_original_resolver_retries_per_scan: usize,
+    original_resolver_retry_min_age_seconds: u64,
+    current_unix_seconds: u64,
+) -> Result<ScanRetryAdmissions, ManifestError> {
+    let mut lifecycle_budget = LifecycleAdmissionBudget::for_scan(manifest, max_lifecycle_per_scan);
+    let failed_retry = admit_failed_retryable_assets_with_budget(
+        manifest,
+        &mut lifecycle_budget,
+        max_failed_retry_admissions_per_scan,
+        failed_retry_min_age_seconds,
+        current_unix_seconds,
+    )?;
+    let adjusted_source_required = admit_adjusted_source_required_assets_with_budget(
+        manifest,
+        &mut lifecycle_budget,
+        max_failed_retry_admissions_per_scan,
+        current_unix_seconds,
+    )?;
+    let original_asset_resolver = recover_original_asset_resolver_retries_with_budget(
+        manifest,
+        &mut lifecycle_budget,
+        max_original_resolver_retries_per_scan,
+        original_resolver_retry_min_age_seconds,
+        current_unix_seconds,
+    )?;
+    Ok(ScanRetryAdmissions {
+        failed_retry,
+        adjusted_source_required,
+        original_asset_resolver,
+    })
 }
 
 /// Returns only adjusted-source queue categories and performs no filesystem,
@@ -14620,6 +14756,338 @@ esac
                 .proofs
                 .contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF)
         );
+    }
+
+    #[test]
+    fn adjusted_source_selector_shares_one_ordered_cap_between_first_and_retry_candidates() {
+        let mut base = Manifest::new();
+        base.upsert(policy_failed_record(
+            "z-retry",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "050.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut base, 2, 2, 1_000)
+            .expect("first resolver marker should be admitted");
+        policy_failed_again_at(
+            &mut base,
+            "z-retry",
+            "adjusted_source_resolve",
+            "resolver failure",
+            FailureKind::AdjustedSourceResolveFailed,
+            "100.000000000Z",
+        );
+        base.upsert(policy_failed_record(
+            "a-first",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "200.000000000Z",
+        ));
+
+        let mut cap_one = base.clone();
+        let admission = admit_adjusted_source_required_assets(&mut cap_one, 2, 1, 1_000)
+            .expect("one shared admission token should select the oldest retry");
+        assert_eq!(admission.resolver_retry_ready, 1);
+        assert_eq!(admission.first_ready, 0);
+        assert_eq!(
+            cap_one.get("z-retry").unwrap().proofs[ADJUSTED_SOURCE_REQUIRED_PROOF]["attempt"],
+            json!(2)
+        );
+        assert!(
+            !cap_one
+                .get("a-first")
+                .unwrap()
+                .proofs
+                .contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF)
+        );
+
+        let mut cap_zero = base;
+        let before = cap_zero.clone();
+        let admission = admit_adjusted_source_required_assets(&mut cap_zero, 2, 0, 1_000)
+            .expect("zero shared admission tokens must admit neither candidate");
+        assert_eq!(admission.first_ready, 0);
+        assert_eq!(admission.resolver_retry_ready, 0);
+        assert_eq!(cap_zero, before);
+    }
+
+    #[test]
+    fn scan_admission_does_not_spend_an_existing_adjusted_marker_reservation_twice() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "adjusted-reservation",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("first adjusted marker should reserve the only lifecycle slot");
+        manifest.upsert(policy_failed_record(
+            "generic-retry",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            Some(FailureKind::ConversionTimedOut),
+            "100.000000000Z",
+        ));
+
+        let admissions =
+            admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, 1_000_000)
+                .expect("shared lifecycle budget should preserve the marker reservation");
+
+        assert!(admissions.failed_retry.admitted_by_category.is_empty());
+        assert_eq!(manifest.get("generic-retry").unwrap().state, State::Failed);
+        assert_eq!(
+            manifest.get("adjusted-reservation").unwrap().state,
+            State::Failed
+        );
+
+        let repeated = admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, 1_000_000)
+            .expect("the same marker must reserve exactly one slot on later scans");
+        assert!(repeated.failed_retry.admitted_by_category.is_empty());
+        assert_eq!(manifest.get("generic-retry").unwrap().state, State::Failed);
+    }
+
+    #[test]
+    fn scan_admission_generic_recovery_leaves_no_slot_for_a_new_adjusted_marker() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "generic-first",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            Some(FailureKind::ConversionTimedOut),
+            "100.000000000Z",
+        ));
+        manifest.upsert(policy_failed_record(
+            "adjusted-second",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "200.000000000Z",
+        ));
+
+        let admissions =
+            admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, 1_000_000)
+                .expect("generic recovery should consume the scan's only lifecycle slot");
+
+        assert_eq!(
+            admissions.failed_retry.admitted_by_category["retryable_conversion_timed_out"],
+            1
+        );
+        assert_eq!(
+            manifest.get("generic-first").unwrap().state,
+            State::NasVerified
+        );
+        let adjusted = manifest.get("adjusted-second").unwrap();
+        assert_eq!(adjusted.state, State::Failed);
+        assert!(!adjusted.proofs.contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF));
+    }
+
+    #[test]
+    fn scan_admission_new_adjusted_marker_leaves_no_slot_for_original_resolver_retry() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "adjusted-first",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        manifest.upsert(failed_original_asset_resolve_record(
+            "original-second",
+            "100.000000000Z",
+        ));
+
+        let admissions =
+            admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, 1_000_000)
+                .expect("new adjusted marker should consume the scan's only lifecycle slot");
+
+        assert_eq!(admissions.adjusted_source_required.first_ready, 1);
+        assert_eq!(admissions.original_asset_resolver.recovered_now, 0);
+        assert!(
+            manifest
+                .get("adjusted-first")
+                .unwrap()
+                .proofs
+                .contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF)
+        );
+        assert_eq!(
+            manifest.get("original-second").unwrap().state,
+            State::Failed
+        );
+    }
+
+    #[test]
+    fn scan_admission_retry_marker_uses_a_token_but_not_a_second_lifecycle_slot() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "z-retry",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "010.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("first marker should reserve the only slot");
+        policy_failed_again_at(
+            &mut manifest,
+            "z-retry",
+            "adjusted_source_resolve",
+            "resolver failure",
+            FailureKind::AdjustedSourceResolveFailed,
+            "100.000000000Z",
+        );
+        manifest.upsert(policy_failed_record(
+            "a-first",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "050.000000000Z",
+        ));
+
+        let admissions = admit_scan_retry_policies(&mut manifest, 1, 1, 300, 16, 86_400, 1_000_000)
+            .expect("reserved retry should remain eligible when new first markers have no slot");
+
+        assert_eq!(admissions.adjusted_source_required.resolver_retry_ready, 1);
+        assert_eq!(admissions.adjusted_source_required.first_ready, 0);
+        assert_eq!(
+            manifest.get("z-retry").unwrap().proofs[ADJUSTED_SOURCE_REQUIRED_PROOF]["attempt"],
+            json!(2)
+        );
+        assert!(
+            !manifest
+                .get("a-first")
+                .unwrap()
+                .proofs
+                .contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF)
+        );
+    }
+
+    #[test]
+    fn lifecycle_budget_reserves_only_valid_adjusted_marker_lineages_and_does_not_leak() {
+        let mut ready = Manifest::new();
+        ready.upsert(policy_failed_record(
+            "ready",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut ready, 1, 1, 1_000)
+            .expect("ready marker should be admitted");
+
+        let mut backoff = Manifest::new();
+        backoff.upsert(policy_failed_record(
+            "backoff",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut backoff, 1, 1, 1_000)
+            .expect("backoff marker should be admitted");
+        policy_failed_again_at(
+            &mut backoff,
+            "backoff",
+            "adjusted_source_resolve",
+            "resolver failure",
+            FailureKind::AdjustedSourceResolveFailed,
+            "900.000000000Z",
+        );
+
+        let mut retry_ready = Manifest::new();
+        retry_ready.upsert(policy_failed_record(
+            "retry-ready",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut retry_ready, 1, 1, 1_000)
+            .expect("retry-ready marker should be admitted");
+        policy_failed_again_at(
+            &mut retry_ready,
+            "retry-ready",
+            "adjusted_source_resolve",
+            "resolver failure",
+            FailureKind::AdjustedSourceResolveFailed,
+            "400.000000000Z",
+        );
+
+        let mut exhausted = Manifest::new();
+        exhausted.upsert(policy_failed_record(
+            "exhausted",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut exhausted, 1, 1, 1_000)
+            .expect("first exhausted marker should be admitted");
+        for (timestamp, admitted_at) in [("400.000000000Z", 700), ("800.000000000Z", 1_100)] {
+            policy_failed_again_at(
+                &mut exhausted,
+                "exhausted",
+                "adjusted_source_resolve",
+                "resolver failure",
+                FailureKind::AdjustedSourceResolveFailed,
+                timestamp,
+            );
+            admit_adjusted_source_required_assets(&mut exhausted, 1, 1, admitted_at)
+                .expect("resolver retry should preserve its reservation");
+        }
+        policy_failed_again_at(
+            &mut exhausted,
+            "exhausted",
+            "adjusted_source_resolve",
+            "terminal resolver failure",
+            FailureKind::AdjustedSourceResolveFailed,
+            "1200.000000000Z",
+        );
+
+        let mut malformed = Manifest::new();
+        malformed.upsert(policy_failed_record(
+            "malformed",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut malformed, 1, 1, 1_000)
+            .expect("malformed marker should start as a valid marker");
+        let mut malformed_record = malformed.get("malformed").unwrap().clone();
+        malformed_record
+            .proofs
+            .get_mut(ADJUSTED_SOURCE_REQUIRED_PROOF)
+            .unwrap()["failure_history_digest"] = json!("forged");
+        malformed.upsert(malformed_record);
+
+        let mut manifest = Manifest::new();
+        for source in [&ready, &backoff, &retry_ready, &exhausted, &malformed] {
+            for record in source.records().values() {
+                manifest.upsert(record.clone());
+            }
+        }
+        let mut budget = LifecycleAdmissionBudget::for_scan(&manifest, 5);
+        assert_eq!(budget.remaining_slots(), 1);
+        let before = budget;
+        let before_manifest = manifest.clone();
+
+        let admission =
+            admit_adjusted_source_required_assets_with_budget(&mut manifest, &mut budget, 0, 1_000)
+                .expect(
+                    "zero admission cap should not leak budget while classifying malformed markers",
+                );
+
+        assert_eq!(admission.malformed_or_unknown, 1);
+        assert_eq!(budget, before);
+        assert_eq!(manifest, before_manifest);
+        assert_eq!(manifest.get("ready").unwrap().state, State::Failed);
+        assert_eq!(manifest.get("backoff").unwrap().state, State::Failed);
+        assert_eq!(manifest.get("retry-ready").unwrap().state, State::Failed);
+        assert_eq!(manifest.get("exhausted").unwrap().state, State::Failed);
+        assert_eq!(manifest.get("malformed").unwrap().state, State::Failed);
     }
 
     #[test]
