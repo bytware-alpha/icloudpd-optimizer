@@ -428,7 +428,7 @@ fn plans_linux_native_conversion_without_sips() {
 }
 
 #[test]
-fn adjusted_source_plans_encode_the_proven_jpeg_without_preview_extraction_or_resize() {
+fn adjusted_source_plans_keep_encoders_native_size_and_bound_visual_previews() {
     let raw = PathBuf::from("/nas/raw/IMG_0007.dng");
     let adjusted = PathBuf::from("/staging/IMG_0007.adjusted-source.jpg");
     let output = PathBuf::from("/staging/IMG_0007.heic");
@@ -449,25 +449,15 @@ fn adjusted_source_plans_encode_the_proven_jpeg_without_preview_extraction_or_re
                 .all(|command| { command.program != "exiftool" && command.program != "magick" }),
             "adjusted conversion must not extract or auto-orient an embedded preview"
         );
-        let all_commands = [
-            plan.conversion_commands.as_slice(),
-            &[
-                plan.metadata.clone(),
-                plan.render_raw_preview.clone(),
-                plan.render_heic_preview.clone(),
-                plan.verify_visual_match.clone(),
-            ],
-        ]
-        .concat();
         assert!(
-            all_commands
+            plan.conversion_commands
                 .iter()
                 .flat_map(|command| command.args.iter())
                 .all(|arg| {
                     let value = arg.to_string_lossy();
                     value != "-Z" && value != "-resize"
                 }),
-            "adjusted conversion preserves its proven dimensions"
+            "adjusted encoders must preserve the proven source dimensions"
         );
         assert!(
             args(&plan.conversion_commands[0])
@@ -481,6 +471,57 @@ fn adjusted_source_plans_encode_the_proven_jpeg_without_preview_extraction_or_re
                 .any(|arg| arg == adjusted.to_string_lossy().as_ref()),
             "the visual reference must be the adjusted JPEG"
         );
+        match encoder {
+            "sips" => {
+                assert_eq!(
+                    args(&plan.render_raw_preview),
+                    vec![
+                        "-Z",
+                        "512",
+                        "-s",
+                        "format",
+                        "png",
+                        "/staging/IMG_0007.adjusted-source.jpg",
+                        "--out",
+                        "/staging/IMG_0007.raw-preview.png",
+                    ]
+                );
+                assert_eq!(
+                    args(&plan.render_heic_preview),
+                    vec![
+                        "-Z",
+                        "512",
+                        "-s",
+                        "format",
+                        "png",
+                        "/staging/IMG_0007.heic",
+                        "--out",
+                        "/staging/IMG_0007.heic-preview.png",
+                    ]
+                );
+            }
+            "heif-enc" => {
+                assert_eq!(
+                    args(&plan.render_raw_preview),
+                    vec![
+                        "/staging/IMG_0007.adjusted-source.jpg",
+                        "-resize",
+                        "512x512",
+                        "/staging/IMG_0007.raw-preview.png",
+                    ]
+                );
+                assert_eq!(
+                    args(&plan.render_heic_preview),
+                    vec![
+                        "/staging/IMG_0007.heic",
+                        "-resize",
+                        "512x512",
+                        "/staging/IMG_0007.heic-preview.png",
+                    ]
+                );
+            }
+            _ => unreachable!("only macOS and Linux adjusted planners are covered"),
+        }
         assert_eq!(
             args(&plan.metadata),
             vec![

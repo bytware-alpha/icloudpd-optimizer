@@ -204,9 +204,8 @@ pub fn plan_conversion_for_target_with_preview_tag_and_orientation(
 /// Builds a conversion plan that encodes an already-verified adjusted JPEG.
 ///
 /// The RAW is still the metadata authority, but never a pixel source on this
-/// path. The visual reference is rendered from the adjusted JPEG at its native
-/// dimensions so a later verifier compares the encoded image to the exact
-/// approved source.
+/// path. The encoder preserves the adjusted JPEG's native dimensions, while
+/// visual comparison uses bounded previews from the exact approved source.
 pub fn plan_adjusted_source_conversion_for_target(
     target: TargetPlatform,
     raw_path: impl AsRef<Path>,
@@ -294,6 +293,8 @@ fn macos_adjusted_source_conversion_plan(
     let render_raw_preview = CommandPlan::new(
         "sips",
         vec![
+            OsString::from("-Z"),
+            OsString::from("512"),
             OsString::from("-s"),
             OsString::from("format"),
             OsString::from("png"),
@@ -305,6 +306,8 @@ fn macos_adjusted_source_conversion_plan(
     let render_heic_preview = CommandPlan::new(
         "sips",
         vec![
+            OsString::from("-Z"),
+            OsString::from("512"),
             OsString::from("-s"),
             OsString::from("format"),
             OsString::from("png"),
@@ -339,12 +342,19 @@ fn linux_adjusted_source_conversion_plan(
         "magick",
         vec![
             input.adjusted_source_arg.clone(),
+            OsString::from("-resize"),
+            OsString::from("512x512"),
             input.raw_preview_arg.clone(),
         ],
     );
     let render_heic_preview = CommandPlan::new(
         "magick",
-        vec![input.output_arg.clone(), input.heic_preview_arg.clone()],
+        vec![
+            input.output_arg.clone(),
+            OsString::from("-resize"),
+            OsString::from("512x512"),
+            input.heic_preview_arg.clone(),
+        ],
     );
     Ok(adjusted_source_conversion_plan(
         encode,
