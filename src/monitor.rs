@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::env;
@@ -17,6 +19,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::adjusted_source::{
+    AdjustedSourceError, CloudKitAdjustedSourceResolveRequest, CloudKitAdjustedSourceResolver,
+    CloudKitAdjustedSourceTransport, adjusted_source_path_for_output,
+};
 use crate::conversion_execution::{
     ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversion,
 };
@@ -33,21 +39,21 @@ use crate::proof::{MIN_RAW_AGE_DAYS, NasRawProof, ProofError};
 use crate::reconciliation::{
     OriginalAssetResolutionBatch, OriginalAssetResolutionBatchSummary, OriginalAssetResolutionError,
 };
-use crate::state_store::{AssetStateStore, AssetStateStoreError};
+use crate::state_store::{AssetRecordExactCasUpdate, AssetStateStore, AssetStateStoreError};
 use crate::upload::{
     CLOUDKIT_RECORDS_MODIFY_MAX_OPERATIONS, CloudKitDatabaseScope, CloudKitDeleteBatchRequest,
     CloudKitDeleteBatchSendError, CloudKitDeleteClient, CloudKitDeleteOutcome,
     CloudKitDeleteSession, CloudKitDeleteTransport, CloudKitLibraryDestination,
     CloudKitOriginalAssetBatchResolveOutcome, CloudKitOriginalAssetBatchResolveRequest,
-    CloudKitOriginalAssetResolveTarget, ReqwestCloudKitDeleteTransport, UploadError, UploadTimings,
-    load_cloudkit_delete_session,
+    CloudKitOriginalAssetResolveTarget, ReqwestCloudKitDeleteTransport,
+    ReqwestCloudKitReadTransport, UploadError, UploadTimings, load_cloudkit_delete_session,
 };
 use crate::workflow::{
     ConversionResultProof, DeleteReconciliation, HeicVerificationProof, IcloudpdLocalMirrorProof,
     OriginalAssetProof, PrevalidatedDelete, SourceAgeProof, UploadProof, WorkflowError,
     approve_delete, icloudpd_local_mirror_ready_proofs, mark_delete_eligible,
     prepare_delete_reconciliation, prevalidate_approved_original_delete, prove_and_record_nas,
-    record_heic_verification, record_icloudpd_local_mirror_proof,
+    record_adjusted_source_proof, record_heic_verification, record_icloudpd_local_mirror_proof,
     record_prevalidated_delete_execution, record_reconciled_delete_execution,
     record_source_age_proof, record_stage_failure, record_stage_failure_with_kind,
     record_upload_proof, upload_ready_heic_proof,
@@ -57,6 +63,10 @@ static MONITOR_FAILURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static PENDING_MONITOR_FAILURE_CORRELATION: RefCell<Option<MonitorFailureCorrelation>> =
         const { RefCell::new(None) };
+}
+#[cfg(test)]
+thread_local! {
+    static ADJUSTED_SOURCE_RESOLUTION_FAIL_BEFORE_CAS: Cell<bool> = const { Cell::new(false) };
 }
 
 const MONITOR_CONFIG_SCHEMA_VERSION: u64 = 1;
@@ -595,6 +605,8 @@ pub struct MonitorScanSummary {
     pub conversions_completed: u64,
     pub heics_verified: u64,
     pub originals_resolved: u64,
+    pub adjusted_sources_resolved: u64,
+    pub adjusted_source_resolution_failures: u64,
     pub uploads_attempted: u64,
     pub uploads_completed: u64,
     pub mirrors_recorded: u64,
@@ -1812,6 +1824,18 @@ fn run_rolling_lifecycle_worker_pool(
 ) -> Result<(), MonitorError> {
     let worker_asset_ids = dedupe_worker_asset_ids(worker_asset_ids);
     let worker_count = rolling_lifecycle_worker_count(config, worker_asset_ids.len());
+    let requires_adjusted_source_resolution = worker_asset_ids.iter().any(|asset_id| {
+        manifest.records().get(asset_id).is_some_and(|record| {
+            rolling_lifecycle_next_worker_step(record, config, true)
+                == Some(RollingAssetStep::ResolveAdjustedSource)
+        })
+    });
+    let base_read_session = if requires_adjusted_source_resolution {
+        let read_session_path = required_path(&config.delete_session_path, "delete_session_path")?;
+        Some(Arc::new(load_cloudkit_delete_session(read_session_path)?))
+    } else {
+        None
+    };
     let available_parallelism = thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(1);
@@ -1853,6 +1877,7 @@ fn run_rolling_lifecycle_worker_pool(
         let shared_deferred_worker_asset_ids = Arc::clone(&shared_deferred_worker_asset_ids);
         let stage_permits = Arc::clone(&stage_permits);
         let state_store = Arc::clone(state_store);
+        let base_read_session = base_read_session.as_ref().map(Arc::clone);
         let worker_id = worker_index + 1;
         handles.push(thread::spawn(move || {
             run_rolling_lifecycle_worker(
@@ -1865,6 +1890,7 @@ fn run_rolling_lifecycle_worker_pool(
                     deferred_worker_asset_ids: shared_deferred_worker_asset_ids,
                     stage_permits,
                     state_store,
+                    base_read_session,
                 },
             )
         }));
@@ -1906,6 +1932,8 @@ fn run_rolling_lifecycle_worker_pool(
         summary.started_unix_seconds,
         json!({
             "worker_slots": worker_count,
+            "adjusted_sources_resolved": summary.adjusted_sources_resolved,
+            "adjusted_source_resolution_failures": summary.adjusted_source_resolution_failures,
             "conversions_attempted": summary.conversions_attempted,
             "conversions_completed": summary.conversions_completed,
             "heics_verified": summary.heics_verified,
@@ -1971,6 +1999,8 @@ impl RollingAssetStepOutcome {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RollingAssetLifecycleDelta {
+    adjusted_sources_resolved: u64,
+    adjusted_source_resolution_failures: u64,
     conversions_completed: u64,
     heics_verified: u64,
     uploads_completed: u64,
@@ -1982,6 +2012,7 @@ impl RollingAssetLifecycleDelta {
     fn record(&mut self, step: RollingAssetStep, outcome: &RollingAssetStepOutcome) {
         if outcome.completed {
             match step {
+                RollingAssetStep::ResolveAdjustedSource => self.adjusted_sources_resolved = 1,
                 RollingAssetStep::ConvertHeic => self.conversions_completed = 1,
                 RollingAssetStep::VerifyConvertedHeics => self.heics_verified = 1,
                 RollingAssetStep::UploadVerifiedHeics => self.uploads_completed = 1,
@@ -1990,12 +2021,16 @@ impl RollingAssetLifecycleDelta {
         }
         if outcome.failed {
             self.failures = 1;
+            if step == RollingAssetStep::ResolveAdjustedSource {
+                self.adjusted_source_resolution_failures = 1;
+            }
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RollingAssetStep {
+    ResolveAdjustedSource,
     ConvertHeic,
     VerifyConvertedHeics,
     UploadVerifiedHeics,
@@ -2005,6 +2040,7 @@ enum RollingAssetStep {
 impl RollingAssetStep {
     fn name(self) -> &'static str {
         match self {
+            Self::ResolveAdjustedSource => "adjusted_source_resolve",
             Self::ConvertHeic => "convert_heic",
             Self::VerifyConvertedHeics => "verify_converted_heics",
             Self::UploadVerifiedHeics => "upload_verified_heics",
@@ -2028,6 +2064,7 @@ fn rolling_lifecycle_worker_stage_sequence_from(
     _auto_delete: bool,
 ) -> Vec<RollingAssetStep> {
     let full_sequence = [
+        RollingAssetStep::ResolveAdjustedSource,
         RollingAssetStep::ConvertHeic,
         RollingAssetStep::VerifyConvertedHeics,
         RollingAssetStep::UploadVerifiedHeics,
@@ -2092,6 +2129,7 @@ enum RollingStagePermitPolicy {
 
 fn rolling_asset_step_permit_policy(step: RollingAssetStep) -> RollingStagePermitPolicy {
     match step {
+        RollingAssetStep::ResolveAdjustedSource => RollingStagePermitPolicy::None,
         RollingAssetStep::ConvertHeic => RollingStagePermitPolicy::CpuAndConvert,
         RollingAssetStep::VerifyConvertedHeics => RollingStagePermitPolicy::Cpu,
         RollingAssetStep::UploadVerifiedHeics => RollingStagePermitPolicy::None,
@@ -2374,6 +2412,13 @@ fn rolling_lifecycle_next_worker_step(
     conversion_capacity_available: bool,
 ) -> Option<RollingAssetStep> {
     match record.state {
+        State::Failed
+            if config.full_lifecycle
+                && config.rolling_lifecycle
+                && adjusted_source_required_proof(record).is_ok() =>
+        {
+            Some(RollingAssetStep::ResolveAdjustedSource)
+        }
         State::NasVerified
             if conversion_capacity_available
                 && (!config.full_lifecycle || record.proofs.contains_key("original_asset")) =>
@@ -2407,6 +2452,7 @@ struct RollingLifecycleWorkerContext {
     deferred_worker_asset_ids: Arc<Mutex<BTreeSet<String>>>,
     stage_permits: Arc<RollingStagePermits>,
     state_store: Arc<AssetStateStore>,
+    base_read_session: Option<Arc<CloudKitDeleteSession>>,
 }
 
 fn run_rolling_lifecycle_worker(
@@ -2421,7 +2467,12 @@ fn run_rolling_lifecycle_worker(
         deferred_worker_asset_ids,
         stage_permits,
         state_store,
+        base_read_session,
     } = context;
+    let mut adjusted_source_resolver = base_read_session
+        .is_some()
+        .then(|| ReqwestCloudKitReadTransport::new().map(CloudKitAdjustedSourceResolver::new))
+        .transpose()?;
     loop {
         let asset_id = {
             let mut queue = lock_shared(&queue, "rolling lifecycle queue")?;
@@ -2443,17 +2494,21 @@ fn run_rolling_lifecycle_worker(
                 "state_before": state_before,
             }),
         );
-        let delta = run_rolling_asset_lifecycle(
-            &config,
-            worker_id,
-            &asset_id,
-            &manifest,
-            &summary,
-            &stage_permits,
-            &state_store,
-        )?;
+        let delta = {
+            let mut execution = RollingAssetExecutionContext {
+                config: &config,
+                state_store: &state_store,
+                worker_id,
+                manifest: &manifest,
+                summary: &summary,
+                base_read_session: base_read_session.as_deref(),
+                adjusted_source_resolver: adjusted_source_resolver.as_mut(),
+            };
+            run_rolling_asset_lifecycle(&asset_id, &stage_permits, &mut execution)?
+        };
         let state_after = shared_asset_state_name(&manifest, &asset_id)?;
         let no_forward_movement = delta.conversions_completed == 0
+            && delta.adjusted_sources_resolved == 0
             && delta.heics_verified == 0
             && delta.uploads_completed == 0
             && delta.mirrors_recorded == 0;
@@ -2473,6 +2528,8 @@ fn run_rolling_lifecycle_worker(
                 "asset_id": asset_id,
                 "state_after": state_after,
                 "originals_resolved_delta": 0,
+                "adjusted_sources_resolved_delta": delta.adjusted_sources_resolved,
+                "adjusted_source_resolution_failures_delta": delta.adjusted_source_resolution_failures,
                 "conversions_completed_delta": delta.conversions_completed,
                 "heics_verified_delta": delta.heics_verified,
                 "uploads_completed_delta": delta.uploads_completed,
@@ -2487,34 +2544,40 @@ fn run_rolling_lifecycle_worker(
     Ok(())
 }
 
-fn run_rolling_asset_lifecycle(
-    config: &MonitorConfig,
+struct RollingAssetExecutionContext<'a, T: CloudKitAdjustedSourceTransport> {
+    config: &'a MonitorConfig,
+    state_store: &'a AssetStateStore,
     worker_id: usize,
+    manifest: &'a Arc<Mutex<Manifest>>,
+    summary: &'a Arc<Mutex<MonitorScanSummary>>,
+    base_read_session: Option<&'a CloudKitDeleteSession>,
+    adjusted_source_resolver: Option<&'a mut CloudKitAdjustedSourceResolver<T>>,
+}
+
+fn run_rolling_asset_lifecycle<T: CloudKitAdjustedSourceTransport>(
     asset_id: &str,
-    manifest: &Arc<Mutex<Manifest>>,
-    summary: &Arc<Mutex<MonitorScanSummary>>,
     stage_permits: &Arc<RollingStagePermits>,
-    state_store: &AssetStateStore,
+    execution: &mut RollingAssetExecutionContext<'_, T>,
 ) -> Result<RollingAssetLifecycleDelta, MonitorError> {
     let mut delta = RollingAssetLifecycleDelta::default();
     let steps = {
-        let snapshot = lock_shared(manifest, "rolling lifecycle manifest")?;
+        let snapshot = lock_shared(execution.manifest, "rolling lifecycle manifest")?;
         let record = snapshot.get(asset_id)?;
-        rolling_lifecycle_worker_stage_sequence(record, config)
+        rolling_lifecycle_worker_stage_sequence(record, execution.config)
     };
     for step in steps {
-        if rolling_asset_terminal_state(manifest, asset_id)? {
+        if rolling_asset_terminal_state(execution.manifest, asset_id)? {
             break;
         }
 
-        let scan_started = shared_scan_started(summary)?;
-        let state_before = shared_asset_state_name(manifest, asset_id)?;
+        let scan_started = shared_scan_started(execution.summary)?;
+        let state_before = shared_asset_state_name(execution.manifest, asset_id)?;
         if rolling_asset_step_uses_stage_permit(step) {
             log_monitor_event(
                 "rolling_lifecycle_worker_stage_waiting",
                 scan_started,
                 json!({
-                    "worker_id": worker_id,
+                    "worker_id": execution.worker_id,
                     "asset_id": asset_id,
                     "stage": step.name(),
                     "state_before": state_before,
@@ -2530,21 +2593,20 @@ fn run_rolling_asset_lifecycle(
             "rolling_lifecycle_worker_stage_started",
             scan_started,
             json!({
-                "worker_id": worker_id,
+                "worker_id": execution.worker_id,
                 "asset_id": asset_id,
                 "stage": step.name(),
                 "state_before": state_before,
             }),
         );
-        let outcome =
-            run_rolling_asset_step(config, state_store, asset_id, step, manifest, summary)?;
+        let outcome = run_rolling_asset_step(asset_id, step, execution)?;
         delta.record(step, &outcome);
-        let state_after = shared_asset_state_name(manifest, asset_id)?;
+        let state_after = shared_asset_state_name(execution.manifest, asset_id)?;
         log_monitor_event(
             "rolling_lifecycle_worker_stage_finished",
             scan_started,
             json!({
-                "worker_id": worker_id,
+                "worker_id": execution.worker_id,
                 "asset_id": asset_id,
                 "stage": step.name(),
                 "attempted": outcome.attempted,
@@ -2564,28 +2626,389 @@ fn rolling_asset_step_stops_lifecycle(outcome: &RollingAssetStepOutcome) -> bool
     !outcome.changed
 }
 
-fn run_rolling_asset_step(
-    config: &MonitorConfig,
-    state_store: &AssetStateStore,
+fn run_rolling_asset_step<T: CloudKitAdjustedSourceTransport>(
     asset_id: &str,
     step: RollingAssetStep,
-    manifest: &Arc<Mutex<Manifest>>,
-    summary: &Arc<Mutex<MonitorScanSummary>>,
+    execution: &mut RollingAssetExecutionContext<'_, T>,
 ) -> Result<RollingAssetStepOutcome, MonitorError> {
     match step {
-        RollingAssetStep::ConvertHeic => {
-            run_rolling_asset_conversion(config, state_store, asset_id, manifest, summary)
+        RollingAssetStep::ResolveAdjustedSource => {
+            let base_read_session =
+                execution
+                    .base_read_session
+                    .ok_or(MonitorError::InvalidConfig {
+                        message: "rolling adjusted-source worker is missing its read session"
+                            .to_string(),
+                    })?;
+            let adjusted_source_resolver =
+                execution
+                    .adjusted_source_resolver
+                    .take()
+                    .ok_or(MonitorError::InvalidConfig {
+                        message: "rolling adjusted-source worker is missing its read transport"
+                            .to_string(),
+                    })?;
+            let outcome = run_rolling_adjusted_source_resolution(
+                asset_id,
+                execution,
+                base_read_session,
+                adjusted_source_resolver,
+            );
+            execution.adjusted_source_resolver = Some(adjusted_source_resolver);
+            outcome
         }
-        RollingAssetStep::VerifyConvertedHeics => {
-            run_rolling_asset_verify(config, state_store, asset_id, manifest, summary)
+        RollingAssetStep::ConvertHeic => run_rolling_asset_conversion(
+            execution.config,
+            execution.state_store,
+            asset_id,
+            execution.manifest,
+            execution.summary,
+        ),
+        RollingAssetStep::VerifyConvertedHeics => run_rolling_asset_verify(
+            execution.config,
+            execution.state_store,
+            asset_id,
+            execution.manifest,
+            execution.summary,
+        ),
+        RollingAssetStep::UploadVerifiedHeics => run_rolling_asset_upload(
+            execution.config,
+            execution.state_store,
+            asset_id,
+            execution.manifest,
+            execution.summary,
+        ),
+        RollingAssetStep::RecordLocalMirrors => run_rolling_asset_local_mirror(
+            execution.config,
+            execution.state_store,
+            asset_id,
+            execution.manifest,
+            execution.summary,
+        ),
+    }
+}
+
+fn run_rolling_adjusted_source_resolution<T: CloudKitAdjustedSourceTransport>(
+    asset_id: &str,
+    execution: &mut RollingAssetExecutionContext<'_, T>,
+    base_read_session: &CloudKitDeleteSession,
+    resolver: &mut CloudKitAdjustedSourceResolver<T>,
+) -> Result<RollingAssetStepOutcome, MonitorError> {
+    if !execution.config.full_lifecycle || !execution.config.rolling_lifecycle {
+        return Ok(RollingAssetStepOutcome::skipped());
+    }
+
+    let (expected, marker, original, conversion_output_path, output_path) = {
+        let snapshot = lock_shared(execution.manifest, "rolling lifecycle manifest")?;
+        let expected = snapshot.get(asset_id)?.clone();
+        let marker = match adjusted_source_required_proof(&expected) {
+            Ok(marker) => marker,
+            Err(_) => return Ok(RollingAssetStepOutcome::skipped()),
+        };
+        let original = adjusted_source_recovery_original_proof(&expected).map_err(|_| {
+            MonitorError::InvalidConfig {
+                message: "adjusted-source marker passed validation without an original proof"
+                    .to_string(),
+            }
+        })?;
+        let output_path =
+            adjusted_source_output_path_for_marker(execution.config, asset_id, &marker)?;
+        let conversion_output_path = execution
+            .config
+            .heic_output_dir
+            .join(format!("{asset_id}.heic"));
+        (
+            expected,
+            marker,
+            original,
+            conversion_output_path,
+            output_path,
+        )
+    };
+
+    let mut session = base_read_session.clone();
+    session.database_scope = original.database_scope;
+    session.zone = CloudKitLibraryDestination {
+        database_scope: original.database_scope,
+        zone_name: original.zone_name.clone(),
+    };
+    let scan_started = shared_scan_started(execution.summary)?;
+    let started = Instant::now();
+    log_monitor_event(
+        "adjusted_source_resolve_started",
+        scan_started,
+        json!({
+            "worker_id": execution.worker_id,
+            "asset_id": asset_id,
+            "attempt": marker.attempt(),
+            "database_scope": original.database_scope.as_str(),
+            "zone_category": "original_asset_proof",
+        }),
+    );
+
+    let request = CloudKitAdjustedSourceResolveRequest {
+        asset_id: asset_id.to_string(),
+        original_asset: original,
+        output_path,
+    };
+    match resolver.resolve(&session, &request) {
+        Ok(proof) => {
+            if take_adjusted_source_resolution_fail_before_cas() {
+                return Err(MonitorError::CommandFailed {
+                    program: "icloudpd-optimizer",
+                    message: "injected adjusted-source post-download fault".to_string(),
+                });
+            }
+            let updated = stage_adjusted_source_resolution_success(
+                &expected,
+                asset_id,
+                &conversion_output_path,
+                proof,
+            )?;
+            match persist_rolling_adjusted_source_exact_cas(
+                execution.state_store,
+                execution.manifest,
+                &expected,
+                &updated,
+            )? {
+                Some(commit_elapsed) => {
+                    {
+                        let mut summary =
+                            lock_shared(execution.summary, "rolling lifecycle summary")?;
+                        summary.adjusted_sources_resolved =
+                            summary.adjusted_sources_resolved.saturating_add(1);
+                    }
+                    log_monitor_event(
+                        "asset_state_committed",
+                        scan_started,
+                        json!({
+                            "asset_id": asset_id,
+                            "proof_stage": "adjusted_source_resolve",
+                            "state": State::NasVerified.as_str(),
+                            "commit_wall_time_micros": commit_elapsed.as_micros() as u64,
+                        }),
+                    );
+                    log_adjusted_source_resolution_finished(
+                        scan_started,
+                        execution.worker_id,
+                        asset_id,
+                        marker.attempt(),
+                        session.database_scope,
+                        "completed",
+                        started.elapsed(),
+                    );
+                    Ok(RollingAssetStepOutcome::completed())
+                }
+                None => {
+                    log_adjusted_source_resolution_finished(
+                        scan_started,
+                        execution.worker_id,
+                        asset_id,
+                        marker.attempt(),
+                        session.database_scope,
+                        "cas_conflict",
+                        started.elapsed(),
+                    );
+                    Ok(RollingAssetStepOutcome::attempted(false))
+                }
+            }
         }
-        RollingAssetStep::UploadVerifiedHeics => {
-            run_rolling_asset_upload(config, state_store, asset_id, manifest, summary)
-        }
-        RollingAssetStep::RecordLocalMirrors => {
-            run_rolling_asset_local_mirror(config, state_store, asset_id, manifest, summary)
+        Err(error) => {
+            let updated = stage_adjusted_source_resolution_failure(&expected, asset_id, &error)?;
+            match persist_rolling_adjusted_source_exact_cas(
+                execution.state_store,
+                execution.manifest,
+                &expected,
+                &updated,
+            )? {
+                Some(commit_elapsed) => {
+                    {
+                        let mut summary =
+                            lock_shared(execution.summary, "rolling lifecycle summary")?;
+                        summary.adjusted_source_resolution_failures = summary
+                            .adjusted_source_resolution_failures
+                            .saturating_add(1);
+                        summary.failures = summary.failures.saturating_add(1);
+                        summary.last_error = Some(format!(
+                            "adjusted source resolution failed for {asset_id}: {}",
+                            error
+                        ));
+                    }
+                    log_monitor_event(
+                        "asset_state_committed",
+                        scan_started,
+                        json!({
+                            "asset_id": asset_id,
+                            "proof_stage": "adjusted_source_resolve_failure",
+                            "state": State::Failed.as_str(),
+                            "commit_wall_time_micros": commit_elapsed.as_micros() as u64,
+                        }),
+                    );
+                    log_adjusted_source_resolution_finished(
+                        scan_started,
+                        execution.worker_id,
+                        asset_id,
+                        marker.attempt(),
+                        session.database_scope,
+                        "failed",
+                        started.elapsed(),
+                    );
+                    Ok(RollingAssetStepOutcome::failed(true))
+                }
+                None => {
+                    log_adjusted_source_resolution_finished(
+                        scan_started,
+                        execution.worker_id,
+                        asset_id,
+                        marker.attempt(),
+                        session.database_scope,
+                        "cas_conflict",
+                        started.elapsed(),
+                    );
+                    Ok(RollingAssetStepOutcome::attempted(false))
+                }
+            }
         }
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn run_rolling_adjusted_source_resolution_with<T: CloudKitAdjustedSourceTransport>(
+    config: &MonitorConfig,
+    state_store: &AssetStateStore,
+    worker_id: usize,
+    asset_id: &str,
+    manifest: &Arc<Mutex<Manifest>>,
+    summary: &Arc<Mutex<MonitorScanSummary>>,
+    base_read_session: &CloudKitDeleteSession,
+    resolver: &mut CloudKitAdjustedSourceResolver<T>,
+) -> Result<RollingAssetStepOutcome, MonitorError> {
+    let mut execution = RollingAssetExecutionContext {
+        config,
+        state_store,
+        worker_id,
+        manifest,
+        summary,
+        base_read_session: Some(base_read_session),
+        adjusted_source_resolver: None,
+    };
+    run_rolling_adjusted_source_resolution(asset_id, &mut execution, base_read_session, resolver)
+}
+
+#[cfg(test)]
+fn fail_next_adjusted_source_resolution_before_cas() {
+    ADJUSTED_SOURCE_RESOLUTION_FAIL_BEFORE_CAS.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn take_adjusted_source_resolution_fail_before_cas() -> bool {
+    ADJUSTED_SOURCE_RESOLUTION_FAIL_BEFORE_CAS.with(|fail| fail.replace(false))
+}
+
+#[cfg(not(test))]
+fn take_adjusted_source_resolution_fail_before_cas() -> bool {
+    false
+}
+
+fn adjusted_source_output_path_for_marker(
+    config: &MonitorConfig,
+    asset_id: &str,
+    marker: &AdjustedSourceRequiredProof,
+) -> Result<PathBuf, MonitorError> {
+    let conversion_output = config.heic_output_dir.join(format!("{asset_id}.heic"));
+    let expected = adjusted_source_path_for_output(&conversion_output);
+    let marker_relative = marker.adjusted_source_relative_path();
+    let relative_is_safe = !marker_relative.as_os_str().is_empty()
+        && marker_relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    let marker_path = config.heic_output_dir.join(marker_relative);
+    if !relative_is_safe
+        || marker_path != expected
+        || !marker_path.starts_with(&config.heic_output_dir)
+        || marker_path.strip_prefix(&config.heic_output_dir).is_err()
+    {
+        return Err(MonitorError::InvalidConfig {
+            message: "adjusted-source marker output path escaped the HEIC output root".to_string(),
+        });
+    }
+    Ok(marker_path)
+}
+
+fn stage_adjusted_source_resolution_success(
+    expected: &AssetRecord,
+    asset_id: &str,
+    conversion_output_path: &Path,
+    proof: crate::adjusted_source::CloudKitAdjustedSourceProof,
+) -> Result<AssetRecord, MonitorError> {
+    let mut staged = Manifest::new();
+    staged.upsert(expected.clone());
+    staged.recover_failed_for_retry(asset_id, State::NasVerified)?;
+    record_adjusted_source_proof(&mut staged, asset_id, conversion_output_path, proof)?;
+    Ok(staged.get(asset_id)?.clone())
+}
+
+fn stage_adjusted_source_resolution_failure(
+    expected: &AssetRecord,
+    asset_id: &str,
+    error: &AdjustedSourceError,
+) -> Result<AssetRecord, MonitorError> {
+    let mut staged = Manifest::new();
+    staged.upsert(expected.clone());
+    record_stage_failure_with_kind(
+        &mut staged,
+        asset_id,
+        "adjusted_source_resolve",
+        &error.to_string(),
+        FailureKind::AdjustedSourceResolveFailed,
+    )?;
+    Ok(staged.get(asset_id)?.clone())
+}
+
+fn persist_rolling_adjusted_source_exact_cas(
+    state_store: &AssetStateStore,
+    manifest: &Arc<Mutex<Manifest>>,
+    expected: &AssetRecord,
+    updated: &AssetRecord,
+) -> Result<Option<Duration>, MonitorError> {
+    match state_store
+        .persist_records_exact_cas_atomic([AssetRecordExactCasUpdate { expected, updated }])
+    {
+        Ok(elapsed) => {
+            lock_shared(manifest, "rolling lifecycle manifest")?.upsert(updated.clone());
+            Ok(Some(elapsed))
+        }
+        Err(AssetStateStoreError::ExactCasMismatch { .. }) => {
+            let _ = state_store.load()?;
+            Ok(None)
+        }
+        Err(error) => Err(MonitorError::StateStore(error)),
+    }
+}
+
+fn log_adjusted_source_resolution_finished(
+    scan_started: u64,
+    worker_id: usize,
+    asset_id: &str,
+    attempt: u64,
+    database_scope: CloudKitDatabaseScope,
+    outcome: &'static str,
+    elapsed: Duration,
+) {
+    log_monitor_event(
+        "adjusted_source_resolve_finished",
+        scan_started,
+        json!({
+            "worker_id": worker_id,
+            "asset_id": asset_id,
+            "attempt": attempt,
+            "database_scope": database_scope.as_str(),
+            "zone_category": "original_asset_proof",
+            "outcome": outcome,
+            "wall_time_millis": elapsed.as_millis() as u64,
+        }),
+    );
 }
 
 fn run_rolling_asset_conversion(
@@ -3196,8 +3619,9 @@ fn rolling_asset_terminal_state(
     asset_id: &str,
 ) -> Result<bool, MonitorError> {
     let manifest = lock_shared(manifest, "rolling lifecycle manifest")?;
-    let state = manifest.get(asset_id)?.state;
-    Ok(state.is_terminal() || state == State::Failed)
+    let record = manifest.get(asset_id)?;
+    Ok(record.state.is_terminal()
+        || (record.state == State::Failed && adjusted_source_required_proof(record).is_err()))
 }
 
 fn remove_stale_monitor_conversion_artifacts(
@@ -3354,7 +3778,8 @@ fn rolling_lifecycle_made_forward_progress(
     before: &MonitorScanSummary,
     after: &MonitorScanSummary,
 ) -> bool {
-    after.originals_resolved > before.originals_resolved
+    after.adjusted_sources_resolved > before.adjusted_sources_resolved
+        || after.originals_resolved > before.originals_resolved
         || after.conversions_completed > before.conversions_completed
         || after.heics_verified > before.heics_verified
         || after.uploads_completed > before.uploads_completed
@@ -6905,12 +7330,18 @@ fn admit_scan_retry_policies(
         failed_retry_min_age_seconds,
         current_unix_seconds,
     )?;
-    let adjusted_source_required = admit_adjusted_source_required_assets_with_budget(
+    let mut adjusted_source_required = admit_adjusted_source_required_assets_with_budget(
         manifest,
         &mut lifecycle_budget,
         max_failed_retry_admissions_per_scan,
         current_unix_seconds,
     )?;
+    let terminalized_exhausted =
+        terminalize_exhausted_adjusted_source_required_assets(manifest, current_unix_seconds)?;
+    if terminalized_exhausted > 0 {
+        adjusted_source_required.manifest_changed = true;
+        lifecycle_budget.release(terminalized_exhausted);
+    }
     let original_asset_resolver = recover_original_asset_resolver_retries_with_budget(
         manifest,
         &mut lifecycle_budget,
@@ -6923,6 +7354,36 @@ fn admit_scan_retry_policies(
         adjusted_source_required,
         original_asset_resolver,
     })
+}
+
+fn terminalize_exhausted_adjusted_source_required_assets(
+    manifest: &mut Manifest,
+    applied_at_unix_seconds: u64,
+) -> Result<usize, ManifestError> {
+    let asset_ids = manifest
+        .records()
+        .values()
+        .filter(|record| record.state == State::Failed)
+        .filter_map(|record| {
+            let marker = record
+                .proofs
+                .get(ADJUSTED_SOURCE_REQUIRED_PROOF)
+                .and_then(|value| {
+                    serde_json::from_value::<AdjustedSourceRequiredProof>(value.clone()).ok()
+                })?;
+            (marker.attempt >= ADJUSTED_SOURCE_RESOLVE_MAX_ATTEMPTS
+                && validate_adjusted_source_required_retry(record, &marker).is_ok())
+            .then_some(record.asset_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for asset_id in &asset_ids {
+        terminalize_adjusted_source_required_exhaustion(
+            manifest,
+            asset_id,
+            applied_at_unix_seconds,
+        )?;
+    }
+    Ok(asset_ids.len())
 }
 
 /// Returns only adjusted-source queue categories and performs no filesystem,
@@ -7887,14 +8348,16 @@ fn is_lifecycle_candidate(record: &AssetRecord) -> bool {
 }
 
 fn is_lifecycle_continuation_candidate(record: &AssetRecord) -> bool {
-    matches!(
-        record.state,
-        State::Converted
-            | State::ConversionVerified
-            | State::UploadVerified
-            | State::DeleteEligible
-            | State::DeleteApproved
-    ) || (record.state == State::NasVerified && record.proofs.contains_key("original_asset"))
+    (record.state == State::Failed && adjusted_source_required_proof(record).is_ok())
+        || matches!(
+            record.state,
+            State::Converted
+                | State::ConversionVerified
+                | State::UploadVerified
+                | State::DeleteEligible
+                | State::DeleteApproved
+        )
+        || (record.state == State::NasVerified && record.proofs.contains_key("original_asset"))
 }
 
 fn lifecycle_continuation_asset_ids(manifest: &Manifest, limit: usize) -> Vec<String> {
@@ -7951,11 +8414,12 @@ fn lifecycle_continuation_priority(record: &AssetRecord) -> u8 {
         State::UploadVerified if record.proofs.contains_key("icloudpd_local_mirror") => 2,
         State::UploadVerified => 3,
         State::ConversionVerified if record.proofs.contains_key("original_asset") => 4,
-        State::NasVerified if record.proofs.contains_key("original_asset") => 5,
-        State::Converted if record.proofs.contains_key("original_asset") => 6,
-        State::ConversionVerified => 7,
-        State::Converted => 8,
-        _ => 9,
+        State::Failed if adjusted_source_required_proof(record).is_ok() => 5,
+        State::NasVerified if record.proofs.contains_key("original_asset") => 6,
+        State::Converted if record.proofs.contains_key("original_asset") => 7,
+        State::ConversionVerified => 8,
+        State::Converted => 9,
+        _ => 10,
     }
 }
 
@@ -9046,6 +9510,10 @@ pub enum MonitorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adjusted_source::{
+        AdjustedSourceError, CloudKitAdjustedSourceDownload, CloudKitAdjustedSourceResolver,
+        CloudKitAdjustedSourceTransport,
+    };
     use crate::upload::{
         CLOUDKIT_ORIGINAL_ASSET_RESOLVER_VERSION, CloudKitDatabaseScope,
         CloudKitOriginalAssetInventoryFingerprint, CloudKitOriginalAssetResolution,
@@ -9054,6 +9522,114 @@ mod tests {
     use filetime::{FileTime, set_file_mtime};
     use serde_json::Value;
     use serde_json::json;
+    use std::io::Write;
+    use url::Url;
+
+    struct TestAdjustedSourceTransport {
+        response: Value,
+        bytes: Vec<u8>,
+        destinations: Vec<CloudKitLibraryDestination>,
+        lookup_calls: usize,
+        download_calls: usize,
+    }
+
+    impl CloudKitAdjustedSourceTransport for TestAdjustedSourceTransport {
+        fn post_records_lookup(
+            &mut self,
+            session: &CloudKitDeleteSession,
+            _payload: Value,
+        ) -> Result<Value, AdjustedSourceError> {
+            self.lookup_calls = self.lookup_calls.saturating_add(1);
+            self.destinations.push(session.zone.clone());
+            Ok(self.response.clone())
+        }
+
+        fn download_resource_to_create_new(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _download_url: &Url,
+            _expected_size_bytes: u64,
+            temp_file: &mut File,
+        ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
+            self.download_calls = self.download_calls.saturating_add(1);
+            temp_file
+                .write_all(&self.bytes)
+                .expect("test adjusted-source transport should write JPEG bytes");
+            temp_file
+                .sync_all()
+                .expect("test adjusted-source transport should sync JPEG bytes");
+            Ok(CloudKitAdjustedSourceDownload {
+                size_bytes: self.bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&self.bytes)),
+            })
+        }
+    }
+
+    struct FailingAdjustedSourceTransport {
+        lookup_calls: usize,
+    }
+
+    impl CloudKitAdjustedSourceTransport for FailingAdjustedSourceTransport {
+        fn post_records_lookup(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _payload: Value,
+        ) -> Result<Value, AdjustedSourceError> {
+            self.lookup_calls = self.lookup_calls.saturating_add(1);
+            Err(AdjustedSourceError::LookupTransport)
+        }
+
+        fn download_resource_to_create_new(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _download_url: &Url,
+            _expected_size_bytes: u64,
+            _temp_file: &mut File,
+        ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
+            unreachable!("lookup failure must prevent a resource download")
+        }
+    }
+
+    struct RacingAdjustedSourceTransport<'a> {
+        response: Value,
+        bytes: Vec<u8>,
+        state_store: &'a AssetStateStore,
+        newer_record: AssetRecord,
+        raced: bool,
+    }
+
+    impl CloudKitAdjustedSourceTransport for RacingAdjustedSourceTransport<'_> {
+        fn post_records_lookup(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _payload: Value,
+        ) -> Result<Value, AdjustedSourceError> {
+            Ok(self.response.clone())
+        }
+
+        fn download_resource_to_create_new(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _download_url: &Url,
+            _expected_size_bytes: u64,
+            temp_file: &mut File,
+        ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
+            temp_file
+                .write_all(&self.bytes)
+                .expect("racing transport should write JPEG bytes");
+            temp_file
+                .sync_all()
+                .expect("racing transport should sync JPEG bytes");
+            self.state_store
+                .persist_record(&self.newer_record)
+                .expect("racing writer should publish newer durable state");
+            self.raced = true;
+            Ok(CloudKitAdjustedSourceDownload {
+                size_bytes: self.bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&self.bytes)),
+            })
+        }
+    }
 
     #[cfg(unix)]
     const FAKE_NATIVE_VISUAL_VERIFIER_TIMEOUT_SECONDS: u64 = 5;
@@ -10369,6 +10945,657 @@ esac
         assert!(
             rolling_lifecycle_worker_stage_sequence(&needs_resolver, &config).is_empty(),
             "converted HEIC without original_asset proof should wait for resolver feed"
+        );
+    }
+
+    #[test]
+    fn rolling_lifecycle_valid_marked_failed_record_starts_with_adjusted_source_resolution() {
+        let mut config = MonitorConfig::new("/download", "/manifest.json", "/heic");
+        config.full_lifecycle = true;
+        config.rolling_lifecycle = true;
+        config.max_lifecycle_per_scan = 1;
+
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "needs-adjusted-source",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("valid adjusted-source marker should reserve lifecycle capacity");
+
+        let record = manifest
+            .get("needs-adjusted-source")
+            .expect("marked record");
+        assert_eq!(
+            active_lifecycle_asset_ids_for_config(&config, &manifest),
+            vec!["needs-adjusted-source"]
+        );
+        assert_eq!(
+            rolling_lifecycle_worker_stage_sequence(record, &config),
+            vec![
+                RollingAssetStep::ResolveAdjustedSource,
+                RollingAssetStep::ConvertHeic,
+                RollingAssetStep::VerifyConvertedHeics,
+                RollingAssetStep::UploadVerifiedHeics,
+                RollingAssetStep::RecordLocalMirrors,
+            ]
+        );
+    }
+
+    #[test]
+    fn rolling_adjusted_source_success_exact_cas_recovers_and_binds_private_or_shared_source() {
+        for (database_scope, zone_name) in [
+            (CloudKitDatabaseScope::Private, "PrimarySync"),
+            (CloudKitDatabaseScope::Shared, "SharedSync"),
+        ] {
+            let tempdir = tempfile::tempdir().expect("tempdir should be created");
+            let mut config = MonitorConfig::new(
+                tempdir.path().join("download"),
+                tempdir.path().join("manifest.json"),
+                tempdir.path().join("heic"),
+            );
+            fs::create_dir_all(&config.heic_output_dir).expect("HEIC root should be created");
+            config.heic_output_dir =
+                fs::canonicalize(&config.heic_output_dir).expect("HEIC root should canonicalize");
+            config.full_lifecycle = true;
+            config.rolling_lifecycle = true;
+
+            let mut manifest = Manifest::new();
+            let mut record = policy_failed_record(
+                "needs-adjusted-source",
+                "conversion",
+                "RAW has no usable embedded preview",
+                Some(FailureKind::EmbeddedPreviewUnavailable),
+                "100.000000000Z",
+            );
+            record
+                .proofs
+                .get_mut("original_asset")
+                .expect("original proof")["database_scope"] = json!(database_scope);
+            record
+                .proofs
+                .get_mut("original_asset")
+                .expect("original proof")["zone_name"] = json!(zone_name);
+            manifest.upsert(record);
+            admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+                .expect("valid adjusted-source marker should be admitted");
+
+            let state_store = AssetStateStore::open_writer(
+                &config.manifest_path,
+                "test-writer",
+                Duration::from_secs(60),
+            )
+            .expect("state store should open");
+            state_store
+                .persist_manifest_records(&manifest)
+                .expect("initial marked record should persist");
+            let shared_manifest = Arc::new(Mutex::new(manifest));
+            let summary = Arc::new(Mutex::new(MonitorScanSummary {
+                started_unix_seconds: 1_000,
+                ..MonitorScanSummary::default()
+            }));
+            let jpeg = test_adjusted_source_jpeg();
+            let original = adjusted_source_recovery_original_proof(
+                shared_manifest
+                    .lock()
+                    .expect("shared manifest")
+                    .get("needs-adjusted-source")
+                    .expect("marked record"),
+            )
+            .expect("marker source proof should be valid");
+            let mut resolver = CloudKitAdjustedSourceResolver::new(TestAdjustedSourceTransport {
+                response: test_adjusted_source_lookup_response(&original, &jpeg),
+                bytes: jpeg.clone(),
+                destinations: Vec::new(),
+                lookup_calls: 0,
+                download_calls: 0,
+            });
+
+            let outcome = run_rolling_adjusted_source_resolution_with(
+                &config,
+                &state_store,
+                7,
+                "needs-adjusted-source",
+                &shared_manifest,
+                &summary,
+                &test_delete_session(),
+                &mut resolver,
+            )
+            .expect("exact adjusted-source resolution should persist");
+
+            assert_eq!(outcome, RollingAssetStepOutcome::completed());
+            assert_eq!(
+                summary
+                    .lock()
+                    .expect("rolling summary")
+                    .adjusted_sources_resolved,
+                1
+            );
+            let record = shared_manifest
+                .lock()
+                .expect("shared manifest")
+                .get("needs-adjusted-source")
+                .expect("recovered record")
+                .clone();
+            assert_eq!(record.state, State::NasVerified);
+            let adjusted = record
+                .proofs
+                .get("adjusted_source")
+                .expect("adjusted proof");
+            assert_eq!(
+                adjusted["localPath"],
+                json!(
+                    config
+                        .heic_output_dir
+                        .join("needs-adjusted-source.adjusted-source.jpg")
+                )
+            );
+            assert_eq!(adjusted["databaseScope"], json!(database_scope));
+            assert_eq!(adjusted["zoneName"], json!(zone_name));
+            assert_eq!(
+                rolling_lifecycle_worker_stage_sequence(&record, &config),
+                vec![
+                    RollingAssetStep::ConvertHeic,
+                    RollingAssetStep::VerifyConvertedHeics,
+                    RollingAssetStep::UploadVerifiedHeics,
+                    RollingAssetStep::RecordLocalMirrors,
+                ]
+            );
+            let transport = resolver.into_inner();
+            assert_eq!(transport.lookup_calls, 1);
+            assert_eq!(transport.download_calls, 1);
+            assert_eq!(
+                transport.destinations,
+                vec![CloudKitLibraryDestination {
+                    database_scope,
+                    zone_name: zone_name.to_string(),
+                }]
+            );
+            let persisted = state_store
+                .load()
+                .expect("persisted manifest")
+                .get("needs-adjusted-source")
+                .expect("persisted record")
+                .clone();
+            assert_eq!(persisted, record);
+            assert!(
+                !serde_json::to_string(&record)
+                    .expect("record should serialize")
+                    .contains("downloadURL")
+            );
+        }
+    }
+
+    #[test]
+    fn rolling_adjusted_source_failure_preserves_marker_and_does_not_repeat_after_cas() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        fs::create_dir_all(&config.heic_output_dir).expect("HEIC root should be created");
+        config.heic_output_dir =
+            fs::canonicalize(&config.heic_output_dir).expect("HEIC root should canonicalize");
+        config.full_lifecycle = true;
+        config.rolling_lifecycle = true;
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "fails-adjusted-source",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("valid adjusted-source marker should be admitted");
+        let marker = manifest
+            .get("fails-adjusted-source")
+            .expect("marked record")
+            .proofs[ADJUSTED_SOURCE_REQUIRED_PROOF]
+            .clone();
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+        state_store
+            .persist_manifest_records(&manifest)
+            .expect("initial marked record should persist");
+        let shared_manifest = Arc::new(Mutex::new(manifest));
+        let summary = Arc::new(Mutex::new(MonitorScanSummary {
+            started_unix_seconds: 1_000,
+            ..MonitorScanSummary::default()
+        }));
+        let mut resolver =
+            CloudKitAdjustedSourceResolver::new(FailingAdjustedSourceTransport { lookup_calls: 0 });
+
+        let first = run_rolling_adjusted_source_resolution_with(
+            &config,
+            &state_store,
+            7,
+            "fails-adjusted-source",
+            &shared_manifest,
+            &summary,
+            &test_delete_session(),
+            &mut resolver,
+        )
+        .expect("resolver failure should persist as a worker outcome");
+        assert_eq!(first, RollingAssetStepOutcome::failed(true));
+        assert_eq!(
+            summary
+                .lock()
+                .expect("rolling summary")
+                .adjusted_source_resolution_failures,
+            1
+        );
+        let record = shared_manifest
+            .lock()
+            .expect("shared manifest")
+            .get("fails-adjusted-source")
+            .expect("failed record")
+            .clone();
+        assert_eq!(record.state, State::Failed);
+        assert_eq!(record.proofs[ADJUSTED_SOURCE_REQUIRED_PROOF], marker);
+        assert_eq!(record.failures.len(), 2);
+        assert_eq!(record.failures[1].stage, "adjusted_source_resolve");
+        assert_eq!(
+            record.failures[1].kind,
+            Some(FailureKind::AdjustedSourceResolveFailed)
+        );
+
+        let second = run_rolling_adjusted_source_resolution_with(
+            &config,
+            &state_store,
+            7,
+            "fails-adjusted-source",
+            &shared_manifest,
+            &summary,
+            &test_delete_session(),
+            &mut resolver,
+        )
+        .expect("stale marker should be skipped without another failure");
+        assert_eq!(second, RollingAssetStepOutcome::skipped());
+        assert_eq!(resolver.into_inner().lookup_calls, 1);
+        assert_eq!(
+            shared_manifest
+                .lock()
+                .expect("shared manifest")
+                .get("fails-adjusted-source")
+                .expect("failed record")
+                .failures
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn rolling_adjusted_source_retry_waits_for_backoff_then_resumes_at_resolve() {
+        let mut config = MonitorConfig::new("/download", "/manifest.json", "/heic");
+        config.full_lifecycle = true;
+        config.rolling_lifecycle = true;
+        config.max_lifecycle_per_scan = 1;
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "retry-adjusted-source",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("first marker should be admitted");
+        policy_failed_again_at(
+            &mut manifest,
+            "retry-adjusted-source",
+            "adjusted_source_resolve",
+            "resolver failed",
+            FailureKind::AdjustedSourceResolveFailed,
+            "400.000000000Z",
+        );
+
+        assert!(
+            active_lifecycle_asset_ids_for_config(&config, &manifest).is_empty(),
+            "a resolver failure must wait for the bounded retry admission"
+        );
+        let admission = admit_adjusted_source_required_assets(&mut manifest, 1, 1, 699)
+            .expect("backoff evaluation should not mutate the marker");
+        assert_eq!(admission.backoff, 1);
+        assert!(active_lifecycle_asset_ids_for_config(&config, &manifest).is_empty());
+
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 700)
+            .expect("retry marker should be admitted after 300 seconds");
+        let record = manifest
+            .get("retry-adjusted-source")
+            .expect("retry marker should remain failed until resolution");
+        assert_eq!(
+            rolling_lifecycle_worker_stage_sequence(record, &config).first(),
+            Some(&RollingAssetStep::ResolveAdjustedSource)
+        );
+    }
+
+    #[test]
+    fn scan_retry_admission_terminalizes_exhausted_adjusted_source_lineage_before_rolling() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "exhausted-adjusted-source",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("first marker should be admitted");
+        for (failed_at, re_admitted_at) in [(400, 700), (1_000, 1_300)] {
+            policy_failed_again_at(
+                &mut manifest,
+                "exhausted-adjusted-source",
+                "adjusted_source_resolve",
+                "resolver failed",
+                FailureKind::AdjustedSourceResolveFailed,
+                &format!("{failed_at}.000000000Z"),
+            );
+            admit_adjusted_source_required_assets(&mut manifest, 1, 1, re_admitted_at)
+                .expect("next bounded retry marker should be admitted");
+        }
+        policy_failed_again_at(
+            &mut manifest,
+            "exhausted-adjusted-source",
+            "adjusted_source_resolve",
+            "resolver failed",
+            FailureKind::AdjustedSourceResolveFailed,
+            "1600.000000000Z",
+        );
+
+        let admissions = admit_scan_retry_policies(&mut manifest, 1, 1, 300, 1, 300, 2_000)
+            .expect("exhausted resolver lineage should be terminalized before worker selection");
+        assert_eq!(admissions.adjusted_source_required.exhausted, 1);
+        assert_eq!(
+            manifest
+                .get("exhausted-adjusted-source")
+                .expect("exhausted record")
+                .state,
+            State::NeedsReview
+        );
+    }
+
+    #[test]
+    fn nonrolling_adjusted_source_resolution_never_calls_transport() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        fs::create_dir_all(&config.heic_output_dir).expect("HEIC root should be created");
+        config.full_lifecycle = true;
+        config.rolling_lifecycle = false;
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "nonrolling-adjusted-source",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("marker should be admitted without authorizing a non-rolling resolver");
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+        state_store
+            .persist_manifest_records(&manifest)
+            .expect("initial record should persist");
+        let shared_manifest = Arc::new(Mutex::new(manifest));
+        let summary = Arc::new(Mutex::new(MonitorScanSummary {
+            started_unix_seconds: 1_000,
+            ..MonitorScanSummary::default()
+        }));
+        let jpeg = test_adjusted_source_jpeg();
+        let original = adjusted_source_recovery_original_proof(
+            shared_manifest
+                .lock()
+                .expect("shared manifest")
+                .get("nonrolling-adjusted-source")
+                .expect("marked record"),
+        )
+        .expect("source proof should be valid");
+        let mut resolver = CloudKitAdjustedSourceResolver::new(TestAdjustedSourceTransport {
+            response: test_adjusted_source_lookup_response(&original, &jpeg),
+            bytes: jpeg,
+            destinations: Vec::new(),
+            lookup_calls: 0,
+            download_calls: 0,
+        });
+
+        assert_eq!(
+            run_rolling_adjusted_source_resolution_with(
+                &config,
+                &state_store,
+                7,
+                "nonrolling-adjusted-source",
+                &shared_manifest,
+                &summary,
+                &test_delete_session(),
+                &mut resolver,
+            )
+            .expect("non-rolling resolver should safely skip"),
+            RollingAssetStepOutcome::skipped()
+        );
+        let transport = resolver.into_inner();
+        assert_eq!(transport.lookup_calls, 0);
+        assert_eq!(transport.download_calls, 0);
+    }
+
+    #[test]
+    fn adjusted_source_crash_after_download_before_cas_reuses_installed_file_on_resume() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        fs::create_dir_all(&config.heic_output_dir).expect("HEIC root should be created");
+        config.heic_output_dir =
+            fs::canonicalize(&config.heic_output_dir).expect("HEIC root should canonicalize");
+        config.full_lifecycle = true;
+        config.rolling_lifecycle = true;
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "crash-adjusted-source",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("marker should be admitted");
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+        state_store
+            .persist_manifest_records(&manifest)
+            .expect("initial record should persist");
+        let shared_manifest = Arc::new(Mutex::new(manifest));
+        let summary = Arc::new(Mutex::new(MonitorScanSummary {
+            started_unix_seconds: 1_000,
+            ..MonitorScanSummary::default()
+        }));
+        let jpeg = test_adjusted_source_jpeg();
+        let original = adjusted_source_recovery_original_proof(
+            shared_manifest
+                .lock()
+                .expect("shared manifest")
+                .get("crash-adjusted-source")
+                .expect("marked record"),
+        )
+        .expect("source proof should be valid");
+        let mut first_resolver = CloudKitAdjustedSourceResolver::new(TestAdjustedSourceTransport {
+            response: test_adjusted_source_lookup_response(&original, &jpeg),
+            bytes: jpeg.clone(),
+            destinations: Vec::new(),
+            lookup_calls: 0,
+            download_calls: 0,
+        });
+
+        fail_next_adjusted_source_resolution_before_cas();
+        let error = run_rolling_adjusted_source_resolution_with(
+            &config,
+            &state_store,
+            7,
+            "crash-adjusted-source",
+            &shared_manifest,
+            &summary,
+            &test_delete_session(),
+            &mut first_resolver,
+        )
+        .expect_err("injected post-download fault should prevent the CAS");
+        assert!(matches!(error, MonitorError::CommandFailed { .. }));
+        assert_eq!(
+            shared_manifest
+                .lock()
+                .expect("shared manifest")
+                .get("crash-adjusted-source")
+                .expect("record")
+                .state,
+            State::Failed
+        );
+        let adjusted_path = config
+            .heic_output_dir
+            .join("crash-adjusted-source.adjusted-source.jpg");
+        assert_eq!(
+            fs::read(&adjusted_path).expect("downloaded JPEG should survive"),
+            jpeg
+        );
+
+        let mut resumed_resolver =
+            CloudKitAdjustedSourceResolver::new(TestAdjustedSourceTransport {
+                response: test_adjusted_source_lookup_response(&original, &jpeg),
+                bytes: jpeg,
+                destinations: Vec::new(),
+                lookup_calls: 0,
+                download_calls: 0,
+            });
+        assert_eq!(
+            run_rolling_adjusted_source_resolution_with(
+                &config,
+                &state_store,
+                7,
+                "crash-adjusted-source",
+                &shared_manifest,
+                &summary,
+                &test_delete_session(),
+                &mut resumed_resolver,
+            )
+            .expect("restart should bind the already-installed exact JPEG"),
+            RollingAssetStepOutcome::completed()
+        );
+        assert_eq!(
+            shared_manifest
+                .lock()
+                .expect("shared manifest")
+                .get("crash-adjusted-source")
+                .expect("record")
+                .state,
+            State::NasVerified
+        );
+    }
+
+    #[test]
+    fn adjusted_source_cas_conflict_never_overwrites_newer_durable_state() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        fs::create_dir_all(&config.heic_output_dir).expect("HEIC root should be created");
+        config.heic_output_dir =
+            fs::canonicalize(&config.heic_output_dir).expect("HEIC root should canonicalize");
+        config.full_lifecycle = true;
+        config.rolling_lifecycle = true;
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "cas-adjusted-source",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("marker should be admitted");
+        let newer_record = {
+            let mut record = manifest
+                .get("cas-adjusted-source")
+                .expect("marked record")
+                .clone();
+            record.state = State::ConversionVerified;
+            record.updated_at = "200.000000000Z".to_string();
+            record
+        };
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+        state_store
+            .persist_manifest_records(&manifest)
+            .expect("initial record should persist");
+        let shared_manifest = Arc::new(Mutex::new(manifest));
+        let summary = Arc::new(Mutex::new(MonitorScanSummary {
+            started_unix_seconds: 1_000,
+            ..MonitorScanSummary::default()
+        }));
+        let jpeg = test_adjusted_source_jpeg();
+        let original = adjusted_source_recovery_original_proof(
+            shared_manifest
+                .lock()
+                .expect("shared manifest")
+                .get("cas-adjusted-source")
+                .expect("marked record"),
+        )
+        .expect("source proof should be valid");
+        let mut resolver = CloudKitAdjustedSourceResolver::new(RacingAdjustedSourceTransport {
+            response: test_adjusted_source_lookup_response(&original, &jpeg),
+            bytes: jpeg,
+            state_store: &state_store,
+            newer_record: newer_record.clone(),
+            raced: false,
+        });
+
+        assert_eq!(
+            run_rolling_adjusted_source_resolution_with(
+                &config,
+                &state_store,
+                7,
+                "cas-adjusted-source",
+                &shared_manifest,
+                &summary,
+                &test_delete_session(),
+                &mut resolver,
+            )
+            .expect("CAS conflict should be an idempotent no-op"),
+            RollingAssetStepOutcome::attempted(false)
+        );
+        assert!(resolver.into_inner().raced);
+        assert_eq!(
+            state_store
+                .load()
+                .expect("durable manifest")
+                .get("cas-adjusted-source")
+                .expect("newer record"),
+            &newer_record
         );
     }
 
@@ -13013,6 +14240,46 @@ esac
         });
         record.updated_at = recorded_at.to_string();
         record
+    }
+
+    fn test_adjusted_source_jpeg() -> Vec<u8> {
+        use image::codecs::jpeg::JpegEncoder;
+        use image::{DynamicImage, Rgb, RgbImage};
+
+        let mut image = RgbImage::new(2, 2);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = Rgb([(x * 90) as u8, (y * 90) as u8, ((x + y) * 45) as u8]);
+        }
+        let mut bytes = Vec::new();
+        JpegEncoder::new_with_quality(&mut bytes, 100)
+            .encode_image(&DynamicImage::ImageRgb8(image))
+            .expect("test adjusted-source JPEG should encode");
+        bytes
+    }
+
+    fn test_adjusted_source_lookup_response(original: &OriginalAssetProof, jpeg: &[u8]) -> Value {
+        json!({
+            "records": [{
+                "recordName": original.record_name,
+                "recordType": "CPLAsset",
+                "recordChangeTag": original.record_change_tag,
+                "zoneID": {"zoneName": original.zone_name},
+                "fields": {
+                    "isDeleted": {"type": "INT64", "value": 0},
+                    "resJPEGFullRes": {"type": "ASSETID", "value": {
+                        "downloadURL": "https://example.icloud.com/adjusted.jpg",
+                        "size": jpeg.len(),
+                        "fileChecksum": "opaque-fingerprint",
+                        "referenceChecksum": "opaque-reference-checksum",
+                        "wrappingKey": "opaque-wrapping-key"
+                    }},
+                    "resJPEGFullWidth": {"type": "INT64", "value": 2},
+                    "resJPEGFullHeight": {"type": "INT64", "value": 2},
+                    "resJPEGFullFileType": {"type": "STRING", "value": "public.jpeg"},
+                    "resJPEGFullFingerprint": {"type": "STRING", "value": "opaque-fingerprint"}
+                }
+            }]
+        })
     }
 
     fn policy_failed_again(
