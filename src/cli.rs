@@ -1706,15 +1706,6 @@ impl FailedAssetsQuarantineEvidenceAsset {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FailedAssetsQuarantineEvidence {
-    failed_assets: u64,
-    with_upload_or_delete_side_effects: u64,
-    clean_of_recorded_remote_side_effects: u64,
-    side_effect_assets: Vec<FailedAssetsQuarantineEvidenceAsset>,
-}
-
 #[derive(Clone, Debug, Serialize)]
 struct FailedAssetsQuarantineCounts {
     failed_assets: u64,
@@ -1726,6 +1717,7 @@ struct FailedAssetsQuarantineCounts {
 #[derive(Debug)]
 struct VerifiedFailedAssetsQuarantineEvidence {
     evidence_sha256: String,
+    failed_asset_ids: BTreeSet<String>,
     side_effect_assets: BTreeMap<String, FailedAssetsQuarantineEvidenceAsset>,
     counts: FailedAssetsQuarantineCounts,
 }
@@ -1769,7 +1761,7 @@ fn monitor_failed_assets_quarantine<W: Write>(
                 "current state could not be loaded under the writer lease",
             )
         })?;
-        validate_failed_assets_quarantine_failed_cohort(&manifest, evidence.counts.failed_assets)?;
+        validate_failed_assets_quarantine_failed_cohort(&manifest, &evidence.failed_asset_ids)?;
         let target_set_sha256 =
             failed_assets_quarantine_target_set_sha256(&manifest, &evidence.side_effect_assets)?;
         validate_failed_assets_quarantine_target_set_match(
@@ -1803,7 +1795,7 @@ fn monitor_failed_assets_quarantine<W: Write>(
         let manifest = state_store.load().map_err(|_| {
             failed_assets_quarantine_gate("immutable state snapshot could not be loaded")
         })?;
-        validate_failed_assets_quarantine_failed_cohort(&manifest, evidence.counts.failed_assets)?;
+        validate_failed_assets_quarantine_failed_cohort(&manifest, &evidence.failed_asset_ids)?;
         let target_set_sha256 =
             failed_assets_quarantine_target_set_sha256(&manifest, &evidence.side_effect_assets)?;
         if let Some(expected_target_set_sha256) = expected_target_set_sha256 {
@@ -1851,31 +1843,50 @@ fn load_failed_assets_quarantine_evidence(
             "evidence SHA-256 did not match the expected fingerprint",
         ));
     }
-    let evidence: FailedAssetsQuarantineEvidence =
-        serde_json::from_slice(&bytes).map_err(|_| {
+    let evidence: Vec<FailedAssetsQuarantineEvidenceAsset> = serde_json::from_slice(&bytes)
+        .map_err(|_| {
             failed_assets_quarantine_gate("evidence JSON did not match the quarantine schema")
         })?;
     validate_failed_assets_quarantine_evidence(evidence, actual_evidence_sha256, args)
 }
 
 fn validate_failed_assets_quarantine_evidence(
-    evidence: FailedAssetsQuarantineEvidence,
+    evidence: Vec<FailedAssetsQuarantineEvidenceAsset>,
     evidence_sha256: String,
     args: &MonitorFailedAssetsQuarantineArgs,
 ) -> Result<VerifiedFailedAssetsQuarantineEvidence, CliError> {
-    let side_effect_assets = failed_assets_quarantine_asset_map(
-        evidence.side_effect_assets,
-        "side-effect-assets contains an empty or duplicate asset ID",
+    let failed_assets = failed_assets_quarantine_asset_map(
+        evidence,
+        "evidence contains an empty or duplicate asset ID",
     )?;
+    if failed_assets.is_empty() {
+        return Err(failed_assets_quarantine_gate(
+            "evidence failed-asset set must be nonempty",
+        ));
+    }
+    let side_effect_assets = failed_assets
+        .values()
+        .filter(|asset| asset.has_remote_side_effect())
+        .cloned()
+        .map(|asset| (asset.asset_id.clone(), asset))
+        .collect::<BTreeMap<_, _>>();
+    let failed_asset_count = u64::try_from(failed_assets.len()).map_err(|_| {
+        failed_assets_quarantine_gate("failed-asset count exceeded the supported range")
+    })?;
+    let side_effect_asset_count = u64::try_from(side_effect_assets.len()).map_err(|_| {
+        failed_assets_quarantine_gate("side-effect target count exceeded the supported range")
+    })?;
     let counts = FailedAssetsQuarantineCounts {
-        failed_assets: evidence.failed_assets,
-        with_upload_or_delete_side_effects: evidence.with_upload_or_delete_side_effects,
-        clean_of_recorded_remote_side_effects: evidence.clean_of_recorded_remote_side_effects,
-        side_effect_assets: u64::try_from(side_effect_assets.len()).map_err(|_| {
-            failed_assets_quarantine_gate("target count exceeded the supported range")
-        })?,
+        failed_assets: failed_asset_count,
+        with_upload_or_delete_side_effects: side_effect_asset_count,
+        clean_of_recorded_remote_side_effects: failed_asset_count
+            .checked_sub(side_effect_asset_count)
+            .ok_or_else(|| {
+                failed_assets_quarantine_gate("derived clean-asset count was invalid")
+            })?,
+        side_effect_assets: side_effect_asset_count,
     };
-    if counts.failed_assets == 0 || counts.side_effect_assets == 0 {
+    if counts.side_effect_assets == 0 {
         return Err(failed_assets_quarantine_gate(
             "evidence target set must be nonempty",
         ));
@@ -1885,37 +1896,14 @@ fn validate_failed_assets_quarantine_evidence(
             "failed-asset count did not match the expected value",
         ));
     }
-    if counts.with_upload_or_delete_side_effects != args.expected_side_effect_asset_count {
+    if counts.side_effect_assets != args.expected_side_effect_asset_count {
         return Err(failed_assets_quarantine_gate(
-            "audited side-effect count did not match the expected value",
-        ));
-    }
-    let partition_count = counts
-        .with_upload_or_delete_side_effects
-        .checked_add(counts.clean_of_recorded_remote_side_effects)
-        .ok_or_else(|| {
-            failed_assets_quarantine_gate("failed-asset subset counts exceeded the supported range")
-        })?;
-    if counts.failed_assets != partition_count {
-        return Err(failed_assets_quarantine_gate(
-            "failed-asset arithmetic did not match the side-effect and clean subsets",
-        ));
-    }
-    if counts.side_effect_assets != counts.with_upload_or_delete_side_effects {
-        return Err(failed_assets_quarantine_gate(
-            "side-effect target count did not match the audited side-effect total",
-        ));
-    }
-    if !side_effect_assets
-        .values()
-        .all(FailedAssetsQuarantineEvidenceAsset::has_remote_side_effect)
-    {
-        return Err(failed_assets_quarantine_gate(
-            "every side-effect target must have a positive remote-side-effect count",
+            "side-effect target count did not match the expected value",
         ));
     }
     Ok(VerifiedFailedAssetsQuarantineEvidence {
         evidence_sha256,
+        failed_asset_ids: failed_assets.into_keys().collect(),
         side_effect_assets,
         counts,
     })
@@ -1923,21 +1911,17 @@ fn validate_failed_assets_quarantine_evidence(
 
 fn validate_failed_assets_quarantine_failed_cohort(
     manifest: &Manifest,
-    expected_failed_asset_count: u64,
+    expected_failed_asset_ids: &BTreeSet<String>,
 ) -> Result<(), CliError> {
-    let current_failed_asset_count = u64::try_from(
-        manifest
-            .records()
-            .values()
-            .filter(|record| record.state == State::Failed)
-            .count(),
-    )
-    .map_err(|_| {
-        failed_assets_quarantine_gate("current Failed cohort exceeded the supported range")
-    })?;
-    if current_failed_asset_count != expected_failed_asset_count {
+    let current_failed_asset_ids = manifest
+        .records()
+        .iter()
+        .filter(|(_, record)| record.state == State::Failed)
+        .map(|(asset_id, _)| asset_id.clone())
+        .collect::<BTreeSet<_>>();
+    if &current_failed_asset_ids != expected_failed_asset_ids {
         return Err(failed_assets_quarantine_gate(
-            "current Failed cohort did not match the evidence failed-assets count",
+            "current Failed asset IDs did not exactly match the evidence asset IDs",
         ));
     }
     Ok(())
@@ -4369,6 +4353,7 @@ mod failed_assets_quarantine_tests {
         ]);
         let evidence = VerifiedFailedAssetsQuarantineEvidence {
             evidence_sha256: "a".repeat(64),
+            failed_asset_ids: BTreeSet::from(["asset-alpha".to_string(), "asset-beta".to_string()]),
             side_effect_assets: targets.clone(),
             counts: FailedAssetsQuarantineCounts {
                 failed_assets: 2,
