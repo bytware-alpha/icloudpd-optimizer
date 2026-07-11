@@ -7473,6 +7473,36 @@ mod tests {
             normalized_reference: RgbPreview,
             fail_normalized_render: bool,
         ) -> Self {
+            Self::new_with_failures(
+                direct_reference,
+                candidate,
+                normalized_reference,
+                fail_normalized_render,
+                false,
+            )
+        }
+
+        fn with_baseline_encode_failure(
+            direct_reference: RgbPreview,
+            candidate: RgbPreview,
+            normalized_reference: RgbPreview,
+        ) -> Self {
+            Self::new_with_failures(
+                direct_reference,
+                candidate,
+                normalized_reference,
+                false,
+                true,
+            )
+        }
+
+        fn new_with_failures(
+            direct_reference: RgbPreview,
+            candidate: RgbPreview,
+            normalized_reference: RgbPreview,
+            fail_normalized_render: bool,
+            fail_baseline_encode: bool,
+        ) -> Self {
             use std::os::unix::fs::PermissionsExt;
 
             let tempdir = tempfile::tempdir().expect("tempdir should be created");
@@ -7514,6 +7544,12 @@ case "$out" in
       *) exit 65 ;;
     esac
     printf '%s\n' encode >> '{}'
+    [ '{}' = "1" ] && {{
+      printf '%s\n' encode_partial_failure >> '{}'
+      printf 'partial' > "$out"
+      printf '%s\n' partial_baseline_written >> '{}'
+      exit 68
+    }}
     printf 'heic' > "$out"
     exit 0
     ;;
@@ -7535,6 +7571,9 @@ case "$source" in
   *) exit 67 ;;
 esac
 "#,
+                    command_log.display(),
+                    if fail_baseline_encode { "1" } else { "0" },
+                    command_log.display(),
                     command_log.display(),
                     command_log.display(),
                     candidate_png.display(),
@@ -13422,6 +13461,94 @@ esac
             }
         ));
         assert!(temporary_paths.iter().all(|path| !path.exists()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_visual_verification_cleans_up_partial_baseline_when_encode_fails() {
+        let candidate = RgbPreview {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 0, 0, 255, 255, 255],
+        };
+        let fake = FakeNativeVisualVerifier::with_baseline_encode_failure(
+            RgbPreview {
+                width: 2,
+                height: 1,
+                pixels: vec![0, 0, 0, 0, 0, 0],
+            },
+            candidate.clone(),
+            candidate,
+        );
+        let baseline = codec_normalized_reference_path(&fake.candidate);
+        let temporary_paths = [
+            verification_preview_path(&fake.candidate, "heic"),
+            verification_preview_path(&fake.candidate, "raw"),
+            baseline.clone(),
+            verification_preview_path(&baseline, "heic"),
+            verification_preview_path(&fake.candidate, "codec-normalized-candidate"),
+        ];
+
+        let error = visual_metrics_for_conversion_with_sips(
+            &fake.reference,
+            &fake.candidate,
+            1,
+            &fake.program,
+        )
+        .expect_err("partial baseline encode failure must fail verification");
+
+        assert!(matches!(
+            error,
+            MonitorError::CommandFailed {
+                program: "sips",
+                message,
+            } if message.contains("68")
+        ));
+        let commands = fake.command_log();
+        assert!(
+            commands
+                .iter()
+                .any(|command| command == "encode_partial_failure")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command == "partial_baseline_written")
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command == "normalized_reference")
+        );
+        assert!(temporary_paths.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn visual_verification_event_fields_include_basis_and_direct_effective_metrics() {
+        let mut fields = json!({"asset_id": "asset-1"});
+
+        append_visual_verification_event_fields(
+            &mut fields,
+            VisualMetrics {
+                candidate_stdev: 0.25,
+                reference_error: Some(VisualErrorMetrics {
+                    rmse: 0.0024,
+                    mae: 0.0012,
+                }),
+                direct_reference_error: Some(VisualErrorMetrics {
+                    rmse: 0.045,
+                    mae: 0.024,
+                }),
+                match_basis: VisualMatchBasis::CodecNormalized,
+            },
+        );
+
+        assert_eq!(fields["asset_id"], json!("asset-1"));
+        assert_eq!(fields["visual_match_basis"], json!("codec_normalized"));
+        assert_eq!(fields["visual_rmse_ppm"], json!(2_400));
+        assert_eq!(fields["visual_mae_ppm"], json!(1_200));
+        assert_eq!(fields["direct_visual_rmse_ppm"], json!(45_000));
+        assert_eq!(fields["direct_visual_mae_ppm"], json!(24_000));
     }
 
     #[test]
