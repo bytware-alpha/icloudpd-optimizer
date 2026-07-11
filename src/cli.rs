@@ -65,7 +65,7 @@ use crate::workflow::{
 const DAY_SECONDS: u64 = 24 * 60 * 60;
 const ORIGINAL_ASSETS_TARGET_SET_FINGERPRINT_VERSION: &[u8] = b"original-assets-target-set-v1";
 const FAILED_ASSETS_QUARANTINE_TARGET_SET_FINGERPRINT_VERSION: &[u8] =
-    b"failed-assets-quarantine-target-set-v1";
+    b"failed-assets-quarantine-target-set-v2";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -386,7 +386,11 @@ struct MonitorFailedAssetsQuarantineArgs {
     expected_failed_asset_count: u64,
     #[arg(long, value_name = "N")]
     expected_side_effect_asset_count: u64,
-    #[arg(long, value_name = "HEX")]
+    #[arg(
+        long,
+        value_name = "HEX",
+        help = "SHA-256 of the exact side-effect target and Failed cohort snapshot"
+    )]
     expected_target_set_sha256: Option<String>,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     apply: bool,
@@ -1975,33 +1979,73 @@ fn failed_assets_quarantine_target_set_sha256(
     manifest: &Manifest,
     targets: &BTreeMap<String, FailedAssetsQuarantineEvidenceAsset>,
 ) -> Result<String, CliError> {
+    let target_asset_ids = targets.keys().cloned().collect::<Vec<_>>();
+    let failed_asset_ids = manifest
+        .records()
+        .iter()
+        .filter(|(_, record)| record.state == State::Failed)
+        .map(|(asset_id, _)| asset_id.clone())
+        .collect::<Vec<_>>();
+    let mut record_digests = BTreeMap::<String, [u8; 32]>::new();
+    for asset_id in target_asset_ids.iter().chain(failed_asset_ids.iter()) {
+        if record_digests.contains_key(asset_id) {
+            continue;
+        }
+        let record = manifest.records().get(asset_id).ok_or_else(|| {
+            failed_assets_quarantine_gate("a current record was missing from the fingerprint")
+        })?;
+        let exact_record = serde_json::to_vec(record).map_err(|_| {
+            failed_assets_quarantine_gate("a target record could not be fingerprinted")
+        })?;
+        record_digests.insert(asset_id.clone(), Sha256::digest(exact_record).into());
+    }
     let mut encoded = Vec::new();
     failed_assets_quarantine_target_set_append_field(
         &mut encoded,
         FAILED_ASSETS_QUARANTINE_TARGET_SET_FINGERPRINT_VERSION,
     );
-    failed_assets_quarantine_target_set_append_field(
+    failed_assets_quarantine_target_set_append_record_digest_section(
         &mut encoded,
-        &u64::try_from(targets.len())
+        b"side-effect-targets",
+        &target_asset_ids,
+        &record_digests,
+    )?;
+    failed_assets_quarantine_target_set_append_record_digest_section(
+        &mut encoded,
+        b"failed-cohort",
+        &failed_asset_ids,
+        &record_digests,
+    )?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn failed_assets_quarantine_target_set_append_record_digest_section(
+    encoded: &mut Vec<u8>,
+    section_name: &[u8],
+    asset_ids: &[String],
+    record_digests: &BTreeMap<String, [u8; 32]>,
+) -> Result<(), CliError> {
+    failed_assets_quarantine_target_set_append_field(encoded, section_name);
+    failed_assets_quarantine_target_set_append_field(
+        encoded,
+        &u64::try_from(asset_ids.len())
             .map_err(|_| {
-                failed_assets_quarantine_gate("target count exceeded the supported range")
+                failed_assets_quarantine_gate(
+                    "fingerprint record count exceeded the supported range",
+                )
             })?
             .to_be_bytes(),
     );
-    for asset_id in targets.keys() {
-        let record = manifest.records().get(asset_id).ok_or_else(|| {
-            failed_assets_quarantine_gate("a target was missing from the current state")
+    for asset_id in asset_ids {
+        failed_assets_quarantine_target_set_append_field(encoded, asset_id.as_bytes());
+        let digest = record_digests.get(asset_id).ok_or_else(|| {
+            failed_assets_quarantine_gate(
+                "a current record digest was missing from the fingerprint",
+            )
         })?;
-        let exact_record = serde_json::to_vec(record).map_err(|_| {
-            failed_assets_quarantine_gate("a target record could not be fingerprinted")
-        })?;
-        failed_assets_quarantine_target_set_append_field(&mut encoded, asset_id.as_bytes());
-        failed_assets_quarantine_target_set_append_field(
-            &mut encoded,
-            Sha256::digest(exact_record).as_slice(),
-        );
+        failed_assets_quarantine_target_set_append_field(encoded, digest);
     }
-    Ok(format!("{:x}", Sha256::digest(encoded)))
+    Ok(())
 }
 
 fn failed_assets_quarantine_target_set_append_field(encoded: &mut Vec<u8>, value: &[u8]) {

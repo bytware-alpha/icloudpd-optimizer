@@ -2481,6 +2481,7 @@ fn monitor_failed_assets_quarantine_requires_explicit_safety_arguments() {
             "--expected-side-effect-asset-count",
         ))
         .stdout(predicate::str::contains("--expected-target-set-sha256"))
+        .stdout(predicate::str::contains("Failed cohort snapshot"))
         .stdout(predicate::str::contains("--apply"));
 }
 
@@ -2686,6 +2687,188 @@ fn monitor_failed_assets_quarantine_target_set_changes_with_exact_record_bytes()
     assert_ne!(
         first_report["target_set_sha256"],
         second_report["target_set_sha256"]
+    );
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_rejects_same_size_failed_cohort_swap_atomically() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[
+            ("asset-alpha", State::Failed),
+            ("asset-beta", State::Failed),
+            ("asset-gamma", State::Converted),
+        ],
+        quarantine_evidence(2, 1, 1, vec![quarantine_evidence_entry("asset-alpha", 1)]),
+    );
+    let first_report = failed_assets_quarantine_dry_run(&fixture, "2", "1");
+    let first_target_set_sha256 = first_report["target_set_sha256"]
+        .as_str()
+        .expect("target hash should be a string")
+        .to_string();
+    let state_store = AssetStateStore::open_writer(
+        &fixture.manifest_path,
+        "failed-cohort-swap-test",
+        Duration::from_secs(1),
+    )
+    .expect("state store should open");
+    let snapshot = state_store.load().expect("state should load");
+    let mut departed = snapshot
+        .get("asset-beta")
+        .expect("departing asset should exist")
+        .clone();
+    departed.state = State::Converted;
+    departed.updated_at = "9999999999.000000000Z".to_string();
+    let mut arrived = snapshot
+        .get("asset-gamma")
+        .expect("arriving asset should exist")
+        .clone();
+    arrived.state = State::Failed;
+    arrived.updated_at = "9999999999.000000001Z".to_string();
+    state_store
+        .persist_records_atomic([&departed, &arrived])
+        .expect("swapped cohort should persist");
+    drop(state_store);
+
+    let second_report = failed_assets_quarantine_dry_run(&fixture, "2", "1");
+    let manifest_before_apply = fs::read(&fixture.manifest_path).expect("manifest should read");
+    let mut apply_args = failed_assets_quarantine_args_owned(&fixture, "2", "1");
+    apply_args.extend([
+        "--expected-target-set-sha256".to_string(),
+        first_target_set_sha256,
+        "--apply".to_string(),
+    ]);
+    binary()
+        .args(apply_args)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("target set did not match"));
+
+    assert_ne!(
+        first_report["target_set_sha256"],
+        second_report["target_set_sha256"]
+    );
+    assert_eq!(
+        fs::read(&fixture.manifest_path).expect("manifest should read"),
+        manifest_before_apply
+    );
+    let state_store = AssetStateStore::open_read_only(&fixture.manifest_path)
+        .expect("state store should open read-only");
+    let after = state_store.load().expect("state should load");
+    assert_eq!(
+        after.get("asset-alpha").expect("target should exist").state,
+        State::Failed
+    );
+    assert!(
+        !after
+            .get("asset-alpha")
+            .expect("target should exist")
+            .proofs
+            .contains_key("failure_quarantine")
+    );
+    assert_eq!(
+        after
+            .get("asset-beta")
+            .expect("departed should exist")
+            .state,
+        State::Converted
+    );
+    assert_eq!(
+        after
+            .get("asset-gamma")
+            .expect("arrived should exist")
+            .state,
+        State::Failed
+    );
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_rejects_non_target_failed_record_mutation_atomically() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[
+            ("asset-alpha", State::Failed),
+            ("asset-beta", State::Failed),
+        ],
+        quarantine_evidence(2, 1, 1, vec![quarantine_evidence_entry("asset-alpha", 1)]),
+    );
+    let first_report = failed_assets_quarantine_dry_run(&fixture, "2", "1");
+    let first_target_set_sha256 = first_report["target_set_sha256"]
+        .as_str()
+        .expect("target hash should be a string")
+        .to_string();
+    let state_store = AssetStateStore::open_writer(
+        &fixture.manifest_path,
+        "failed-cohort-mutation-test",
+        Duration::from_secs(1),
+    )
+    .expect("state store should open");
+    let mut changed_non_target = state_store
+        .load()
+        .expect("state should load")
+        .get("asset-beta")
+        .expect("non-target should exist")
+        .clone();
+    changed_non_target
+        .proofs
+        .insert("external_change".to_string(), json!({"changed": true}));
+    changed_non_target.updated_at = "9999999999.000000000Z".to_string();
+    state_store
+        .persist_record(&changed_non_target)
+        .expect("non-target mutation should persist");
+    drop(state_store);
+
+    let second_report = failed_assets_quarantine_dry_run(&fixture, "2", "1");
+    let manifest_before_apply = fs::read(&fixture.manifest_path).expect("manifest should read");
+    let mut apply_args = failed_assets_quarantine_args_owned(&fixture, "2", "1");
+    apply_args.extend([
+        "--expected-target-set-sha256".to_string(),
+        first_target_set_sha256,
+        "--apply".to_string(),
+    ]);
+    binary()
+        .args(apply_args)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("target set did not match"));
+
+    assert_ne!(
+        first_report["target_set_sha256"],
+        second_report["target_set_sha256"]
+    );
+    assert_eq!(
+        fs::read(&fixture.manifest_path).expect("manifest should read"),
+        manifest_before_apply
+    );
+    let state_store = AssetStateStore::open_read_only(&fixture.manifest_path)
+        .expect("state store should open read-only");
+    let after = state_store.load().expect("state should load");
+    assert_eq!(
+        after.get("asset-alpha").expect("target should exist").state,
+        State::Failed
+    );
+    assert!(
+        !after
+            .get("asset-alpha")
+            .expect("target should exist")
+            .proofs
+            .contains_key("failure_quarantine")
+    );
+    assert_eq!(
+        after
+            .get("asset-beta")
+            .expect("non-target should exist")
+            .state,
+        State::Failed
+    );
+    assert_eq!(
+        after
+            .get("asset-beta")
+            .expect("non-target should exist")
+            .proofs["external_change"],
+        json!({"changed": true})
     );
 }
 
