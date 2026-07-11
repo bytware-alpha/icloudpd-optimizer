@@ -2398,6 +2398,12 @@ impl RollingConversionReservations {
             })
     }
 
+    fn release_on_drop(&self, asset_id: &str) {
+        if let Ok(mut asset_ids) = self.resolver_asset_ids.lock() {
+            asset_ids.remove(asset_id);
+        }
+    }
+
     fn claim_conversion_attempt(
         &self,
         asset_id: &str,
@@ -2426,6 +2432,34 @@ impl RollingConversionReservations {
         }
         summary.conversions_attempted = summary.conversions_attempted.saturating_add(1);
         Ok(true)
+    }
+}
+
+struct RollingAdjustedSourceReservationGuard<'a> {
+    reservations: &'a RollingConversionReservations,
+    asset_id: &'a str,
+    release_on_drop: bool,
+}
+
+impl<'a> RollingAdjustedSourceReservationGuard<'a> {
+    fn new(reservations: &'a RollingConversionReservations, asset_id: &'a str) -> Self {
+        Self {
+            reservations,
+            asset_id,
+            release_on_drop: true,
+        }
+    }
+
+    fn retain_for_conversion(&mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for RollingAdjustedSourceReservationGuard<'_> {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.reservations.release_on_drop(self.asset_id);
+        }
     }
 }
 
@@ -2707,6 +2741,11 @@ fn run_rolling_asset_lifecycle<T: CloudKitAdjustedSourceTransport>(
         rolling_lifecycle_worker_stage_sequence(record, execution.config)
     };
     for step in steps {
+        let resolver_reservations = (step == RollingAssetStep::ResolveAdjustedSource)
+            .then(|| Arc::clone(execution.conversion_reservations));
+        let mut resolver_reservation = resolver_reservations
+            .as_deref()
+            .map(|reservations| RollingAdjustedSourceReservationGuard::new(reservations, asset_id));
         if rolling_asset_terminal_state(execution.manifest, asset_id)? {
             break;
         }
@@ -2741,8 +2780,10 @@ fn run_rolling_asset_lifecycle<T: CloudKitAdjustedSourceTransport>(
             }),
         );
         let outcome = run_rolling_asset_step(asset_id, step, execution)?;
-        if step == RollingAssetStep::ResolveAdjustedSource && !outcome.completed {
-            execution.conversion_reservations.release(asset_id)?;
+        if outcome.completed {
+            if let Some(reservation) = resolver_reservation.as_mut() {
+                reservation.retain_for_conversion();
+            }
         }
         delta.record(step, &outcome);
         let state_after = shared_asset_state_name(execution.manifest, asset_id)?;
@@ -3186,6 +3227,28 @@ fn validate_authoritative_adjusted_source_conflict_record(
     };
     match durable_record.state {
         State::NasVerified => {
+            if !reconciliation_exact_state_is_consistent(
+                durable_manifest,
+                &durable_record.asset_id,
+                &destination,
+            )? {
+                return Err(MonitorError::InvalidConfig {
+                    message: "durable adjusted-source conflict record is not lifecycle-consistent"
+                        .to_string(),
+                });
+            }
+            if ADJUSTED_SOURCE_RECOVERY_BLOCKING_PROOFS
+                .iter()
+                .any(|proof_key| {
+                    *proof_key != "adjusted_source"
+                        && durable_record.proofs.contains_key(*proof_key)
+                })
+            {
+                return Err(MonitorError::InvalidConfig {
+                    message: "durable adjusted-source conflict record has stale downstream proof"
+                        .to_string(),
+                });
+            }
             let conversion_output = config
                 .heic_output_dir
                 .join(format!("{}.heic", durable_record.asset_id));
@@ -9957,6 +10020,28 @@ mod tests {
         }
     }
 
+    struct PanickingAdjustedSourceTransport;
+
+    impl CloudKitAdjustedSourceTransport for PanickingAdjustedSourceTransport {
+        fn post_records_lookup(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _payload: Value,
+        ) -> Result<Value, AdjustedSourceError> {
+            panic!("injected adjusted-source resolver panic")
+        }
+
+        fn download_resource_to_create_new(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _download_url: &Url,
+            _expected_size_bytes: u64,
+            _temp_file: &mut File,
+        ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
+            unreachable!("a resolver panic must prevent a resource download")
+        }
+    }
+
     #[cfg(unix)]
     const FAKE_NATIVE_VISUAL_VERIFIER_TIMEOUT_SECONDS: u64 = 5;
 
@@ -11002,6 +11087,175 @@ esac
                 .claim_conversion_attempt("resolver-a", &config, &summary)
                 .expect("reserved resolver claim should succeed"),
             "the selected resolver must retain the conversion slot for its immediate next stage"
+        );
+        assert_eq!(
+            summary
+                .lock()
+                .expect("summary should not be poisoned")
+                .conversions_attempted,
+            1
+        );
+    }
+
+    #[test]
+    fn rolling_resolver_error_releases_its_conversion_reservation_for_a_sibling() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        fs::create_dir_all(&config.heic_output_dir).expect("HEIC root should be created");
+        config.heic_output_dir =
+            fs::canonicalize(&config.heic_output_dir).expect("HEIC root should canonicalize");
+        config.full_lifecycle = true;
+        config.rolling_lifecycle = true;
+        config.max_conversions_per_scan = 1;
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "resolver-error",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("resolver marker should be admitted");
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+        state_store
+            .persist_manifest_records(&manifest)
+            .expect("initial record should persist");
+        let shared_manifest = Arc::new(Mutex::new(manifest));
+        let summary = Arc::new(Mutex::new(MonitorScanSummary {
+            started_unix_seconds: 1_000,
+            ..MonitorScanSummary::default()
+        }));
+        let original = adjusted_source_recovery_original_proof(
+            shared_manifest
+                .lock()
+                .expect("shared manifest")
+                .get("resolver-error")
+                .expect("marked record"),
+        )
+        .expect("marked record should retain its source identity");
+        let jpeg = test_adjusted_source_jpeg();
+        let mut resolver = CloudKitAdjustedSourceResolver::new(TestAdjustedSourceTransport {
+            response: test_adjusted_source_lookup_response(&original, &jpeg),
+            bytes: jpeg,
+            destinations: Vec::new(),
+            lookup_calls: 0,
+            download_calls: 0,
+        });
+        let reservations = Arc::new(RollingConversionReservations::new([
+            "resolver-error".to_string()
+        ]));
+        let base_read_session = test_delete_session();
+        let mut execution = RollingAssetExecutionContext {
+            config: &config,
+            state_store: &state_store,
+            worker_id: 1,
+            manifest: &shared_manifest,
+            summary: &summary,
+            conversion_reservations: &reservations,
+            base_read_session: Some(&base_read_session),
+            adjusted_source_resolver: Some(&mut resolver),
+        };
+
+        fail_next_adjusted_source_resolution_before_cas();
+        let error = run_rolling_asset_lifecycle(
+            "resolver-error",
+            &Arc::new(RollingStagePermits::new(1, 1, 1)),
+            &mut execution,
+        )
+        .expect_err("injected resolver error should leave the lifecycle");
+        assert!(matches!(error, MonitorError::CommandFailed { .. }));
+        assert!(
+            reservations
+                .claim_conversion_attempt("sibling-conversion", &config, &summary)
+                .expect("sibling capacity claim should succeed"),
+            "a resolver error must release its reservation before a sibling claims capacity"
+        );
+        assert_eq!(
+            summary
+                .lock()
+                .expect("summary should not be poisoned")
+                .conversions_attempted,
+            1
+        );
+    }
+
+    #[test]
+    fn rolling_resolver_panic_releases_its_conversion_reservation_for_a_sibling() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        fs::create_dir_all(&config.heic_output_dir).expect("HEIC root should be created");
+        config.heic_output_dir =
+            fs::canonicalize(&config.heic_output_dir).expect("HEIC root should canonicalize");
+        config.full_lifecycle = true;
+        config.rolling_lifecycle = true;
+        config.max_conversions_per_scan = 1;
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "resolver-panic",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("resolver marker should be admitted");
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+        state_store
+            .persist_manifest_records(&manifest)
+            .expect("initial record should persist");
+        let shared_manifest = Arc::new(Mutex::new(manifest));
+        let summary = Arc::new(Mutex::new(MonitorScanSummary {
+            started_unix_seconds: 1_000,
+            ..MonitorScanSummary::default()
+        }));
+        let reservations = Arc::new(RollingConversionReservations::new([
+            "resolver-panic".to_string()
+        ]));
+        let base_read_session = test_delete_session();
+        let mut resolver = CloudKitAdjustedSourceResolver::new(PanickingAdjustedSourceTransport);
+        let mut execution = RollingAssetExecutionContext {
+            config: &config,
+            state_store: &state_store,
+            worker_id: 1,
+            manifest: &shared_manifest,
+            summary: &summary,
+            conversion_reservations: &reservations,
+            base_read_session: Some(&base_read_session),
+            adjusted_source_resolver: Some(&mut resolver),
+        };
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_rolling_asset_lifecycle(
+                "resolver-panic",
+                &Arc::new(RollingStagePermits::new(1, 1, 1)),
+                &mut execution,
+            )
+        }));
+        assert!(unwind.is_err(), "injected resolver panic should unwind");
+        assert!(
+            reservations
+                .claim_conversion_attempt("sibling-conversion", &config, &summary)
+                .expect("sibling capacity claim should succeed"),
+            "unwinding resolver work must release its reservation before a sibling claims capacity"
         );
         assert_eq!(
             summary
@@ -12356,6 +12610,142 @@ esac
                 .get("pool-cas-adjusted-source")
                 .expect("durable record"),
             &newer_record
+        );
+    }
+
+    #[test]
+    fn rolling_pool_rejects_nas_conflict_with_stale_downstream_proof() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        fs::create_dir_all(&config.heic_output_dir).expect("HEIC root should be created");
+        config.heic_output_dir =
+            fs::canonicalize(&config.heic_output_dir).expect("HEIC root should canonicalize");
+        config.full_lifecycle = true;
+        config.rolling_lifecycle = true;
+        config.max_conversions_per_scan = 1;
+        config.delete_session_path = Some(tempdir.path().join("read-session.json"));
+        write_test_read_session(
+            config
+                .delete_session_path
+                .as_deref()
+                .expect("read session path"),
+        );
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "stale-nas-conflict",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("marker should be admitted");
+        let expected = manifest
+            .get("stale-nas-conflict")
+            .expect("marked record")
+            .clone();
+        let original = adjusted_source_recovery_original_proof(&expected)
+            .expect("marked record should retain its original proof");
+        let jpeg = test_adjusted_source_jpeg();
+        let conversion_output = config.heic_output_dir.join("stale-nas-conflict.heic");
+        let mut preparer = CloudKitAdjustedSourceResolver::new(TestAdjustedSourceTransport {
+            response: test_adjusted_source_lookup_response(&original, &jpeg),
+            bytes: jpeg.clone(),
+            destinations: Vec::new(),
+            lookup_calls: 0,
+            download_calls: 0,
+        });
+        let proof = preparer
+            .resolve(
+                &test_delete_session(),
+                &CloudKitAdjustedSourceResolveRequest {
+                    asset_id: "stale-nas-conflict".to_string(),
+                    original_asset: original.clone(),
+                    output_path: adjusted_source_path_for_output(&conversion_output),
+                },
+            )
+            .expect("preparer should install the exact adjusted JPEG");
+        let mut stale_nas = stage_adjusted_source_resolution_success(
+            &expected,
+            "stale-nas-conflict",
+            &conversion_output,
+            proof,
+        )
+        .expect("prepared proof should create a clean recovered record");
+        stale_nas
+            .proofs
+            .insert("icloudpd_local_mirror".to_string(), json!({"stale": true}));
+        let state_store = Arc::new(
+            AssetStateStore::open_writer(
+                &config.manifest_path,
+                "test-writer",
+                Duration::from_secs(60),
+            )
+            .expect("state store should open"),
+        );
+        state_store
+            .persist_manifest_records(&manifest)
+            .expect("initial marked record should persist");
+        let mut summary = MonitorScanSummary {
+            started_unix_seconds: 1_000,
+            ..MonitorScanSummary::default()
+        };
+        let raced = Arc::new(Mutex::new(false));
+        let factory_original = original.clone();
+        let factory_jpeg = jpeg.clone();
+        let factory_state_store = Arc::clone(&state_store);
+        let factory_stale_nas = stale_nas.clone();
+        let factory_raced = Arc::clone(&raced);
+
+        let error = run_rolling_lifecycle_worker_pool_with_transport_factory(
+            &config,
+            &state_store,
+            &mut manifest,
+            &mut summary,
+            RollingLifecycleWorkerPoolInput {
+                active_lifecycle_count: 1,
+                worker_asset_ids: vec!["stale-nas-conflict".to_string()],
+                deferred_worker_asset_ids: &mut BTreeSet::new(),
+            },
+            move || {
+                Ok(PoolRacingAdjustedSourceTransport {
+                    response: test_adjusted_source_lookup_response(
+                        &factory_original,
+                        &factory_jpeg,
+                    ),
+                    bytes: factory_jpeg.clone(),
+                    state_store: Arc::clone(&factory_state_store),
+                    newer_record: factory_stale_nas.clone(),
+                    raced: Arc::clone(&factory_raced),
+                })
+            },
+        )
+        .expect_err("NasVerified rows with downstream proofs must fail closed");
+
+        assert!(matches!(error, MonitorError::InvalidConfig { .. }));
+        assert!(*raced.lock().expect("race flag should not be poisoned"));
+        assert_eq!(
+            manifest.get("stale-nas-conflict").expect("caller record"),
+            &expected,
+            "failed reconciliation must not replace the caller manifest"
+        );
+        assert_eq!(summary.adjusted_sources_resolved, 0);
+        assert_eq!(summary.conversions_attempted, 0);
+        assert_eq!(summary.conversions_completed, 0);
+        assert_eq!(summary.uploads_completed, 0);
+        assert_eq!(summary.mirrors_recorded, 0);
+        assert_eq!(
+            state_store
+                .load()
+                .expect("durable manifest")
+                .get("stale-nas-conflict")
+                .expect("durable record"),
+            &stale_nas,
+            "failed reconciliation must not checkpoint a stale row over durable state"
         );
     }
 
