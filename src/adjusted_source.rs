@@ -1,5 +1,5 @@
 use std::ffi::CString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +23,10 @@ use crate::workflow::OriginalAssetProof;
 const ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION: &str = "cloudkit-adjusted-source-v1";
 const ADJUSTED_SOURCE_KIND: &str = "cloudkit_adjusted_res_jpeg_full_res";
 const ADJUSTED_RESOURCE_FIELD: &str = "resJPEGFullRes";
+const ADJUSTED_WIDTH_FIELD: &str = "resJPEGFullWidth";
+const ADJUSTED_HEIGHT_FIELD: &str = "resJPEGFullHeight";
+const ADJUSTED_FILE_TYPE_FIELD: &str = "resJPEGFullFileType";
+const ADJUSTED_FINGERPRINT_FIELD: &str = "resJPEGFullFingerprint";
 const MAX_DECODED_JPEG_BYTES: u64 = 256 * 1024 * 1024;
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -120,11 +124,12 @@ impl<T: CloudKitAdjustedSourceTransport> CloudKitAdjustedSourceResolver<T> {
             &destination,
             &[
                 "masterRef",
+                "isDeleted",
                 ADJUSTED_RESOURCE_FIELD,
-                "resJPEGFullResWidth",
-                "resJPEGFullResHeight",
-                "resJPEGFullResFileType",
-                "resJPEGFullResFingerprint",
+                ADJUSTED_WIDTH_FIELD,
+                ADJUSTED_HEIGHT_FIELD,
+                ADJUSTED_FILE_TYPE_FIELD,
+                ADJUSTED_FINGERPRINT_FIELD,
             ],
         )?;
         let asset_fields = record_fields(&asset)?;
@@ -140,11 +145,12 @@ impl<T: CloudKitAdjustedSourceTransport> CloudKitAdjustedSourceResolver<T> {
                     "CPLMaster",
                     &destination,
                     &[
+                        "isDeleted",
                         ADJUSTED_RESOURCE_FIELD,
-                        "resJPEGFullResWidth",
-                        "resJPEGFullResHeight",
-                        "resJPEGFullResFileType",
-                        "resJPEGFullResFingerprint",
+                        ADJUSTED_WIDTH_FIELD,
+                        ADJUSTED_HEIGHT_FIELD,
+                        ADJUSTED_FILE_TYPE_FIELD,
+                        ADJUSTED_FINGERPRINT_FIELD,
                     ],
                 )?;
                 parse_adjusted_resource(&master, Some(master_record_name))?.ok_or(
@@ -398,6 +404,7 @@ fn lookup_exact_record<T: CloudKitAdjustedSourceTransport>(
             "lookup response returned a record error",
         ));
     }
+    require_non_deleted(&record)?;
     if record_string(&record, "recordName")? != record_name
         || record_string(&record, "recordType")? != expected_type
     {
@@ -421,9 +428,11 @@ fn validate_record_destination(
     record: &Value,
     destination: &CloudKitLibraryDestination,
 ) -> Result<(), AdjustedSourceError> {
-    let Some(zone) = record.get("zoneID") else {
-        return Ok(());
-    };
+    let zone = record
+        .get("zoneID")
+        .ok_or(AdjustedSourceError::InvalidResponse(
+            "lookup record omitted zone identity",
+        ))?;
     let zone = zone
         .as_object()
         .ok_or(AdjustedSourceError::InvalidResponse(
@@ -442,14 +451,27 @@ fn parse_adjusted_resource(
     master_record_name: Option<String>,
 ) -> Result<Option<AdjustedResource>, AdjustedSourceError> {
     let fields = record_fields(record)?;
-    let resource_field = match fields.get(ADJUSTED_RESOURCE_FIELD) {
-        Some(value) => value,
-        None => return Ok(None),
-    };
-    let resource = wrapped_value_object(resource_field, ADJUSTED_RESOURCE_FIELD)?;
-    let download_url = resource.get("downloadURL").and_then(Value::as_str).ok_or(
-        AdjustedSourceError::InvalidResponse("resJPEGFullRes download URL is malformed"),
-    )?;
+    let adjusted_fields = [
+        ADJUSTED_RESOURCE_FIELD,
+        ADJUSTED_WIDTH_FIELD,
+        ADJUSTED_HEIGHT_FIELD,
+        ADJUSTED_FILE_TYPE_FIELD,
+        ADJUSTED_FINGERPRINT_FIELD,
+    ];
+    let present = adjusted_fields
+        .iter()
+        .filter(|field| fields.contains_key(**field))
+        .count();
+    if present == 0 {
+        return Ok(None);
+    }
+    if present != adjusted_fields.len() {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "adjusted resource fields are partial",
+        ));
+    }
+    let resource = wrapped_value_object(fields, ADJUSTED_RESOURCE_FIELD, "ASSETID")?;
+    let download_url = required_nonempty_object_string(resource, "downloadURL")?;
     let download_url =
         Url::parse(download_url).map_err(|_| AdjustedSourceError::InvalidResourceUrl)?;
     validate_cloudkit_resource_download_url(&download_url)
@@ -461,18 +483,23 @@ fn parse_adjusted_resource(
         .ok_or(AdjustedSourceError::InvalidResponse(
             "resJPEGFullRes size is missing or zero",
         ))?;
-    let width = wrapped_positive_u32(fields, "resJPEGFullResWidth")?;
-    let height = wrapped_positive_u32(fields, "resJPEGFullResHeight")?;
-    let file_type = wrapped_nonempty_string(fields, "resJPEGFullResFileType")?;
-    if !matches!(
-        file_type.to_ascii_lowercase().as_str(),
-        "public.jpeg" | "image/jpeg"
-    ) {
+    let file_checksum = required_nonempty_object_string(resource, "fileChecksum")?;
+    let _reference_checksum = required_nonempty_object_string(resource, "referenceChecksum")?;
+    let _wrapping_key = required_nonempty_object_string(resource, "wrappingKey")?;
+    let width = wrapped_positive_u32(fields, ADJUSTED_WIDTH_FIELD)?;
+    let height = wrapped_positive_u32(fields, ADJUSTED_HEIGHT_FIELD)?;
+    let file_type = wrapped_nonempty_string(fields, ADJUSTED_FILE_TYPE_FIELD)?;
+    if !matches!(file_type.as_str(), "public.jpeg" | "image/jpeg") {
         return Err(AdjustedSourceError::InvalidResponse(
             "resJPEGFullRes file type is not JPEG",
         ));
     }
-    let fingerprint = wrapped_nonempty_string(fields, "resJPEGFullResFingerprint")?;
+    let fingerprint = wrapped_nonempty_string(fields, ADJUSTED_FINGERPRINT_FIELD)?;
+    if fingerprint != file_checksum {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "resJPEGFullRes fingerprint differs from fileChecksum",
+        ));
+    }
     Ok(Some(AdjustedResource {
         record_name: record_string(record, "recordName")?.to_string(),
         record_change_tag: record_string(record, "recordChangeTag")?.to_string(),
@@ -491,26 +518,17 @@ fn parse_master_ref(
     fields: &Map<String, Value>,
     destination: &CloudKitLibraryDestination,
 ) -> Result<String, AdjustedSourceError> {
-    let master_ref = wrapped_value_object(
-        fields
-            .get("masterRef")
-            .ok_or(AdjustedSourceError::InvalidResponse(
-                "asset record omitted masterRef",
-            ))?,
-        "masterRef",
-    )?;
-    if let Some(zone) = master_ref.get("zoneID") {
-        let zone = zone
-            .as_object()
-            .ok_or(AdjustedSourceError::InvalidResponse(
-                "masterRef zone is malformed",
-            ))?;
-        if zone.get("zoneName").and_then(Value::as_str) != Some(destination.zone_name.as_str()) {
-            return Err(AdjustedSourceError::InvalidResponse(
-                "masterRef zone differs from the original asset proof",
-            ));
-        }
+    let master_ref = wrapped_value_object(fields, "masterRef", "REFERENCE")?;
+    if master_ref.get("action").and_then(Value::as_str) != Some("DELETE_SELF") {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "masterRef action is not DELETE_SELF",
+        ));
     }
+    validate_zone_identity(
+        master_ref.get("zoneID"),
+        destination,
+        "masterRef zone differs from the original asset proof",
+    )?;
     master_ref
         .get("recordName")
         .and_then(Value::as_str)
@@ -540,12 +558,54 @@ fn record_string<'a>(record: &'a Value, key: &'static str) -> Result<&'a str, Ad
         ))
 }
 
+fn require_non_deleted(record: &Value) -> Result<(), AdjustedSourceError> {
+    let fields = record_fields(record)?;
+    let deleted = fields.get("isDeleted").and_then(Value::as_object).ok_or(
+        AdjustedSourceError::InvalidResponse("lookup record isDeleted is malformed"),
+    )?;
+    let is_deleted = match (
+        deleted.get("type").and_then(Value::as_str),
+        deleted.get("value"),
+    ) {
+        (Some("INT64"), Some(value)) => value.as_i64() != Some(0),
+        (Some("BOOLEAN"), Some(value)) => value.as_bool() != Some(false),
+        _ => {
+            return Err(AdjustedSourceError::InvalidResponse(
+                "lookup record isDeleted is malformed",
+            ));
+        }
+    };
+    if is_deleted {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "lookup record is deleted",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_zone_identity(
+    zone: Option<&Value>,
+    destination: &CloudKitLibraryDestination,
+    error: &'static str,
+) -> Result<(), AdjustedSourceError> {
+    let zone = zone
+        .and_then(Value::as_object)
+        .ok_or(AdjustedSourceError::InvalidResponse(error))?;
+    if zone.get("zoneName").and_then(Value::as_str) != Some(destination.zone_name.as_str()) {
+        return Err(AdjustedSourceError::InvalidResponse(error));
+    }
+    Ok(())
+}
+
 fn wrapped_value_object<'a>(
-    field: &'a Value,
-    _field_name: &'static str,
+    fields: &'a Map<String, Value>,
+    field_name: &'static str,
+    expected_type: &'static str,
 ) -> Result<&'a Map<String, Value>, AdjustedSourceError> {
-    field
-        .as_object()
+    fields
+        .get(field_name)
+        .and_then(Value::as_object)
+        .filter(|wrapper| wrapper.get("type").and_then(Value::as_str) == Some(expected_type))
         .and_then(|wrapper| wrapper.get("value"))
         .and_then(Value::as_object)
         .ok_or(AdjustedSourceError::InvalidResponse(
@@ -560,6 +620,7 @@ fn wrapped_positive_u32(
     fields
         .get(name)
         .and_then(Value::as_object)
+        .filter(|wrapper| wrapper.get("type").and_then(Value::as_str) == Some("INT64"))
         .and_then(|wrapper| wrapper.get("value"))
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
@@ -576,12 +637,26 @@ fn wrapped_nonempty_string(
     fields
         .get(name)
         .and_then(Value::as_object)
+        .filter(|wrapper| wrapper.get("type").and_then(Value::as_str) == Some("STRING"))
         .and_then(|wrapper| wrapper.get("value"))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string)
         .ok_or(AdjustedSourceError::InvalidResponse(
             "adjusted resource metadata is malformed",
+        ))
+}
+
+fn required_nonempty_object_string<'a>(
+    object: &'a Map<String, Value>,
+    field_name: &'static str,
+) -> Result<&'a str, AdjustedSourceError> {
+    object
+        .get(field_name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(AdjustedSourceError::InvalidResponse(
+            "adjusted resource asset metadata is malformed",
         ))
 }
 
@@ -664,10 +739,21 @@ fn verify_jpeg(path: &Path, width: u32, height: u32) -> Result<(), AdjustedSourc
     }
     let decoded_size =
         usize::try_from(decoded_size).map_err(|_| AdjustedSourceError::InvalidJpeg)?;
+    let channels = decoder.color_type().bytes_per_pixel() as usize;
     let mut decoded = vec![0_u8; decoded_size];
     decoder
         .read_image(&mut decoded)
-        .map_err(|_| AdjustedSourceError::InvalidJpeg)
+        .map_err(|_| AdjustedSourceError::InvalidJpeg)?;
+    let first_pixel = decoded
+        .get(..channels)
+        .ok_or(AdjustedSourceError::InvalidJpeg)?;
+    if decoded
+        .chunks_exact(channels)
+        .all(|pixel| pixel == first_pixel)
+    {
+        return Err(AdjustedSourceError::InvalidJpeg);
+    }
+    Ok(())
 }
 
 fn install_without_overwrite(
@@ -688,31 +774,8 @@ where
     match rename(temp_path, output_path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(_) => copy_without_overwrite(temp_path, output_path),
+        Err(_) => Err(AdjustedSourceError::Filesystem),
     }
-}
-
-fn copy_without_overwrite(temp_path: &Path, output_path: &Path) -> Result<(), AdjustedSourceError> {
-    let mut source = File::open(temp_path).map_err(|_| AdjustedSourceError::Filesystem)?;
-    let mut destination = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output_path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(_) => return Err(AdjustedSourceError::Filesystem),
-    };
-    let result = (|| {
-        io::copy(&mut source, &mut destination).map_err(|_| AdjustedSourceError::Filesystem)?;
-        destination
-            .sync_all()
-            .map_err(|_| AdjustedSourceError::Filesystem)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(output_path);
-    }
-    result
 }
 
 #[cfg(target_os = "macos")]
@@ -796,27 +859,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_overwrite_install_copies_with_create_new_when_rename_is_unavailable() {
+    fn no_overwrite_install_fails_without_copy_when_rename_is_unavailable() {
         let directory = tempfile::tempdir().expect("test directory");
         let temp_path = directory.path().join("source.tmp");
         let output_path = directory.path().join("adjusted.jpg");
         fs::write(&temp_path, b"verified JPEG bytes").expect("temporary artifact");
 
-        install_without_overwrite_with(&temp_path, &output_path, |_, _| {
+        let error = install_without_overwrite_with(&temp_path, &output_path, |_, _| {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "test rename unavailable",
             ))
         })
-        .expect("fallback copy should install without overwrite");
+        .expect_err("copy fallback must not weaken atomic installation");
 
-        assert_eq!(
-            fs::read(&output_path).expect("output artifact"),
-            b"verified JPEG bytes"
-        );
+        assert!(matches!(error, AdjustedSourceError::Filesystem));
+        assert!(!output_path.exists(), "no final output may be copied");
         assert!(
             temp_path.exists(),
-            "fallback copy must retain the source temp"
+            "caller cleanup retains ownership of temp"
         );
     }
 }
