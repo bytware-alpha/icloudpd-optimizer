@@ -1695,16 +1695,19 @@ struct FailedAssetsQuarantineEvidenceAsset {
 
 impl FailedAssetsQuarantineEvidenceAsset {
     fn has_remote_side_effect(&self) -> bool {
-        self.successful_uploads > 0 || self.delete_attempts > 0 || self.deleted_finishes > 0
+        self.successful_uploads > 0
+            || self.delete_attempts > 0
+            || self.deleted_finishes > 0
+            || self.mirror_successes > 0
     }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FailedAssetsQuarantineEvidence {
-    failed_assets: Vec<FailedAssetsQuarantineEvidenceAsset>,
-    with_upload_or_delete_side_effects: Vec<FailedAssetsQuarantineEvidenceAsset>,
-    clean_of_recorded_remote_side_effects: Vec<FailedAssetsQuarantineEvidenceAsset>,
+    failed_assets: u64,
+    with_upload_or_delete_side_effects: u64,
+    clean_of_recorded_remote_side_effects: u64,
     side_effect_assets: Vec<FailedAssetsQuarantineEvidenceAsset>,
 }
 
@@ -1762,6 +1765,7 @@ fn monitor_failed_assets_quarantine<W: Write>(
                 "current state could not be loaded under the writer lease",
             )
         })?;
+        validate_failed_assets_quarantine_failed_cohort(&manifest, evidence.counts.failed_assets)?;
         let target_set_sha256 =
             failed_assets_quarantine_target_set_sha256(&manifest, &evidence.side_effect_assets)?;
         validate_failed_assets_quarantine_target_set_match(
@@ -1795,6 +1799,7 @@ fn monitor_failed_assets_quarantine<W: Write>(
         let manifest = state_store.load().map_err(|_| {
             failed_assets_quarantine_gate("immutable state snapshot could not be loaded")
         })?;
+        validate_failed_assets_quarantine_failed_cohort(&manifest, evidence.counts.failed_assets)?;
         let target_set_sha256 =
             failed_assets_quarantine_target_set_sha256(&manifest, &evidence.side_effect_assets)?;
         if let Some(expected_target_set_sha256) = expected_target_set_sha256 {
@@ -1854,32 +1859,14 @@ fn validate_failed_assets_quarantine_evidence(
     evidence_sha256: String,
     args: &MonitorFailedAssetsQuarantineArgs,
 ) -> Result<VerifiedFailedAssetsQuarantineEvidence, CliError> {
-    let failed_assets = failed_assets_quarantine_asset_map(
-        evidence.failed_assets,
-        "failed-assets contains an empty or duplicate asset ID",
-    )?;
-    let with_side_effects = failed_assets_quarantine_asset_map(
-        evidence.with_upload_or_delete_side_effects,
-        "with-upload-or-delete-side-effects contains an empty or duplicate asset ID",
-    )?;
-    let clean_assets = failed_assets_quarantine_asset_map(
-        evidence.clean_of_recorded_remote_side_effects,
-        "clean-of-recorded-remote-side-effects contains an empty or duplicate asset ID",
-    )?;
     let side_effect_assets = failed_assets_quarantine_asset_map(
         evidence.side_effect_assets,
         "side-effect-assets contains an empty or duplicate asset ID",
     )?;
     let counts = FailedAssetsQuarantineCounts {
-        failed_assets: u64::try_from(failed_assets.len()).map_err(|_| {
-            failed_assets_quarantine_gate("failed-asset count exceeded the supported range")
-        })?,
-        with_upload_or_delete_side_effects: u64::try_from(with_side_effects.len()).map_err(
-            |_| failed_assets_quarantine_gate("side-effect count exceeded the supported range"),
-        )?,
-        clean_of_recorded_remote_side_effects: u64::try_from(clean_assets.len()).map_err(|_| {
-            failed_assets_quarantine_gate("clean-asset count exceeded the supported range")
-        })?,
+        failed_assets: evidence.failed_assets,
+        with_upload_or_delete_side_effects: evidence.with_upload_or_delete_side_effects,
+        clean_of_recorded_remote_side_effects: evidence.clean_of_recorded_remote_side_effects,
         side_effect_assets: u64::try_from(side_effect_assets.len()).map_err(|_| {
             failed_assets_quarantine_gate("target count exceeded the supported range")
         })?,
@@ -1894,9 +1881,9 @@ fn validate_failed_assets_quarantine_evidence(
             "failed-asset count did not match the expected value",
         ));
     }
-    if counts.side_effect_assets != args.expected_side_effect_asset_count {
+    if counts.with_upload_or_delete_side_effects != args.expected_side_effect_asset_count {
         return Err(failed_assets_quarantine_gate(
-            "side-effect target count did not match the expected value",
+            "audited side-effect count did not match the expected value",
         ));
     }
     let partition_count = counts
@@ -1910,45 +1897,9 @@ fn validate_failed_assets_quarantine_evidence(
             "failed-asset arithmetic did not match the side-effect and clean subsets",
         ));
     }
-    if !with_side_effects.keys().eq(side_effect_assets.keys())
-        || with_side_effects != side_effect_assets
-    {
+    if counts.side_effect_assets != counts.with_upload_or_delete_side_effects {
         return Err(failed_assets_quarantine_gate(
-            "side-effect targets did not exactly match the audited side-effect subset",
-        ));
-    }
-    if !with_side_effects.values().all(|asset| {
-        failed_assets
-            .get(&asset.asset_id)
-            .is_some_and(|failed| failed == asset)
-    }) || !clean_assets.values().all(|asset| {
-        failed_assets
-            .get(&asset.asset_id)
-            .is_some_and(|failed| failed == asset)
-    }) {
-        return Err(failed_assets_quarantine_gate(
-            "failed-asset subset evidence did not exactly match the audited entries",
-        ));
-    }
-    if !with_side_effects
-        .keys()
-        .all(|asset_id| failed_assets.contains_key(asset_id))
-        || !clean_assets
-            .keys()
-            .all(|asset_id| failed_assets.contains_key(asset_id))
-        || with_side_effects
-            .keys()
-            .any(|asset_id| clean_assets.contains_key(asset_id))
-    {
-        return Err(failed_assets_quarantine_gate(
-            "failed-asset subsets did not form an exact disjoint partition",
-        ));
-    }
-    if !failed_assets.keys().all(|asset_id| {
-        with_side_effects.contains_key(asset_id) || clean_assets.contains_key(asset_id)
-    }) {
-        return Err(failed_assets_quarantine_gate(
-            "failed-asset subsets did not cover every failed asset",
+            "side-effect target count did not match the audited side-effect total",
         ));
     }
     if !side_effect_assets
@@ -1956,15 +1907,7 @@ fn validate_failed_assets_quarantine_evidence(
         .all(FailedAssetsQuarantineEvidenceAsset::has_remote_side_effect)
     {
         return Err(failed_assets_quarantine_gate(
-            "every side-effect target must have a positive upload or delete count",
-        ));
-    }
-    if !clean_assets
-        .values()
-        .all(|asset| !asset.has_remote_side_effect())
-    {
-        return Err(failed_assets_quarantine_gate(
-            "clean evidence entries must not have upload or delete counts",
+            "every side-effect target must have a positive remote-side-effect count",
         ));
     }
     Ok(VerifiedFailedAssetsQuarantineEvidence {
@@ -1972,6 +1915,28 @@ fn validate_failed_assets_quarantine_evidence(
         side_effect_assets,
         counts,
     })
+}
+
+fn validate_failed_assets_quarantine_failed_cohort(
+    manifest: &Manifest,
+    expected_failed_asset_count: u64,
+) -> Result<(), CliError> {
+    let current_failed_asset_count = u64::try_from(
+        manifest
+            .records()
+            .values()
+            .filter(|record| record.state == State::Failed)
+            .count(),
+    )
+    .map_err(|_| {
+        failed_assets_quarantine_gate("current Failed cohort exceeded the supported range")
+    })?;
+    if current_failed_asset_count != expected_failed_asset_count {
+        return Err(failed_assets_quarantine_gate(
+            "current Failed cohort did not match the evidence failed-assets count",
+        ));
+    }
+    Ok(())
 }
 
 fn failed_assets_quarantine_asset_map(

@@ -39,7 +39,31 @@ fn quarantine_evidence_entry(asset_id: &str, successful_uploads: u64) -> Value {
         "successful_uploads": successful_uploads,
         "delete_attempts": 0,
         "deleted_finishes": 0,
+        "mirror_successes": 0,
+    })
+}
+
+fn quarantine_mirror_only_evidence_entry(asset_id: &str) -> Value {
+    json!({
+        "asset_id": asset_id,
+        "successful_uploads": 0,
+        "delete_attempts": 0,
+        "deleted_finishes": 0,
         "mirror_successes": 1,
+    })
+}
+
+fn quarantine_evidence(
+    failed_assets: u64,
+    with_upload_or_delete_side_effects: u64,
+    clean_of_recorded_remote_side_effects: u64,
+    side_effect_assets: Vec<Value>,
+) -> Value {
+    json!({
+        "failed_assets": failed_assets,
+        "with_upload_or_delete_side_effects": with_upload_or_delete_side_effects,
+        "clean_of_recorded_remote_side_effects": clean_of_recorded_remote_side_effects,
+        "side_effect_assets": side_effect_assets,
     })
 }
 
@@ -105,6 +129,17 @@ fn write_failed_assets_quarantine_fixture(
         evidence_sha256,
         manifest_path,
     }
+}
+
+fn replace_failed_assets_quarantine_evidence(
+    fixture: &mut FailedAssetsQuarantineFixture,
+    evidence: impl AsRef<[u8]>,
+) {
+    fs::write(&fixture.evidence_path, evidence).expect("fixture evidence should save");
+    fixture.evidence_sha256 = format!(
+        "{:x}",
+        Sha256::digest(fs::read(&fixture.evidence_path).expect("evidence should read"))
+    );
 }
 
 fn failed_assets_quarantine_args<'a>(
@@ -2452,21 +2487,15 @@ fn monitor_failed_assets_quarantine_requires_explicit_safety_arguments() {
 #[test]
 fn monitor_failed_assets_quarantine_dry_run_reports_verified_immutable_target_set() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
-    let evidence = json!({
-        "failed_assets": [
+    let evidence = quarantine_evidence(
+        2,
+        2,
+        0,
+        vec![
             quarantine_evidence_entry("asset-alpha", 1),
             quarantine_evidence_entry("asset-beta", 2),
         ],
-        "with_upload_or_delete_side_effects": [
-            quarantine_evidence_entry("asset-alpha", 1),
-            quarantine_evidence_entry("asset-beta", 2),
-        ],
-        "clean_of_recorded_remote_side_effects": [],
-        "side_effect_assets": [
-            quarantine_evidence_entry("asset-alpha", 1),
-            quarantine_evidence_entry("asset-beta", 2),
-        ],
-    });
+    );
     let fixture = write_failed_assets_quarantine_fixture(
         &tempdir,
         &[
@@ -2510,14 +2539,160 @@ fn monitor_failed_assets_quarantine_dry_run_reports_verified_immutable_target_se
 }
 
 #[test]
+fn monitor_failed_assets_quarantine_accepts_literal_numeric_audit_evidence_shape() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let asset_ids = (0..33)
+        .map(|index| format!("asset-{index:02}"))
+        .collect::<Vec<_>>();
+    let records = asset_ids
+        .iter()
+        .map(|asset_id| (asset_id.as_str(), State::Failed))
+        .collect::<Vec<_>>();
+    let mut fixture =
+        write_failed_assets_quarantine_fixture(&tempdir, &records, json!({"ignored": true}));
+    replace_failed_assets_quarantine_evidence(
+        &mut fixture,
+        r#"{
+  "failed_assets": 33,
+  "with_upload_or_delete_side_effects": 6,
+  "clean_of_recorded_remote_side_effects": 27,
+  "side_effect_assets": [
+    {"asset_id":"asset-00","successful_uploads":1,"delete_attempts":1,"deleted_finishes":2,"mirror_successes":0},
+    {"asset_id":"asset-01","successful_uploads":1,"delete_attempts":0,"deleted_finishes":0,"mirror_successes":0},
+    {"asset_id":"asset-02","successful_uploads":0,"delete_attempts":1,"deleted_finishes":0,"mirror_successes":0},
+    {"asset_id":"asset-03","successful_uploads":0,"delete_attempts":0,"deleted_finishes":1,"mirror_successes":0},
+    {"asset_id":"asset-04","successful_uploads":0,"delete_attempts":0,"deleted_finishes":0,"mirror_successes":1},
+    {"asset_id":"asset-05","successful_uploads":1,"delete_attempts":1,"deleted_finishes":1,"mirror_successes":1}
+  ]
+}
+"#,
+    );
+
+    let report = failed_assets_quarantine_dry_run(&fixture, "33", "6");
+
+    assert_eq!(report["counts"]["failed_assets"], 33);
+    assert_eq!(report["counts"]["with_upload_or_delete_side_effects"], 6);
+    assert_eq!(
+        report["counts"]["clean_of_recorded_remote_side_effects"],
+        27
+    );
+    assert_eq!(report["counts"]["side_effect_assets"], 6);
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_accepts_mirror_only_side_effect_evidence() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[("asset-alpha", State::Failed)],
+        quarantine_evidence(
+            1,
+            1,
+            0,
+            vec![quarantine_mirror_only_evidence_entry("asset-alpha")],
+        ),
+    );
+
+    let report = failed_assets_quarantine_dry_run(&fixture, "1", "1");
+
+    assert_eq!(report["verified"], true);
+    assert_eq!(report["counts"]["side_effect_assets"], 1);
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_rejects_stale_failed_cohorts_without_record_updates() {
+    let evidence = quarantine_evidence(2, 1, 1, vec![quarantine_evidence_entry("asset-alpha", 1)]);
+    for records in [
+        vec![
+            ("asset-alpha", State::Failed),
+            ("asset-clean", State::Failed),
+            ("asset-extra", State::Failed),
+        ],
+        vec![("asset-alpha", State::Failed)],
+        vec![
+            ("asset-alpha", State::Failed),
+            ("asset-clean", State::Converted),
+        ],
+    ] {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let fixture = write_failed_assets_quarantine_fixture(&tempdir, &records, evidence.clone());
+        let mut apply_args = failed_assets_quarantine_args_owned(&fixture, "2", "1");
+        apply_args.extend([
+            "--expected-target-set-sha256".to_string(),
+            "0".repeat(64),
+            "--apply".to_string(),
+        ]);
+        binary()
+            .args(apply_args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "current Failed cohort did not match the evidence failed-assets count",
+            ));
+
+        let manifest = Manifest::load(&fixture.manifest_path).expect("manifest should load");
+        let state_store = AssetStateStore::open_read_only(&fixture.manifest_path)
+            .expect("state store should open read-only");
+        let durable_manifest = state_store.load().expect("state should load");
+        for (asset_id, state) in records {
+            assert_eq!(
+                manifest.get(asset_id).expect("asset should exist").state,
+                state
+            );
+            assert_eq!(
+                durable_manifest
+                    .get(asset_id)
+                    .expect("durable asset should exist")
+                    .state,
+                state
+            );
+        }
+    }
+}
+
+#[test]
+fn monitor_failed_assets_quarantine_target_set_changes_with_exact_record_bytes() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[("asset-alpha", State::Failed)],
+        quarantine_evidence(1, 1, 0, vec![quarantine_evidence_entry("asset-alpha", 1)]),
+    );
+    let first_report = failed_assets_quarantine_dry_run(&fixture, "1", "1");
+    let state_store = AssetStateStore::open_writer(
+        &fixture.manifest_path,
+        "target-set-change-test",
+        Duration::from_secs(1),
+    )
+    .expect("state store should open");
+    let mut changed_record = state_store
+        .load()
+        .expect("state should load")
+        .get("asset-alpha")
+        .expect("asset should exist")
+        .clone();
+    changed_record
+        .proofs
+        .insert("record_byte_change".to_string(), json!({"changed": true}));
+    changed_record.updated_at = "9999999999.000000000Z".to_string();
+    state_store
+        .persist_record(&changed_record)
+        .expect("changed record should persist");
+    state_store.export_json().expect("state should export");
+    drop(state_store);
+
+    let second_report = failed_assets_quarantine_dry_run(&fixture, "1", "1");
+
+    assert_ne!(
+        first_report["target_set_sha256"],
+        second_report["target_set_sha256"]
+    );
+}
+
+#[test]
 fn monitor_failed_assets_quarantine_rejects_mismatched_or_invalid_evidence_hashes() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
-    let evidence = json!({
-        "failed_assets": [quarantine_evidence_entry("asset-alpha", 1)],
-        "with_upload_or_delete_side_effects": [quarantine_evidence_entry("asset-alpha", 1)],
-        "clean_of_recorded_remote_side_effects": [],
-        "side_effect_assets": [quarantine_evidence_entry("asset-alpha", 1)],
-    });
+    let evidence = quarantine_evidence(1, 1, 0, vec![quarantine_evidence_entry("asset-alpha", 1)]);
     let fixture = write_failed_assets_quarantine_fixture(
         &tempdir,
         &[("asset-alpha", State::Failed)],
@@ -2545,21 +2720,15 @@ fn monitor_failed_assets_quarantine_rejects_mismatched_or_invalid_evidence_hashe
 #[test]
 fn monitor_failed_assets_quarantine_rejects_count_and_arithmetic_mismatches() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
-    let consistent = json!({
-        "failed_assets": [
+    let consistent = quarantine_evidence(
+        2,
+        2,
+        0,
+        vec![
             quarantine_evidence_entry("asset-alpha", 1),
             quarantine_evidence_entry("asset-beta", 1),
         ],
-        "with_upload_or_delete_side_effects": [
-            quarantine_evidence_entry("asset-alpha", 1),
-            quarantine_evidence_entry("asset-beta", 1),
-        ],
-        "clean_of_recorded_remote_side_effects": [],
-        "side_effect_assets": [
-            quarantine_evidence_entry("asset-alpha", 1),
-            quarantine_evidence_entry("asset-beta", 1),
-        ],
-    });
+    );
     let count_fixture = write_failed_assets_quarantine_fixture(
         &tempdir,
         &[
@@ -2573,16 +2742,16 @@ fn monitor_failed_assets_quarantine_rejects_count_and_arithmetic_mismatches() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("failed-asset count did not match"));
+    binary()
+        .args(failed_assets_quarantine_args(&count_fixture, "2", "1"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "audited side-effect count did not match the expected value",
+        ));
 
-    let arithmetic_evidence = json!({
-        "failed_assets": [
-            quarantine_evidence_entry("asset-alpha", 1),
-            quarantine_evidence_entry("asset-beta", 1),
-        ],
-        "with_upload_or_delete_side_effects": [quarantine_evidence_entry("asset-alpha", 1)],
-        "clean_of_recorded_remote_side_effects": [],
-        "side_effect_assets": [quarantine_evidence_entry("asset-alpha", 1)],
-    });
+    let arithmetic_evidence =
+        quarantine_evidence(2, 1, 0, vec![quarantine_evidence_entry("asset-alpha", 1)]);
     let arithmetic_fixture = write_failed_assets_quarantine_fixture(
         &tempdir,
         &[
@@ -2598,33 +2767,64 @@ fn monitor_failed_assets_quarantine_rejects_count_and_arithmetic_mismatches() {
         .stderr(predicate::str::contains(
             "failed-asset arithmetic did not match",
         ));
+
+    let target_count_evidence =
+        quarantine_evidence(2, 2, 0, vec![quarantine_evidence_entry("asset-alpha", 1)]);
+    let target_count_fixture = write_failed_assets_quarantine_fixture(
+        &tempdir,
+        &[
+            ("asset-alpha", State::Failed),
+            ("asset-beta", State::Failed),
+        ],
+        target_count_evidence,
+    );
+    binary()
+        .args(failed_assets_quarantine_args(
+            &target_count_fixture,
+            "2",
+            "2",
+        ))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "side-effect target count did not match the audited side-effect total",
+        ));
 }
 
 #[test]
 fn monitor_failed_assets_quarantine_rejects_duplicate_or_empty_asset_ids() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
-    for asset_id in ["asset-alpha", ""] {
-        let failed_assets = if asset_id.is_empty() {
-            vec![quarantine_evidence_entry("", 1)]
-        } else {
-            vec![
-                quarantine_evidence_entry("asset-alpha", 1),
-                quarantine_evidence_entry("asset-alpha", 1),
-            ]
-        };
-        let evidence = json!({
-            "failed_assets": failed_assets,
-            "with_upload_or_delete_side_effects": [quarantine_evidence_entry(asset_id, 1)],
-            "clean_of_recorded_remote_side_effects": [],
-            "side_effect_assets": [quarantine_evidence_entry(asset_id, 1)],
-        });
+    for (evidence, expected_failed_asset_count, expected_side_effect_asset_count) in [
+        (
+            quarantine_evidence(
+                2,
+                2,
+                0,
+                vec![
+                    quarantine_evidence_entry("asset-alpha", 1),
+                    quarantine_evidence_entry("asset-alpha", 1),
+                ],
+            ),
+            "2",
+            "2",
+        ),
+        (
+            quarantine_evidence(1, 1, 0, vec![quarantine_evidence_entry("", 1)]),
+            "1",
+            "1",
+        ),
+    ] {
         let fixture = write_failed_assets_quarantine_fixture(
             &tempdir,
             &[("asset-alpha", State::Failed)],
             evidence,
         );
         binary()
-            .args(failed_assets_quarantine_args(&fixture, "1", "1"))
+            .args(failed_assets_quarantine_args(
+                &fixture,
+                expected_failed_asset_count,
+                expected_side_effect_asset_count,
+            ))
             .assert()
             .failure()
             .stderr(predicate::str::contains("empty or duplicate asset ID"));
@@ -2634,12 +2834,7 @@ fn monitor_failed_assets_quarantine_rejects_duplicate_or_empty_asset_ids() {
 #[test]
 fn monitor_failed_assets_quarantine_rejects_empty_targets_and_zero_remote_side_effects() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
-    let empty_evidence = json!({
-        "failed_assets": [],
-        "with_upload_or_delete_side_effects": [],
-        "clean_of_recorded_remote_side_effects": [],
-        "side_effect_assets": [],
-    });
+    let empty_evidence = quarantine_evidence(0, 0, 0, vec![]);
     let empty_fixture = write_failed_assets_quarantine_fixture(
         &tempdir,
         &[("asset-alpha", State::Failed)],
@@ -2651,12 +2846,8 @@ fn monitor_failed_assets_quarantine_rejects_empty_targets_and_zero_remote_side_e
         .failure()
         .stderr(predicate::str::contains("target set must be nonempty"));
 
-    let zero_side_effect_evidence = json!({
-        "failed_assets": [quarantine_evidence_entry("asset-alpha", 0)],
-        "with_upload_or_delete_side_effects": [quarantine_evidence_entry("asset-alpha", 0)],
-        "clean_of_recorded_remote_side_effects": [],
-        "side_effect_assets": [quarantine_evidence_entry("asset-alpha", 0)],
-    });
+    let zero_side_effect_evidence =
+        quarantine_evidence(1, 1, 0, vec![quarantine_evidence_entry("asset-alpha", 0)]);
     let zero_side_effect_fixture = write_failed_assets_quarantine_fixture(
         &tempdir,
         &[("asset-alpha", State::Failed)],
@@ -2670,27 +2861,23 @@ fn monitor_failed_assets_quarantine_rejects_empty_targets_and_zero_remote_side_e
         ))
         .assert()
         .failure()
-        .stderr(predicate::str::contains("positive upload or delete count"));
+        .stderr(predicate::str::contains(
+            "positive remote-side-effect count",
+        ));
 }
 
 #[test]
 fn monitor_failed_assets_quarantine_target_set_is_deterministic_across_evidence_order() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
-    let first_evidence = json!({
-        "failed_assets": [
+    let first_evidence = quarantine_evidence(
+        2,
+        2,
+        0,
+        vec![
             quarantine_evidence_entry("asset-alpha", 1),
             quarantine_evidence_entry("asset-beta", 2),
         ],
-        "with_upload_or_delete_side_effects": [
-            quarantine_evidence_entry("asset-alpha", 1),
-            quarantine_evidence_entry("asset-beta", 2),
-        ],
-        "clean_of_recorded_remote_side_effects": [],
-        "side_effect_assets": [
-            quarantine_evidence_entry("asset-alpha", 1),
-            quarantine_evidence_entry("asset-beta", 2),
-        ],
-    });
+    );
     let mut fixture = write_failed_assets_quarantine_fixture(
         &tempdir,
         &[
@@ -2700,32 +2887,21 @@ fn monitor_failed_assets_quarantine_target_set_is_deterministic_across_evidence_
         first_evidence,
     );
     let first_report = failed_assets_quarantine_dry_run(&fixture, "2", "2");
-    let reversed_evidence = json!({
-        "failed_assets": [
+    let reversed_evidence = quarantine_evidence(
+        2,
+        2,
+        0,
+        vec![
             quarantine_evidence_entry("asset-beta", 2),
             quarantine_evidence_entry("asset-alpha", 1),
         ],
-        "with_upload_or_delete_side_effects": [
-            quarantine_evidence_entry("asset-beta", 2),
-            quarantine_evidence_entry("asset-alpha", 1),
-        ],
-        "clean_of_recorded_remote_side_effects": [],
-        "side_effect_assets": [
-            quarantine_evidence_entry("asset-beta", 2),
-            quarantine_evidence_entry("asset-alpha", 1),
-        ],
-    });
-    fs::write(
-        &fixture.evidence_path,
+    );
+    replace_failed_assets_quarantine_evidence(
+        &mut fixture,
         format!(
             "{}\n",
             serde_json::to_string_pretty(&reversed_evidence).expect("evidence should serialize")
         ),
-    )
-    .expect("reversed evidence should save");
-    fixture.evidence_sha256 = format!(
-        "{:x}",
-        Sha256::digest(fs::read(&fixture.evidence_path).expect("evidence should read"))
     );
     let second_report = failed_assets_quarantine_dry_run(&fixture, "2", "2");
 
@@ -2738,12 +2914,7 @@ fn monitor_failed_assets_quarantine_target_set_is_deterministic_across_evidence_
 #[test]
 fn monitor_failed_assets_quarantine_apply_requires_matching_target_set_hash() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
-    let evidence = json!({
-        "failed_assets": [quarantine_evidence_entry("asset-alpha", 1)],
-        "with_upload_or_delete_side_effects": [quarantine_evidence_entry("asset-alpha", 1)],
-        "clean_of_recorded_remote_side_effects": [],
-        "side_effect_assets": [quarantine_evidence_entry("asset-alpha", 1)],
-    });
+    let evidence = quarantine_evidence(1, 1, 0, vec![quarantine_evidence_entry("asset-alpha", 1)]);
     let fixture = write_failed_assets_quarantine_fixture(
         &tempdir,
         &[("asset-alpha", State::Failed)],
@@ -2783,26 +2954,21 @@ fn monitor_failed_assets_quarantine_apply_requires_matching_target_set_hash() {
 #[test]
 fn monitor_failed_assets_quarantine_rejects_non_failed_target_without_batch_changes() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
-    let evidence = json!({
-        "failed_assets": [
+    let evidence = quarantine_evidence(
+        2,
+        2,
+        0,
+        vec![
             quarantine_evidence_entry("asset-alpha", 1),
             quarantine_evidence_entry("asset-beta", 1),
         ],
-        "with_upload_or_delete_side_effects": [
-            quarantine_evidence_entry("asset-alpha", 1),
-            quarantine_evidence_entry("asset-beta", 1),
-        ],
-        "clean_of_recorded_remote_side_effects": [],
-        "side_effect_assets": [
-            quarantine_evidence_entry("asset-alpha", 1),
-            quarantine_evidence_entry("asset-beta", 1),
-        ],
-    });
+    );
     let fixture = write_failed_assets_quarantine_fixture(
         &tempdir,
         &[
             ("asset-alpha", State::Failed),
             ("asset-beta", State::Converted),
+            ("asset-gamma", State::Failed),
         ],
         evidence,
     );
@@ -2838,27 +3004,28 @@ fn monitor_failed_assets_quarantine_rejects_non_failed_target_without_batch_chan
             .state,
         State::Converted
     );
+    assert_eq!(
+        manifest
+            .get("asset-gamma")
+            .expect("asset should exist")
+            .state,
+        State::Failed
+    );
 }
 
 #[test]
 fn monitor_failed_assets_quarantine_applies_atomically_preserves_history_and_rejects_second_apply()
 {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
-    let evidence = json!({
-        "failed_assets": [
+    let evidence = quarantine_evidence(
+        2,
+        2,
+        0,
+        vec![
             quarantine_evidence_entry("asset-alpha", 3),
             quarantine_evidence_entry("asset-beta", 1),
         ],
-        "with_upload_or_delete_side_effects": [
-            quarantine_evidence_entry("asset-alpha", 3),
-            quarantine_evidence_entry("asset-beta", 1),
-        ],
-        "clean_of_recorded_remote_side_effects": [],
-        "side_effect_assets": [
-            quarantine_evidence_entry("asset-alpha", 3),
-            quarantine_evidence_entry("asset-beta", 1),
-        ],
-    });
+    );
     let fixture = write_failed_assets_quarantine_fixture(
         &tempdir,
         &[
@@ -2927,7 +3094,7 @@ fn monitor_failed_assets_quarantine_applies_atomically_preserves_history_and_rej
         );
         assert_eq!(record.proofs["failure_quarantine"]["delete_attempts"], 0);
         assert_eq!(record.proofs["failure_quarantine"]["deleted_finishes"], 0);
-        assert_eq!(record.proofs["failure_quarantine"]["mirror_successes"], 1);
+        assert_eq!(record.proofs["failure_quarantine"]["mirror_successes"], 0);
         assert!(
             record.proofs["failure_quarantine"]["applied_at_unix_seconds"]
                 .as_u64()
@@ -2940,14 +3107,10 @@ fn monitor_failed_assets_quarantine_applies_atomically_preserves_history_and_rej
         );
     }
 
-    let second_dry_report = failed_assets_quarantine_dry_run(&fixture, "2", "2");
     let mut second_apply_args = failed_assets_quarantine_args_owned(&fixture, "2", "2");
     second_apply_args.extend([
         "--expected-target-set-sha256".to_string(),
-        second_dry_report["target_set_sha256"]
-            .as_str()
-            .expect("target hash should be a string")
-            .to_string(),
+        target_set_sha256,
         "--apply".to_string(),
     ]);
     binary()
@@ -2955,7 +3118,7 @@ fn monitor_failed_assets_quarantine_applies_atomically_preserves_history_and_rej
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "every target must remain exactly Failed",
+            "current Failed cohort did not match the evidence failed-assets count",
         ));
 }
 
