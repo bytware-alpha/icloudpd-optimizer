@@ -294,6 +294,46 @@ struct FailingAfterTempTransport {
     writes: usize,
 }
 
+struct StagingObservingTransport {
+    inner: FakeTransport,
+    parent: PathBuf,
+    shared_marker: Option<PathBuf>,
+    fail_after_observing: bool,
+    saw_private_staging: bool,
+}
+
+impl CloudKitAdjustedSourceTransport for StagingObservingTransport {
+    fn post_records_lookup(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, AdjustedSourceError> {
+        self.inner.post_records_lookup(session, payload)
+    }
+
+    fn download_resource_to_create_new(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        download_url: &Url,
+        expected_size_bytes: u64,
+        temp_file: &mut File,
+    ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
+        self.saw_private_staging = has_private_staging_directory(&self.parent);
+        if let Some(marker) = &self.shared_marker {
+            std::fs::write(marker, b"shared namespace marker").expect("shared marker");
+        }
+        if self.fail_after_observing {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        self.inner.download_resource_to_create_new(
+            session,
+            download_url,
+            expected_size_bytes,
+            temp_file,
+        )
+    }
+}
+
 impl CloudKitAdjustedSourceTransport for FailingAfterTempTransport {
     fn post_records_lookup(
         &mut self,
@@ -328,6 +368,41 @@ fn no_temp_files(directory: &Path) -> bool {
                 .to_string_lossy()
                 .contains(".adjusted-")
         })
+}
+
+fn has_staging_directory(directory: &Path) -> bool {
+    std::fs::read_dir(directory)
+        .expect("test directory should read")
+        .any(|entry| {
+            let entry = entry.expect("entry");
+            entry.file_type().expect("entry type").is_dir()
+                && entry.file_name().to_string_lossy().contains(".adjusted-")
+                && entry.file_name().to_string_lossy().ends_with(".staging")
+        })
+}
+
+#[cfg(unix)]
+fn has_private_staging_directory(directory: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::read_dir(directory)
+        .expect("test directory should read")
+        .any(|entry| {
+            let entry = entry.expect("entry");
+            let name = entry.file_name();
+            let metadata = entry.metadata().expect("entry metadata");
+            metadata.is_dir()
+                && name.to_string_lossy().contains(".adjusted-")
+                && name.to_string_lossy().ends_with(".staging")
+                && metadata.mode() & 0o777 == 0o700
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.nlink() >= 2
+        })
+}
+
+#[cfg(not(unix))]
+fn has_private_staging_directory(_directory: &Path) -> bool {
+    false
 }
 
 fn resolve_error(record: Value) -> (AdjustedSourceError, FakeTransport, tempfile::TempDir) {
@@ -830,6 +905,108 @@ fn cleans_temp_after_transport_failure_and_never_uses_original_resource_fallback
         .expect_err("original resource must never be selected");
     assert!(matches!(error, AdjustedSourceError::InvalidResponse(_)));
     assert_eq!(transport.download_calls, 0);
+}
+
+#[test]
+fn error_cleanup_removes_the_observed_private_staging_directory() {
+    let bytes = nonblank_jpeg(4, 3);
+    let directory = tempdir().expect("test directory");
+    let output_path = safe_path(&directory, "adjusted.jpg");
+    let mut transport = StagingObservingTransport {
+        inner: FakeTransport {
+            lookups: VecDeque::from([json!({"records": [direct_asset_record(&bytes, 4, 3)]})]),
+            ..Default::default()
+        },
+        parent: directory
+            .path()
+            .canonicalize()
+            .expect("stable test directory"),
+        shared_marker: Some(safe_path(&directory, "shared-marker")),
+        fail_after_observing: true,
+        saw_private_staging: false,
+    };
+
+    let error = CloudKitAdjustedSourceResolver::new(&mut transport)
+        .resolve(&session(), &resolve_request(output_path.clone()))
+        .expect_err("transport failure must fail closed");
+
+    assert!(matches!(error, AdjustedSourceError::Filesystem));
+    assert!(
+        transport.saw_private_staging,
+        "download must receive an exclusively-owned staging namespace"
+    );
+    assert!(
+        !has_staging_directory(directory.path()),
+        "error cleanup must remove the per-resolution staging directory"
+    );
+    assert_eq!(
+        std::fs::read(safe_path(&directory, "shared-marker")).expect("shared marker survives"),
+        b"shared namespace marker"
+    );
+    assert!(!output_path.exists());
+}
+
+#[test]
+fn success_removes_the_observed_private_staging_directory() {
+    let bytes = nonblank_jpeg(4, 3);
+    let directory = tempdir().expect("test directory");
+    let output_path = safe_path(&directory, "adjusted.jpg");
+    let mut transport = StagingObservingTransport {
+        inner: FakeTransport {
+            lookups: VecDeque::from([json!({"records": [direct_asset_record(&bytes, 4, 3)]})]),
+            downloads: VecDeque::from([bytes]),
+            ..Default::default()
+        },
+        parent: directory
+            .path()
+            .canonicalize()
+            .expect("stable test directory"),
+        shared_marker: None,
+        fail_after_observing: false,
+        saw_private_staging: false,
+    };
+
+    CloudKitAdjustedSourceResolver::new(&mut transport)
+        .resolve(&session(), &resolve_request(output_path.clone()))
+        .expect("adjusted JPEG should resolve");
+
+    assert!(
+        transport.saw_private_staging,
+        "download must receive an exclusively-owned staging namespace"
+    );
+    assert!(
+        !has_staging_directory(directory.path()),
+        "successful install must remove the per-resolution staging directory"
+    );
+    assert!(output_path.is_file());
+}
+
+#[test]
+fn resolver_leaves_an_unrelated_crash_staging_directory_untouched() {
+    let bytes = nonblank_jpeg(4, 3);
+    let directory = tempdir().expect("test directory");
+    let output_path = safe_path(&directory, "adjusted.jpg");
+    let crash_staging = directory
+        .path()
+        .canonicalize()
+        .expect("stable test directory")
+        .join(".adjusted-orphan.staging");
+    std::fs::create_dir(&crash_staging).expect("crash staging directory");
+    std::fs::write(crash_staging.join("marker"), b"preserve").expect("crash marker");
+    let mut transport = FakeTransport {
+        lookups: VecDeque::from([json!({"records": [direct_asset_record(&bytes, 4, 3)]})]),
+        downloads: VecDeque::from([bytes]),
+        ..Default::default()
+    };
+
+    CloudKitAdjustedSourceResolver::new(&mut transport)
+        .resolve(&session(), &resolve_request(output_path))
+        .expect("resolver should not touch crash leftovers");
+
+    assert_eq!(
+        std::fs::read(crash_staging.join("marker")).expect("crash marker survives"),
+        b"preserve"
+    );
 }
 
 #[test]

@@ -175,7 +175,7 @@ impl<T: CloudKitAdjustedSourceTransport> CloudKitAdjustedSourceResolver<T> {
             temp.file_mut()?,
         )?;
         temp.sync_and_close()?;
-        let temp_artifact = output.open_regular(temp.name())?;
+        let temp_artifact = temp.open_regular()?;
         let temp_identity = temp_artifact.identity.clone();
         if temp_identity.size_bytes != source.size_bytes || download.size_bytes != source.size_bytes
         {
@@ -194,17 +194,8 @@ impl<T: CloudKitAdjustedSourceTransport> CloudKitAdjustedSourceResolver<T> {
                 existing
             }
             None => {
-                match output.install_exclusive(temp.name(), &temp_identity)? {
-                    InstallResult::Installed => temp.disarm(),
-                    InstallResult::AlreadyExists => {}
-                }
-                let final_artifact = output
-                    .open_final()?
-                    .ok_or(AdjustedSourceError::InstalledOutputMismatch)?;
-                if final_artifact.identity != temp_identity {
-                    return Err(AdjustedSourceError::InstalledOutputMismatch);
-                }
-                final_artifact
+                let result = temp.install_exclusive(&temp_identity)?;
+                output.final_after_install(&temp_identity, result)?
             }
         };
         verify_jpeg(&final_artifact.file, source.width, source.height)?;
@@ -214,7 +205,7 @@ impl<T: CloudKitAdjustedSourceTransport> CloudKitAdjustedSourceResolver<T> {
             .map_err(|_| AdjustedSourceError::Filesystem)?;
         output.fsync_parent()?;
         output.ensure_final_identity(&final_artifact.identity)?;
-        temp.remove();
+        temp.cleanup()?;
 
         Ok(CloudKitAdjustedSourceProof {
             schema_version: ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION.to_string(),
@@ -336,9 +327,11 @@ impl FileIdentity {
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileToken {
+struct StagingDirectoryIdentity {
     device: u64,
     inode: u64,
+    owner: u32,
+    mode: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -368,6 +361,7 @@ struct OpenArtifact {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InstallResult {
     Installed,
     AlreadyExists,
@@ -376,9 +370,11 @@ enum InstallResult {
 #[cfg(unix)]
 struct AnchoredTemp<'a> {
     output: &'a AnchoredOutput,
-    name: CString,
+    staging_name: CString,
+    staging: File,
+    staging_identity: StagingDirectoryIdentity,
+    file_name: CString,
     file: Option<File>,
-    token: Option<FileToken>,
     active: bool,
 }
 
@@ -440,22 +436,42 @@ impl AnchoredOutput {
         let prefix = std::str::from_utf8(self.final_name.to_bytes())
             .map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
         for _ in 0..16 {
-            let name = CString::new(format!(".{prefix}.adjusted-{}.tmp", Uuid::new_v4()))
-                .map_err(|_| AdjustedSourceError::Filesystem)?;
-            match open_temp_at(self.parent.as_raw_fd(), &name) {
-                Ok(file) => return AnchoredTemp::new(self, name, file),
+            let staging_name =
+                CString::new(format!(".{prefix}.adjusted-{}.staging", Uuid::new_v4()))
+                    .map_err(|_| AdjustedSourceError::Filesystem)?;
+            match create_staging_directory_at(self.parent.as_raw_fd(), &staging_name) {
+                Ok(()) => {}
                 Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
                 Err(_) => return Err(AdjustedSourceError::Filesystem),
             }
+            let staging = open_directory_at(self.parent.as_raw_fd(), &staging_name)
+                .map_err(|_| AdjustedSourceError::Filesystem)?;
+            let staging_identity = inspect_staging_directory(&staging)?;
+            let file_name =
+                CString::new("source.jpg").map_err(|_| AdjustedSourceError::Filesystem)?;
+            match open_temp_at(staging.as_raw_fd(), &file_name) {
+                Ok(file) => {
+                    return Ok(AnchoredTemp::new(
+                        self,
+                        staging_name,
+                        staging,
+                        staging_identity,
+                        file_name,
+                        file,
+                    ));
+                }
+                Err(_) => {
+                    let _ = remove_owned_staging_directory(
+                        self,
+                        &staging_name,
+                        &staging,
+                        staging_identity,
+                    );
+                    return Err(AdjustedSourceError::Filesystem);
+                }
+            }
         }
         Err(AdjustedSourceError::Filesystem)
-    }
-
-    fn open_regular(&self, name: &CStr) -> Result<OpenArtifact, AdjustedSourceError> {
-        use std::os::fd::AsRawFd;
-
-        let file = open_regular_at(self.parent.as_raw_fd(), name)?;
-        inspect_open_file(file)
     }
 
     fn open_final(&self) -> Result<Option<OpenArtifact>, AdjustedSourceError> {
@@ -466,23 +482,22 @@ impl AnchoredOutput {
             .transpose()
     }
 
-    fn install_exclusive(
+    fn final_after_install(
         &self,
-        temp_name: &CStr,
         expected: &FileIdentity,
-    ) -> Result<InstallResult, AdjustedSourceError> {
-        use std::os::fd::AsRawFd;
-
-        let current = self.open_regular(temp_name)?;
-        if current.identity != *expected {
-            return Err(AdjustedSourceError::InvalidTemporaryFile);
-        }
-        match rename_without_overwrite_at(self.parent.as_raw_fd(), temp_name, &self.final_name) {
-            Ok(()) => Ok(InstallResult::Installed),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                Ok(InstallResult::AlreadyExists)
+        result: InstallResult,
+    ) -> Result<OpenArtifact, AdjustedSourceError> {
+        let final_artifact = self
+            .open_final()?
+            .ok_or(AdjustedSourceError::InstalledOutputMismatch)?;
+        match result {
+            InstallResult::Installed if final_artifact.identity != *expected => {
+                Err(AdjustedSourceError::InstalledOutputMismatch)
             }
-            Err(_) => Err(AdjustedSourceError::Filesystem),
+            InstallResult::AlreadyExists if !final_artifact.identity.matches_bytes(expected) => {
+                Err(AdjustedSourceError::ExistingOutputMismatch)
+            }
+            InstallResult::Installed | InstallResult::AlreadyExists => Ok(final_artifact),
         }
     }
 
@@ -501,35 +516,27 @@ impl AnchoredOutput {
         }
         Ok(())
     }
-
-    fn unlink_temp_if_matches(&self, name: &CStr, token: FileToken) {
-        use std::os::fd::AsRawFd;
-
-        let Ok(current) = self.open_regular(name) else {
-            return;
-        };
-        if FileToken::from_identity(&current.identity) != token {
-            return;
-        }
-        let _ = unsafe { libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), 0) };
-    }
 }
 
 #[cfg(unix)]
 impl<'a> AnchoredTemp<'a> {
     fn new(
         output: &'a AnchoredOutput,
-        name: CString,
+        staging_name: CString,
+        staging: File,
+        staging_identity: StagingDirectoryIdentity,
+        file_name: CString,
         file: File,
-    ) -> Result<Self, AdjustedSourceError> {
-        let token = file_token(&file)?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             output,
-            name,
+            staging_name,
+            staging,
+            staging_identity,
+            file_name,
             file: Some(file),
-            token: Some(token),
             active: true,
-        })
+        }
     }
 
     fn file_mut(&mut self) -> Result<&mut File, AdjustedSourceError> {
@@ -538,8 +545,11 @@ impl<'a> AnchoredTemp<'a> {
             .ok_or(AdjustedSourceError::InvalidTemporaryFile)
     }
 
-    fn name(&self) -> &CStr {
-        &self.name
+    fn open_regular(&self) -> Result<OpenArtifact, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        self.validate_staging()?;
+        inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)
     }
 
     fn sync_and_close(&mut self) -> Result<(), AdjustedSourceError> {
@@ -549,29 +559,73 @@ impl<'a> AnchoredTemp<'a> {
             .ok_or(AdjustedSourceError::InvalidTemporaryFile)?;
         file.sync_all()
             .map_err(|_| AdjustedSourceError::Filesystem)?;
-        self.token = Some(file_token(file)?);
         self.file.take();
         Ok(())
     }
 
-    fn disarm(&mut self) {
-        self.active = false;
+    fn install_exclusive(
+        &self,
+        expected: &FileIdentity,
+    ) -> Result<InstallResult, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        let current = self.open_regular()?;
+        if current.identity != *expected {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        match rename_without_overwrite_at(
+            self.staging.as_raw_fd(),
+            &self.file_name,
+            self.output.parent.as_raw_fd(),
+            &self.output.final_name,
+        ) {
+            Ok(()) => Ok(InstallResult::Installed),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Ok(InstallResult::AlreadyExists)
+            }
+            Err(_) => Err(AdjustedSourceError::Filesystem),
+        }
     }
 
-    fn remove(&mut self) {
-        if self.active {
-            if let Some(token) = self.token {
-                self.output.unlink_temp_if_matches(&self.name, token);
-            }
-            self.active = false;
+    fn cleanup(&mut self) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        if !self.active {
+            return Ok(());
         }
+        self.file.take();
+        self.validate_staging()?;
+        let unlink =
+            unsafe { libc::unlinkat(self.staging.as_raw_fd(), self.file_name.as_ptr(), 0) };
+        if unlink != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        self.remove_empty_staging_directory()?;
+        self.active = false;
+        Ok(())
+    }
+
+    fn validate_staging(&self) -> Result<(), AdjustedSourceError> {
+        if inspect_staging_directory(&self.staging)? != self.staging_identity {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        Ok(())
+    }
+
+    fn remove_empty_staging_directory(&self) -> Result<(), AdjustedSourceError> {
+        remove_owned_staging_directory(
+            self.output,
+            &self.staging_name,
+            &self.staging,
+            self.staging_identity,
+        )
     }
 }
 
 #[cfg(unix)]
 impl Drop for AnchoredTemp<'_> {
     fn drop(&mut self) {
-        self.remove();
+        let _ = self.cleanup();
     }
 }
 
@@ -937,6 +991,16 @@ fn open_temp_at(dirfd: libc::c_int, name: &CStr) -> io::Result<File> {
 }
 
 #[cfg(unix)]
+fn create_staging_directory_at(dirfd: libc::c_int, name: &CStr) -> io::Result<()> {
+    let result = unsafe { libc::mkdirat(dirfd, name.as_ptr(), 0o700) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
 fn open_regular_at(dirfd: libc::c_int, name: &CStr) -> Result<File, AdjustedSourceError> {
     open_optional_regular_at(dirfd, name)?.ok_or(AdjustedSourceError::Filesystem)
 }
@@ -967,29 +1031,66 @@ fn open_optional_regular_at(
 }
 
 #[cfg(unix)]
-fn file_token(file: &File) -> Result<FileToken, AdjustedSourceError> {
+fn inspect_staging_directory(
+    directory: &File,
+) -> Result<StagingDirectoryIdentity, AdjustedSourceError> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = file
+    let metadata = directory
         .metadata()
         .map_err(|_| AdjustedSourceError::Filesystem)?;
-    if !metadata.file_type().is_file() {
-        return Err(AdjustedSourceError::UnsafeOutputPath);
+    let mode = metadata.mode() & 0o777;
+    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } || mode != 0o700 {
+        return Err(AdjustedSourceError::InvalidTemporaryFile);
     }
-    Ok(FileToken {
+    Ok(StagingDirectoryIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
+        owner: metadata.uid(),
+        mode,
     })
 }
 
 #[cfg(unix)]
-impl FileToken {
-    fn from_identity(identity: &FileIdentity) -> Self {
-        Self {
-            device: identity.device,
-            inode: identity.inode,
-        }
+fn staging_link_count(directory: &File) -> Result<u64, AdjustedSourceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    directory
+        .metadata()
+        .map(|metadata| metadata.nlink())
+        .map_err(|_| AdjustedSourceError::Filesystem)
+}
+
+#[cfg(unix)]
+fn remove_owned_staging_directory(
+    output: &AnchoredOutput,
+    staging_name: &CStr,
+    staging: &File,
+    expected: StagingDirectoryIdentity,
+) -> Result<(), AdjustedSourceError> {
+    use std::os::fd::AsRawFd;
+
+    if inspect_staging_directory(staging)? != expected || staging_link_count(staging)? != 2 {
+        return Err(AdjustedSourceError::InvalidTemporaryFile);
     }
+    let named_staging = open_directory_at(output.parent.as_raw_fd(), staging_name)
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    if inspect_staging_directory(&named_staging)? != expected
+        || staging_link_count(&named_staging)? != 2
+    {
+        return Err(AdjustedSourceError::InvalidTemporaryFile);
+    }
+    let remove = unsafe {
+        libc::unlinkat(
+            output.parent.as_raw_fd(),
+            staging_name.as_ptr(),
+            libc::AT_REMOVEDIR,
+        )
+    };
+    if remove != 0 {
+        return Err(AdjustedSourceError::Filesystem);
+    }
+    output.fsync_parent()
 }
 
 #[cfg(unix)]
@@ -1089,9 +1190,21 @@ fn rgb_standard_deviation(decoded: &[u8], channels: usize) -> Result<f64, Adjust
 }
 
 #[cfg(target_os = "macos")]
-fn rename_without_overwrite_at(dirfd: libc::c_int, from: &CStr, to: &CStr) -> io::Result<()> {
-    let result =
-        unsafe { libc::renameatx_np(dirfd, from.as_ptr(), dirfd, to.as_ptr(), libc::RENAME_EXCL) };
+fn rename_without_overwrite_at(
+    from_dirfd: libc::c_int,
+    from: &CStr,
+    to_dirfd: libc::c_int,
+    to: &CStr,
+) -> io::Result<()> {
+    let result = unsafe {
+        libc::renameatx_np(
+            from_dirfd,
+            from.as_ptr(),
+            to_dirfd,
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
     if result == 0 {
         Ok(())
     } else {
@@ -1100,13 +1213,18 @@ fn rename_without_overwrite_at(dirfd: libc::c_int, from: &CStr, to: &CStr) -> io
 }
 
 #[cfg(target_os = "linux")]
-fn rename_without_overwrite_at(dirfd: libc::c_int, from: &CStr, to: &CStr) -> io::Result<()> {
+fn rename_without_overwrite_at(
+    from_dirfd: libc::c_int,
+    from: &CStr,
+    to_dirfd: libc::c_int,
+    to: &CStr,
+) -> io::Result<()> {
     let result = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
-            dirfd,
+            from_dirfd,
             from.as_ptr(),
-            dirfd,
+            to_dirfd,
             to.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
@@ -1119,7 +1237,12 @@ fn rename_without_overwrite_at(dirfd: libc::c_int, from: &CStr, to: &CStr) -> io
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn rename_without_overwrite_at(_dirfd: libc::c_int, _from: &CStr, _to: &CStr) -> io::Result<()> {
+fn rename_without_overwrite_at(
+    _from_dirfd: libc::c_int,
+    _from: &CStr,
+    _to_dirfd: libc::c_int,
+    _to: &CStr,
+) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "rename unsupported",
@@ -1158,14 +1281,11 @@ mod tests {
             .write_all(b"verified JPEG bytes")
             .expect("write temp");
         temp.sync_and_close().expect("sync temp");
-        let expected = output
-            .open_regular(temp.name())
-            .expect("reopen temp")
-            .identity;
+        let expected = temp.open_regular().expect("reopen temp").identity;
         std::fs::write(&output_path, b"existing output").expect("existing destination");
 
-        let result = output
-            .install_exclusive(temp.name(), &expected)
+        let result = temp
+            .install_exclusive(&expected)
             .expect("occupied destination is a normal race outcome");
 
         assert!(matches!(result, InstallResult::AlreadyExists));
@@ -1173,5 +1293,78 @@ mod tests {
             std::fs::read(&output_path).expect("existing output bytes"),
             b"existing output"
         );
+        temp.cleanup().expect("cleanup staging directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn already_exists_with_identical_bytes_accepts_the_concurrent_winner() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let output_path = directory
+            .path()
+            .canonicalize()
+            .expect("stable test directory")
+            .join("adjusted.jpg");
+        let output = AnchoredOutput::open(&output_path).expect("anchored output");
+        let bytes = b"verified JPEG bytes";
+        let mut temp = output.create_temp().expect("create-new temp");
+        temp.file_mut()
+            .expect("open temp")
+            .write_all(bytes)
+            .expect("write temp");
+        temp.sync_and_close().expect("sync temp");
+        let expected = temp.open_regular().expect("reopen temp").identity;
+        std::fs::write(&output_path, bytes).expect("concurrent winner");
+
+        let result = temp
+            .install_exclusive(&expected)
+            .expect("occupied destination is a normal race outcome");
+        let winner = output
+            .final_after_install(&expected, result)
+            .expect("identical concurrent winner must be accepted");
+
+        assert!(matches!(result, InstallResult::AlreadyExists));
+        assert!(winner.identity.matches_bytes(&expected));
+        assert_ne!(
+            winner.identity, expected,
+            "concurrent winner has another inode"
+        );
+        temp.cleanup().expect("cleanup staging directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn already_exists_with_different_bytes_rejects_the_concurrent_winner() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let output_path = directory
+            .path()
+            .canonicalize()
+            .expect("stable test directory")
+            .join("adjusted.jpg");
+        let output = AnchoredOutput::open(&output_path).expect("anchored output");
+        let mut temp = output.create_temp().expect("create-new temp");
+        temp.file_mut()
+            .expect("open temp")
+            .write_all(b"verified JPEG bytes")
+            .expect("write temp");
+        temp.sync_and_close().expect("sync temp");
+        let expected = temp.open_regular().expect("reopen temp").identity;
+        std::fs::write(&output_path, b"different winner").expect("concurrent winner");
+
+        let result = temp
+            .install_exclusive(&expected)
+            .expect("occupied destination is a normal race outcome");
+        let error = match output.final_after_install(&expected, result) {
+            Ok(_) => panic!("different concurrent winner must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(result, InstallResult::AlreadyExists));
+        assert!(matches!(error, AdjustedSourceError::ExistingOutputMismatch));
+        assert_eq!(
+            std::fs::read(&output_path).expect("winner remains"),
+            b"different winner"
+        );
+        temp.cleanup().expect("cleanup staging directory");
     }
 }
