@@ -14,15 +14,17 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::conversion::{
-    CommandPlan, ConversionError, EmbeddedPreviewTag, ExifOrientation, plan_conversion_for_target,
+    CommandPlan, ConversionError, EmbeddedPreviewTag, ExifOrientation,
+    plan_adjusted_source_conversion_for_target, plan_conversion_for_target,
     plan_conversion_for_target_with_preview_tag_and_orientation,
 };
 use crate::conversion_backend::{TargetPlatform, backend_report_for_target};
 use crate::manifest::{FailureKind, Manifest, ManifestError, State};
 use crate::proof::NasRawProof;
 use crate::workflow::{
-    ConversionCommandTiming, ConversionPerformanceInput, ConversionResultProof, WorkflowError,
-    record_conversion_performance, record_conversion_result,
+    ConversionCommandTiming, ConversionPerformanceInput, ConversionResultProof,
+    ConversionSourceBinding, WorkflowError, record_conversion_performance,
+    record_conversion_result, validated_adjusted_source_for_conversion,
 };
 
 const DEFAULT_CHILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -231,6 +233,11 @@ fn execute_measured_conversion_for_target(
         });
     }
 
+    let adjusted_source = validated_adjusted_source_for_conversion(
+        manifest,
+        &request.asset_id,
+        &request.output_path,
+    )?;
     refuse_preexisting_output(&request.output_path)?;
     let staged_raw = stage_raw_for_conversion(
         &request.asset_id,
@@ -239,25 +246,47 @@ fn execute_measured_conversion_for_target(
         &request.output_path,
     )?;
     let staged_raw_path = staged_raw.path();
-    let mut plan = plan_conversion_for_target(
-        target,
-        staged_raw_path,
-        &request.output_path,
-        request.heic_quality,
-    )?;
-    let preview_probe = probe_embedded_preview(staged_raw_path)?;
-    if preview_probe.preview_tag != EmbeddedPreviewTag::PreviewImage
-        || preview_probe.orientation.is_some()
-    {
-        plan = plan_conversion_for_target_with_preview_tag_and_orientation(
+    let plan = if let Some(proof) = &adjusted_source {
+        plan_adjusted_source_conversion_for_target(
+            target,
+            staged_raw_path,
+            &proof.local_path,
+            &request.output_path,
+            request.heic_quality,
+        )?
+    } else {
+        let mut plan = plan_conversion_for_target(
             target,
             staged_raw_path,
             &request.output_path,
             request.heic_quality,
-            preview_probe.preview_tag,
-            preview_probe.orientation,
         )?;
-    }
+        let preview_probe = probe_embedded_preview(staged_raw_path)?;
+        if preview_probe.preview_tag != EmbeddedPreviewTag::PreviewImage
+            || preview_probe.orientation.is_some()
+        {
+            plan = plan_conversion_for_target_with_preview_tag_and_orientation(
+                target,
+                staged_raw_path,
+                &request.output_path,
+                request.heic_quality,
+                preview_probe.preview_tag,
+                preview_probe.orientation,
+            )?;
+        }
+        plan
+    };
+    let source_binding =
+        adjusted_source
+            .as_ref()
+            .map_or(ConversionSourceBinding::EmbeddedPreview, |proof| {
+                ConversionSourceBinding::AdjustedSource {
+                    adjusted_source_proof_digest:
+                        crate::adjusted_source::adjusted_source_proof_digest(proof),
+                    adjusted_jpeg_sha256: proof.downloaded_sha256.clone(),
+                    adjusted_jpeg_path: proof.local_path.clone(),
+                }
+            });
     let conversion_result = (|| {
         let total_started = Instant::now();
         let convert_started = Instant::now();
@@ -276,6 +305,7 @@ fn execute_measured_conversion_for_target(
                 heic_path: request.output_path.clone(),
                 heic_sha256: output.sha256,
                 size_bytes: output.size_bytes,
+                source_binding,
             },
         )?;
         record_conversion_performance(
@@ -1548,8 +1578,15 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::sync::{Mutex, MutexGuard};
 
+    use crate::adjusted_source::{
+        ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION, CloudKitAdjustedSourceProof,
+        adjusted_source_path_for_output, adjusted_source_proof_digest,
+    };
     use crate::proof::NasRawProof;
-    use crate::workflow::{discover_raw_asset, record_nas_proof};
+    use crate::workflow::{
+        ConversionSourceBinding, OriginalAssetProof, discover_raw_asset,
+        record_adjusted_source_proof, record_nas_proof, record_original_asset_proof,
+    };
 
     #[test]
     fn conversion_errors_expose_stable_failure_kinds_before_stringification() {
@@ -1649,6 +1686,36 @@ mod tests {
         assert!(result.is_err(), "mutated output must fail closed");
     }
 
+    #[test]
+    fn conversion_cleanup_removes_only_generated_files_and_retains_adjusted_source_for_retry() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        let adjusted_path = adjusted_source_path_for_output(&output_path);
+        let embedded_path = embedded_preview_path(&output_path);
+        let oriented_path = oriented_preview_path(&output_path);
+        let staged_path = staged_raw_path_for_output(&output_path, Path::new("IMG_0001.dng"));
+        fs::write(&output_path, b"partial-heic").expect("partial HEIC should be written");
+        fs::write(&adjusted_path, b"proven-adjusted-source")
+            .expect("adjusted source should be written");
+        fs::write(&embedded_path, b"generated-preview")
+            .expect("embedded preview should be written");
+        fs::write(&oriented_path, b"generated-preview")
+            .expect("oriented preview should be written");
+        fs::write(&staged_path, b"staged-raw").expect("staged RAW should be written");
+
+        remove_conversion_output_path(&output_path);
+        remove_failed_output(&staged_path);
+
+        assert_eq!(
+            fs::read(&adjusted_path).expect("proven source must survive cleanup"),
+            b"proven-adjusted-source"
+        );
+        assert!(!output_path.exists());
+        assert!(!embedded_path.exists());
+        assert!(!oriented_path.exists());
+        assert!(!staged_path.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn linux_conversion_runs_full_chain_and_records_chain_tool_name() {
@@ -1720,6 +1787,111 @@ mod tests {
         assert_eq!(
             fs::read_to_string(log_path).expect("command log should be readable"),
             "exiftool-preview\nexiftool-preview-orientation\nmagick-auto-orient\nheif-enc\nexiftool-metadata\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_adjusted_conversion_skips_embedded_preview_probe_and_retains_proven_source() {
+        let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
+        write_executable_script(
+            &tool_dir.path().join("heif-enc"),
+            r#"#!/bin/sh
+printf 'heif-enc\n' >> "$EXECUTION_LOG"
+out=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-o" ]; then
+    out="$arg"
+  fi
+  previous="$arg"
+done
+[ -n "$out" ] || exit 43
+printf 'heic' > "$out"
+"#,
+        );
+        write_executable_script(
+            &tool_dir.path().join("exiftool"),
+            r#"#!/bin/sh
+if [ "$1" = "-j" ] || [ "$1" = "-b" ]; then
+  exit 66
+fi
+if [ "$1" = "-TagsFromFile" ]; then
+  printf 'exiftool-metadata\n' >> "$EXECUTION_LOG"
+  exit 0
+fi
+exit 67
+"#,
+        );
+        write_executable_script(&tool_dir.path().join("magick"), "#!/bin/sh\nexit 68\n");
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let output_dir = tempdir
+            .path()
+            .canonicalize()
+            .expect("tempdir should canonicalize")
+            .join("out");
+        fs::create_dir_all(&output_dir).expect("output directory should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        let raw_bytes = b"raw-bytes";
+        fs::write(&raw_path, raw_bytes).expect("raw should be written");
+        let output_path = output_dir.join("IMG_0001.heic");
+        let adjusted_path = adjusted_source_path_for_output(&output_path);
+        let adjusted_bytes = adjusted_test_jpeg();
+        fs::write(&adjusted_path, &adjusted_bytes).expect("adjusted JPEG should be written");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let mut manifest = nas_verified_manifest(&raw_path);
+        let original = OriginalAssetProof {
+            record_name: "original-record-1".to_string(),
+            record_change_tag: "original-tag-1".to_string(),
+            record_type: "CPLAsset".to_string(),
+            database_scope: Default::default(),
+            zone_name: "PrimarySync".to_string(),
+            filename: "IMG_0001.dng".to_string(),
+            size_bytes: raw_bytes.len() as u64,
+            matched_raw_sha256: format!("{:x}", Sha256::digest(raw_bytes)),
+        };
+        record_original_asset_proof(&mut manifest, "asset-1", original.clone())
+            .expect("original asset proof should record");
+        let adjusted =
+            adjusted_test_proof("asset-1", &original, adjusted_path.clone(), &adjusted_bytes);
+        record_adjusted_source_proof(&mut manifest, "asset-1", &output_path, adjusted.clone())
+            .expect("adjusted proof should record");
+
+        let updated = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect("adjusted conversion should complete without an embedded preview");
+
+        assert_eq!(
+            fs::read_to_string(&log_path).expect("command log should be readable"),
+            "heif-enc\nexiftool-metadata\n"
+        );
+        assert_eq!(
+            fs::read(&adjusted_path).expect("source should survive"),
+            adjusted_bytes
+        );
+        assert!(!staged_raw_path_for_output(&output_path, &raw_path).exists());
+        assert_eq!(
+            serde_json::from_value::<ConversionSourceBinding>(
+                updated.get("asset-1").expect("asset should exist").proofs["conversion"]
+                    ["source_binding"]
+                    .clone(),
+            )
+            .expect("source binding should deserialize"),
+            ConversionSourceBinding::AdjustedSource {
+                adjusted_source_proof_digest: adjusted_source_proof_digest(&adjusted),
+                adjusted_jpeg_sha256: adjusted.downloaded_sha256,
+                adjusted_jpeg_path: adjusted_path,
+            }
         );
     }
 
@@ -3108,6 +3280,56 @@ printf 'heic' > "$out"
         let mut preview_path = output_path.to_path_buf();
         preview_path.set_extension("oriented-preview.jpg");
         preview_path
+    }
+
+    #[cfg(unix)]
+    fn adjusted_test_jpeg() -> Vec<u8> {
+        use image::codecs::jpeg::JpegEncoder;
+        use image::{DynamicImage, Rgb, RgbImage};
+
+        let mut image = RgbImage::new(4, 3);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = Rgb([x as u8 * 50, y as u8 * 70, 23]);
+        }
+        let mut bytes = Vec::new();
+        JpegEncoder::new_with_quality(&mut bytes, 100)
+            .encode_image(&DynamicImage::ImageRgb8(image))
+            .expect("test adjusted JPEG should encode");
+        bytes
+    }
+
+    #[cfg(unix)]
+    fn adjusted_test_proof(
+        asset_id: &str,
+        original: &OriginalAssetProof,
+        local_path: PathBuf,
+        bytes: &[u8],
+    ) -> CloudKitAdjustedSourceProof {
+        CloudKitAdjustedSourceProof {
+            schema_version: ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION.to_string(),
+            source_kind: "cloudkit_adjusted_res_jpeg_full_res".to_string(),
+            asset_id: asset_id.to_string(),
+            asset_record_name: original.record_name.clone(),
+            asset_record_change_tag: original.record_change_tag.clone(),
+            asset_record_type: original.record_type.clone(),
+            resource_record_name: original.record_name.clone(),
+            resource_record_change_tag: original.record_change_tag.clone(),
+            resource_record_type: "CPLAsset".to_string(),
+            database_scope: original.database_scope,
+            zone_name: original.zone_name.clone(),
+            master_record_name: None,
+            resource_field: "resJPEGFullRes".to_string(),
+            declared_file_type: "public.jpeg".to_string(),
+            declared_fingerprint: "test-fingerprint".to_string(),
+            declared_size_bytes: bytes.len() as u64,
+            width: 4,
+            height: 3,
+            local_path,
+            downloaded_size_bytes: bytes.len() as u64,
+            downloaded_sha256: format!("{:x}", Sha256::digest(bytes)),
+            orientation: 1,
+            verified_at_unix_seconds: 1_800_000_001,
+        }
     }
 
     #[cfg(unix)]

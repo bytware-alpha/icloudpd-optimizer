@@ -52,11 +52,12 @@ use crate::upload::{
     load_upload_session, run_icloud_upload, validate_library_destination, verify_local_heic,
 };
 use crate::workflow::{
-    ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, OriginalAssetProof,
-    SourceAgeProof, UploadProof, WorkflowError, approve_delete, approved_original_delete_request,
-    build_delete_plan, icloudpd_local_mirror_ready_proofs, mark_delete_eligible,
-    prove_and_record_nas, record_conversion_performance, record_conversion_result,
-    record_delete_execution, record_heic_verification, record_icloudpd_local_mirror_proof,
+    ConversionPerformanceInput, ConversionResultProof, ConversionSourceBinding,
+    HeicVerificationProof, OriginalAssetProof, SourceAgeProof, UploadProof, WorkflowError,
+    approve_delete, approved_original_delete_request, build_delete_plan,
+    icloudpd_local_mirror_ready_proofs, mark_delete_eligible, prove_and_record_nas,
+    record_conversion_performance, record_conversion_result, record_delete_execution,
+    record_heic_verification, record_icloudpd_local_mirror_proof,
     record_original_asset_batch_proofs, record_original_asset_proof, record_source_age_proof,
     record_stage_failure, record_upload_proof, record_uploaded_heic_delete,
     upload_ready_heic_proof, uploaded_heic_delete_request,
@@ -3680,6 +3681,7 @@ fn workflow_conversion_result(args: WorkflowConversionResultArgs) -> Result<(), 
             heic_path: args.heic_path,
             heic_sha256: args.heic_sha256,
             size_bytes: args.size_bytes,
+            source_binding: ConversionSourceBinding::EmbeddedPreview,
         },
     )?;
     save_manifest(&manifest, &args.manifest)

@@ -13,8 +13,9 @@ use icloudpd_optimizer::upload::{
     CloudKitOriginalAssetResolveTarget, CloudKitReplacementResourceProof,
 };
 use icloudpd_optimizer::workflow::{
-    ConversionPerformanceProof, ConversionResultProof, HeicVerificationProof, OriginalAssetProof,
-    SourceAgeProof, UploadProof, WorkflowError, mark_delete_eligible, record_source_age_proof,
+    ConversionPerformanceProof, ConversionResultProof, ConversionSourceBinding,
+    HeicVerificationProof, OriginalAssetProof, SourceAgeProof, UploadProof, WorkflowError,
+    mark_delete_eligible, record_source_age_proof,
 };
 
 const DAY: u64 = 24 * 60 * 60;
@@ -213,6 +214,7 @@ fn failed_resolver_record_at_strength(asset_id: &str, strength: State) -> AssetR
             heic_path: PathBuf::from("/staging/IMG_0001.heic"),
             heic_sha256: HEIC_SHA256.to_string(),
             size_bytes: 24,
+            source_binding: ConversionSourceBinding::EmbeddedPreview,
         })
         .unwrap(),
     );

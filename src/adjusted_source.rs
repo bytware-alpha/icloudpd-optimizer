@@ -20,7 +20,7 @@ use crate::upload::{
 };
 use crate::workflow::OriginalAssetProof;
 
-const ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION: &str = "cloudkit-adjusted-source-v1";
+pub const ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION: &str = "cloudkit-adjusted-source-v1";
 const ADJUSTED_SOURCE_KIND: &str = "cloudkit_adjusted_res_jpeg_full_res";
 const ADJUSTED_RESOURCE_FIELD: &str = "resJPEGFullRes";
 const ADJUSTED_WIDTH_FIELD: &str = "resJPEGFullWidth";
@@ -275,6 +275,63 @@ pub struct CloudKitAdjustedSourceProof {
     pub verified_at_unix_seconds: u64,
 }
 
+/// Returns the dedicated, output-adjacent location for a proven adjusted JPEG.
+///
+/// This name is deliberately distinct from conversion intermediates so retry
+/// cleanup cannot mistake the proof-bearing source for a disposable preview.
+pub fn adjusted_source_path_for_output(output_path: impl AsRef<Path>) -> PathBuf {
+    let mut adjusted_path = output_path.as_ref().to_path_buf();
+    adjusted_path.set_extension("adjusted-source.jpg");
+    adjusted_path
+}
+
+/// Produces the durable identity used to bind an adjusted conversion result to
+/// the exact CloudKit proof that authorized its JPEG input.
+pub fn adjusted_source_proof_digest(proof: &CloudKitAdjustedSourceProof) -> String {
+    let encoded = serde_json::to_vec(proof)
+        .expect("CloudKitAdjustedSourceProof must always serialize into JSON");
+    format!("{:x}", Sha256::digest(encoded))
+}
+
+/// Re-validates a proof-bearing adjusted JPEG through the same descriptor-safe
+/// path anchoring used by the read-only resolver.
+#[cfg(unix)]
+pub fn validate_installed_adjusted_source_proof(
+    proof: &CloudKitAdjustedSourceProof,
+    asset_id: &str,
+    original_asset: &OriginalAssetProof,
+    output_path: impl AsRef<Path>,
+) -> Result<(), AdjustedSourceError> {
+    let expected_path = adjusted_source_path_for_output(output_path);
+    validate_adjusted_source_proof_fields(proof, asset_id, original_asset, &expected_path)?;
+
+    let output = AnchoredOutput::open(&expected_path)?;
+    let artifact = output
+        .open_final()?
+        .ok_or(AdjustedSourceError::ProofLocalFileMissing)?;
+    if !has_single_link(&artifact.file)? {
+        return Err(AdjustedSourceError::UnsafeOutputPath);
+    }
+    if artifact.identity.size_bytes != proof.downloaded_size_bytes
+        || artifact.identity.sha256 != proof.downloaded_sha256
+    {
+        return Err(AdjustedSourceError::ProofLocalFileMismatch);
+    }
+    verify_jpeg(&artifact.file, proof.width, proof.height)?;
+    output.ensure_final_identity(&artifact.identity)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn validate_installed_adjusted_source_proof(
+    _proof: &CloudKitAdjustedSourceProof,
+    _asset_id: &str,
+    _original_asset: &OriginalAssetProof,
+    _output_path: impl AsRef<Path>,
+) -> Result<(), AdjustedSourceError> {
+    Err(AdjustedSourceError::Filesystem)
+}
+
 #[derive(Debug, Error)]
 pub enum AdjustedSourceError {
     #[error("adjusted source request is invalid: {0}")]
@@ -303,6 +360,14 @@ pub enum AdjustedSourceError {
     InstalledOutputMismatch,
     #[error("adjusted source JPEG validation failed")]
     InvalidJpeg,
+    #[error("adjusted source proof is malformed")]
+    InvalidProof,
+    #[error("adjusted source proof identity does not match its workflow context")]
+    ProofMismatch,
+    #[error("adjusted source proof local JPEG is missing")]
+    ProofLocalFileMissing,
+    #[error("adjusted source proof local JPEG no longer matches its verified identity")]
+    ProofLocalFileMismatch,
     #[error("adjusted source filesystem operation failed")]
     Filesystem,
     #[error("adjusted source timestamp is unavailable")]
@@ -1251,6 +1316,64 @@ fn rename_without_overwrite_at(
 
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_adjusted_source_proof_fields(
+    proof: &CloudKitAdjustedSourceProof,
+    asset_id: &str,
+    original_asset: &OriginalAssetProof,
+    expected_path: &Path,
+) -> Result<(), AdjustedSourceError> {
+    if proof.schema_version != ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION
+        || proof.source_kind != ADJUSTED_SOURCE_KIND
+        || proof.resource_field != ADJUSTED_RESOURCE_FIELD
+        || proof.declared_file_type != "public.jpeg"
+        || proof.orientation != 1
+        || proof.asset_id.trim().is_empty()
+        || proof.resource_record_name.trim().is_empty()
+        || proof.resource_record_change_tag.trim().is_empty()
+        || proof.resource_record_type.trim().is_empty()
+        || proof.zone_name.trim().is_empty()
+        || proof.declared_fingerprint.trim().is_empty()
+        || proof.verified_at_unix_seconds == 0
+        || proof.width == 0
+        || proof.height == 0
+        || proof.declared_size_bytes == 0
+        || proof.declared_size_bytes > MAX_ADJUSTED_SOURCE_ENCODED_BYTES
+        || proof.downloaded_size_bytes == 0
+        || proof.downloaded_size_bytes != proof.declared_size_bytes
+        || !is_sha256(&proof.downloaded_sha256)
+    {
+        return Err(AdjustedSourceError::InvalidProof);
+    }
+    if proof.asset_id != asset_id
+        || proof.asset_record_name != original_asset.record_name
+        || proof.asset_record_change_tag != original_asset.record_change_tag
+        || proof.asset_record_type != original_asset.record_type
+        || proof.database_scope != original_asset.database_scope
+        || proof.zone_name != original_asset.zone_name
+        || proof.local_path != expected_path
+    {
+        return Err(AdjustedSourceError::ProofMismatch);
+    }
+    if proof.asset_record_type != "CPLAsset"
+        || !matches!(
+            proof.resource_record_type.as_str(),
+            "CPLAsset" | "CPLMaster"
+        )
+    {
+        return Err(AdjustedSourceError::InvalidProof);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn has_single_link(file: &File) -> Result<bool, AdjustedSourceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    file.metadata()
+        .map(|metadata| metadata.nlink() == 1)
+        .map_err(|_| AdjustedSourceError::Filesystem)
 }
 
 fn verified_timestamp() -> Result<u64, AdjustedSourceError> {

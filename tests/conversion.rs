@@ -2,7 +2,8 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 
 use icloudpd_optimizer::conversion::{
-    CommandPlan, ConversionError, ExifOrientation, plan_conversion, plan_conversion_for_target,
+    CommandPlan, ConversionError, ExifOrientation, plan_adjusted_source_conversion_for_target,
+    plan_conversion, plan_conversion_for_target,
     plan_conversion_for_target_with_preview_tag_and_orientation,
 };
 use icloudpd_optimizer::conversion_backend::TargetPlatform;
@@ -424,6 +425,75 @@ fn plans_linux_native_conversion_without_sips() {
         all_plans.iter().all(|command| command.program != "sips"),
         "linux conversion plans must not require sips"
     );
+}
+
+#[test]
+fn adjusted_source_plans_encode_the_proven_jpeg_without_preview_extraction_or_resize() {
+    let raw = PathBuf::from("/nas/raw/IMG_0007.dng");
+    let adjusted = PathBuf::from("/staging/IMG_0007.adjusted-source.jpg");
+    let output = PathBuf::from("/staging/IMG_0007.heic");
+
+    for (target, encoder) in [
+        (TargetPlatform::new("macos", "aarch64"), "sips"),
+        (TargetPlatform::new("linux", "x86_64"), "heif-enc"),
+    ] {
+        let plan = plan_adjusted_source_conversion_for_target(target, &raw, &adjusted, &output, 83)
+            .expect("adjusted JPEG conversion should plan");
+
+        assert_eq!(plan.convert.program, encoder);
+        assert_eq!(plan.conversion_commands.len(), 1);
+        assert_eq!(plan.conversion_commands[0].program, encoder);
+        assert!(
+            plan.conversion_commands
+                .iter()
+                .all(|command| { command.program != "exiftool" && command.program != "magick" }),
+            "adjusted conversion must not extract or auto-orient an embedded preview"
+        );
+        let all_commands = [
+            plan.conversion_commands.as_slice(),
+            &[
+                plan.metadata.clone(),
+                plan.render_raw_preview.clone(),
+                plan.render_heic_preview.clone(),
+                plan.verify_visual_match.clone(),
+            ],
+        ]
+        .concat();
+        assert!(
+            all_commands
+                .iter()
+                .flat_map(|command| command.args.iter())
+                .all(|arg| {
+                    let value = arg.to_string_lossy();
+                    value != "-Z" && value != "-resize"
+                }),
+            "adjusted conversion preserves its proven dimensions"
+        );
+        assert!(
+            args(&plan.conversion_commands[0])
+                .iter()
+                .any(|arg| arg == adjusted.to_string_lossy().as_ref()),
+            "the encoder must consume the adjusted JPEG directly"
+        );
+        assert!(
+            args(&plan.render_raw_preview)
+                .iter()
+                .any(|arg| arg == adjusted.to_string_lossy().as_ref()),
+            "the visual reference must be the adjusted JPEG"
+        );
+        assert_eq!(
+            args(&plan.metadata),
+            vec![
+                "-TagsFromFile",
+                "/nas/raw/IMG_0007.dng",
+                "-all:all",
+                "-Orientation#=1",
+                "-QuickTime:Rotation#=0",
+                "-overwrite_original",
+                "/staging/IMG_0007.heic",
+            ]
+        );
+    }
 }
 
 #[test]

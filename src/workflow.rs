@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::adjusted_source::{
+    AdjustedSourceError, CloudKitAdjustedSourceProof, adjusted_source_proof_digest,
+    validate_installed_adjusted_source_proof,
+};
 use crate::manifest::{AssetRecord, FailureKind, Manifest, ManifestError, State};
 use crate::proof::{
     MIN_RAW_AGE_SECONDS, NasRawProof, ProofError, RawFileFingerprint, prove_nas_raw,
@@ -19,6 +23,7 @@ use crate::upload::{
 
 const NAS_PROOF: &str = "nas";
 const ORIGINAL_ASSET_PROOF: &str = "original_asset";
+const ADJUSTED_SOURCE_PROOF: &str = "adjusted_source";
 const CONVERSION_PROOF: &str = "conversion";
 const CONVERSION_PERFORMANCE_PROOF: &str = "conversion_performance";
 const HEIC_PROOF: &str = "heic";
@@ -32,7 +37,7 @@ const DELETE_EXECUTION_PROOF: &str = "delete";
 const CONVERSION_PERFORMANCE_SCHEMA_VERSION: u8 = 1;
 const CONVERSION_PERFORMANCE_MEASUREMENT_METHOD: &str = "monotonic_wall_clock";
 const UNSAFE_LEGACY_RAW_SENSOR_RENDER_TOOL: &str = "dcraw_emu+magick+heif-enc";
-const DELETE_PLAN_PROOFS: [&str; 10] = [
+const BASE_DELETE_PLAN_PROOFS: [&str; 10] = [
     NAS_PROOF,
     ORIGINAL_ASSET_PROOF,
     CONVERSION_PROOF,
@@ -50,6 +55,20 @@ pub struct ConversionResultProof {
     pub heic_path: PathBuf,
     pub heic_sha256: String,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub source_binding: ConversionSourceBinding,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversionSourceBinding {
+    #[default]
+    EmbeddedPreview,
+    AdjustedSource {
+        adjusted_source_proof_digest: String,
+        adjusted_jpeg_sha256: String,
+        adjusted_jpeg_path: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,6 +184,10 @@ struct DeleteEligibilityProof {
     heic_proof_key: String,
     source_age_proof_key: String,
     icloudpd_local_mirror_proof_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adjusted_source_proof_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adjusted_source_proof_digest: Option<String>,
     #[serde(default)]
     original_database_scope: CloudKitDatabaseScope,
     #[serde(default = "primary_sync_zone_name")]
@@ -205,6 +228,7 @@ struct PreDeleteFacts {
     mirror: IcloudpdLocalMirrorProof,
     source_age: SourceAgeProof,
     source_age_seconds: u64,
+    adjusted_source: Option<CloudKitAdjustedSourceProof>,
 }
 
 struct LiveDeleteFacts {
@@ -219,6 +243,7 @@ struct DeleteEligibilityValidationFacts<'a> {
     mirror: &'a IcloudpdLocalMirrorProof,
     source_age: &'a SourceAgeProof,
     source_age_seconds: u64,
+    adjusted_source: Option<&'a CloudKitAdjustedSourceProof>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -383,6 +408,32 @@ pub fn record_nas_proof<'a>(
     transition_with_proof(manifest, asset_id, State::NasVerified, NAS_PROOF, &proof)
 }
 
+/// Records the exact, already-installed adjusted JPEG proof without advancing
+/// lifecycle state. The next conversion is therefore forced to bind to it.
+pub fn record_adjusted_source_proof<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    output_path: impl AsRef<Path>,
+    proof: CloudKitAdjustedSourceProof,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    let record = manifest.get(asset_id)?;
+    if record.state != State::NasVerified {
+        return Err(WorkflowError::AdjustedSourceUnavailable {
+            asset_id: asset_id.to_string(),
+            state: record.state,
+        });
+    }
+    if record.proofs.contains_key(ADJUSTED_SOURCE_PROOF) {
+        return Err(WorkflowError::AdjustedSourceProofAlreadyRecorded {
+            asset_id: asset_id.to_string(),
+        });
+    }
+    let original = stored_proof::<OriginalAssetProof>(manifest, asset_id, ORIGINAL_ASSET_PROOF)?;
+    validate_installed_adjusted_source_proof(&proof, asset_id, &original, output_path)
+        .map_err(WorkflowError::AdjustedSource)?;
+    insert_workflow_proof(manifest, asset_id, ADJUSTED_SOURCE_PROOF, &proof)
+}
+
 pub fn record_conversion_result<'a>(
     manifest: &'a mut Manifest,
     asset_id: &str,
@@ -390,6 +441,7 @@ pub fn record_conversion_result<'a>(
 ) -> Result<&'a AssetRecord, WorkflowError> {
     require_non_empty_path("heic_path", &proof.heic_path)?;
     require_non_empty("heic_sha256", &proof.heic_sha256)?;
+    validate_conversion_source_binding(manifest, asset_id, &proof)?;
     transition_with_proof(
         manifest,
         asset_id,
@@ -978,7 +1030,10 @@ pub fn build_delete_plan(manifest: &Manifest, asset_id: &str) -> Result<DeletePl
     Ok(DeletePlan {
         asset_id: record.asset_id.clone(),
         raw_path: record.raw_path.clone(),
-        required_proof_keys: DELETE_PLAN_PROOFS.into_iter().map(str::to_string).collect(),
+        required_proof_keys: delete_plan_proof_keys(record)?
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         proofs: delete_plan_proof_snapshot(record)?,
     })
 }
@@ -1017,7 +1072,7 @@ fn delete_plan_proof_snapshot(
     record: &AssetRecord,
 ) -> Result<BTreeMap<String, Value>, WorkflowError> {
     let mut proofs = BTreeMap::new();
-    for proof_key in DELETE_PLAN_PROOFS {
+    for proof_key in delete_plan_proof_keys(record)? {
         let proof = record
             .proofs
             .get(proof_key)
@@ -1028,6 +1083,22 @@ fn delete_plan_proof_snapshot(
         proofs.insert(proof_key.to_string(), proof.clone());
     }
     Ok(proofs)
+}
+
+fn delete_plan_proof_keys(record: &AssetRecord) -> Result<Vec<&'static str>, WorkflowError> {
+    let mut proof_keys = BASE_DELETE_PLAN_PROOFS.to_vec();
+    let conversion = optional_workflow_proof::<ConversionResultProof>(record, CONVERSION_PROOF)?
+        .ok_or_else(|| WorkflowError::MissingProof {
+            asset_id: record.asset_id.clone(),
+            proof_key: CONVERSION_PROOF.to_string(),
+        })?;
+    if matches!(
+        conversion.source_binding,
+        ConversionSourceBinding::AdjustedSource { .. }
+    ) {
+        proof_keys.push(ADJUSTED_SOURCE_PROOF);
+    }
+    Ok(proof_keys)
 }
 
 fn validate_prevalidated_delete(
@@ -1060,7 +1131,11 @@ fn validate_delete_token_snapshot(
         return delete_token_stale(token_kind, asset_id, "raw_path");
     }
 
-    for proof_key in DELETE_PLAN_PROOFS {
+    let proof_keys = delete_plan_proof_keys(record)?;
+    if proofs.len() != proof_keys.len() {
+        return delete_token_stale(token_kind, asset_id, "proof_set");
+    }
+    for proof_key in proof_keys {
         if record.proofs.get(proof_key) != proofs.get(proof_key) {
             return delete_token_stale(token_kind, asset_id, proof_key);
         }
@@ -1157,6 +1232,7 @@ fn validate_pre_delete_facts(
 ) -> Result<PreDeleteFacts, WorkflowError> {
     let record = manifest.get(asset_id)?;
     let (nas, conversion) = load_conversion_context(manifest, asset_id)?;
+    let adjusted_source = validate_conversion_source_binding(manifest, asset_id, &conversion)?;
 
     let heic = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
     require_matching_path(
@@ -1222,6 +1298,7 @@ fn validate_pre_delete_facts(
         mirror,
         source_age,
         source_age_seconds,
+        adjusted_source,
     })
 }
 
@@ -1242,6 +1319,7 @@ fn validate_delete_eligibility_chain(
             mirror: &facts.mirror,
             source_age: &facts.source_age,
             source_age_seconds: facts.source_age_seconds,
+            adjusted_source: facts.adjusted_source.as_ref(),
         },
     )?;
 
@@ -1261,7 +1339,7 @@ fn validate_delete_approval_proof(
 }
 
 fn delete_eligibility_proof(facts: &PreDeleteFacts) -> Value {
-    json!({
+    let mut proof = json!({
         "upload_proof_key": UPLOAD_PROOF,
         "original_asset_proof_key": ORIGINAL_ASSET_PROOF,
         "conversion_performance_proof_key": CONVERSION_PERFORMANCE_PROOF,
@@ -1289,7 +1367,13 @@ fn delete_eligibility_proof(facts: &PreDeleteFacts) -> Value {
         "original_filename": &facts.original.filename,
         "original_size_bytes": facts.original.size_bytes,
         "matched_raw_sha256": &facts.original.matched_raw_sha256,
-    })
+    });
+    if let Some(adjusted_source) = &facts.adjusted_source {
+        proof["adjusted_source_proof_key"] = json!(ADJUSTED_SOURCE_PROOF);
+        proof["adjusted_source_proof_digest"] =
+            json!(adjusted_source_proof_digest(adjusted_source));
+    }
+    proof
 }
 
 fn validate_nas_proof(
@@ -1570,6 +1654,41 @@ fn validate_delete_eligibility_proof(
         ICLOUDPD_LOCAL_MIRROR_PROOF,
         &eligibility.icloudpd_local_mirror_proof_key,
     )?;
+    match facts.adjusted_source {
+        Some(adjusted_source) => {
+            if eligibility.adjusted_source_proof_key.as_deref() != Some(ADJUSTED_SOURCE_PROOF) {
+                return Err(WorkflowError::ProofMismatch {
+                    proof_key: DELETE_ELIGIBILITY_PROOF,
+                    field: "adjusted_source_proof_key",
+                    expected: ADJUSTED_SOURCE_PROOF.to_string(),
+                    actual: eligibility
+                        .adjusted_source_proof_key
+                        .clone()
+                        .unwrap_or_else(|| "<missing>".to_string()),
+                });
+            }
+            require_matching_str(
+                DELETE_ELIGIBILITY_PROOF,
+                "adjusted_source_proof_digest",
+                &adjusted_source_proof_digest(adjusted_source),
+                eligibility
+                    .adjusted_source_proof_digest
+                    .as_deref()
+                    .unwrap_or("<missing>"),
+            )?;
+        }
+        None => {
+            if eligibility.adjusted_source_proof_key.is_some()
+                || eligibility.adjusted_source_proof_digest.is_some()
+            {
+                return Err(WorkflowError::InvalidProofField {
+                    proof_key: DELETE_ELIGIBILITY_PROOF,
+                    field: "adjusted_source",
+                    reason: "embedded-preview conversion must not claim adjusted-source lineage",
+                });
+            }
+        }
+    }
     if facts.original.database_scope != eligibility.original_database_scope {
         return Err(WorkflowError::ProofMismatch {
             proof_key: DELETE_ELIGIBILITY_PROOF,
@@ -1941,7 +2060,71 @@ fn load_conversion_context(
 ) -> Result<(NasRawProof, ConversionResultProof), WorkflowError> {
     let nas = stored_proof::<NasRawProof>(manifest, asset_id, NAS_PROOF)?;
     let conversion = stored_proof::<ConversionResultProof>(manifest, asset_id, CONVERSION_PROOF)?;
+    validate_conversion_source_binding(manifest, asset_id, &conversion)?;
     Ok((nas, conversion))
+}
+
+/// Returns the source proof that an imminent conversion must consume, if one
+/// was durably recorded. This deliberately reuses the descriptor-safe local
+/// JPEG validator immediately before command planning.
+pub fn validated_adjusted_source_for_conversion(
+    manifest: &Manifest,
+    asset_id: &str,
+    output_path: impl AsRef<Path>,
+) -> Result<Option<CloudKitAdjustedSourceProof>, WorkflowError> {
+    let record = manifest.get(asset_id)?;
+    let Some(proof) =
+        optional_workflow_proof::<CloudKitAdjustedSourceProof>(record, ADJUSTED_SOURCE_PROOF)?
+    else {
+        return Ok(None);
+    };
+    let original = stored_proof::<OriginalAssetProof>(manifest, asset_id, ORIGINAL_ASSET_PROOF)?;
+    validate_installed_adjusted_source_proof(&proof, asset_id, &original, output_path)
+        .map_err(WorkflowError::AdjustedSource)?;
+    Ok(Some(proof))
+}
+
+fn validate_conversion_source_binding(
+    manifest: &Manifest,
+    asset_id: &str,
+    conversion: &ConversionResultProof,
+) -> Result<Option<CloudKitAdjustedSourceProof>, WorkflowError> {
+    let adjusted_source =
+        validated_adjusted_source_for_conversion(manifest, asset_id, &conversion.heic_path)?;
+    match (&adjusted_source, &conversion.source_binding) {
+        (None, ConversionSourceBinding::EmbeddedPreview) => Ok(None),
+        (None, ConversionSourceBinding::AdjustedSource { .. }) => {
+            Err(WorkflowError::ConversionSourceBindingMismatch {
+                asset_id: asset_id.to_string(),
+                reason: "adjusted conversion has no adjusted-source proof",
+            })
+        }
+        (Some(_), ConversionSourceBinding::EmbeddedPreview) => {
+            Err(WorkflowError::ConversionSourceBindingMismatch {
+                asset_id: asset_id.to_string(),
+                reason: "adjusted-source proof requires adjusted conversion lineage",
+            })
+        }
+        (
+            Some(proof),
+            ConversionSourceBinding::AdjustedSource {
+                adjusted_source_proof_digest: binding_proof_digest,
+                adjusted_jpeg_sha256,
+                adjusted_jpeg_path,
+            },
+        ) => {
+            if binding_proof_digest != &adjusted_source_proof_digest(proof)
+                || adjusted_jpeg_sha256 != &proof.downloaded_sha256
+                || adjusted_jpeg_path != &proof.local_path
+            {
+                return Err(WorkflowError::ConversionSourceBindingMismatch {
+                    asset_id: asset_id.to_string(),
+                    reason: "adjusted conversion binding differs from current adjusted-source proof",
+                });
+            }
+            Ok(adjusted_source)
+        }
+    }
 }
 
 fn require_valid_conversion_performance(
@@ -1983,6 +2166,7 @@ pub(crate) fn reconciliation_lifecycle_state(
             reason: "conversion output path, SHA-256, and size are required",
         });
     }
+    validate_conversion_source_binding(manifest, asset_id, &conversion)?;
 
     let Some(heic) = heic else {
         if upload.is_some() {
@@ -2340,6 +2524,8 @@ pub enum WorkflowError {
     Manifest(#[from] ManifestError),
     #[error("proof error: {0}")]
     Proof(#[from] ProofError),
+    #[error("adjusted source proof failed: {0}")]
+    AdjustedSource(#[source] AdjustedSourceError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("asset {asset_id} is {state}; only discovered records can be reused")]
@@ -2427,6 +2613,17 @@ pub enum WorkflowError {
         "iCloudPD local mirror unavailable for {asset_id}: state is {state}; upload verification required"
     )]
     IcloudpdLocalMirrorUnavailable { asset_id: String, state: State },
+    #[error(
+        "adjusted source unavailable for {asset_id}: state is {state}; NAS verification required"
+    )]
+    AdjustedSourceUnavailable { asset_id: String, state: State },
+    #[error("adjusted source proof already exists for {asset_id}; refusing overwrite")]
+    AdjustedSourceProofAlreadyRecorded { asset_id: String },
+    #[error("conversion source binding is invalid for {asset_id}: {reason}")]
+    ConversionSourceBindingMismatch {
+        asset_id: String,
+        reason: &'static str,
+    },
     #[error("delete approval operator is required")]
     EmptyOperator,
     #[error("workflow proof field {field} is required")]

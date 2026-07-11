@@ -12,9 +12,9 @@ use icloudpd_optimizer::monitor::MonitorConfig;
 use icloudpd_optimizer::proof::NasRawProof;
 use icloudpd_optimizer::state_store::AssetStateStore;
 use icloudpd_optimizer::workflow::{
-    ConversionPerformanceInput, ConversionResultProof, HeicVerificationProof, SourceAgeProof,
-    discover_raw_asset, record_conversion_performance, record_conversion_result,
-    record_heic_verification, record_nas_proof, record_source_age_proof,
+    ConversionPerformanceInput, ConversionResultProof, ConversionSourceBinding,
+    HeicVerificationProof, SourceAgeProof, discover_raw_asset, record_conversion_performance,
+    record_conversion_result, record_heic_verification, record_nas_proof, record_source_age_proof,
 };
 use predicates::prelude::*;
 use serde_json::{Value, json};
@@ -439,6 +439,7 @@ fn conversion_proof() -> ConversionResultProof {
         heic_path: PathBuf::from("/staging/IMG_0001.heic"),
         heic_sha256: "heic-sha256".to_string(),
         size_bytes: 24,
+        source_binding: ConversionSourceBinding::EmbeddedPreview,
     }
 }
 
@@ -683,6 +684,7 @@ fn manifest_with_real_conversion_verified(path: &std::path::Path, heic_path: Pat
             heic_path: heic_path.clone(),
             heic_sha256: sha256_hex(body),
             size_bytes: body.len() as u64,
+            source_binding: ConversionSourceBinding::EmbeddedPreview,
         },
     )
     .expect("conversion should record");

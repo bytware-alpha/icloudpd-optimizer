@@ -3,23 +3,29 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use filetime::{FileTime, set_file_mtime};
+use icloudpd_optimizer::adjusted_source::{
+    ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION, CloudKitAdjustedSourceProof,
+    adjusted_source_path_for_output, adjusted_source_proof_digest,
+};
 use icloudpd_optimizer::manifest::{AssetRecord, FailureKind, Manifest, ManifestError, State};
 use icloudpd_optimizer::proof::{NasRawProof, ProofError, prove_nas_raw};
 use icloudpd_optimizer::upload::{CloudKitDeleteOutcome, CloudKitUploadedHeicAsset};
 use icloudpd_optimizer::workflow::{
     ConversionCommandTiming, ConversionPerformanceInput, ConversionPerformanceProof,
-    ConversionResultProof, HeicVerificationProof, IcloudpdLocalMirrorProof, OriginalAssetProof,
-    SourceAgeProof, UploadProof, WorkflowError, approve_delete, build_delete_plan,
-    discover_raw_asset, mark_delete_eligible, prepare_delete_reconciliation,
-    prevalidate_approved_original_delete, prove_and_record_nas, record_conversion_performance,
-    record_conversion_result, record_delete_execution, record_heic_verification,
-    record_icloudpd_local_mirror_proof, record_nas_proof, record_original_asset_batch_proofs,
-    record_original_asset_proof, record_prevalidated_delete_execution,
-    record_reconciled_delete_execution, record_source_age_proof, record_stage_failure,
-    record_stage_failure_with_kind, record_upload_proof, record_uploaded_heic_delete,
-    upload_ready_heic_proof, uploaded_heic_delete_request,
+    ConversionResultProof, ConversionSourceBinding, HeicVerificationProof,
+    IcloudpdLocalMirrorProof, OriginalAssetProof, SourceAgeProof, UploadProof, WorkflowError,
+    approve_delete, build_delete_plan, discover_raw_asset, mark_delete_eligible,
+    prepare_delete_reconciliation, prevalidate_approved_original_delete, prove_and_record_nas,
+    record_adjusted_source_proof, record_conversion_performance, record_conversion_result,
+    record_delete_execution, record_heic_verification, record_icloudpd_local_mirror_proof,
+    record_nas_proof, record_original_asset_batch_proofs, record_original_asset_proof,
+    record_prevalidated_delete_execution, record_reconciled_delete_execution,
+    record_source_age_proof, record_stage_failure, record_stage_failure_with_kind,
+    record_upload_proof, record_uploaded_heic_delete, upload_ready_heic_proof,
+    uploaded_heic_delete_request,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 const DAY: u64 = 24 * 60 * 60;
 const SOURCE_AGE_VERIFIED_AT: u64 = 1_800_000_000;
@@ -42,6 +48,7 @@ fn conversion_proof() -> ConversionResultProof {
         heic_path: PathBuf::from("/staging/IMG_0001.heic"),
         heic_sha256: "heic-sha256".to_string(),
         size_bytes: 24,
+        source_binding: ConversionSourceBinding::EmbeddedPreview,
     }
 }
 
@@ -121,6 +128,54 @@ fn original_asset_proof() -> OriginalAssetProof {
         size_bytes: 42,
         matched_raw_sha256: "raw-sha256".to_string(),
     }
+}
+
+fn adjusted_source_proof(
+    asset_id: &str,
+    original: &OriginalAssetProof,
+    local_path: PathBuf,
+    bytes: &[u8],
+) -> CloudKitAdjustedSourceProof {
+    CloudKitAdjustedSourceProof {
+        schema_version: ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION.to_string(),
+        source_kind: "cloudkit_adjusted_res_jpeg_full_res".to_string(),
+        asset_id: asset_id.to_string(),
+        asset_record_name: original.record_name.clone(),
+        asset_record_change_tag: original.record_change_tag.clone(),
+        asset_record_type: original.record_type.clone(),
+        resource_record_name: original.record_name.clone(),
+        resource_record_change_tag: original.record_change_tag.clone(),
+        resource_record_type: "CPLAsset".to_string(),
+        database_scope: original.database_scope,
+        zone_name: original.zone_name.clone(),
+        master_record_name: None,
+        resource_field: "resJPEGFullRes".to_string(),
+        declared_file_type: "public.jpeg".to_string(),
+        declared_fingerprint: "test-fingerprint".to_string(),
+        declared_size_bytes: bytes.len() as u64,
+        width: 4,
+        height: 3,
+        local_path,
+        downloaded_size_bytes: bytes.len() as u64,
+        downloaded_sha256: format!("{:x}", Sha256::digest(bytes)),
+        orientation: 1,
+        verified_at_unix_seconds: 1_800_000_001,
+    }
+}
+
+fn nonblank_adjusted_jpeg() -> Vec<u8> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::{DynamicImage, Rgb, RgbImage};
+
+    let mut image = RgbImage::new(4, 3);
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        *pixel = Rgb([x as u8 * 50, y as u8 * 70, 23]);
+    }
+    let mut bytes = Vec::new();
+    JpegEncoder::new_with_quality(&mut bytes, 100)
+        .encode_image(&DynamicImage::ImageRgb8(image))
+        .expect("test adjusted JPEG should encode");
+    bytes
 }
 
 fn delete_outcome() -> CloudKitDeleteOutcome {
@@ -288,6 +343,7 @@ fn two_asset_upload_verified_manifest() -> Manifest {
                 heic_path: PathBuf::from(heic_path),
                 heic_sha256: heic_sha256.to_string(),
                 size_bytes: heic_size,
+                source_binding: ConversionSourceBinding::EmbeddedPreview,
             },
         )
         .expect("conversion should record");
@@ -547,6 +603,196 @@ fn converted_manifest() -> Manifest {
     record_conversion_result(&mut manifest, "asset-1", conversion_proof())
         .expect("conversion should record");
     manifest
+}
+
+#[test]
+fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_lineage() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let nas_root = tempdir.path().join("nas");
+    let raw_path = write_old_raw(
+        &nas_root,
+        "camera/IMG_0001.dng",
+        b"raw-bytes-that-are-larger-than-the-adjusted-heic-proof",
+    );
+    let nas = prove_nas_raw(&nas_root, &raw_path, 30, SystemTime::now())
+        .expect("NAS proof should be recorded");
+    let output_path = tempdir
+        .path()
+        .canonicalize()
+        .expect("temp directory should canonicalize")
+        .join("out/IMG_0001.heic");
+    fs::create_dir_all(output_path.parent().expect("output parent should exist"))
+        .expect("output parent should be created");
+    let adjusted_path = adjusted_source_path_for_output(&output_path);
+    let adjusted_bytes = nonblank_adjusted_jpeg();
+    fs::write(&adjusted_path, &adjusted_bytes).expect("adjusted JPEG should be written");
+
+    let mut manifest = Manifest::new();
+    discover_raw_asset(&mut manifest, "asset-1", nas.canonical_path.clone())
+        .expect("asset should be discovered");
+    record_nas_proof(&mut manifest, "asset-1", nas.clone()).expect("NAS proof should record");
+    let original = OriginalAssetProof {
+        record_name: "original-record-1".to_string(),
+        record_change_tag: "old-change-tag".to_string(),
+        record_type: "CPLAsset".to_string(),
+        database_scope: Default::default(),
+        zone_name: "PrimarySync".to_string(),
+        filename: "IMG_0001.dng".to_string(),
+        size_bytes: nas.size_bytes,
+        matched_raw_sha256: nas.sha256.clone(),
+    };
+    record_original_asset_proof(&mut manifest, "asset-1", original.clone())
+        .expect("original asset proof should record");
+    let adjusted =
+        adjusted_source_proof("asset-1", &original, adjusted_path.clone(), &adjusted_bytes);
+    record_adjusted_source_proof(&mut manifest, "asset-1", &output_path, adjusted.clone())
+        .expect("adjusted source proof should record while NAS-verified");
+
+    let unbound = ConversionResultProof {
+        heic_path: output_path.clone(),
+        heic_sha256: "heic-sha256".to_string(),
+        size_bytes: 24,
+        source_binding: ConversionSourceBinding::EmbeddedPreview,
+    };
+    let before = manifest.clone();
+    let error = record_conversion_result(&mut manifest, "asset-1", unbound)
+        .expect_err("adjusted proof must not permit an unbound conversion");
+    assert!(matches!(
+        error,
+        WorkflowError::ConversionSourceBindingMismatch { .. }
+    ));
+    assert_eq!(manifest, before);
+
+    let binding = ConversionSourceBinding::AdjustedSource {
+        adjusted_source_proof_digest: adjusted_source_proof_digest(&adjusted),
+        adjusted_jpeg_sha256: adjusted.downloaded_sha256.clone(),
+        adjusted_jpeg_path: adjusted_path.clone(),
+    };
+    record_conversion_result(
+        &mut manifest,
+        "asset-1",
+        ConversionResultProof {
+            heic_path: output_path.clone(),
+            heic_sha256: "heic-sha256".to_string(),
+            size_bytes: 24,
+            source_binding: binding.clone(),
+        },
+    )
+    .expect("exact adjusted conversion binding should record");
+    record_conversion_performance(&mut manifest, "asset-1", conversion_performance_input())
+        .expect("conversion performance should record");
+    record_heic_verification(
+        &mut manifest,
+        "asset-1",
+        HeicVerificationProof {
+            heic_path: output_path.clone(),
+            heic_sha256: "heic-sha256".to_string(),
+            size_bytes: 24,
+            heif_info_ok: true,
+            metadata_copied: true,
+            visual_content_ok: true,
+            visual_match_ok: true,
+            visual_rmse_ppm: Some(0),
+            visual_mae_ppm: Some(0),
+        },
+    )
+    .expect("HEIC verification should record");
+    record_source_age_proof(&mut manifest, "asset-1", old_source_age_proof())
+        .expect("source age should record");
+    record_upload_proof(
+        &mut manifest,
+        "asset-1",
+        UploadProof {
+            uploaded_heic_asset_id: "icloud-heic-asset-1".to_string(),
+            uploaded_heic_sha256: "heic-sha256".to_string(),
+            database_scope: Default::default(),
+            zone_name: "PrimarySync".to_string(),
+            uploaded_heic_path: Some(output_path.clone()),
+        },
+    )
+    .expect("upload proof should record");
+    record_icloudpd_local_mirror_proof(
+        &mut manifest,
+        "asset-1",
+        IcloudpdLocalMirrorProof {
+            uploaded_heic_asset_id: "icloud-heic-asset-1".to_string(),
+            uploaded_heic_sha256: "heic-sha256".to_string(),
+            uploaded_heic_path: output_path.clone(),
+            icloudpd_download_path: PathBuf::from("/PrimarySync/IMG_0001.HEIC"),
+            size_bytes: 24,
+        },
+    )
+    .expect("mirror proof should record");
+    mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
+    approve_delete(&mut manifest, "asset-1", "operator").expect("approval should record");
+
+    let plan = build_delete_plan(&manifest, "asset-1").expect("delete plan should build");
+    assert!(
+        plan.required_proof_keys
+            .contains(&"adjusted_source".to_string())
+    );
+    assert_eq!(
+        plan.proofs["delete_eligibility"]["adjusted_source_proof_digest"],
+        adjusted_source_proof_digest(&adjusted)
+    );
+    assert_eq!(
+        plan.proofs["conversion"]["source_binding"],
+        serde_json::to_value(binding).unwrap()
+    );
+
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    proof_mut(&mut record, "adjusted_source")["downloadedSha256"] = json!("f".repeat(64));
+    manifest.upsert(record);
+    assert!(
+        build_delete_plan(&manifest, "asset-1").is_err(),
+        "adjusted source tampering must block delete planning"
+    );
+}
+
+#[test]
+fn legacy_conversion_proof_deserializes_as_embedded_preview() {
+    let proof: ConversionResultProof = serde_json::from_value(json!({
+        "heic_path": "/staging/IMG_0001.heic",
+        "heic_sha256": "heic-sha256",
+        "size_bytes": 24
+    }))
+    .expect("legacy conversion proof should deserialize");
+
+    assert_eq!(
+        proof.source_binding,
+        ConversionSourceBinding::EmbeddedPreview
+    );
+}
+
+#[test]
+fn embedded_preview_workflow_rejects_an_unproven_adjusted_conversion_claim() {
+    let mut manifest = Manifest::new();
+    discover_raw_asset(&mut manifest, "asset-1", "/nas/photos/IMG_0001.dng")
+        .expect("asset should be discovered");
+    record_nas_proof(&mut manifest, "asset-1", nas_proof()).expect("NAS proof should record");
+    let before = manifest.clone();
+
+    let error = record_conversion_result(
+        &mut manifest,
+        "asset-1",
+        ConversionResultProof {
+            heic_path: PathBuf::from("/staging/IMG_0001.heic"),
+            heic_sha256: "heic-sha256".to_string(),
+            size_bytes: 24,
+            source_binding: ConversionSourceBinding::AdjustedSource {
+                adjusted_source_proof_digest: "a".repeat(64),
+                adjusted_jpeg_sha256: "b".repeat(64),
+                adjusted_jpeg_path: PathBuf::from("/staging/IMG_0001.adjusted-source.jpg"),
+            },
+        },
+    )
+    .expect_err("normal conversion must not claim adjusted lineage");
+
+    assert!(matches!(
+        error,
+        WorkflowError::ConversionSourceBindingMismatch { .. }
+    ));
+    assert_eq!(manifest, before);
 }
 
 fn conversion_performance_manifest() -> Manifest {

@@ -201,6 +201,58 @@ pub fn plan_conversion_for_target_with_preview_tag_and_orientation(
     }
 }
 
+/// Builds a conversion plan that encodes an already-verified adjusted JPEG.
+///
+/// The RAW is still the metadata authority, but never a pixel source on this
+/// path. The visual reference is rendered from the adjusted JPEG at its native
+/// dimensions so a later verifier compares the encoded image to the exact
+/// approved source.
+pub fn plan_adjusted_source_conversion_for_target(
+    target: TargetPlatform,
+    raw_path: impl AsRef<Path>,
+    adjusted_source_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    heic_quality: u8,
+) -> Result<ConversionPlan, ConversionError> {
+    let raw_path = raw_path.as_ref();
+    let adjusted_source_path = adjusted_source_path.as_ref();
+    let output_path = output_path.as_ref();
+
+    if paths_collide(raw_path, output_path) || paths_collide(adjusted_source_path, output_path) {
+        return Err(ConversionError::OutputCollidesWithRaw {
+            raw_path: raw_path.to_path_buf(),
+            output_path: output_path.to_path_buf(),
+        });
+    }
+    if !has_heic_extension(output_path) {
+        return Err(ConversionError::InvalidOutputExtension {
+            path: output_path.to_path_buf(),
+        });
+    }
+    if !(1..=100).contains(&heic_quality) {
+        return Err(ConversionError::InvalidHeicQuality {
+            quality: heic_quality,
+        });
+    }
+
+    let input = AdjustedSourceConversionPlanInput {
+        raw_arg: raw_path.as_os_str().to_os_string(),
+        adjusted_source_arg: adjusted_source_path.as_os_str().to_os_string(),
+        output_arg: output_path.as_os_str().to_os_string(),
+        raw_preview_arg: visual_preview_path(output_path, "raw")
+            .as_os_str()
+            .to_os_string(),
+        heic_preview_arg: visual_preview_path(output_path, "heic")
+            .as_os_str()
+            .to_os_string(),
+        heic_quality,
+    };
+    match target.os {
+        "linux" => linux_adjusted_source_conversion_plan(input),
+        _ => macos_adjusted_source_conversion_plan(input),
+    }
+}
+
 struct PlatformConversionPlanInput<'a> {
     raw_arg: OsString,
     output_arg: OsString,
@@ -210,6 +262,155 @@ struct PlatformConversionPlanInput<'a> {
     heic_quality: u8,
     preview_tag: EmbeddedPreviewTag,
     orientation: Option<ExifOrientation>,
+}
+
+struct AdjustedSourceConversionPlanInput {
+    raw_arg: OsString,
+    adjusted_source_arg: OsString,
+    output_arg: OsString,
+    raw_preview_arg: OsString,
+    heic_preview_arg: OsString,
+    heic_quality: u8,
+}
+
+fn macos_adjusted_source_conversion_plan(
+    input: AdjustedSourceConversionPlanInput,
+) -> Result<ConversionPlan, ConversionError> {
+    let encode = CommandPlan::new(
+        "sips",
+        vec![
+            OsString::from("-s"),
+            OsString::from("format"),
+            OsString::from("heic"),
+            OsString::from("-s"),
+            OsString::from("formatOptions"),
+            OsString::from(input.heic_quality.to_string()),
+            input.adjusted_source_arg.clone(),
+            OsString::from("--out"),
+            input.output_arg.clone(),
+        ],
+    );
+
+    let render_raw_preview = CommandPlan::new(
+        "sips",
+        vec![
+            OsString::from("-s"),
+            OsString::from("format"),
+            OsString::from("png"),
+            input.adjusted_source_arg.clone(),
+            OsString::from("--out"),
+            input.raw_preview_arg.clone(),
+        ],
+    );
+    let render_heic_preview = CommandPlan::new(
+        "sips",
+        vec![
+            OsString::from("-s"),
+            OsString::from("format"),
+            OsString::from("png"),
+            input.output_arg.clone(),
+            OsString::from("--out"),
+            input.heic_preview_arg.clone(),
+        ],
+    );
+    Ok(adjusted_source_conversion_plan(
+        encode,
+        input,
+        render_raw_preview,
+        render_heic_preview,
+    ))
+}
+
+fn linux_adjusted_source_conversion_plan(
+    input: AdjustedSourceConversionPlanInput,
+) -> Result<ConversionPlan, ConversionError> {
+    let encode = CommandPlan::new(
+        "heif-enc",
+        vec![
+            OsString::from("-q"),
+            OsString::from(input.heic_quality.to_string()),
+            input.adjusted_source_arg.clone(),
+            OsString::from("-o"),
+            input.output_arg.clone(),
+        ],
+    );
+
+    let render_raw_preview = CommandPlan::new(
+        "magick",
+        vec![
+            input.adjusted_source_arg.clone(),
+            input.raw_preview_arg.clone(),
+        ],
+    );
+    let render_heic_preview = CommandPlan::new(
+        "magick",
+        vec![input.output_arg.clone(), input.heic_preview_arg.clone()],
+    );
+    Ok(adjusted_source_conversion_plan(
+        encode,
+        input,
+        render_raw_preview,
+        render_heic_preview,
+    ))
+}
+
+fn adjusted_source_conversion_plan(
+    encode: CommandPlan,
+    input: AdjustedSourceConversionPlanInput,
+    render_raw_preview: CommandPlan,
+    render_heic_preview: CommandPlan,
+) -> ConversionPlan {
+    ConversionPlan {
+        convert: encode.clone(),
+        conversion_commands: vec![encode],
+        metadata: CommandPlan::new(
+            "exiftool",
+            vec![
+                OsString::from("-TagsFromFile"),
+                input.raw_arg,
+                OsString::from("-all:all"),
+                OsString::from("-Orientation#=1"),
+                OsString::from("-QuickTime:Rotation#=0"),
+                OsString::from("-overwrite_original"),
+                input.output_arg.clone(),
+            ],
+        ),
+        verify_image: CommandPlan::new("heif-info", vec![input.output_arg.clone()]),
+        render_raw_preview,
+        render_heic_preview,
+        verify_visual_content: CommandPlan::new(
+            "magick",
+            vec![
+                input.heic_preview_arg.clone(),
+                OsString::from("-colorspace"),
+                OsString::from("RGB"),
+                OsString::from("-format"),
+                OsString::from("%[fx:standard_deviation]"),
+                OsString::from("info:"),
+            ],
+        ),
+        verify_visual_match: CommandPlan::new(
+            "magick",
+            vec![
+                OsString::from("compare"),
+                OsString::from("-metric"),
+                OsString::from("RMSE"),
+                input.raw_preview_arg,
+                input.heic_preview_arg,
+                OsString::from("null:"),
+            ],
+        ),
+        verify_metadata: CommandPlan::new(
+            "exiftool",
+            vec![
+                OsString::from("-json"),
+                OsString::from("-a"),
+                OsString::from("-G1"),
+                OsString::from("-s"),
+                input.output_arg,
+            ],
+        ),
+    }
 }
 
 fn macos_conversion_plan(

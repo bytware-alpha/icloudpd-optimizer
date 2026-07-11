@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use icloudpd_optimizer::adjusted_source::{
     AdjustedSourceError, CloudKitAdjustedSourceDownload, CloudKitAdjustedSourceProof,
     CloudKitAdjustedSourceResolveRequest, CloudKitAdjustedSourceResolver,
-    CloudKitAdjustedSourceTransport,
+    CloudKitAdjustedSourceTransport, adjusted_source_path_for_output, adjusted_source_proof_digest,
+    validate_installed_adjusted_source_proof,
 };
 use icloudpd_optimizer::upload::{CloudKitDatabaseScope, CloudKitDeleteSession};
 use icloudpd_optimizer::workflow::OriginalAssetProof;
@@ -471,6 +472,192 @@ fn resolves_direct_asset_with_exact_adjusted_contract_and_redacted_proof() {
     ] {
         assert!(!encoded.contains(forbidden));
     }
+}
+
+#[test]
+fn installed_adjusted_source_proof_has_stable_digest_and_requires_its_output_adjacent_path() {
+    let bytes = nonblank_jpeg(4, 3);
+    let mut transport = FakeTransport {
+        lookups: VecDeque::from([json!({"records": [direct_asset_record(&bytes, 4, 3)]})]),
+        downloads: VecDeque::from([bytes]),
+        ..Default::default()
+    };
+    let directory = tempdir().expect("test directory");
+    let output_path = safe_path(&directory, "IMG_0001.heic");
+    let adjusted_path = adjusted_source_path_for_output(&output_path);
+    let proof = CloudKitAdjustedSourceResolver::new(&mut transport)
+        .resolve(&session(), &resolve_request(adjusted_path.clone()))
+        .expect("adjusted JPEG should resolve");
+
+    validate_installed_adjusted_source_proof(
+        &proof,
+        "local-asset",
+        &original_proof(),
+        &output_path,
+    )
+    .expect("the resolved proof must validate at its deterministic path");
+    let encoded = serde_json::to_value(&proof).expect("proof should serialize");
+    let decoded: CloudKitAdjustedSourceProof =
+        serde_json::from_value(encoded).expect("proof should deserialize exactly");
+    assert_eq!(
+        adjusted_source_proof_digest(&proof),
+        adjusted_source_proof_digest(&decoded)
+    );
+    assert_eq!(adjusted_source_proof_digest(&proof).len(), 64);
+
+    let error = validate_installed_adjusted_source_proof(
+        &proof,
+        "local-asset",
+        &original_proof(),
+        safe_path(&directory, "different.heic"),
+    )
+    .expect_err("a proof must not be reusable for a different output");
+    assert!(matches!(error, AdjustedSourceError::ProofMismatch));
+}
+
+#[test]
+fn installed_adjusted_source_validation_fails_closed_for_stale_missing_size_dimension_orientation_and_blank_files()
+ {
+    let bytes = nonblank_jpeg(4, 3);
+    let mut transport = FakeTransport {
+        lookups: VecDeque::from([json!({"records": [direct_asset_record(&bytes, 4, 3)]})]),
+        downloads: VecDeque::from([bytes.clone()]),
+        ..Default::default()
+    };
+    let directory = tempdir().expect("test directory");
+    let output_path = safe_path(&directory, "IMG_0002.heic");
+    let adjusted_path = adjusted_source_path_for_output(&output_path);
+    let proof = CloudKitAdjustedSourceResolver::new(&mut transport)
+        .resolve(&session(), &resolve_request(adjusted_path.clone()))
+        .expect("adjusted JPEG should resolve");
+
+    fs::remove_file(&adjusted_path).expect("source should be removable for test");
+    let missing = validate_installed_adjusted_source_proof(
+        &proof,
+        "local-asset",
+        &original_proof(),
+        &output_path,
+    )
+    .expect_err("missing source must fail before encoding");
+    assert!(matches!(
+        missing,
+        AdjustedSourceError::ProofLocalFileMissing
+    ));
+
+    fs::write(&adjusted_path, b"stale-bytes").expect("stale source should be written");
+    let stale = validate_installed_adjusted_source_proof(
+        &proof,
+        "local-asset",
+        &original_proof(),
+        &output_path,
+    )
+    .expect_err("stale bytes must fail before encoding");
+    assert!(matches!(stale, AdjustedSourceError::ProofLocalFileMismatch));
+
+    fs::write(&adjusted_path, &bytes).expect("valid source should be restored");
+    let invalid_size = CloudKitAdjustedSourceProof {
+        declared_size_bytes: proof.declared_size_bytes + 1,
+        ..proof.clone()
+    };
+    assert!(matches!(
+        validate_installed_adjusted_source_proof(
+            &invalid_size,
+            "local-asset",
+            &original_proof(),
+            &output_path,
+        ),
+        Err(AdjustedSourceError::InvalidProof)
+    ));
+
+    let invalid_dimensions = CloudKitAdjustedSourceProof {
+        width: proof.width + 1,
+        ..proof.clone()
+    };
+    assert!(matches!(
+        validate_installed_adjusted_source_proof(
+            &invalid_dimensions,
+            "local-asset",
+            &original_proof(),
+            &output_path,
+        ),
+        Err(AdjustedSourceError::InvalidJpeg)
+    ));
+    let invalid_orientation = CloudKitAdjustedSourceProof {
+        orientation: 8,
+        ..proof.clone()
+    };
+    assert!(matches!(
+        validate_installed_adjusted_source_proof(
+            &invalid_orientation,
+            "local-asset",
+            &original_proof(),
+            &output_path,
+        ),
+        Err(AdjustedSourceError::InvalidProof)
+    ));
+
+    let blank = uniform_jpeg(4, 3, 0);
+    fs::write(&adjusted_path, &blank).expect("blank JPEG should be written");
+    let blank_proof = CloudKitAdjustedSourceProof {
+        declared_size_bytes: blank.len() as u64,
+        downloaded_size_bytes: blank.len() as u64,
+        downloaded_sha256: sha256_hex(&blank),
+        ..proof
+    };
+    assert!(matches!(
+        validate_installed_adjusted_source_proof(
+            &blank_proof,
+            "local-asset",
+            &original_proof(),
+            &output_path,
+        ),
+        Err(AdjustedSourceError::InvalidJpeg)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_adjusted_source_validation_rejects_symlinks_and_hardlinks() {
+    use std::os::unix::fs::symlink;
+
+    let bytes = nonblank_jpeg(4, 3);
+    let mut transport = FakeTransport {
+        lookups: VecDeque::from([json!({"records": [direct_asset_record(&bytes, 4, 3)]})]),
+        downloads: VecDeque::from([bytes.clone()]),
+        ..Default::default()
+    };
+    let directory = tempdir().expect("test directory");
+    let output_path = safe_path(&directory, "IMG_0003.heic");
+    let adjusted_path = adjusted_source_path_for_output(&output_path);
+    let proof = CloudKitAdjustedSourceResolver::new(&mut transport)
+        .resolve(&session(), &resolve_request(adjusted_path.clone()))
+        .expect("adjusted JPEG should resolve");
+    let target = safe_path(&directory, "target.jpg");
+    fs::write(&target, &bytes).expect("target should be written");
+
+    fs::remove_file(&adjusted_path).expect("source should be removable for test");
+    symlink(&target, &adjusted_path).expect("source symlink should be created");
+    assert!(matches!(
+        validate_installed_adjusted_source_proof(
+            &proof,
+            "local-asset",
+            &original_proof(),
+            &output_path,
+        ),
+        Err(AdjustedSourceError::UnsafeOutputPath)
+    ));
+
+    fs::remove_file(&adjusted_path).expect("source symlink should be removable");
+    fs::hard_link(&target, &adjusted_path).expect("source hardlink should be created");
+    assert!(matches!(
+        validate_installed_adjusted_source_proof(
+            &proof,
+            "local-asset",
+            &original_proof(),
+            &output_path,
+        ),
+        Err(AdjustedSourceError::UnsafeOutputPath)
+    ));
 }
 
 #[test]
