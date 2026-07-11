@@ -6,6 +6,9 @@ on:
     branches:
       - main
 
+env:
+  RUST_VERSION: "1.95"
+
 jobs:
   check:
     runs-on: macos-latest
@@ -13,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy, rustfmt
       - name: Install runtime tools
         run: brew install just libheif imagemagick exiftool
@@ -21,3 +24,25 @@ jobs:
         run: just check
       - name: Package dry run
         run: cargo package --locked
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy, rustfmt
+      - name: Install runtime tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libheif-examples \
+            libimage-exiftool-perl \
+            imagemagick
+      - name: Test
+        run: cargo test --locked
+      - name: Build production image
+        run: docker build --tag icloudpd-optimizer:ci --file container/Containerfile .
+      - name: Smoke image doctor
+        run: docker run --rm icloudpd-optimizer:ci doctor --json

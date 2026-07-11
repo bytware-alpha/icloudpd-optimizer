@@ -4080,14 +4080,83 @@ fn container_builder_uses_declared_supported_rust_version() {
         .expect("Cargo.toml should declare rust-version");
 
     assert!(
-        rust_version_at_least(rust_version, 1, 86),
-        "locked dependency graph requires rustc 1.86 or newer"
+        rust_version_at_least(rust_version, 1, 95),
+        "locked dependency graph uses libsqlite3-sys build logic that requires cfg_select!, stabilized in rustc 1.95"
+    );
+    let expected_builder = format!("FROM docker.io/rust:{rust_version}-bookworm AS builder");
+    assert_eq!(
+        containerfile.lines().next(),
+        Some(expected_builder.as_str()),
+        "Containerfile builder image must match Cargo.toml rust-version"
+    );
+}
+
+#[test]
+fn ci_linux_contract_tests_the_declared_toolchain_and_production_image() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cargo_toml =
+        fs::read_to_string(repo_root.join("Cargo.toml")).expect("Cargo.toml should be readable");
+    let ci = fs::read_to_string(repo_root.join(".github/workflows/ci.yml"))
+        .expect("CI workflow should be readable");
+    let rust_version = cargo_toml
+        .lines()
+        .find_map(|line| line.strip_prefix("rust-version = \""))
+        .and_then(|version| version.strip_suffix('\"'))
+        .expect("Cargo.toml should declare rust-version");
+
+    assert!(
+        ci.contains(&format!("env:\n  RUST_VERSION: \"{rust_version}\"")),
+        "CI must define Cargo.toml's Rust toolchain once at workflow scope"
+    );
+
+    let rust_toolchain_actions = ci.matches("uses: dtolnay/rust-toolchain@stable").count();
+    let toolchain_inputs: Vec<_> = ci
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("toolchain: "))
+        .collect();
+    assert!(
+        rust_toolchain_actions > 0,
+        "CI must install Rust with dtolnay/rust-toolchain"
+    );
+    assert_eq!(
+        toolchain_inputs.len(),
+        rust_toolchain_actions,
+        "every dtolnay/rust-toolchain action must set a toolchain input"
     );
     assert!(
-        containerfile.contains(&format!(
-            "FROM docker.io/rust:{rust_version}-bookworm AS builder"
-        )),
-        "Containerfile builder image must match Cargo.toml rust-version"
+        toolchain_inputs
+            .iter()
+            .all(|toolchain| *toolchain == "${{ env.RUST_VERSION }}"),
+        "every dtolnay/rust-toolchain input must use the workflow RUST_VERSION"
+    );
+
+    let linux_job = ci
+        .split("\n  linux:\n")
+        .nth(1)
+        .expect("CI must define an independent linux job");
+    for required in [
+        "runs-on: ubuntu-latest",
+        "uses: actions/checkout@v4",
+        "components: clippy, rustfmt",
+        "libheif-examples",
+        "libimage-exiftool-perl",
+        "imagemagick",
+        "cargo test --locked",
+        "docker build --tag icloudpd-optimizer:ci --file container/Containerfile .",
+        "docker run --rm icloudpd-optimizer:ci doctor --json",
+    ] {
+        assert!(
+            linux_job.contains(required),
+            "Linux CI contract must include {required:?}"
+        );
+    }
+    assert!(
+        !linux_job.contains("--privileged"),
+        "Linux CI image smoke must not use privileged containers"
+    );
+    assert!(
+        !linux_job.contains("--volume"),
+        "Linux CI image smoke must not mount host directories"
     );
 }
 
