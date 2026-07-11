@@ -4163,15 +4163,27 @@ fn ci_linux_contract_tests_the_declared_toolchain_and_production_image() {
 
 #[test]
 fn ci_linux_job_block_excludes_later_sibling_job_tokens() {
-    let workflow = "jobs:\n  linux:\n    runs-on: ubuntu-latest\n  later:\n    later-only-token\n";
+    for later_header in [
+        "later:",
+        "later: # comment",
+        "later: { runs-on: ubuntu-latest }",
+    ] {
+        let workflow = format!(
+            "jobs:\n  linux:\n    runs-on: ubuntu-latest\n    nested-property: remains-in-linux\n  {later_header}\n    later-only-token\n"
+        );
 
-    let linux_job = direct_job_block(workflow, "linux").expect("linux job should exist");
+        let linux_job = direct_job_block(&workflow, "linux").expect("linux job should exist");
 
-    assert!(linux_job.contains("runs-on: ubuntu-latest"));
-    assert!(
-        !linux_job.contains("later-only-token"),
-        "linux job requirements must not be satisfied by later sibling jobs"
-    );
+        assert!(linux_job.contains("runs-on: ubuntu-latest"));
+        assert!(
+            linux_job.contains("nested-property: remains-in-linux"),
+            "deeper-indented properties must remain in the linux job"
+        );
+        assert!(
+            !linux_job.contains("later-only-token"),
+            "linux job requirements must not be satisfied by {later_header:?} sibling jobs"
+        );
+    }
 }
 
 #[test]
@@ -4266,7 +4278,6 @@ fn direct_job_block<'a>(workflow: &'a str, job_name: &str) -> Result<&'a str, St
     else {
         return Err("CI must define a jobs mapping".to_string());
     };
-    let job_header = format!("{job_name}:");
     let child_indent = jobs_indent + 2;
     let mut matches = Vec::new();
 
@@ -4274,7 +4285,10 @@ fn direct_job_block<'a>(workflow: &'a str, job_name: &str) -> Result<&'a str, St
         if !line.trim().is_empty() && yaml_indentation(line) <= jobs_indent {
             break;
         }
-        if yaml_indentation(line) == child_indent && line.trim() == job_header {
+        if matches!(
+            direct_job_header(line, child_indent),
+            Some(candidate) if candidate == job_name
+        ) {
             matches.push(index);
         }
     }
@@ -4292,7 +4306,7 @@ fn direct_job_block<'a>(workflow: &'a str, job_name: &str) -> Result<&'a str, St
         .find_map(|(line_start, line)| {
             (!line.trim().is_empty()
                 && (yaml_indentation(line) <= jobs_indent
-                    || (yaml_indentation(line) == child_indent && line.trim_end().ends_with(':'))))
+                    || direct_job_header(line, child_indent).is_some()))
             .then_some(*line_start)
         })
         .unwrap_or(workflow.len());
@@ -4302,6 +4316,21 @@ fn direct_job_block<'a>(workflow: &'a str, job_name: &str) -> Result<&'a str, St
 
 fn yaml_indentation(line: &str) -> usize {
     line.len() - line.trim_start_matches(' ').len()
+}
+
+fn direct_job_header(line: &str, child_indent: usize) -> Option<&str> {
+    if yaml_indentation(line) != child_indent {
+        return None;
+    }
+    let (job_id, _) = line[child_indent..].split_once(':')?;
+
+    is_valid_github_job_id(job_id).then_some(job_id)
+}
+
+fn is_valid_github_job_id(job_id: &str) -> bool {
+    let mut bytes = job_id.bytes();
+    matches!(bytes.next(), Some(byte) if byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 #[test]
