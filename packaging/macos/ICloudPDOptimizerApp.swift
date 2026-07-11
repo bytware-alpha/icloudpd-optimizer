@@ -1113,20 +1113,16 @@ final class DashboardViewModel: ObservableObject {
     }
 
     func authorizeNAS() {
-        DispatchQueue.global(qos: .userInitiated).async {
+        DispatchQueue.main.async {
             do {
                 AppLogger.log("nas_authorization_started")
                 try self.authorizeAccess()
                 AppLogger.log("nas_authorization_succeeded")
-                DispatchQueue.main.async {
-                    self.showAlert(title: "NAS Access Verified", message: "The app can read and write the configured NAS paths.")
-                    self.refreshNow()
-                }
+                self.showAlert(title: "NAS Access Verified", message: "The app can read and write the configured NAS paths.")
+                self.refreshNow()
             } catch {
                 AppLogger.log("nas_authorization_failed", fields: ["error": String(describing: error)])
-                DispatchQueue.main.async {
-                    self.showAlert(title: "NAS Access Failed", message: String(describing: error))
-                }
+                self.showAlert(title: "NAS Access Failed", message: String(describing: error))
             }
         }
     }
@@ -1250,6 +1246,12 @@ final class DashboardViewModel: ObservableObject {
     }
 
     private func showAlert(title: String, message: String) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.showAlert(title: title, message: message)
+            }
+            return
+        }
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message
@@ -3125,6 +3127,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func requestFolderAccess(for plan: MonitorAccessPlan) throws -> [URL] {
+        guard Thread.isMainThread else {
+            throw PrimeError("folder authorization must run on the main thread")
+        }
         let panel = NSOpenPanel()
         panel.title = "Authorize NAS Access"
         panel.message = "Select the NAS folder that contains the configured iCloudPD photo roots."
@@ -3205,6 +3210,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showResult(_ status: PrimeStatus) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.showResult(status)
+            }
+            return
+        }
         let alert = NSAlert()
         alert.messageText = status.ok ? "iCloudPD Optimizer Access Verified" : "iCloudPD Optimizer Needs Access"
         if status.ok {

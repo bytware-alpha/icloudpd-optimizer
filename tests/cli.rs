@@ -26,6 +26,32 @@ fn binary() -> Command {
     Command::cargo_bin("icloudpd-optimizer").expect("binary should build")
 }
 
+fn swift_function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let signature_start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("Swift function {signature:?} should exist"));
+    let body_start = source[signature_start..]
+        .find('{')
+        .map(|offset| signature_start + offset)
+        .unwrap_or_else(|| panic!("Swift function {signature:?} should have a body"));
+    let mut depth = 0usize;
+
+    for (offset, character) in source[body_start..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[signature_start..=body_start + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+
+    panic!("Swift function {signature:?} should have a closing brace");
+}
+
 struct FailedAssetsQuarantineFixture {
     config_path: PathBuf,
     evidence_path: PathBuf,
@@ -4526,6 +4552,73 @@ fn macos_app_packaging_surface_is_documented() {
     assert!(readme.contains("just macos-app-service-install"));
     assert!(readme.contains("just macos-app-verify"));
     assert!(readme.contains("Library/Application Support/iCloudPD Optimizer/Service"));
+}
+
+#[test]
+fn macos_nas_authorization_keeps_appkit_on_the_main_thread() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let app_source =
+        fs::read_to_string(repo_root.join("packaging/macos/ICloudPDOptimizerApp.swift"))
+            .expect("macOS app source should be readable");
+
+    let authorize_nas = swift_function_body(&app_source, "func authorizeNAS()");
+    assert!(authorize_nas.contains("DispatchQueue.main.async"));
+    assert!(!authorize_nas.contains("DispatchQueue.global"));
+    assert!(authorize_nas.contains("AppLogger.log(\"nas_authorization_started\")"));
+    assert!(authorize_nas.contains("try self.authorizeAccess()"));
+    assert!(authorize_nas.contains("AppLogger.log(\"nas_authorization_succeeded\")"));
+    assert!(authorize_nas.contains("AppLogger.log(\"nas_authorization_failed\""));
+    assert!(authorize_nas.contains("NAS Access Verified"));
+    assert!(authorize_nas.contains("NAS Access Failed"));
+    assert!(authorize_nas.contains("self.refreshNow()"));
+
+    let request_folder_access = swift_function_body(
+        &app_source,
+        "private func requestFolderAccess(for plan: MonitorAccessPlan) throws -> [URL]",
+    );
+    let main_thread_guard = request_folder_access
+        .find("guard Thread.isMainThread else")
+        .expect("folder authorization should reject off-main-thread calls");
+    let open_panel = request_folder_access
+        .find("NSOpenPanel()")
+        .expect("folder authorization should create an open panel");
+    assert!(
+        main_thread_guard < open_panel,
+        "folder authorization must check the main thread before creating NSOpenPanel"
+    );
+    assert!(request_folder_access.contains("folder authorization must run on the main thread"));
+
+    let show_alert = swift_function_body(
+        &app_source,
+        "private func showAlert(title: String, message: String)",
+    );
+    let alert_main_thread_guard = show_alert
+        .find("guard Thread.isMainThread else")
+        .expect("alert presentation should return to the main thread");
+    let alert_construction = show_alert
+        .find("NSAlert()")
+        .expect("alert presentation should construct an alert");
+    assert!(
+        alert_main_thread_guard < alert_construction,
+        "alert presentation must check the main thread before constructing NSAlert"
+    );
+    assert!(show_alert.contains("DispatchQueue.main.async"));
+
+    let show_result = swift_function_body(
+        &app_source,
+        "private func showResult(_ status: PrimeStatus)",
+    );
+    let result_main_thread_guard = show_result
+        .find("guard Thread.isMainThread else")
+        .expect("prime-access result presentation should return to the main thread");
+    let result_alert_construction = show_result
+        .find("NSAlert()")
+        .expect("prime-access result presentation should construct an alert");
+    assert!(
+        result_main_thread_guard < result_alert_construction,
+        "prime-access result presentation must check the main thread before constructing NSAlert"
+    );
+    assert!(show_result.contains("DispatchQueue.main.async"));
 }
 
 #[test]
