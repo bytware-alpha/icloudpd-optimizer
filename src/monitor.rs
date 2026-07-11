@@ -5576,7 +5576,7 @@ fn pending_lifecycle_count(manifest: &Manifest) -> usize {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LifecycleAdmissionBudget {
     max_slots: usize,
-    remaining_slots: usize,
+    occupied_slots: usize,
 }
 
 impl LifecycleAdmissionBudget {
@@ -5586,30 +5586,26 @@ impl LifecycleAdmissionBudget {
             .values()
             .filter(|record| valid_adjusted_source_marker_reservation(record))
             .count();
-        let max_slots = max_lifecycle_per_scan.saturating_sub(marker_reservations);
         Self {
-            max_slots,
-            remaining_slots: max_slots.saturating_sub(pending_lifecycle_count(manifest)),
+            max_slots: max_lifecycle_per_scan,
+            occupied_slots: pending_lifecycle_count(manifest).saturating_add(marker_reservations),
         }
     }
 
     fn remaining_slots(self) -> usize {
-        self.remaining_slots
+        self.max_slots.saturating_sub(self.occupied_slots)
     }
 
     fn consume(&mut self) -> bool {
-        let Some(remaining_slots) = self.remaining_slots.checked_sub(1) else {
+        if self.occupied_slots >= self.max_slots {
             return false;
-        };
-        self.remaining_slots = remaining_slots;
+        }
+        self.occupied_slots = self.occupied_slots.saturating_add(1);
         true
     }
 
     fn release(&mut self, slots: usize) {
-        self.remaining_slots = self
-            .remaining_slots
-            .saturating_add(slots)
-            .min(self.max_slots);
+        self.occupied_slots = self.occupied_slots.saturating_sub(slots);
     }
 }
 
@@ -15088,6 +15084,93 @@ esac
         assert_eq!(manifest.get("retry-ready").unwrap().state, State::Failed);
         assert_eq!(manifest.get("exhausted").unwrap().state, State::Failed);
         assert_eq!(manifest.get("malformed").unwrap().state, State::Failed);
+    }
+
+    #[test]
+    fn lifecycle_budget_preserves_over_capacity_debt_when_an_interrupted_retry_requeues() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(interrupted_original_asset_resolve_retry_record(
+            "interrupted",
+            State::NasVerified,
+            "100.000000000Z",
+        ));
+        manifest.upsert(lifecycle_record("still-active", State::NasVerified));
+        let mut budget = LifecycleAdmissionBudget::for_scan(&manifest, 1);
+        assert_eq!(budget.remaining_slots(), 0);
+
+        let admission = recover_original_asset_resolver_retries_with_budget(
+            &mut manifest,
+            &mut budget,
+            16,
+            0,
+            1_000_000,
+        )
+        .expect("requeue should preserve capacity debt without admitting work");
+
+        assert_eq!(admission.interrupted_retries_requeued, 1);
+        assert_eq!(admission.recovered_now, 0);
+        assert_eq!(budget.remaining_slots(), 0);
+        assert_eq!(manifest.get("interrupted").unwrap().state, State::Failed);
+        assert_eq!(
+            manifest.get("still-active").unwrap().state,
+            State::NasVerified
+        );
+    }
+
+    #[test]
+    fn lifecycle_budget_releases_overcommit_debt_only_after_occupancy_drops_below_capacity() {
+        let mut manifest = Manifest::new();
+        for asset_id in ["active-a", "active-b", "active-c"] {
+            manifest.upsert(lifecycle_record(asset_id, State::NasVerified));
+        }
+        let mut budget = LifecycleAdmissionBudget::for_scan(&manifest, 1);
+        assert_eq!(budget.max_slots, 1);
+        assert_eq!(budget.occupied_slots, 3);
+        assert_eq!(budget.remaining_slots(), 0);
+
+        budget.release(1);
+        assert_eq!(budget.occupied_slots, 2);
+        assert_eq!(budget.remaining_slots(), 0);
+        budget.release(1);
+        assert_eq!(budget.occupied_slots, 1);
+        assert_eq!(budget.remaining_slots(), 0);
+        budget.release(1);
+        assert_eq!(budget.occupied_slots, 0);
+        assert_eq!(budget.remaining_slots(), 1);
+        assert!(budget.consume());
+        assert_eq!(budget.remaining_slots(), 0);
+    }
+
+    #[test]
+    fn lifecycle_budget_counts_valid_adjusted_marker_reservations_as_occupancy_debt() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "marker-reservation",
+            "conversion",
+            "RAW has no usable embedded preview",
+            Some(FailureKind::EmbeddedPreviewUnavailable),
+            "100.000000000Z",
+        ));
+        admit_adjusted_source_required_assets(&mut manifest, 1, 1, 1_000)
+            .expect("marker should be admitted before adding active work");
+        manifest.upsert(lifecycle_record("active", State::NasVerified));
+
+        let mut budget = LifecycleAdmissionBudget::for_scan(&manifest, 1);
+        assert_eq!(budget.occupied_slots, 2);
+        assert_eq!(budget.remaining_slots(), 0);
+        budget.release(1);
+        assert_eq!(budget.occupied_slots, 1);
+        assert_eq!(budget.remaining_slots(), 0);
+        budget.release(1);
+        assert_eq!(budget.occupied_slots, 0);
+        assert_eq!(budget.remaining_slots(), 1);
+        assert!(
+            manifest
+                .get("marker-reservation")
+                .unwrap()
+                .proofs
+                .contains_key(ADJUSTED_SOURCE_REQUIRED_PROOF)
+        );
     }
 
     #[test]
