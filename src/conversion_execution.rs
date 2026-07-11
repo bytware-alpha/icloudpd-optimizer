@@ -88,7 +88,9 @@ static TEST_ADJUSTED_ENCODER_STAGING_SWAP: std::sync::Mutex<Option<Vec<u8>>> =
 #[cfg(test)]
 static TEST_ADJUSTED_ENCODER_STAGING_SWAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
-static TEST_ADJUSTED_DESCRIPTOR_LEAK_CHECK: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+static TEST_ADJUSTED_DESCRIPTOR_LEAK_CHECK: std::sync::Mutex<
+    Option<std::sync::Arc<std::sync::Mutex<Option<bool>>>>,
+> = std::sync::Mutex::new(None);
 #[cfg(test)]
 static TEST_ADJUSTED_DESCRIPTOR_LEAK_CHECK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1004,22 +1006,27 @@ fn run_planned_adjusted_source_command(
     plan: &CommandPlan,
     source: &MaterializedAdjustedSource,
 ) -> Result<ChildResourceUsage, ConversionExecutionError> {
+    #[cfg(target_os = "macos")]
+    if plan.program == "sips" {
+        return run_macos_adjusted_source_command(stage, plan, source);
+    }
+
     use std::os::unix::process::CommandExt;
 
-    source.revalidate_for_command().map_err(|error| {
-        ConversionExecutionError::Workflow(WorkflowError::AdjustedSource(error))
-    })?;
     if let Some(path) = &plan.checked_output_path {
         refuse_preexisting_output(path)?;
     }
     if !fs::metadata("/dev/fd").is_ok_and(|metadata| metadata.is_dir()) {
         return Err(ConversionExecutionError::AdjustedSourceDescriptorUnavailable);
     }
-    let descriptor = source.duplicate_for_encoder().map_err(|error| {
-        ConversionExecutionError::Workflow(WorkflowError::AdjustedSource(error))
-    })?;
+    let descriptor = match plan.program.as_str() {
+        "sips" => source.duplicate_file_for_encoder(),
+        "heif-enc" => duplicate_linux_adjusted_source_for_encoder(source),
+        _ => return Err(ConversionExecutionError::AdjustedSourceCommandPlan),
+    }
+    .map_err(|error| ConversionExecutionError::Workflow(WorkflowError::AdjustedSource(error)))?;
     let descriptor_fd = descriptor.raw_fd();
-    let descriptor_input = OsString::from(format!("/dev/fd/{descriptor_fd}"));
+    let descriptor_input = descriptor.input_path();
     let matching_input_positions = plan
         .args
         .iter()
@@ -1033,7 +1040,7 @@ fn run_planned_adjusted_source_command(
     args[*input_position] = descriptor_input;
 
     #[cfg(test)]
-    test_assert_unrelated_child_does_not_inherit_adjusted_descriptor(descriptor_fd)?;
+    let unrelated_child = test_spawn_unrelated_child_without_adjusted_descriptor(descriptor_fd)?;
     #[cfg(test)]
     test_replace_staging_path_after_validation(source.path())?;
 
@@ -1047,7 +1054,27 @@ fn run_planned_adjusted_source_command(
         command.pre_exec(move || clear_close_on_exec(descriptor_fd));
     }
     command.args(&args).stdin(Stdio::null()).stdout(stdout);
-    let outcome = wait_for_command_with_usage(stage, &plan.program, command)?;
+    command.process_group(0);
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            drop(descriptor);
+            #[cfg(test)]
+            test_reap_unrelated_child(unrelated_child);
+            return Err(error.into());
+        }
+    };
+    drop(descriptor);
+    #[cfg(test)]
+    if let Err(error) = test_assert_parent_descriptor_closed(descriptor_fd, &child) {
+        let _ = wait_for_child_with_usage(stage, &plan.program, child);
+        let _ = test_wait_for_unrelated_child(unrelated_child);
+        return Err(error);
+    }
+    let outcome = wait_for_child_with_usage(stage, &plan.program, child);
+    #[cfg(test)]
+    test_wait_for_unrelated_child(unrelated_child)?;
+    let outcome = outcome?;
     if !outcome.status.success() {
         return Err(ConversionExecutionError::CommandFailed {
             stage,
@@ -1062,6 +1089,84 @@ fn run_planned_adjusted_source_command(
         inspect_required_intermediate_output(path)?;
     }
     Ok(outcome.resource_usage)
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_adjusted_source_command(
+    stage: &'static str,
+    plan: &CommandPlan,
+    source: &MaterializedAdjustedSource,
+) -> Result<ChildResourceUsage, ConversionExecutionError> {
+    use std::os::unix::process::CommandExt;
+
+    source.revalidate_for_command().map_err(|error| {
+        ConversionExecutionError::Workflow(WorkflowError::AdjustedSource(error))
+    })?;
+    if let Some(path) = &plan.checked_output_path {
+        refuse_preexisting_output(path)?;
+    }
+    let matching_input_positions = plan
+        .args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| (argument == source.path().as_os_str()).then_some(index))
+        .collect::<Vec<_>>();
+    let [input_position] = matching_input_positions.as_slice() else {
+        return Err(ConversionExecutionError::AdjustedSourceCommandPlan);
+    };
+    let mut args = plan.args.clone();
+    args[*input_position] = source.path().as_os_str().to_os_string();
+
+    let resolved_program = resolve_sanitized_path_tool(&plan.program)?;
+    let mut command = Command::new(resolved_program);
+    let stdout = match &plan.stdout_path {
+        Some(path) => Stdio::from(create_new_stdout_file(path)?),
+        None => Stdio::null(),
+    };
+    command.args(&args).stdin(Stdio::null()).stdout(stdout);
+    command.process_group(0);
+    let child = command.spawn()?;
+    let outcome = wait_for_child_with_usage(stage, &plan.program, child)?;
+    source.revalidate_for_command().map_err(|error| {
+        ConversionExecutionError::Workflow(WorkflowError::AdjustedSource(error))
+    })?;
+    if !outcome.status.success() {
+        return Err(ConversionExecutionError::CommandFailed {
+            stage,
+            program: plan.program.clone(),
+            status: outcome.status.to_string(),
+        });
+    }
+    if let Some(path) = &plan.stdout_path {
+        inspect_required_intermediate_output(path)?;
+    }
+    if let Some(path) = &plan.checked_output_path {
+        inspect_required_intermediate_output(path)?;
+    }
+    Ok(outcome.resource_usage)
+}
+
+#[cfg(target_os = "linux")]
+fn duplicate_linux_adjusted_source_for_encoder(
+    source: &MaterializedAdjustedSource,
+) -> Result<
+    crate::adjusted_source::AdjustedSourceEncoderDescriptor,
+    crate::adjusted_source::AdjustedSourceError,
+> {
+    source.duplicate_directory_for_encoder()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn duplicate_linux_adjusted_source_for_encoder(
+    source: &MaterializedAdjustedSource,
+) -> Result<
+    crate::adjusted_source::AdjustedSourceEncoderDescriptor,
+    crate::adjusted_source::AdjustedSourceError,
+> {
+    // Cross-target planner tests run on macOS, whose /dev/fd does not support
+    // descriptor-relative traversal. Native Linux execution always uses the
+    // sealed directory descriptor above.
+    source.duplicate_file_for_encoder()
 }
 
 #[cfg(unix)]
@@ -1111,7 +1216,8 @@ impl Drop for TestAdjustedEncoderStagingSwapGuard {
 
 #[cfg(test)]
 pub(crate) struct TestAdjustedDescriptorLeakCheckGuard {
-    previous: bool,
+    previous: Option<std::sync::Arc<std::sync::Mutex<Option<bool>>>>,
+    observation: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -1124,11 +1230,24 @@ impl TestAdjustedDescriptorLeakCheckGuard {
         let mut configured = TEST_ADJUSTED_DESCRIPTOR_LEAK_CHECK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::mem::replace(&mut *configured, true);
+        let observation = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let previous = configured.replace(observation.clone());
         Self {
             previous,
+            observation,
             _lock: lock,
         }
+    }
+
+    pub(crate) fn assert_parent_descriptor_was_closed(&self) {
+        assert_eq!(
+            *self
+                .observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(true),
+            "the parent descriptor must be closed while the intended encoder child remains alive"
+        );
     }
 }
 
@@ -1138,36 +1257,84 @@ impl Drop for TestAdjustedDescriptorLeakCheckGuard {
         let mut configured = TEST_ADJUSTED_DESCRIPTOR_LEAK_CHECK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *configured = self.previous;
+        *configured = self.previous.take();
     }
 }
 
 #[cfg(test)]
-fn test_assert_unrelated_child_does_not_inherit_adjusted_descriptor(
+fn test_spawn_unrelated_child_without_adjusted_descriptor(
     descriptor_fd: libc::c_int,
-) -> Result<(), ConversionExecutionError> {
-    let enabled = *TEST_ADJUSTED_DESCRIPTOR_LEAK_CHECK
+) -> Result<Option<Child>, ConversionExecutionError> {
+    let enabled = TEST_ADJUSTED_DESCRIPTOR_LEAK_CHECK
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    #[cfg(target_os = "linux")]
-    if enabled {
-        let status = Command::new("/bin/sh")
-            .args([
-                "-c",
-                "test ! -e /proc/self/fd/$1",
-                "adjusted-source-fd-leak-check",
-                &descriptor_fd.to_string(),
-            ])
-            .status()?;
-        if !status.success() {
-            return Err(ConversionExecutionError::Io(io::Error::other(
-                "unrelated child inherited adjusted source descriptor",
-            )));
-        }
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if enabled.is_none() {
+        return Ok(None);
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = (enabled, descriptor_fd);
-    Ok(())
+    let descriptor_fd = descriptor_fd.to_string();
+    Command::new("/bin/sh")
+        .args([
+            "-c",
+            "test ! -e /dev/fd/$1 || exit 70; /bin/sleep 1",
+            "adjusted-source-fd-leak-check",
+            &descriptor_fd,
+        ])
+        .spawn()
+        .map(Some)
+        .map_err(ConversionExecutionError::Io)
+}
+
+#[cfg(test)]
+fn test_assert_parent_descriptor_closed(
+    descriptor_fd: libc::c_int,
+    child: &Child,
+) -> Result<(), ConversionExecutionError> {
+    let observation = TEST_ADJUSTED_DESCRIPTOR_LEAK_CHECK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(observation) = observation else {
+        return Ok(());
+    };
+    let descriptor_closed = unsafe { libc::fcntl(descriptor_fd, libc::F_GETFD) } < 0
+        && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
+    let child_is_alive = unsafe { libc::kill(child.id() as libc::pid_t, 0) } == 0;
+    let passed = descriptor_closed && child_is_alive;
+    *observation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(passed);
+    if passed {
+        Ok(())
+    } else {
+        Err(ConversionExecutionError::Io(io::Error::other(
+            "parent retained adjusted source descriptor after encoder spawn",
+        )))
+    }
+}
+
+#[cfg(test)]
+fn test_wait_for_unrelated_child(
+    unrelated_child: Option<Child>,
+) -> Result<(), ConversionExecutionError> {
+    let Some(mut unrelated_child) = unrelated_child else {
+        return Ok(());
+    };
+    let status = unrelated_child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(ConversionExecutionError::Io(io::Error::other(
+            "unrelated child inherited adjusted source descriptor",
+        )))
+    }
+}
+
+#[cfg(test)]
+fn test_reap_unrelated_child(unrelated_child: Option<Child>) {
+    if let Some(mut unrelated_child) = unrelated_child {
+        let _ = unrelated_child.wait();
+    }
 }
 
 #[cfg(test)]
@@ -1185,10 +1352,24 @@ fn test_replace_staging_path_after_validation(
         ConversionExecutionError::Io(io::Error::other("staged source has no parent directory"))
     })?;
     let displaced_directory = staging_directory.with_extension("displaced-by-test");
-    fs::rename(staging_directory, &displaced_directory)?;
-    fs::create_dir(staging_directory)?;
-    fs::write(staging_directory.join("source.jpg"), replacement)?;
-    Ok(())
+    #[cfg(target_os = "macos")]
+    {
+        let _ = replacement;
+        match fs::rename(staging_directory, displaced_directory) {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+            Err(error) => Err(ConversionExecutionError::Io(error)),
+            Ok(()) => Err(ConversionExecutionError::Io(io::Error::other(
+                "immutable macOS staging directory was renamed",
+            ))),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fs::rename(staging_directory, &displaced_directory)?;
+        fs::create_dir(staging_directory)?;
+        fs::write(staging_directory.join("source.jpg"), replacement)?;
+        Ok(())
+    }
 }
 
 #[cfg(not(unix))]
@@ -2064,6 +2245,7 @@ done
 [ -n "$out" ] || exit 43
 printf 'heif-input=%s\n' "$input" >> "$EXECUTION_LOG"
 /bin/cat "$input" > "$out"
+/bin/sleep 1
 "#,
         );
         write_executable_script(
@@ -2135,10 +2317,18 @@ exit 67
             TargetPlatform::new("linux", "x86_64"),
         )
         .expect("adjusted conversion should complete without an embedded preview");
+        _descriptor_leak_guard.assert_parent_descriptor_was_closed();
 
         let command_log = fs::read_to_string(&log_path).expect("command log should be readable");
         assert!(command_log.starts_with("heif-enc\nheif-input="));
         assert!(command_log.contains("/dev/fd/"));
+        #[cfg(target_os = "linux")]
+        assert!(
+            command_log.lines().any(
+                |line| line.starts_with("heif-input=/dev/fd/") && line.ends_with("/source.jpg")
+            ),
+            "heif-enc needs the exact directory-descriptor path with its .jpg suffix"
+        );
         assert!(
             !command_log.contains(".conversion-"),
             "the encoder must not receive the lexical staged pathname"
@@ -2182,6 +2372,12 @@ exit 67
             r#"#!/bin/sh
 printf 'sips\n' >> "$EXECUTION_LOG"
 input="$7"
+for descriptor in /dev/fd/*; do
+  target=$(/usr/bin/readlink "$descriptor" 2>/dev/null || true)
+  case "$target" in
+    /private/tmp/.icloudpd-adjusted-*) exit 69 ;;
+  esac
+done
 out=""
 previous=""
 for arg in "$@"; do
@@ -2191,8 +2387,13 @@ for arg in "$@"; do
   previous="$arg"
 done
 [ -n "$out" ] || exit 43
+case "$input" in
+  /private/tmp/.icloudpd-adjusted-*/source.jpg) ;;
+  *) exit 44 ;;
+esac
 printf 'sips-input=%s\n' "$input" >> "$EXECUTION_LOG"
 /bin/cat "$input" > "$out"
+/bin/sleep 1
 "#,
         );
         write_executable_script(
@@ -2257,10 +2458,11 @@ exit 67
 
         let command_log = fs::read_to_string(&log_path).expect("command log should be readable");
         assert!(command_log.starts_with("sips\nsips-input="));
-        assert!(command_log.contains("/dev/fd/"));
         assert!(
-            !command_log.contains(".conversion-"),
-            "the encoder must not receive the lexical staged pathname"
+            command_log.lines().any(|line| line
+                .starts_with("sips-input=/private/tmp/.icloudpd-adjusted-")
+                && line.ends_with("/source.jpg")),
+            "sips must receive only the immutable root-stable staging path"
         );
         assert!(!command_log.contains(adjusted_path.to_string_lossy().as_ref()));
         assert!(command_log.ends_with("exiftool-metadata\n"));
@@ -2426,7 +2628,11 @@ printf '%s\n%s\n' "$2" "$3" > "$STAGE_COPY_LOG"
         let _copy_guard = RawStageCopyCommandGuard::install(copy_script.path());
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let nas_dir = tempdir.path().join("nas");
-        let output_dir = tempdir.path().join("out");
+        let output_dir = tempdir
+            .path()
+            .canonicalize()
+            .expect("tempdir should canonicalize")
+            .join("out");
         fs::create_dir_all(&nas_dir).expect("nas dir should be created");
         fs::create_dir_all(&output_dir).expect("output dir should be created");
         let raw_path = nas_dir.join("IMG_0001.dng");
@@ -2495,7 +2701,11 @@ printf 'partial-stage' > "$3"
         let _copy_guard = RawStageCopyCommandGuard::install(copy_script.path());
         let _timeout_guard = CommandTimeoutGuard::install(Duration::from_millis(500));
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let output_dir = tempdir.path().join("out");
+        let output_dir = tempdir
+            .path()
+            .canonicalize()
+            .expect("tempdir should canonicalize")
+            .join("out");
         fs::create_dir_all(&output_dir).expect("output dir should be created");
         let raw_path = tempdir.path().join("IMG_0001.dng");
         fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
@@ -3664,12 +3874,17 @@ printf 'heic' > "$out"
 
     #[cfg(unix)]
     fn adjusted_test_jpeg_with_seed(seed: u8) -> Vec<u8> {
+        adjusted_test_jpeg_with_dimensions(4, 3, seed)
+    }
+
+    #[cfg(unix)]
+    fn adjusted_test_jpeg_with_dimensions(width: u32, height: u32, seed: u8) -> Vec<u8> {
         use image::codecs::jpeg::JpegEncoder;
         use image::{DynamicImage, Rgb, RgbImage};
 
-        let mut image = RgbImage::new(4, 3);
+        let mut image = RgbImage::new(width, height);
         for (x, y, pixel) in image.enumerate_pixels_mut() {
-            *pixel = Rgb([x as u8 * 50, y as u8 * 70, seed]);
+            *pixel = Rgb([((x * 50) % 255) as u8, ((y * 70) % 255) as u8, seed]);
         }
         let mut bytes = Vec::new();
         JpegEncoder::new_with_quality(&mut bytes, 100)
@@ -3710,6 +3925,187 @@ printf 'heic' > "$out"
             orientation: 1,
             verified_at_unix_seconds: 1_800_000_001,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_real_heif_encoder_accepts_a_sealed_directory_descriptor_jpeg_when_available() {
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("skipping real heif-enc directory-descriptor smoke: this host is not Linux");
+        }
+        #[cfg(target_os = "linux")]
+        linux_real_heif_encoder_accepts_a_sealed_directory_descriptor_jpeg();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_real_heif_encoder_accepts_a_sealed_directory_descriptor_jpeg() {
+        use std::os::unix::fs::symlink;
+
+        let Some(heif_enc) = executable_on_path("heif-enc") else {
+            eprintln!("skipping real heif-enc smoke: heif-enc is unavailable");
+            return;
+        };
+        let Some(heif_info) = executable_on_path("heif-info") else {
+            eprintln!("skipping real heif-enc smoke: heif-info is unavailable");
+            return;
+        };
+        let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
+        symlink(&heif_enc, tool_dir.path().join("heif-enc"))
+            .expect("real heif-enc should be exposed through sanitized PATH");
+        write_executable_script(
+            &tool_dir.path().join("exiftool"),
+            r#"#!/bin/sh
+if [ "$1" = "-j" ] || [ "$1" = "-b" ]; then
+  exit 66
+fi
+if [ "$1" = "-TagsFromFile" ]; then
+  exit 0
+fi
+exit 67
+"#,
+        );
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("test tempdir should be created");
+        let output_dir = tempdir
+            .path()
+            .canonicalize()
+            .expect("tempdir should canonicalize")
+            .join("out");
+        fs::create_dir(&output_dir).expect("output directory should be created");
+        let raw_path = tempdir.path().join("IMG_REAL_HEIF.dng");
+        let raw_bytes = vec![b'r'; 4_096];
+        fs::write(&raw_path, &raw_bytes).expect("raw should be written");
+        let output_path = output_dir.join("IMG_REAL_HEIF.heic");
+        let adjusted_path = adjusted_source_path_for_output(&output_path);
+        let adjusted_bytes = adjusted_test_jpeg_with_dimensions(64, 64, 31);
+        fs::write(&adjusted_path, &adjusted_bytes).expect("adjusted JPEG should be written");
+        let mut manifest = nas_verified_manifest(&raw_path);
+        let original = OriginalAssetProof {
+            record_name: "original-real-heif".to_string(),
+            record_change_tag: "original-real-heif-tag".to_string(),
+            record_type: "CPLAsset".to_string(),
+            database_scope: Default::default(),
+            zone_name: "PrimarySync".to_string(),
+            filename: "IMG_REAL_HEIF.dng".to_string(),
+            size_bytes: raw_bytes.len() as u64,
+            matched_raw_sha256: format!("{:x}", Sha256::digest(&raw_bytes)),
+        };
+        record_original_asset_proof(&mut manifest, "asset-1", original.clone())
+            .expect("original asset proof should record");
+        let adjusted = CloudKitAdjustedSourceProof {
+            width: 64,
+            height: 64,
+            ..adjusted_test_proof("asset-1", &original, adjusted_path.clone(), &adjusted_bytes)
+        };
+        record_adjusted_source_proof(&mut manifest, "asset-1", &output_path, adjusted)
+            .expect("adjusted proof should record");
+
+        execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect("real heif-enc should encode the sealed /dev/fd directory input");
+
+        assert!(
+            Command::new(heif_info)
+                .arg(&output_path)
+                .status()
+                .expect("heif-info should run")
+                .success(),
+            "real heif-info must accept the 64x64 HEIC produced from the descriptor input"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_real_sips_accepts_a_sealed_file_descriptor_jpeg_when_available() {
+        use std::os::unix::fs::symlink;
+
+        let Some(sips) = executable_on_path("sips") else {
+            eprintln!("skipping real sips descriptor smoke: sips is unavailable");
+            return;
+        };
+        let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
+        symlink(&sips, tool_dir.path().join("sips"))
+            .expect("real sips should be exposed through sanitized PATH");
+        write_executable_script(
+            &tool_dir.path().join("exiftool"),
+            r#"#!/bin/sh
+if [ "$1" = "-j" ] || [ "$1" = "-b" ]; then
+  exit 66
+fi
+if [ "$1" = "-TagsFromFile" ]; then
+  exit 0
+fi
+exit 67
+"#,
+        );
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("test tempdir should be created");
+        let output_dir = tempdir
+            .path()
+            .canonicalize()
+            .expect("tempdir should canonicalize")
+            .join("out");
+        fs::create_dir(&output_dir).expect("output directory should be created");
+        let raw_path = tempdir.path().join("IMG_REAL_SIPS.dng");
+        let raw_bytes = vec![b'r'; 4_096];
+        fs::write(&raw_path, &raw_bytes).expect("raw should be written");
+        let output_path = output_dir.join("IMG_REAL_SIPS.heic");
+        let adjusted_path = adjusted_source_path_for_output(&output_path);
+        let adjusted_bytes = adjusted_test_jpeg_with_dimensions(64, 64, 47);
+        fs::write(&adjusted_path, &adjusted_bytes).expect("adjusted JPEG should be written");
+        let mut manifest = nas_verified_manifest(&raw_path);
+        let original = OriginalAssetProof {
+            record_name: "original-real-sips".to_string(),
+            record_change_tag: "original-real-sips-tag".to_string(),
+            record_type: "CPLAsset".to_string(),
+            database_scope: Default::default(),
+            zone_name: "PrimarySync".to_string(),
+            filename: "IMG_REAL_SIPS.dng".to_string(),
+            size_bytes: raw_bytes.len() as u64,
+            matched_raw_sha256: format!("{:x}", Sha256::digest(&raw_bytes)),
+        };
+        record_original_asset_proof(&mut manifest, "asset-1", original.clone())
+            .expect("original asset proof should record");
+        let adjusted = CloudKitAdjustedSourceProof {
+            width: 64,
+            height: 64,
+            ..adjusted_test_proof("asset-1", &original, adjusted_path.clone(), &adjusted_bytes)
+        };
+        record_adjusted_source_proof(&mut manifest, "asset-1", &output_path, adjusted)
+            .expect("adjusted proof should record");
+
+        execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("macos", "aarch64"),
+        )
+        .expect("real sips should encode the sealed /dev/fd file input");
+
+        let dimensions = Command::new(sips)
+            .args(["-g", "pixelWidth", "-g", "pixelHeight"])
+            .arg(&output_path)
+            .output()
+            .expect("sips should inspect its output");
+        assert!(dimensions.status.success());
+        let dimensions = String::from_utf8_lossy(&dimensions.stdout);
+        assert!(
+            dimensions.contains("64"),
+            "sips output must retain 64px dimensions"
+        );
     }
 
     #[cfg(unix)]
@@ -3843,6 +4239,15 @@ exit 49
             .permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).expect("fake tool should be executable");
+    }
+
+    #[cfg(unix)]
+    fn executable_on_path(program: &str) -> Option<PathBuf> {
+        env::var_os("PATH").and_then(|paths| {
+            env::split_paths(&paths)
+                .map(|directory| directory.join(program))
+                .find(|candidate| is_executable_file(candidate))
+        })
     }
 
     #[cfg(unix)]

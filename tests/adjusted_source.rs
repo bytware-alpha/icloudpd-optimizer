@@ -176,6 +176,19 @@ fn safe_path(directory: &tempfile::TempDir, name: &str) -> PathBuf {
         .join(name)
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
+fn set_staging_directory_mode(staged_path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(
+        staged_path
+            .parent()
+            .expect("staged source should have a parent directory"),
+        fs::Permissions::from_mode(mode),
+    )
+    .expect("test should be able to change its owned staging directory mode");
+}
+
 fn zone() -> Value {
     json!({"zoneName": ZONE})
 }
@@ -544,6 +557,41 @@ fn materialized_adjusted_source_is_a_private_verified_copy_that_cleans_up_withou
         fs::read(&staged_path).expect("staged bytes should read"),
         bytes
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            fs::metadata(&staged_path)
+                .expect("staged source metadata should be readable")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400,
+            "the staged source must be sealed read-only before command launch"
+        );
+        assert_eq!(
+            fs::metadata(
+                staged_path
+                    .parent()
+                    .expect("staged source must have a parent")
+            )
+            .expect("staging directory metadata should be readable")
+            .permissions()
+            .mode()
+                & 0o777,
+            0o500,
+            "the private staging directory must be sealed before command launch"
+        );
+        assert!(
+            fs::write(&staged_path, b"write must fail").is_err(),
+            "a sealed source must reject replacement writes"
+        );
+        assert!(
+            fs::remove_file(&staged_path).is_err(),
+            "a sealed staging directory must reject source unlink"
+        );
+    }
     materialized
         .revalidate_for_command()
         .expect("staged path must remain descriptor-verified before launch");
@@ -553,6 +601,73 @@ fn materialized_adjusted_source_is_a_private_verified_copy_that_cleans_up_withou
     assert_eq!(
         fs::read(&adjusted_path).expect("original proof source must survive cleanup"),
         bytes
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_materialized_adjusted_source_is_immutable_under_root_stable_private_tmp() {
+    use std::os::darwin::fs::MetadataExt;
+    use std::os::unix::fs::MetadataExt as UnixMetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let bytes = nonblank_jpeg(4, 3);
+    let mut transport = FakeTransport {
+        lookups: VecDeque::from([json!({"records": [direct_asset_record(&bytes, 4, 3)]})]),
+        downloads: VecDeque::from([bytes.clone()]),
+        ..Default::default()
+    };
+    let directory = tempdir().expect("test directory");
+    let output_path = safe_path(&directory, "IMG_0100.heic");
+    let proof = CloudKitAdjustedSourceResolver::new(&mut transport)
+        .resolve(
+            &session(),
+            &resolve_request(adjusted_source_path_for_output(&output_path)),
+        )
+        .expect("adjusted JPEG should resolve");
+
+    let materialized = materialize_adjusted_source_for_conversion(
+        &proof,
+        "local-asset",
+        &original_proof(),
+        &output_path,
+    )
+    .expect("source should materialize into immutable private tmp staging");
+    let staged_path = materialized.path().to_path_buf();
+    let staging_directory = staged_path
+        .parent()
+        .expect("staged source should have a parent");
+    assert_eq!(staging_directory.parent(), Some(Path::new("/private/tmp")));
+    assert!(
+        staging_directory
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".icloudpd-adjusted-"))
+    );
+    let private_tmp =
+        fs::metadata("/private/tmp").expect("private tmp metadata should be readable");
+    assert_eq!(private_tmp.uid(), 0, "private tmp must remain root-owned");
+    assert_eq!(private_tmp.permissions().mode() & 0o7777, 0o1777);
+    for path in [&staged_path, staging_directory] {
+        assert_ne!(
+            fs::metadata(path)
+                .expect("immutable staging metadata should be readable")
+                .st_flags()
+                & libc::UF_IMMUTABLE,
+            0,
+            "immutable staging must carry UF_IMMUTABLE"
+        );
+    }
+    assert!(fs::write(&staged_path, b"replacement").is_err());
+    assert!(fs::remove_file(&staged_path).is_err());
+    assert!(fs::write(staging_directory.join("attacker"), b"entry").is_err());
+    assert!(fs::rename(staging_directory, staging_directory.with_extension("moved")).is_err());
+    materialized
+        .revalidate_for_command()
+        .expect("failed mutation attempts must preserve immutable staged identity");
+    drop(materialized);
+    assert!(
+        !staging_directory.exists(),
+        "owned immutable staging must clean up"
     );
 }
 
@@ -674,7 +789,7 @@ fn resolver_canonicalizes_supported_jpeg_file_type_spellings_in_durable_proofs()
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn materialized_adjusted_source_rejects_replaced_symlinked_hardlinked_and_wrong_path_inputs() {
     use std::os::unix::fs::symlink;
@@ -728,8 +843,10 @@ fn materialized_adjusted_source_rejects_replaced_symlinked_hardlinked_and_wrong_
     )
     .expect("source should materialize");
     let staged_path = materialized.path().to_path_buf();
+    set_staging_directory_mode(&staged_path, 0o700);
     fs::remove_file(&staged_path).expect("staged file should be removable in test");
     fs::write(&staged_path, b"replacement").expect("replacement should be written");
+    set_staging_directory_mode(&staged_path, 0o500);
     assert!(matches!(
         materialized.revalidate_for_command(),
         Err(AdjustedSourceError::ProofLocalFileMismatch)
@@ -744,11 +861,13 @@ fn materialized_adjusted_source_rejects_replaced_symlinked_hardlinked_and_wrong_
     )
     .expect("source should materialize with a fresh staged inode");
     let staged_path = materialized.path().to_path_buf();
+    set_staging_directory_mode(&staged_path, 0o700);
     let same_byte_replacement = staged_path.with_extension("same-byte-replacement.jpg");
     fs::write(&same_byte_replacement, &bytes)
         .expect("same-byte replacement should be written as a distinct file");
     fs::rename(&same_byte_replacement, &staged_path)
         .expect("same-byte replacement should atomically replace the staged path");
+    set_staging_directory_mode(&staged_path, 0o500);
     assert!(
         matches!(
             materialized.revalidate_for_command(),
@@ -766,11 +885,13 @@ fn materialized_adjusted_source_rejects_replaced_symlinked_hardlinked_and_wrong_
     )
     .expect("source should materialize again");
     let staged_path = materialized.path().to_path_buf();
+    set_staging_directory_mode(&staged_path, 0o700);
     fs::remove_file(&staged_path).expect("staged file should be removable in test");
     symlink(&adjusted_path, &staged_path).expect("staged symlink should be created");
+    set_staging_directory_mode(&staged_path, 0o500);
     assert!(matches!(
         materialized.revalidate_for_command(),
-        Err(AdjustedSourceError::UnsafeOutputPath)
+        Err(AdjustedSourceError::UnsafeOutputPath | AdjustedSourceError::ProofLocalFileMismatch)
     ));
     drop(materialized);
 
@@ -782,8 +903,10 @@ fn materialized_adjusted_source_rejects_replaced_symlinked_hardlinked_and_wrong_
     )
     .expect("source should materialize a third time");
     let staged_path = materialized.path().to_path_buf();
+    set_staging_directory_mode(&staged_path, 0o700);
     fs::remove_file(&staged_path).expect("staged file should be removable in test");
     fs::hard_link(&adjusted_path, &staged_path).expect("staged hardlink should be created");
+    set_staging_directory_mode(&staged_path, 0o500);
     assert!(matches!(
         materialized.revalidate_for_command(),
         Err(AdjustedSourceError::ProofLocalFileMismatch)

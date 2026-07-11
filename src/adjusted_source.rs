@@ -1,4 +1,4 @@
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -319,11 +319,13 @@ pub struct MaterializedAdjustedSource {
     staged: OpenArtifact,
 }
 
-/// A CLOEXEC duplicate of the immutable staged JPEG, intended solely for the
-/// encoder child that explicitly opts into inheriting it.
+/// A CLOEXEC duplicate of an immutable staged capability, intended solely for
+/// the encoder child that explicitly opts into inheriting it.
 #[cfg(unix)]
-pub(crate) struct AdjustedSourceEncoderDescriptor {
-    file: File,
+pub(crate) enum AdjustedSourceEncoderDescriptor {
+    File(File),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Directory(File),
 }
 
 #[cfg(not(unix))]
@@ -385,32 +387,29 @@ impl MaterializedAdjustedSource {
     }
 
     /// Validates both the held staged descriptor and its anchored pathname
-    /// immediately before the encoder is launched. The encoder must use the
-    /// descriptor returned by `duplicate_for_encoder`, never this pathname.
+    /// immediately before the encoder is launched. The encoder must use a
+    /// descriptor returned below, never this pathname.
     pub fn revalidate_for_command(&self) -> Result<(), AdjustedSourceError> {
         self.validate_held_descriptor()?;
         self.staging
             .validate_file(&self.staged.identity, self.width, self.height)
     }
 
-    pub(crate) fn duplicate_for_encoder(
+    pub(crate) fn duplicate_file_for_encoder(
         &self,
     ) -> Result<AdjustedSourceEncoderDescriptor, AdjustedSourceError> {
-        use std::os::fd::{AsRawFd, FromRawFd};
+        self.revalidate_for_command()?;
+        duplicate_encoder_descriptor(&self.staged.file, true)
+            .map(AdjustedSourceEncoderDescriptor::File)
+    }
 
-        self.validate_held_descriptor()?;
-        let descriptor =
-            unsafe { libc::fcntl(self.staged.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
-        if descriptor < 0 {
-            return Err(AdjustedSourceError::Filesystem);
-        }
-        if unsafe { libc::lseek(descriptor, 0, libc::SEEK_SET) } < 0 {
-            let _ = unsafe { libc::close(descriptor) };
-            return Err(AdjustedSourceError::Filesystem);
-        }
-        Ok(AdjustedSourceEncoderDescriptor {
-            file: unsafe { File::from_raw_fd(descriptor) },
-        })
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn duplicate_directory_for_encoder(
+        &self,
+    ) -> Result<AdjustedSourceEncoderDescriptor, AdjustedSourceError> {
+        self.revalidate_for_command()?;
+        duplicate_encoder_descriptor(&self.staging.staging, false)
+            .map(AdjustedSourceEncoderDescriptor::Directory)
     }
 
     fn validate_held_descriptor(&self) -> Result<(), AdjustedSourceError> {
@@ -432,7 +431,17 @@ impl AdjustedSourceEncoderDescriptor {
     pub(crate) fn raw_fd(&self) -> libc::c_int {
         use std::os::fd::AsRawFd;
 
-        self.file.as_raw_fd()
+        match self {
+            Self::File(file) | Self::Directory(file) => file.as_raw_fd(),
+        }
+    }
+
+    pub(crate) fn input_path(&self) -> OsString {
+        let descriptor = self.raw_fd();
+        match self {
+            Self::File(_) => OsString::from(format!("/dev/fd/{descriptor}")),
+            Self::Directory(_) => OsString::from(format!("/dev/fd/{descriptor}/source.jpg")),
+        }
     }
 }
 
@@ -452,6 +461,7 @@ pub fn materialize_adjusted_source_for_conversion(
     let source_identity = source.identity.clone();
     let mut staging = ConversionSourceStaging::create(&output, &expected_path)?;
     staging.copy_from_descriptor(&source.file, &source_identity)?;
+    staging.seal()?;
     let staged = staging.capture_file(&source_identity, proof.width, proof.height)?;
     #[cfg(test)]
     test_swap_original_after_materialization(&proof.local_path)?;
@@ -547,6 +557,14 @@ struct FileIdentity {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    owner: u32,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    link_count: u64,
+    #[cfg(target_os = "macos")]
+    flags: u32,
 }
 
 impl FileIdentity {
@@ -558,6 +576,15 @@ impl FileIdentity {
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StagingDirectoryIdentity {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    mode: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MacPrivateTempIdentity {
     device: u64,
     inode: u64,
     owner: u32,
@@ -616,8 +643,16 @@ struct ConversionSourceStaging {
     staging_identity: StagingDirectoryIdentity,
     file_name: CString,
     file: Option<File>,
+    source_device: u64,
+    source_inode: u64,
     path: PathBuf,
     active: bool,
+    #[cfg(target_os = "macos")]
+    private_tmp_identity: MacPrivateTempIdentity,
+    #[cfg(target_os = "macos")]
+    staging_flags: u32,
+    #[cfg(target_os = "macos")]
+    immutable: bool,
 }
 
 #[cfg(unix)]
@@ -763,49 +798,116 @@ impl AnchoredOutput {
 #[cfg(unix)]
 impl ConversionSourceStaging {
     fn create(output: &AnchoredOutput, expected_path: &Path) -> Result<Self, AdjustedSourceError> {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (output, expected_path);
+            Self::create_macos_private_tmp()
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            use std::os::fd::AsRawFd;
+
+            let parent_path = expected_path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .ok_or(AdjustedSourceError::UnsafeOutputPath)?;
+            let prefix = std::str::from_utf8(output.final_name.to_bytes())
+                .map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
+            for _ in 0..16 {
+                let name = format!(".{prefix}.conversion-{}.staging", Uuid::new_v4());
+                let staging_name =
+                    CString::new(name.as_str()).map_err(|_| AdjustedSourceError::Filesystem)?;
+                match create_staging_directory_at(output.parent.as_raw_fd(), &staging_name) {
+                    Ok(()) => {}
+                    Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
+                    Err(_) => return Err(AdjustedSourceError::Filesystem),
+                }
+                let staging = match open_directory_at(output.parent.as_raw_fd(), &staging_name) {
+                    Ok(staging) => staging,
+                    Err(_) => return Err(AdjustedSourceError::Filesystem),
+                };
+                let staging_identity = inspect_staging_directory(&staging)?;
+                let file_name =
+                    CString::new("source.jpg").map_err(|_| AdjustedSourceError::Filesystem)?;
+                match open_temp_at(staging.as_raw_fd(), &file_name) {
+                    Ok(file) => {
+                        let (source_device, source_inode) = file_location(&file)?;
+                        return Ok(Self {
+                            parent: output
+                                .parent
+                                .try_clone()
+                                .map_err(|_| AdjustedSourceError::Filesystem)?,
+                            staging,
+                            staging_name,
+                            staging_identity,
+                            file_name,
+                            file: Some(file),
+                            source_device,
+                            source_inode,
+                            path: parent_path.join(name).join("source.jpg"),
+                            active: true,
+                        });
+                    }
+                    Err(_) => {
+                        let _ = remove_owned_staging_directory(
+                            output,
+                            &staging_name,
+                            &staging,
+                            staging_identity,
+                        );
+                        return Err(AdjustedSourceError::Filesystem);
+                    }
+                }
+            }
+            Err(AdjustedSourceError::Filesystem)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_macos_private_tmp() -> Result<Self, AdjustedSourceError> {
         use std::os::fd::AsRawFd;
 
-        let parent_path = expected_path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .ok_or(AdjustedSourceError::UnsafeOutputPath)?;
-        let prefix = std::str::from_utf8(output.final_name.to_bytes())
-            .map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
+        let (parent, private_tmp_identity) = open_macos_private_tmp()?;
         for _ in 0..16 {
-            let name = format!(".{prefix}.conversion-{}.staging", Uuid::new_v4());
+            let name = format!(".icloudpd-adjusted-{}.staging", Uuid::new_v4());
             let staging_name =
                 CString::new(name.as_str()).map_err(|_| AdjustedSourceError::Filesystem)?;
-            match create_staging_directory_at(output.parent.as_raw_fd(), &staging_name) {
+            match create_staging_directory_at(parent.as_raw_fd(), &staging_name) {
                 Ok(()) => {}
                 Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
                 Err(_) => return Err(AdjustedSourceError::Filesystem),
             }
-            let staging = match open_directory_at(output.parent.as_raw_fd(), &staging_name) {
+            let staging = match open_directory_at(parent.as_raw_fd(), &staging_name) {
                 Ok(staging) => staging,
                 Err(_) => return Err(AdjustedSourceError::Filesystem),
             };
             let staging_identity = inspect_staging_directory(&staging)?;
+            let staging_flags = macos_file_flags(&staging)?;
             let file_name =
                 CString::new("source.jpg").map_err(|_| AdjustedSourceError::Filesystem)?;
             match open_temp_at(staging.as_raw_fd(), &file_name) {
                 Ok(file) => {
+                    let (source_device, source_inode) = file_location(&file)?;
                     return Ok(Self {
-                        parent: output
-                            .parent
-                            .try_clone()
-                            .map_err(|_| AdjustedSourceError::Filesystem)?,
+                        parent,
                         staging,
                         staging_name,
                         staging_identity,
                         file_name,
                         file: Some(file),
-                        path: parent_path.join(name).join("source.jpg"),
+                        source_device,
+                        source_inode,
+                        path: PathBuf::from("/private/tmp").join(name).join("source.jpg"),
                         active: true,
+                        private_tmp_identity,
+                        staging_flags,
+                        immutable: false,
                     });
                 }
                 Err(_) => {
-                    let _ = remove_owned_staging_directory(
-                        output,
+                    let _ = remove_owned_staging_directory_at(
+                        &parent,
                         &staging_name,
                         &staging,
                         staging_identity,
@@ -851,6 +953,7 @@ impl ConversionSourceStaging {
         destination
             .sync_all()
             .map_err(|_| AdjustedSourceError::Filesystem)?;
+        seal_source_file(destination)?;
         self.file.take();
         if size_bytes != expected.size_bytes
             || format!("{:x}", hasher.finalize()) != expected.sha256
@@ -858,6 +961,17 @@ impl ConversionSourceStaging {
             return Err(AdjustedSourceError::ProofLocalFileMismatch);
         }
         Ok(())
+    }
+
+    fn seal(&mut self) -> Result<(), AdjustedSourceError> {
+        if self.file.is_some() {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        self.validate_named_staging()?;
+        self.set_staging_mode(0o500)?;
+        #[cfg(target_os = "macos")]
+        self.seal_macos_immutable()?;
+        self.validate_named_staging()
     }
 
     fn capture_file(
@@ -871,7 +985,7 @@ impl ConversionSourceStaging {
         self.validate_named_staging()?;
         let artifact =
             inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
-        if !has_single_link(&artifact.file)? || !artifact.identity.matches_bytes(source_identity) {
+        if !self.is_sealed_source(&artifact) || !artifact.identity.matches_bytes(source_identity) {
             return Err(AdjustedSourceError::ProofLocalFileMismatch);
         }
         verify_jpeg(&artifact.file, width, height)?;
@@ -895,7 +1009,7 @@ impl ConversionSourceStaging {
         self.validate_named_staging()?;
         let artifact =
             inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
-        if !has_single_link(&artifact.file)? || artifact.identity != *expected {
+        if !self.is_sealed_source(&artifact) || artifact.identity != *expected {
             return Err(AdjustedSourceError::ProofLocalFileMismatch);
         }
         verify_jpeg(&artifact.file, width, height)?;
@@ -911,6 +1025,8 @@ impl ConversionSourceStaging {
     fn validate_named_staging(&self) -> Result<(), AdjustedSourceError> {
         use std::os::fd::AsRawFd;
 
+        #[cfg(target_os = "macos")]
+        self.validate_macos_private_tmp()?;
         if inspect_staging_directory(&self.staging)? != self.staging_identity
             || staging_link_count(&self.staging)? < 2
         {
@@ -925,13 +1041,149 @@ impl ConversionSourceStaging {
         Ok(())
     }
 
+    fn is_sealed_source(&self, artifact: &OpenArtifact) -> bool {
+        let sealed = self.has_sealed_source_identity(artifact);
+        #[cfg(target_os = "macos")]
+        {
+            sealed && self.immutable && artifact.identity.flags & libc::UF_IMMUTABLE != 0
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            sealed
+        }
+    }
+
+    fn has_sealed_source_identity(&self, artifact: &OpenArtifact) -> bool {
+        artifact.identity.device == self.source_device
+            && artifact.identity.inode == self.source_inode
+            && artifact.identity.owner == unsafe { libc::geteuid() }
+            && artifact.identity.mode == 0o400
+            && artifact.identity.link_count == 1
+    }
+
+    fn set_staging_mode(&mut self, mode: u32) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        if unsafe { libc::fchmod(self.staging.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        let identity = inspect_staging_directory(&self.staging)?;
+        if identity.mode != mode {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        self.staging_identity = identity;
+        self.staging
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        self.parent
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn validate_macos_private_tmp(&self) -> Result<(), AdjustedSourceError> {
+        let (current_parent, identity) = open_macos_private_tmp()?;
+        if identity != self.private_tmp_identity
+            || inspect_macos_private_tmp(&self.parent)? != self.private_tmp_identity
+            || inspect_macos_private_tmp(&current_parent)? != self.private_tmp_identity
+        {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        if self.immutable && macos_file_flags(&self.staging)? != self.staging_flags {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn seal_macos_immutable(&mut self) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        let source =
+            inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
+        if !self.has_sealed_source_identity(&source) {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        let source_flags = macos_file_flags(&source.file)?;
+        let staging_flags = macos_file_flags(&self.staging)?;
+        if source_flags & libc::UF_IMMUTABLE != 0 || staging_flags & libc::UF_IMMUTABLE != 0 {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        if unsafe { libc::fchflags(source.file.as_raw_fd(), source_flags | libc::UF_IMMUTABLE) }
+            != 0
+        {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        if macos_file_flags(&source.file)? != source_flags | libc::UF_IMMUTABLE {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        if unsafe { libc::fchflags(self.staging.as_raw_fd(), staging_flags | libc::UF_IMMUTABLE) }
+            != 0
+        {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        self.staging_flags = staging_flags | libc::UF_IMMUTABLE;
+        self.immutable = true;
+        self.staging
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        self.parent
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        self.validate_macos_private_tmp()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn unseal_macos_immutable(&mut self) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        if !self.immutable {
+            return Ok(());
+        }
+        let source =
+            inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
+        let source_flags = macos_file_flags(&source.file)?;
+        if source_flags & libc::UF_IMMUTABLE == 0
+            || unsafe {
+                libc::fchflags(source.file.as_raw_fd(), source_flags & !libc::UF_IMMUTABLE)
+            } != 0
+        {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        if macos_file_flags(&source.file)? & libc::UF_IMMUTABLE != 0
+            || unsafe {
+                libc::fchflags(
+                    self.staging.as_raw_fd(),
+                    self.staging_flags & !libc::UF_IMMUTABLE,
+                )
+            } != 0
+        {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        if macos_file_flags(&self.staging)? & libc::UF_IMMUTABLE != 0 {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        self.staging_flags &= !libc::UF_IMMUTABLE;
+        self.immutable = false;
+        self.staging
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        self.parent
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)
+    }
+
     fn cleanup(&mut self) -> Result<(), AdjustedSourceError> {
         use std::os::fd::AsRawFd;
 
         if !self.active {
             return Ok(());
         }
+        self.file.take();
         self.validate_named_staging()?;
+        #[cfg(target_os = "macos")]
+        self.unseal_macos_immutable()?;
+        self.set_staging_mode(0o700)?;
         let unlink =
             unsafe { libc::unlinkat(self.staging.as_raw_fd(), self.file_name.as_ptr(), 0) };
         if unlink != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
@@ -1408,6 +1660,62 @@ fn open_directory_at(dirfd: libc::c_int, name: &CStr) -> Result<File, AdjustedSo
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+#[cfg(target_os = "macos")]
+fn open_macos_private_tmp() -> Result<(File, MacPrivateTempIdentity), AdjustedSourceError> {
+    use std::os::fd::AsRawFd;
+
+    let root = open_directory_at(libc::AT_FDCWD, c"/")?;
+    inspect_macos_root_stable_directory(&root)?;
+    let private = open_directory_at(root.as_raw_fd(), c"private")?;
+    inspect_macos_root_stable_directory(&private)?;
+    let tmp = open_directory_at(private.as_raw_fd(), c"tmp")?;
+    let identity = inspect_macos_private_tmp(&tmp)?;
+    Ok((tmp, identity))
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_macos_root_stable_directory(directory: &File) -> Result<(), AdjustedSourceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = directory
+        .metadata()
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(AdjustedSourceError::InvalidTemporaryFile);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_macos_private_tmp(
+    directory: &File,
+) -> Result<MacPrivateTempIdentity, AdjustedSourceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = directory
+        .metadata()
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    let mode = metadata.mode() & 0o7777;
+    if !metadata.is_dir() || metadata.uid() != 0 || mode != 0o1777 {
+        return Err(AdjustedSourceError::InvalidTemporaryFile);
+    }
+    Ok(MacPrivateTempIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner: metadata.uid(),
+        mode,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_flags(file: &File) -> Result<u32, AdjustedSourceError> {
+    use std::os::darwin::fs::MetadataExt;
+
+    file.metadata()
+        .map(|metadata| metadata.st_flags())
+        .map_err(|_| AdjustedSourceError::Filesystem)
+}
+
 #[cfg(unix)]
 fn open_temp_at(dirfd: libc::c_int, name: &CStr) -> io::Result<File> {
     use std::os::fd::FromRawFd;
@@ -1477,7 +1785,10 @@ fn inspect_staging_directory(
         .metadata()
         .map_err(|_| AdjustedSourceError::Filesystem)?;
     let mode = metadata.mode() & 0o777;
-    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } || mode != 0o700 {
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || !matches!(mode, 0o700 | 0o500)
+    {
         return Err(AdjustedSourceError::InvalidTemporaryFile);
     }
     Ok(StagingDirectoryIdentity {
@@ -1559,9 +1870,60 @@ fn inspect_open_file(file: File) -> Result<OpenArtifact, AdjustedSourceError> {
             sha256: hash_open_file(&file)?,
             device: metadata.dev(),
             inode: metadata.ino(),
+            owner: metadata.uid(),
+            mode: metadata.mode() & 0o777,
+            link_count: metadata.nlink(),
+            #[cfg(target_os = "macos")]
+            flags: macos_file_flags(&file)?,
         },
         file,
     })
+}
+
+#[cfg(unix)]
+fn file_location(file: &File) -> Result<(u64, u64), AdjustedSourceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    file.metadata()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+        .map_err(|_| AdjustedSourceError::Filesystem)
+}
+
+#[cfg(unix)]
+fn seal_source_file(file: &File) -> Result<(), AdjustedSourceError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o400) } != 0 {
+        return Err(AdjustedSourceError::Filesystem);
+    }
+    file.sync_all()
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    if metadata.mode() & 0o777 != 0o400 || metadata.nlink() != 1 {
+        return Err(AdjustedSourceError::InvalidTemporaryFile);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn duplicate_encoder_descriptor(
+    source: &File,
+    reset_offset: bool,
+) -> Result<File, AdjustedSourceError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let descriptor = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
+    if descriptor < 0 {
+        return Err(AdjustedSourceError::Filesystem);
+    }
+    if reset_offset && unsafe { libc::lseek(descriptor, 0, libc::SEEK_SET) } < 0 {
+        let _ = unsafe { libc::close(descriptor) };
+        return Err(AdjustedSourceError::Filesystem);
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
 fn hash_open_file(file: &File) -> Result<String, AdjustedSourceError> {
