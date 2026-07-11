@@ -939,6 +939,12 @@ pub enum CliError {
     LegacyFailuresClassifyGate { message: String },
     #[error("legacy-failures-classify database commit succeeded but the JSON checkpoint is stale")]
     LegacyFailuresClassifyCheckpointStale,
+    #[error("legacy-failures-classify dry-run report output failed; no mutation was performed")]
+    LegacyFailuresClassifyDryRunReportOutput,
+    #[error(
+        "legacy-failures-classify database commit and JSON checkpoint succeeded but report output failed"
+    )]
+    LegacyFailuresClassifyReportOutputAfterCommit,
     #[error("macOS app bundle does not contain a monitor config path resource")]
     MissingAppConfigResource,
     #[error("macOS access prime failed at {path}: {source}")]
@@ -2300,9 +2306,21 @@ fn monitor_legacy_failures_classify<W: Write>(
         applied,
         changed_count,
     };
-    serde_json::to_writer_pretty(&mut *writer, &report)?;
-    writeln!(writer)?;
-    Ok(())
+    write_legacy_failures_classify_report(&report, writer).map_err(|_| {
+        if applied {
+            CliError::LegacyFailuresClassifyReportOutputAfterCommit
+        } else {
+            CliError::LegacyFailuresClassifyDryRunReportOutput
+        }
+    })
+}
+
+fn write_legacy_failures_classify_report<W: Write>(
+    report: &LegacyFailuresClassifyReport,
+    writer: &mut W,
+) -> Result<(), ()> {
+    serde_json::to_writer_pretty(&mut *writer, report).map_err(|_| ())?;
+    writeln!(writer).map_err(|_| ())
 }
 
 fn validate_legacy_failures_classify_preflight(
@@ -2400,7 +2418,9 @@ fn validate_legacy_failures_classify_expectations(
             "candidate count did not match the expected value",
         ));
     }
-    if expected_target_set_sha256.is_some_and(|expected| expected != target_set_sha256) {
+    if expected_target_set_sha256
+        .is_some_and(|expected| !expected.eq_ignore_ascii_case(target_set_sha256))
+    {
         return Err(legacy_failures_classify_gate(
             "target set did not match the expected fingerprint",
         ));
@@ -4768,6 +4788,32 @@ mod legacy_failures_classify_tests {
         (tempdir, state_store, candidates.targets)
     }
 
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("output fixture failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn legacy_failures_classify_config_path(tempdir: &tempfile::TempDir) -> PathBuf {
+        let download_root = tempdir.path().join("download");
+        fs::create_dir_all(&download_root).expect("download root should be created");
+        let config_path = tempdir.path().join("monitor.json");
+        MonitorConfig::new(
+            &download_root,
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        )
+        .save_atomic(&config_path)
+        .expect("monitor config should save");
+        config_path
+    }
+
     #[test]
     fn exact_cas_conflict_keeps_the_entire_legacy_classification_batch_unapplied() {
         let (_tempdir, state_store, expected_records) = persisted_legacy_candidates();
@@ -4858,6 +4904,95 @@ mod legacy_failures_classify_tests {
                 .expect("failure should exist")
                 .kind,
             None
+        );
+    }
+
+    #[test]
+    fn legacy_classification_report_failure_distinguishes_dry_run_from_committed_apply() {
+        let (tempdir, state_store, _) = persisted_legacy_candidates();
+        let config_path = legacy_failures_classify_config_path(&tempdir);
+        drop(state_store);
+
+        let mut writer = FailingWriter;
+        let dry_run_error = monitor_legacy_failures_classify(
+            MonitorLegacyFailuresClassifyArgs {
+                config: config_path.clone(),
+                expected_target_set_sha256: None,
+                expected_candidate_count: None,
+                apply: false,
+            },
+            &mut writer,
+        )
+        .expect_err("dry-run report writer should fail");
+        assert!(
+            dry_run_error
+                .to_string()
+                .contains("dry-run report output failed; no mutation was performed")
+        );
+        let durable_before_apply =
+            AssetStateStore::open_read_only(tempdir.path().join("manifest.json"))
+                .expect("state store should open")
+                .load()
+                .expect("state should load");
+        assert_eq!(
+            durable_before_apply
+                .get("asset-alpha")
+                .expect("record should exist")
+                .failures
+                .last()
+                .expect("failure should exist")
+                .kind,
+            None
+        );
+
+        let mut dry_run_report = Vec::new();
+        monitor_legacy_failures_classify(
+            MonitorLegacyFailuresClassifyArgs {
+                config: config_path.clone(),
+                expected_target_set_sha256: None,
+                expected_candidate_count: None,
+                apply: false,
+            },
+            &mut dry_run_report,
+        )
+        .expect("dry-run report should succeed");
+        let report: serde_json::Value =
+            serde_json::from_slice(&dry_run_report).expect("report should decode");
+        let target_set_sha256 = report["target_set_sha256"]
+            .as_str()
+            .expect("target hash should be present")
+            .to_string();
+
+        let mut writer = FailingWriter;
+        let apply_error = monitor_legacy_failures_classify(
+            MonitorLegacyFailuresClassifyArgs {
+                config: config_path,
+                expected_target_set_sha256: Some(target_set_sha256),
+                expected_candidate_count: Some(2),
+                apply: true,
+            },
+            &mut writer,
+        )
+        .expect_err("apply report writer should fail after commit");
+        assert!(
+            apply_error
+                .to_string()
+                .contains("database commit and JSON checkpoint succeeded but report output failed")
+        );
+        let durable_after_apply =
+            AssetStateStore::open_read_only(tempdir.path().join("manifest.json"))
+                .expect("state store should open")
+                .load()
+                .expect("state should load");
+        assert_eq!(
+            durable_after_apply
+                .get("asset-alpha")
+                .expect("record should exist")
+                .failures
+                .last()
+                .expect("failure should exist")
+                .kind,
+            Some(FailureKind::EmbeddedPreviewUnavailable)
         );
     }
 }

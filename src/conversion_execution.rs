@@ -3959,6 +3959,7 @@ printf 'heic' > "$out"
     fn linux_real_heif_encoder_accepts_a_sealed_directory_descriptor_jpeg() {
         use std::os::unix::fs::symlink;
 
+        let mut path_guard = PathGuard::preserve();
         let require_real_heif_smoke = env::var_os("ICLOUDPD_OPTIMIZER_REQUIRE_REAL_HEIF_SMOKE")
             .is_some_and(|value| value == "1");
         let (heif_enc, heif_info) = match (
@@ -3983,13 +3984,13 @@ printf 'heic' > "$out"
 if [ "$1" = "-j" ] || [ "$1" = "-b" ]; then
   exit 66
 fi
-if [ "$1" = "-TagsFromFile" ]; then
-  exit 0
-fi
-exit 67
+        if [ "$1" = "-TagsFromFile" ]; then
+          exit 0
+        fi
+        exit 67
 "#,
         );
-        let _path_guard = PathGuard::install(tool_dir.path());
+        path_guard.replace(tool_dir.path());
         let tempdir = tempfile::tempdir().expect("test tempdir should be created");
         let output_dir = tempdir
             .path()

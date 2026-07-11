@@ -3428,6 +3428,22 @@ fn monitor_legacy_failures_classify_apply_requires_both_dry_run_expectations() {
         .stderr(predicate::str::contains(
             "apply requires an expected candidate count",
         ));
+
+    let mut malformed_hash = legacy_failures_classify_args(&fixture);
+    malformed_hash.extend([
+        "--expected-target-set-sha256".to_string(),
+        "a".repeat(63),
+        "--expected-candidate-count".to_string(),
+        "1".to_string(),
+        "--apply".to_string(),
+    ]);
+    binary()
+        .args(malformed_hash)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "expected target-set SHA-256 must be 64 hexadecimal characters",
+        ));
 }
 
 #[test]
@@ -3474,7 +3490,7 @@ fn monitor_legacy_failures_classify_types_only_last_failure_and_admits_it_to_adj
     let mut apply_args = legacy_failures_classify_args(&fixture);
     apply_args.extend([
         "--expected-target-set-sha256".to_string(),
-        target_set_sha256.clone(),
+        target_set_sha256.to_ascii_uppercase(),
         "--expected-candidate-count".to_string(),
         "2".to_string(),
         "--apply".to_string(),
