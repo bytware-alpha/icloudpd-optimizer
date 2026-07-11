@@ -6396,6 +6396,9 @@ pub fn failed_retry_queue_counts(manifest: &Manifest) -> BTreeMap<String, u64> {
                     }
                     Some(policy) if kind == FailureKind::HeicVisualMatch => {
                         match failed_retry_attempt(record, kind, policy) {
+                            Ok(attempt) if attempt >= policy.max_attempts => {
+                                "terminalize_retry_attempts_exhausted"
+                            }
                             Ok(_) => "retryable_heic_visual_match_pending_integrity_check",
                             Err(_) => "failed_unknown",
                         }
@@ -12951,6 +12954,67 @@ esac
             .expect("admission should fail closed after its integrity check");
         assert_eq!(admission.blocked_source_proof, 1);
         assert_eq!(manifest.get("visual-match").unwrap().state, State::Failed);
+    }
+
+    #[test]
+    fn exhausted_visual_match_terminalizes_without_rechecking_the_heic_output() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let heic_path = tempdir.path().join("visual-match.heic");
+        let bytes = b"verified heic";
+        fs::write(&heic_path, bytes).expect("HEIC should be written");
+        let mut record = policy_failed_record(
+            "visual-match",
+            "heic_verify",
+            "HEIC verification failed: visual_match_ok",
+            Some(FailureKind::HeicVisualMatch),
+            "100.000000000Z",
+        );
+        record.proofs.insert(
+            "conversion".to_string(),
+            json!({
+                "heic_path": heic_path,
+                "heic_sha256": format!("{:x}", Sha256::digest(bytes)),
+                "size_bytes": bytes.len() as u64,
+            }),
+        );
+        let mut manifest = Manifest::new();
+        manifest.upsert(record);
+        admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("initial visual-match retry should admit");
+
+        policy_failed_again_at(
+            &mut manifest,
+            "visual-match",
+            "heic_verify",
+            "HEIC verification failed: visual_match_ok",
+            FailureKind::HeicVisualMatch,
+            "101.000000000Z",
+        );
+        let mut record = manifest
+            .get("visual-match")
+            .expect("asset should remain")
+            .clone();
+        record.proofs.insert(
+            "conversion".to_string(),
+            json!({
+                "heic_path": "/sentinel/exhausted-visual-match.heic",
+                "heic_sha256": "ab".repeat(32),
+                "size_bytes": 1u64,
+            }),
+        );
+        manifest.upsert(record);
+
+        assert_eq!(
+            failed_retry_queue_counts(&manifest)["terminalize_retry_attempts_exhausted"],
+            1
+        );
+        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("exhausted visual-match retry should terminalize");
+        assert_eq!(admission.exhausted, 1);
+        assert_eq!(
+            manifest.get("visual-match").unwrap().state,
+            State::NeedsReview
+        );
     }
 
     #[test]
