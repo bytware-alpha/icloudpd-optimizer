@@ -73,6 +73,7 @@ const FAILED_RETRY_POLICY_SCHEMA_VERSION: u64 = 1;
 const FAILED_RETRY_POLICY_GENERATION: &str = "codec_normalized_v1";
 const FAILURE_RETRY_PROOF: &str = "failure_retry";
 const FAILURE_REVIEW_PROOF: &str = "failure_review";
+const LEGACY_OUTPUT_UNREADABLE_SUFFIX: &str = ": No such file or directory (os error 2)";
 #[cfg(not(test))]
 const MONITOR_STATE_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 #[cfg(test)]
@@ -6581,7 +6582,7 @@ fn legacy_path_bearing_failure_kind(
         &failure.message,
         "converted output is missing or unreadable at ",
         &oriented_name,
-        ": ",
+        LEGACY_OUTPUT_UNREADABLE_SUFFIX,
     ) {
         Some(FailureKind::ConversionOutputUnreadable)
     } else if legacy_path_message_matches(
@@ -6598,12 +6599,12 @@ fn legacy_path_bearing_failure_kind(
         "; refusing to overwrite",
     ) {
         Some(FailureKind::StagedRawAlreadyExists)
-    } else if failure.message
-        == format!(
-            "RAW has neither PreviewImage nor JpgFromRaw embedded preview: {}",
-            record.raw_path.display()
-        )
-    {
+    } else if legacy_path_message_matches(
+        &failure.message,
+        "RAW has neither PreviewImage nor JpgFromRaw embedded preview: ",
+        &staged_name,
+        "",
+    ) {
         Some(FailureKind::EmbeddedPreviewUnavailable)
     } else {
         None
@@ -6619,18 +6620,10 @@ fn legacy_path_message_matches(
     let Some(path_and_suffix) = message.strip_prefix(prefix) else {
         return false;
     };
-    if suffix == ": " {
-        let Some((path, error_suffix)) = path_and_suffix.rsplit_once(suffix) else {
-            return false;
-        };
-        !error_suffix.is_empty()
-            && Path::new(path).file_name().and_then(OsStr::to_str) == Some(expected_filename)
-    } else {
-        path_and_suffix
-            .strip_suffix(suffix)
-            .and_then(|path| Path::new(path).file_name().and_then(OsStr::to_str))
-            == Some(expected_filename)
-    }
+    path_and_suffix
+        .strip_suffix(suffix)
+        .and_then(|path| Path::new(path).file_name().and_then(OsStr::to_str))
+        == Some(expected_filename)
 }
 
 fn increment_static_count(counts: &mut BTreeMap<&'static str, usize>, key: &'static str) {
@@ -12864,7 +12857,7 @@ esac
         let record = policy_failed_record(
             "asset",
             "conversion",
-            "converted output is missing or unreadable at /output/asset.oriented-preview.jpg: interrupted",
+            "converted output is missing or unreadable at /output/asset.oriented-preview.jpg: No such file or directory (os error 2)",
             None,
             "100.000000000Z",
         );
@@ -12875,15 +12868,77 @@ esac
         for (stage, message) in [
             (
                 "upload",
+                "converted output is missing or unreadable at /output/asset.oriented-preview.jpg: No such file or directory (os error 2)",
+            ),
+            (
+                "conversion",
+                "converted output is missing or unreadable at /output/other.oriented-preview.jpg: No such file or directory (os error 2)",
+            ),
+            (
+                "conversion",
                 "converted output is missing or unreadable at /output/asset.oriented-preview.jpg: interrupted",
             ),
             (
                 "conversion",
-                "converted output is missing or unreadable at /output/other.oriented-preview.jpg: interrupted",
+                "converted output is missing or unreadable at /output/asset.oriented-preview.jpg: Permission denied (os error 13)",
             ),
             (
                 "conversion",
-                "converted output is missing or unreadable at /output/asset.oriented-preview.jpg unexpected",
+                "converted output is missing or unreadable at /output/asset.oriented-preview.jpg",
+            ),
+        ] {
+            let record = policy_failed_record("asset", stage, message, None, "100.000000000Z");
+            assert_eq!(last_failure_kind(&record), None);
+        }
+    }
+
+    #[test]
+    fn legacy_staged_preview_unavailable_is_blocked_without_admission_or_terminalization() {
+        let mut manifest = Manifest::new();
+        let record = policy_failed_record(
+            "asset",
+            "conversion",
+            "RAW has neither PreviewImage nor JpgFromRaw embedded preview: /staging/asset.staged-raw.DNG",
+            None,
+            "100.000000000Z",
+        );
+        assert_eq!(
+            last_failure_kind(&record),
+            Some(FailureKind::EmbeddedPreviewUnavailable)
+        );
+        manifest.upsert(record);
+
+        assert_eq!(
+            failed_retry_queue_counts(&manifest)["blocked_missing_embedded_preview"],
+            1
+        );
+        let admission = admit_failed_retryable_assets(&mut manifest, 16, 16, 300, 3_000_000)
+            .expect("legacy missing preview should remain a blocked failure");
+
+        assert_eq!(admission.blocked_missing_preview, 1);
+        assert!(admission.admitted_by_category.is_empty());
+        assert!(admission.terminalized_by_reason.is_empty());
+        assert_eq!(manifest.get("asset").unwrap().state, State::Failed);
+    }
+
+    #[test]
+    fn legacy_staged_preview_unavailable_requires_the_exact_staged_path_message() {
+        for (stage, message) in [
+            (
+                "upload",
+                "RAW has neither PreviewImage nor JpgFromRaw embedded preview: /staging/asset.staged-raw.DNG",
+            ),
+            (
+                "conversion",
+                "RAW has neither PreviewImage nor JpgFromRaw embedded preview: /staging/other.staged-raw.DNG",
+            ),
+            (
+                "conversion",
+                "RAW has neither PreviewImage nor JpgFromRaw embedded preview: /staging/asset.staged-raw.DNG interrupted",
+            ),
+            (
+                "conversion",
+                "RAW preview unavailable: /staging/asset.staged-raw.DNG",
             ),
         ] {
             let record = policy_failed_record("asset", stage, message, None, "100.000000000Z");
