@@ -3959,13 +3959,20 @@ printf 'heic' > "$out"
     fn linux_real_heif_encoder_accepts_a_sealed_directory_descriptor_jpeg() {
         use std::os::unix::fs::symlink;
 
-        let Some(heif_enc) = executable_on_path("heif-enc") else {
-            eprintln!("skipping real heif-enc smoke: heif-enc is unavailable");
-            return;
-        };
-        let Some(heif_info) = executable_on_path("heif-info") else {
-            eprintln!("skipping real heif-enc smoke: heif-info is unavailable");
-            return;
+        let require_real_heif_smoke = env::var_os("ICLOUDPD_OPTIMIZER_REQUIRE_REAL_HEIF_SMOKE")
+            .is_some_and(|value| value == "1");
+        let (heif_enc, heif_info) = match (
+            executable_on_path("heif-enc"),
+            executable_on_path("heif-info"),
+        ) {
+            (Some(heif_enc), Some(heif_info)) => (heif_enc, heif_info),
+            _ if require_real_heif_smoke => panic!(
+                "real heif-enc smoke is required by ICLOUDPD_OPTIMIZER_REQUIRE_REAL_HEIF_SMOKE=1, but heif-enc or heif-info is unavailable"
+            ),
+            _ => {
+                eprintln!("skipping real heif-enc smoke: heif-enc or heif-info is unavailable");
+                return;
+            }
         };
         let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
         symlink(&heif_enc, tool_dir.path().join("heif-enc"))

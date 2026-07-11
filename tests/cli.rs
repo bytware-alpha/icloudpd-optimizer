@@ -4130,10 +4130,8 @@ fn ci_linux_contract_tests_the_declared_toolchain_and_production_image() {
         "every dtolnay/rust-toolchain input must use the workflow RUST_VERSION"
     );
 
-    let linux_job = ci
-        .split("\n  linux:\n")
-        .nth(1)
-        .expect("CI must define an independent linux job");
+    let linux_job =
+        direct_job_block(&ci, "linux").expect("CI must define an independent linux job");
     for required in [
         "runs-on: ubuntu-latest",
         "uses: actions/checkout@v4",
@@ -4141,6 +4139,9 @@ fn ci_linux_contract_tests_the_declared_toolchain_and_production_image() {
         "libheif-examples",
         "libimage-exiftool-perl",
         "imagemagick",
+        "command -v heif-enc",
+        "command -v heif-info",
+        "ICLOUDPD_OPTIMIZER_REQUIRE_REAL_HEIF_SMOKE=1 cargo test --locked --lib conversion_execution::tests::linux_real_heif_encoder_accepts_a_sealed_directory_descriptor_jpeg_when_available",
         "cargo test --locked",
         "docker build --tag icloudpd-optimizer:ci --file container/Containerfile .",
         "docker run --rm icloudpd-optimizer:ci doctor --json",
@@ -4157,6 +4158,35 @@ fn ci_linux_contract_tests_the_declared_toolchain_and_production_image() {
     assert!(
         !linux_job.contains("--volume"),
         "Linux CI image smoke must not mount host directories"
+    );
+}
+
+#[test]
+fn ci_linux_job_block_excludes_later_sibling_job_tokens() {
+    let workflow = "jobs:\n  linux:\n    runs-on: ubuntu-latest\n  later:\n    later-only-token\n";
+
+    let linux_job = direct_job_block(workflow, "linux").expect("linux job should exist");
+
+    assert!(linux_job.contains("runs-on: ubuntu-latest"));
+    assert!(
+        !linux_job.contains("later-only-token"),
+        "linux job requirements must not be satisfied by later sibling jobs"
+    );
+}
+
+#[test]
+fn real_heif_smoke_has_a_linux_ci_required_mode() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let conversion_execution = fs::read_to_string(repo_root.join("src/conversion_execution.rs"))
+        .expect("conversion execution source should be readable");
+
+    assert!(
+        conversion_execution.contains("ICLOUDPD_OPTIMIZER_REQUIRE_REAL_HEIF_SMOKE"),
+        "real HEIF smoke must expose the Linux CI required-mode environment variable"
+    );
+    assert!(
+        conversion_execution.contains("real heif-enc smoke is required"),
+        "required real HEIF smoke must fail clearly instead of silently skipping"
     );
 }
 
@@ -4214,6 +4244,64 @@ fn rust_version_at_least(version: &str, minimum_major: u64, minimum_minor: u64) 
         (Some(major), Some(minor))
             if major > minimum_major || (major == minimum_major && minor >= minimum_minor)
     )
+}
+
+fn direct_job_block<'a>(workflow: &'a str, job_name: &str) -> Result<&'a str, String> {
+    let mut offset = 0;
+    let lines: Vec<_> = workflow
+        .split_inclusive('\n')
+        .map(|line_with_newline| {
+            let line = line_with_newline
+                .strip_suffix('\n')
+                .unwrap_or(line_with_newline);
+            let start = offset;
+            offset += line_with_newline.len();
+            (start, line)
+        })
+        .collect();
+    let Some((jobs_index, jobs_indent)) =
+        lines.iter().enumerate().find_map(|(index, (_, line))| {
+            (line.trim_end() == "jobs:").then_some((index, yaml_indentation(line)))
+        })
+    else {
+        return Err("CI must define a jobs mapping".to_string());
+    };
+    let job_header = format!("{job_name}:");
+    let child_indent = jobs_indent + 2;
+    let mut matches = Vec::new();
+
+    for (index, (_, line)) in lines.iter().enumerate().skip(jobs_index + 1) {
+        if !line.trim().is_empty() && yaml_indentation(line) <= jobs_indent {
+            break;
+        }
+        if yaml_indentation(line) == child_indent && line.trim() == job_header {
+            matches.push(index);
+        }
+    }
+
+    let [job_index] = matches.as_slice() else {
+        return Err(format!(
+            "CI must define exactly one direct {job_name} job, found {}",
+            matches.len()
+        ));
+    };
+    let start = lines[*job_index].0;
+    let end = lines
+        .iter()
+        .skip(*job_index + 1)
+        .find_map(|(line_start, line)| {
+            (!line.trim().is_empty()
+                && (yaml_indentation(line) <= jobs_indent
+                    || (yaml_indentation(line) == child_indent && line.trim_end().ends_with(':'))))
+            .then_some(*line_start)
+        })
+        .unwrap_or(workflow.len());
+
+    Ok(workflow[start..end].trim_end())
+}
+
+fn yaml_indentation(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
 }
 
 #[test]

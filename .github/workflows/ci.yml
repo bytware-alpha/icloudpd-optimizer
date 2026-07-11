@@ -40,6 +40,12 @@ jobs:
             libheif-examples \
             libimage-exiftool-perl \
             imagemagick
+      - name: Verify real HEIF tools
+        run: |
+          command -v heif-enc
+          command -v heif-info
+      - name: Real sealed HEIF smoke
+        run: ICLOUDPD_OPTIMIZER_REQUIRE_REAL_HEIF_SMOKE=1 cargo test --locked --lib conversion_execution::tests::linux_real_heif_encoder_accepts_a_sealed_directory_descriptor_jpeg_when_available
       - name: Test
         run: cargo test --locked
       - name: Build production image
