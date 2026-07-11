@@ -69,7 +69,7 @@ const DEFAULT_MAX_ORIGINAL_RESOLVER_RETRIES_PER_SCAN: usize = 16;
 const DEFAULT_ORIGINAL_RESOLVER_RETRY_MIN_AGE_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_MAX_FAILED_RETRY_ADMISSIONS_PER_SCAN: usize = 16;
 const DEFAULT_FAILED_RETRY_MIN_AGE_SECONDS: u64 = 300;
-const FAILED_RETRY_POLICY_SCHEMA_VERSION: u64 = 1;
+const FAILED_RETRY_POLICY_SCHEMA_VERSION: u64 = 2;
 const FAILED_RETRY_POLICY_GENERATION: &str = "codec_normalized_v1";
 const FAILURE_RETRY_PROOF: &str = "failure_retry";
 const FAILURE_REVIEW_PROOF: &str = "failure_review";
@@ -6144,7 +6144,9 @@ struct FailureRetryProof {
     attempt: u64,
     last_failure_stage: String,
     last_failure_kind: FailureKind,
+    last_failure_recorded_at: String,
     last_failure_digest: String,
+    failure_count_at_admission: usize,
     admitted_at_unix_seconds: u64,
     retry_state: State,
 }
@@ -6156,6 +6158,7 @@ struct FailureReviewProof {
     policy_generation: String,
     last_failure_stage: String,
     last_failure_kind: FailureKind,
+    last_failure_recorded_at: String,
     last_failure_digest: String,
     attempts_exhausted: u64,
     current_attempt: u64,
@@ -6245,7 +6248,7 @@ fn admit_failed_retryable_assets(
             admission.blocked_source_proof = admission.blocked_source_proof.saturating_add(1);
             continue;
         }
-        let Ok(attempt) = failed_retry_attempt(record, kind) else {
+        let Ok(attempt) = failed_retry_attempt(record, kind, policy) else {
             admission.unknown = admission.unknown.saturating_add(1);
             continue;
         };
@@ -6387,11 +6390,17 @@ pub fn failed_retry_queue_counts(manifest: &Manifest) -> BTreeMap<String, u64> {
                     }
                     Some(_)
                         if kind == FailureKind::HeicVisualMatch
-                            && !conversion_output_still_matches_proof(record) =>
+                            && !conversion_proof_has_expected_shape(record) =>
                     {
                         "blocked_source_proof"
                     }
-                    Some(policy) => match failed_retry_attempt(record, kind) {
+                    Some(policy) if kind == FailureKind::HeicVisualMatch => {
+                        match failed_retry_attempt(record, kind, policy) {
+                            Ok(_) => "retryable_heic_visual_match_pending_integrity_check",
+                            Err(_) => "failed_unknown",
+                        }
+                    }
+                    Some(policy) => match failed_retry_attempt(record, kind, policy) {
                         Ok(attempt) if attempt >= policy.max_attempts => {
                             "terminalize_retry_attempts_exhausted"
                         }
@@ -6428,7 +6437,9 @@ fn admit_failed_retry(
         attempt: candidate.attempt.saturating_add(1),
         last_failure_stage: failure.stage.clone(),
         last_failure_kind: candidate.kind,
+        last_failure_recorded_at: failure.recorded_at.clone(),
         last_failure_digest: failure_digest(&failure),
+        failure_count_at_admission: manifest.get(&candidate.asset_id)?.failures.len(),
         admitted_at_unix_seconds,
         retry_state: candidate.policy.retry_state,
     };
@@ -6441,18 +6452,49 @@ fn admit_failed_retry(
     Ok(())
 }
 
-fn failed_retry_attempt(record: &AssetRecord, kind: FailureKind) -> Result<u64, ()> {
+fn failed_retry_attempt(
+    record: &AssetRecord,
+    kind: FailureKind,
+    policy: FailedRetryPolicy,
+) -> Result<u64, ()> {
     let Some(proof) = record.proofs.get(FAILURE_RETRY_PROOF) else {
         return Ok(0);
     };
     let proof = serde_json::from_value::<FailureRetryProof>(proof.clone()).map_err(|_| ())?;
-    (proof.schema_version == FAILED_RETRY_POLICY_SCHEMA_VERSION
-        && proof.policy_generation == FAILED_RETRY_POLICY_GENERATION
-        && proof.category == kind
-        && proof.last_failure_kind == kind
-        && proof.attempt > 0)
-        .then_some(proof.attempt)
-        .ok_or(())
+    if proof.schema_version != FAILED_RETRY_POLICY_SCHEMA_VERSION
+        || proof.policy_generation != FAILED_RETRY_POLICY_GENERATION
+        || proof.attempt == 0
+        || proof.last_failure_kind != proof.category
+    {
+        return Err(());
+    }
+    let prior_policy = failed_retry_policy(proof.category).ok_or(())?;
+    let expected_failure_count = proof.failure_count_at_admission.checked_add(1).ok_or(())?;
+    if proof.retry_state != prior_policy.retry_state
+        || proof.failure_count_at_admission == 0
+        || record.failures.len() != expected_failure_count
+    {
+        return Err(());
+    }
+    let prior = record
+        .failures
+        .get(proof.failure_count_at_admission.saturating_sub(1))
+        .ok_or(())?;
+    if prior.stage != proof.last_failure_stage
+        || prior.recorded_at != proof.last_failure_recorded_at
+        || failure_digest(prior) != proof.last_failure_digest
+        || failure_kind_for(record, prior) != Some(proof.last_failure_kind)
+        || failure_kind_for(record, record.failures.last().ok_or(())?) != Some(kind)
+    {
+        return Err(());
+    }
+    if proof.category == kind {
+        (proof.retry_state == policy.retry_state)
+            .then_some(proof.attempt)
+            .ok_or(())
+    } else {
+        Ok(0)
+    }
 }
 
 fn has_retry_blocking_proof(record: &AssetRecord) -> bool {
@@ -6510,6 +6552,7 @@ fn terminalize_failure_for_review(
         policy_generation: FAILED_RETRY_POLICY_GENERATION.to_string(),
         last_failure_stage: failure.stage.clone(),
         last_failure_kind: kind,
+        last_failure_recorded_at: failure.recorded_at.clone(),
         last_failure_digest: failure_digest(failure),
         attempts_exhausted,
         current_attempt: attempts_exhausted,
@@ -6529,6 +6572,8 @@ fn failure_digest(failure: &FailureRecord) -> String {
     hasher.update([0]);
     hasher.update(failure.message.as_bytes());
     hasher.update([0]);
+    hasher.update(failure.recorded_at.as_bytes());
+    hasher.update([0]);
     hasher.update(
         failure
             .kind
@@ -6541,6 +6586,10 @@ fn failure_digest(failure: &FailureRecord) -> String {
 
 fn last_failure_kind(record: &AssetRecord) -> Option<FailureKind> {
     let failure = record.failures.last()?;
+    failure_kind_for(record, failure)
+}
+
+fn failure_kind_for(record: &AssetRecord, failure: &FailureRecord) -> Option<FailureKind> {
     failure
         .kind
         .or_else(|| legacy_failure_kind(record, failure))
@@ -6643,6 +6692,22 @@ fn conversion_output_still_matches_proof(record: &AssetRecord) -> bool {
     metadata.is_file()
         && metadata.len() == proof.size_bytes
         && hash_file_sha256(&proof.heic_path).is_ok_and(|hash| hash == proof.heic_sha256)
+}
+
+fn conversion_proof_has_expected_shape(record: &AssetRecord) -> bool {
+    let Some(value) = record.proofs.get("conversion") else {
+        return false;
+    };
+    let Ok(proof) = serde_json::from_value::<ConversionResultProof>(value.clone()) else {
+        return false;
+    };
+    !proof.heic_path.as_os_str().is_empty()
+        && proof.size_bytes > 0
+        && proof.heic_sha256.len() == 64
+        && proof
+            .heic_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn hash_file_sha256(path: &Path) -> io::Result<String> {
@@ -11898,16 +11963,41 @@ esac
         message: &str,
         kind: FailureKind,
     ) {
+        policy_failed_again_at(manifest, asset_id, stage, message, kind, "100.000000000Z");
+    }
+
+    fn policy_failed_again_at(
+        manifest: &mut Manifest,
+        asset_id: &str,
+        stage: &str,
+        message: &str,
+        kind: FailureKind,
+        recorded_at: &str,
+    ) {
         let mut record = manifest.get(asset_id).expect("asset should exist").clone();
         record.state = State::Failed;
         record.failures.push(crate::manifest::FailureRecord {
             stage: stage.to_string(),
             message: message.to_string(),
-            recorded_at: "100.000000000Z".to_string(),
+            recorded_at: recorded_at.to_string(),
             kind: Some(kind),
         });
-        record.updated_at = "100.000000000Z".to_string();
+        record.updated_at = recorded_at.to_string();
         manifest.upsert(record);
+    }
+
+    fn admitted_timeout_manifest(asset_id: &str) -> Manifest {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            asset_id,
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            Some(FailureKind::ConversionTimedOut),
+            "100.000000000Z",
+        ));
+        admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("initial timeout retry should admit");
+        manifest
     }
 
     fn failed_original_asset_resolve_record(
@@ -12647,7 +12737,7 @@ esac
         manifest.upsert(record);
 
         assert_eq!(
-            failed_retry_queue_counts(&manifest)["retryable_heic_visual_match"],
+            failed_retry_queue_counts(&manifest)["retryable_heic_visual_match_pending_integrity_check"],
             1,
             "queue counts assets, not the 120 historical failure records"
         );
@@ -12662,12 +12752,13 @@ esac
         assert_eq!(record.state, State::Converted);
         assert_eq!(record.proofs["failure_retry"]["attempt"], json!(1));
 
-        policy_failed_again(
+        policy_failed_again_at(
             &mut manifest,
             "visual-match",
             "heic_verify",
             "HEIC verification failed: visual_match_ok",
             FailureKind::HeicVisualMatch,
+            "101.000000000Z",
         );
         let exhausted = admit_failed_retryable_assets(&mut manifest, 10, 16, 300, 3_000_000)
             .expect("exhausted retry should terminalize");
@@ -12675,6 +12766,22 @@ esac
         let record = manifest.get("visual-match").expect("record should remain");
         assert_eq!(record.state, State::NeedsReview);
         assert_eq!(record.proofs["failure_review"]["current_attempt"], json!(1));
+        assert_eq!(
+            record.proofs["failure_review"]["last_failure_stage"],
+            json!("heic_verify")
+        );
+        assert_eq!(
+            record.proofs["failure_review"]["last_failure_kind"],
+            json!("heic_visual_match")
+        );
+        assert_eq!(
+            record.proofs["failure_review"]["last_failure_recorded_at"],
+            json!("101.000000000Z")
+        );
+        assert_eq!(
+            record.proofs["failure_review"]["last_failure_digest"],
+            json!(failure_digest(record.failures.last().unwrap()))
+        );
     }
 
     #[test]
@@ -12700,13 +12807,14 @@ esac
         assert_eq!(manifest.get("oldest").unwrap().state, State::NasVerified);
         assert_eq!(manifest.get("newest").unwrap().state, State::Failed);
 
-        for expected_attempt in 2..=3 {
-            policy_failed_again(
+        for (expected_attempt, timestamp) in [(2, "101.000000000Z"), (3, "102.000000000Z")] {
+            policy_failed_again_at(
                 &mut manifest,
                 "oldest",
                 "conversion",
                 "conversion command timed out after 120000 ms: heif-enc",
                 FailureKind::ConversionTimedOut,
+                timestamp,
             );
             admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
                 .expect("retry should admit before budget exhaustion");
@@ -12716,17 +12824,27 @@ esac
                 json!(expected_attempt)
             );
         }
-        policy_failed_again(
+        policy_failed_again_at(
             &mut manifest,
             "oldest",
             "conversion",
             "conversion command timed out after 120000 ms: heif-enc",
             FailureKind::ConversionTimedOut,
+            "103.000000000Z",
         );
         let exhausted = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
             .expect("fourth failure should terminalize");
         assert_eq!(exhausted.exhausted, 1);
-        assert_eq!(manifest.get("oldest").unwrap().state, State::NeedsReview);
+        let record = manifest.get("oldest").unwrap();
+        assert_eq!(record.state, State::NeedsReview);
+        assert_eq!(
+            record.proofs[FAILURE_REVIEW_PROOF]["current_attempt"],
+            json!(3)
+        );
+        assert_eq!(
+            record.proofs[FAILURE_REVIEW_PROOF]["last_failure_recorded_at"],
+            json!("103.000000000Z")
+        );
     }
 
     #[test]
@@ -12802,6 +12920,186 @@ esac
             manifest.get("admitted").unwrap().proofs["failure_retry"]["attempt"],
             json!(1)
         );
+    }
+
+    #[test]
+    fn queue_counts_visual_match_without_touching_its_unavailable_output() {
+        let mut record = policy_failed_record(
+            "visual-match",
+            "heic_verify",
+            "HEIC verification failed: visual_match_ok",
+            Some(FailureKind::HeicVisualMatch),
+            "100.000000000Z",
+        );
+        record.proofs.insert(
+            "conversion".to_string(),
+            json!({
+                "heic_path": "/sentinel/unavailable-visual-match.heic",
+                "heic_sha256": "ab".repeat(32),
+                "size_bytes": 1u64,
+            }),
+        );
+        let mut manifest = Manifest::new();
+        manifest.upsert(record);
+
+        assert_eq!(
+            failed_retry_queue_counts(&manifest)["retryable_heic_visual_match_pending_integrity_check"],
+            1
+        );
+
+        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("admission should fail closed after its integrity check");
+        assert_eq!(admission.blocked_source_proof, 1);
+        assert_eq!(manifest.get("visual-match").unwrap().state, State::Failed);
+    }
+
+    #[test]
+    fn failure_digest_distinguishes_identical_failures_at_different_times() {
+        let first = crate::manifest::FailureRecord {
+            stage: "conversion".to_string(),
+            message: "conversion command timed out after 120000 ms: heif-enc".to_string(),
+            recorded_at: "100.000000000Z".to_string(),
+            kind: Some(FailureKind::ConversionTimedOut),
+        };
+        let second = crate::manifest::FailureRecord {
+            recorded_at: "101.000000000Z".to_string(),
+            ..first.clone()
+        };
+
+        assert_ne!(failure_digest(&first), failure_digest(&second));
+    }
+
+    #[test]
+    fn failed_retry_lineage_blocks_state_regression_without_a_new_failure() {
+        let mut manifest = admitted_timeout_manifest("state-regression");
+        let mut record = manifest.get("state-regression").unwrap().clone();
+        record.state = State::Failed;
+        manifest.upsert(record);
+
+        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("unproven retry lineage should not be admitted");
+
+        assert_eq!(admission.unknown, 1);
+        assert_eq!(
+            manifest.get("state-regression").unwrap().state,
+            State::Failed
+        );
+    }
+
+    #[test]
+    fn failed_retry_lineage_rejects_mutated_or_multiple_failure_history() {
+        let mut mutated = admitted_timeout_manifest("mutated");
+        let mut record = mutated.get("mutated").unwrap().clone();
+        record.failures[0].message = "altered historical failure".to_string();
+        mutated.upsert(record);
+        policy_failed_again_at(
+            &mut mutated,
+            "mutated",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            FailureKind::ConversionTimedOut,
+            "101.000000000Z",
+        );
+
+        let mutated_admission = admit_failed_retryable_assets(&mut mutated, 1, 1, 300, 3_000_000)
+            .expect("mutated history should fail closed");
+        assert_eq!(mutated_admission.unknown, 1);
+        assert_eq!(mutated.get("mutated").unwrap().state, State::Failed);
+
+        let mut multiple = admitted_timeout_manifest("multiple");
+        for timestamp in ["101.000000000Z", "102.000000000Z"] {
+            policy_failed_again_at(
+                &mut multiple,
+                "multiple",
+                "conversion",
+                "conversion command timed out after 120000 ms: heif-enc",
+                FailureKind::ConversionTimedOut,
+                timestamp,
+            );
+        }
+
+        let multiple_admission = admit_failed_retryable_assets(&mut multiple, 1, 1, 300, 3_000_000)
+            .expect("multiple appended failures should fail closed");
+        assert_eq!(multiple_admission.unknown, 1);
+        assert_eq!(multiple.get("multiple").unwrap().state, State::Failed);
+    }
+
+    #[test]
+    fn failed_retry_lineage_requires_matching_retry_state_and_carries_one_append() {
+        let mut wrong_state = admitted_timeout_manifest("wrong-state");
+        let mut record = wrong_state.get("wrong-state").unwrap().clone();
+        record
+            .proofs
+            .get_mut(FAILURE_RETRY_PROOF)
+            .and_then(Value::as_object_mut)
+            .expect("retry proof should be an object")
+            .insert("retry_state".to_string(), json!("converted"));
+        wrong_state.upsert(record);
+        policy_failed_again_at(
+            &mut wrong_state,
+            "wrong-state",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            FailureKind::ConversionTimedOut,
+            "101.000000000Z",
+        );
+        let wrong_state_admission =
+            admit_failed_retryable_assets(&mut wrong_state, 1, 1, 300, 3_000_000)
+                .expect("wrong retry state should fail closed");
+        assert_eq!(wrong_state_admission.unknown, 1);
+
+        let mut valid = admitted_timeout_manifest("valid");
+        policy_failed_again_at(
+            &mut valid,
+            "valid",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            FailureKind::ConversionTimedOut,
+            "101.000000000Z",
+        );
+        let valid_admission = admit_failed_retryable_assets(&mut valid, 1, 1, 300, 3_000_000)
+            .expect("one appended failure should carry the attempt");
+        assert_eq!(
+            valid_admission.admitted_by_category["retryable_conversion_timed_out"],
+            1
+        );
+        let record = valid.get("valid").unwrap();
+        let proof = &record.proofs[FAILURE_RETRY_PROOF];
+        assert_eq!(proof["schema_version"], json!(2));
+        assert_eq!(proof["attempt"], json!(2));
+        assert_eq!(proof["last_failure_stage"], json!("conversion"));
+        assert_eq!(proof["last_failure_kind"], json!("conversion_timed_out"));
+        assert_eq!(proof["last_failure_recorded_at"], json!("101.000000000Z"));
+        assert_eq!(proof["failure_count_at_admission"], json!(2));
+        assert_eq!(proof["retry_state"], json!("nas_verified"));
+        assert_eq!(
+            proof["last_failure_digest"],
+            json!(failure_digest(record.failures.last().unwrap()))
+        );
+    }
+
+    #[test]
+    fn valid_new_failure_category_starts_a_fresh_attempt_after_proven_lineage() {
+        let mut manifest = admitted_timeout_manifest("new-category");
+        policy_failed_again_at(
+            &mut manifest,
+            "new-category",
+            "conversion",
+            "metadata command failed: exiftool exited with exit status: 1",
+            FailureKind::ConversionMetadataFailed,
+            "101.000000000Z",
+        );
+
+        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("new category with a proven appended failure should admit freshly");
+
+        assert_eq!(
+            admission.admitted_by_category["retryable_conversion_metadata_failed"],
+            1
+        );
+        let proof = &manifest.get("new-category").unwrap().proofs[FAILURE_RETRY_PROOF];
+        assert_eq!(proof["attempt"], json!(1));
+        assert_eq!(proof["category"], json!("conversion_metadata_failed"));
     }
 
     #[test]
@@ -12989,6 +13287,26 @@ esac
         assert_eq!(reloaded_record.state, State::NasVerified);
         assert_eq!(reloaded_record.updated_at, recovered.updated_at);
         assert_eq!(reloaded_record.proofs["failure_retry"]["attempt"], json!(1));
+
+        let mut reloaded_for_retry = store.load().expect("state store should reload");
+        policy_failed_again_at(
+            &mut reloaded_for_retry,
+            "conversion-timeout",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            FailureKind::ConversionTimedOut,
+            "101.000000000Z",
+        );
+        let resumed = admit_failed_retryable_assets(&mut reloaded_for_retry, 1, 1, 300, 3_000_000)
+            .expect("reloaded retry proof should carry exactly one appended failure");
+        assert_eq!(
+            resumed.admitted_by_category["retryable_conversion_timed_out"],
+            1
+        );
+        assert_eq!(
+            reloaded_for_retry.get("conversion-timeout").unwrap().proofs[FAILURE_RETRY_PROOF]["attempt"],
+            json!(2)
+        );
     }
 
     #[test]
