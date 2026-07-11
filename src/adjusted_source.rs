@@ -1,8 +1,11 @@
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
 
 use image::ImageDecoder;
 use image::codecs::jpeg::JpegDecoder;
@@ -293,6 +296,132 @@ pub fn adjusted_source_proof_digest(proof: &CloudKitAdjustedSourceProof) -> Stri
     format!("{:x}", Sha256::digest(encoded))
 }
 
+/// Validates only durable proof/lineage fields. Callers that will read pixels
+/// must additionally materialize through the descriptor-safe API below.
+pub fn validate_adjusted_source_proof_lineage(
+    proof: &CloudKitAdjustedSourceProof,
+    asset_id: &str,
+    original_asset: &OriginalAssetProof,
+    output_path: impl AsRef<Path>,
+) -> Result<(), AdjustedSourceError> {
+    let expected_path = adjusted_source_path_for_output(output_path);
+    validate_adjusted_source_proof_fields(proof, asset_id, original_asset, &expected_path)
+}
+
+/// A private, descriptor-validated conversion input copied from the durable
+/// adjusted-source proof. Its random 0700 staging directory is owned by this
+/// object and removed on drop; it never owns or removes the proof source.
+#[cfg(unix)]
+pub struct MaterializedAdjustedSource {
+    staging: ConversionSourceStaging,
+    width: u32,
+    height: u32,
+    expected: FileIdentity,
+}
+
+#[cfg(not(unix))]
+pub struct MaterializedAdjustedSource;
+
+#[cfg(not(unix))]
+impl MaterializedAdjustedSource {
+    pub fn path(&self) -> &Path {
+        Path::new("")
+    }
+
+    pub fn revalidate_for_command(&self) -> Result<(), AdjustedSourceError> {
+        Err(AdjustedSourceError::Filesystem)
+    }
+}
+
+#[cfg(test)]
+static TEST_MATERIALIZATION_SWAP_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static TEST_MATERIALIZATION_SWAP_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) struct TestMaterializationSwapGuard {
+    previous: Option<PathBuf>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TestMaterializationSwapGuard {
+    pub(crate) fn install(replacement_path: impl AsRef<Path>) -> Self {
+        let lock = TEST_MATERIALIZATION_SWAP_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut configured = TEST_MATERIALIZATION_SWAP_PATH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = configured.replace(replacement_path.as_ref().to_path_buf());
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestMaterializationSwapGuard {
+    fn drop(&mut self) {
+        let mut configured = TEST_MATERIALIZATION_SWAP_PATH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *configured = self.previous.take();
+    }
+}
+
+#[cfg(unix)]
+impl MaterializedAdjustedSource {
+    pub fn path(&self) -> &Path {
+        &self.staging.path
+    }
+
+    /// Reopens the staged path through its held directory descriptors and
+    /// verifies the descriptor/path identity immediately before command launch.
+    pub fn revalidate_for_command(&self) -> Result<(), AdjustedSourceError> {
+        self.staging
+            .validate_file(&self.expected, self.width, self.height)
+    }
+}
+
+/// Materializes the exact proven adjusted JPEG into an exclusively-owned
+/// conversion staging directory. The copy is made from the already-open source
+/// descriptor, never by reopening the proof pathname after validation.
+#[cfg(unix)]
+pub fn materialize_adjusted_source_for_conversion(
+    proof: &CloudKitAdjustedSourceProof,
+    asset_id: &str,
+    original_asset: &OriginalAssetProof,
+    output_path: impl AsRef<Path>,
+) -> Result<MaterializedAdjustedSource, AdjustedSourceError> {
+    let expected_path = adjusted_source_path_for_output(output_path);
+    let (output, source) =
+        open_validated_adjusted_source(proof, asset_id, original_asset, &expected_path)?;
+    let expected = source.identity.clone();
+    let mut staging = ConversionSourceStaging::create(&output, &expected_path)?;
+    staging.copy_from_descriptor(&source.file, &expected)?;
+    staging.validate_file(&expected, proof.width, proof.height)?;
+    #[cfg(test)]
+    test_swap_original_after_materialization(&proof.local_path)?;
+    Ok(MaterializedAdjustedSource {
+        staging,
+        width: proof.width,
+        height: proof.height,
+        expected,
+    })
+}
+
+#[cfg(not(unix))]
+pub fn materialize_adjusted_source_for_conversion(
+    _proof: &CloudKitAdjustedSourceProof,
+    _asset_id: &str,
+    _original_asset: &OriginalAssetProof,
+    _output_path: impl AsRef<Path>,
+) -> Result<MaterializedAdjustedSource, AdjustedSourceError> {
+    Err(AdjustedSourceError::Filesystem)
+}
+
 /// Re-validates a proof-bearing adjusted JPEG through the same descriptor-safe
 /// path anchoring used by the read-only resolver.
 #[cfg(unix)]
@@ -303,22 +432,7 @@ pub fn validate_installed_adjusted_source_proof(
     output_path: impl AsRef<Path>,
 ) -> Result<(), AdjustedSourceError> {
     let expected_path = adjusted_source_path_for_output(output_path);
-    validate_adjusted_source_proof_fields(proof, asset_id, original_asset, &expected_path)?;
-
-    let output = AnchoredOutput::open(&expected_path)?;
-    let artifact = output
-        .open_final()?
-        .ok_or(AdjustedSourceError::ProofLocalFileMissing)?;
-    if !has_single_link(&artifact.file)? {
-        return Err(AdjustedSourceError::UnsafeOutputPath);
-    }
-    if artifact.identity.size_bytes != proof.downloaded_size_bytes
-        || artifact.identity.sha256 != proof.downloaded_sha256
-    {
-        return Err(AdjustedSourceError::ProofLocalFileMismatch);
-    }
-    verify_jpeg(&artifact.file, proof.width, proof.height)?;
-    output.ensure_final_identity(&artifact.identity)?;
+    let _ = open_validated_adjusted_source(proof, asset_id, original_asset, &expected_path)?;
     Ok(())
 }
 
@@ -440,6 +554,18 @@ struct AnchoredTemp<'a> {
     staging_identity: StagingDirectoryIdentity,
     file_name: CString,
     file: Option<File>,
+    active: bool,
+}
+
+#[cfg(unix)]
+struct ConversionSourceStaging {
+    parent: File,
+    staging: File,
+    staging_name: CString,
+    staging_identity: StagingDirectoryIdentity,
+    file_name: CString,
+    file: Option<File>,
+    path: PathBuf,
     active: bool,
 }
 
@@ -580,6 +706,177 @@ impl AnchoredOutput {
             return Err(AdjustedSourceError::InstalledOutputMismatch);
         }
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl ConversionSourceStaging {
+    fn create(output: &AnchoredOutput, expected_path: &Path) -> Result<Self, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        let parent_path = expected_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .ok_or(AdjustedSourceError::UnsafeOutputPath)?;
+        let prefix = std::str::from_utf8(output.final_name.to_bytes())
+            .map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
+        for _ in 0..16 {
+            let name = format!(".{prefix}.conversion-{}.staging", Uuid::new_v4());
+            let staging_name =
+                CString::new(name.as_str()).map_err(|_| AdjustedSourceError::Filesystem)?;
+            match create_staging_directory_at(output.parent.as_raw_fd(), &staging_name) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
+                Err(_) => return Err(AdjustedSourceError::Filesystem),
+            }
+            let staging = match open_directory_at(output.parent.as_raw_fd(), &staging_name) {
+                Ok(staging) => staging,
+                Err(_) => return Err(AdjustedSourceError::Filesystem),
+            };
+            let staging_identity = inspect_staging_directory(&staging)?;
+            let file_name =
+                CString::new("source.jpg").map_err(|_| AdjustedSourceError::Filesystem)?;
+            match open_temp_at(staging.as_raw_fd(), &file_name) {
+                Ok(file) => {
+                    return Ok(Self {
+                        parent: output
+                            .parent
+                            .try_clone()
+                            .map_err(|_| AdjustedSourceError::Filesystem)?,
+                        staging,
+                        staging_name,
+                        staging_identity,
+                        file_name,
+                        file: Some(file),
+                        path: parent_path.join(name).join("source.jpg"),
+                        active: true,
+                    });
+                }
+                Err(_) => {
+                    let _ = remove_owned_staging_directory(
+                        output,
+                        &staging_name,
+                        &staging,
+                        staging_identity,
+                    );
+                    return Err(AdjustedSourceError::Filesystem);
+                }
+            }
+        }
+        Err(AdjustedSourceError::Filesystem)
+    }
+
+    fn copy_from_descriptor(
+        &mut self,
+        source: &File,
+        expected: &FileIdentity,
+    ) -> Result<(), AdjustedSourceError> {
+        let mut source = source
+            .try_clone()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        let destination = self
+            .file
+            .as_mut()
+            .ok_or(AdjustedSourceError::InvalidTemporaryFile)?;
+        let mut hasher = Sha256::new();
+        let mut size_bytes = 0_u64;
+        let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+        loop {
+            let read = source
+                .read(&mut buffer)
+                .map_err(|_| AdjustedSourceError::Filesystem)?;
+            if read == 0 {
+                break;
+            }
+            destination
+                .write_all(&buffer[..read])
+                .map_err(|_| AdjustedSourceError::Filesystem)?;
+            hasher.update(&buffer[..read]);
+            size_bytes = size_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        }
+        destination
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        self.file.take();
+        if size_bytes != expected.size_bytes
+            || format!("{:x}", hasher.finalize()) != expected.sha256
+        {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_file(
+        &self,
+        expected: &FileIdentity,
+        width: u32,
+        height: u32,
+    ) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        self.validate_named_staging()?;
+        let artifact =
+            inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
+        if !has_single_link(&artifact.file)? || !artifact.identity.matches_bytes(expected) {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        verify_jpeg(&artifact.file, width, height)?;
+        let named_staging = open_directory_at(self.parent.as_raw_fd(), &self.staging_name)?;
+        let named =
+            inspect_open_file(open_regular_at(named_staging.as_raw_fd(), &self.file_name)?)?;
+        if !named.identity.matches_bytes(expected) {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_named_staging(&self) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        if inspect_staging_directory(&self.staging)? != self.staging_identity
+            || staging_link_count(&self.staging)? < 2
+        {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        let named = open_directory_at(self.parent.as_raw_fd(), &self.staging_name)?;
+        if inspect_staging_directory(&named)? != self.staging_identity
+            || staging_link_count(&named)? < 2
+        {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        Ok(())
+    }
+
+    fn cleanup(&mut self) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        if !self.active {
+            return Ok(());
+        }
+        self.validate_named_staging()?;
+        let unlink =
+            unsafe { libc::unlinkat(self.staging.as_raw_fd(), self.file_name.as_ptr(), 0) };
+        if unlink != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        remove_owned_staging_directory_at(
+            &self.parent,
+            &self.staging_name,
+            &self.staging,
+            self.staging_identity,
+        )?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ConversionSourceStaging {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
     }
 }
 
@@ -868,7 +1165,7 @@ fn parse_adjusted_resource(
         size_bytes,
         width,
         height,
-        file_type,
+        file_type: "public.jpeg".to_string(),
         fingerprint,
     }))
 }
@@ -1133,21 +1430,32 @@ fn remove_owned_staging_directory(
     staging: &File,
     expected: StagingDirectoryIdentity,
 ) -> Result<(), AdjustedSourceError> {
+    remove_owned_staging_directory_at(&output.parent, staging_name, staging, expected)?;
+    output.fsync_parent()
+}
+
+#[cfg(unix)]
+fn remove_owned_staging_directory_at(
+    parent: &File,
+    staging_name: &CStr,
+    staging: &File,
+    expected: StagingDirectoryIdentity,
+) -> Result<(), AdjustedSourceError> {
     use std::os::fd::AsRawFd;
 
-    if inspect_staging_directory(staging)? != expected || staging_link_count(staging)? != 2 {
+    if inspect_staging_directory(staging)? != expected || staging_link_count(staging)? < 2 {
         return Err(AdjustedSourceError::InvalidTemporaryFile);
     }
-    let named_staging = open_directory_at(output.parent.as_raw_fd(), staging_name)
+    let named_staging = open_directory_at(parent.as_raw_fd(), staging_name)
         .map_err(|_| AdjustedSourceError::Filesystem)?;
     if inspect_staging_directory(&named_staging)? != expected
-        || staging_link_count(&named_staging)? != 2
+        || staging_link_count(&named_staging)? < 2
     {
         return Err(AdjustedSourceError::InvalidTemporaryFile);
     }
     let remove = unsafe {
         libc::unlinkat(
-            output.parent.as_raw_fd(),
+            parent.as_raw_fd(),
             staging_name.as_ptr(),
             libc::AT_REMOVEDIR,
         )
@@ -1155,7 +1463,9 @@ fn remove_owned_staging_directory(
     if remove != 0 {
         return Err(AdjustedSourceError::Filesystem);
     }
-    output.fsync_parent()
+    parent
+        .sync_all()
+        .map_err(|_| AdjustedSourceError::Filesystem)
 }
 
 #[cfg(unix)]
@@ -1356,15 +1666,55 @@ fn validate_adjusted_source_proof_fields(
     {
         return Err(AdjustedSourceError::ProofMismatch);
     }
-    if proof.asset_record_type != "CPLAsset"
-        || !matches!(
-            proof.resource_record_type.as_str(),
-            "CPLAsset" | "CPLMaster"
-        )
-    {
+    if proof.asset_record_type != "CPLAsset" {
         return Err(AdjustedSourceError::InvalidProof);
     }
+    match proof.master_record_name.as_deref() {
+        None => {
+            if proof.resource_record_name != proof.asset_record_name
+                || proof.resource_record_change_tag != proof.asset_record_change_tag
+                || proof.resource_record_type != proof.asset_record_type
+            {
+                return Err(AdjustedSourceError::ProofMismatch);
+            }
+        }
+        Some(master_record_name) => {
+            if master_record_name.trim().is_empty()
+                || proof.resource_record_type != "CPLMaster"
+                || proof.resource_record_name != master_record_name
+                || proof.resource_record_name == proof.asset_record_name
+                || proof.resource_record_change_tag == proof.asset_record_change_tag
+            {
+                return Err(AdjustedSourceError::InvalidProof);
+            }
+        }
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn open_validated_adjusted_source(
+    proof: &CloudKitAdjustedSourceProof,
+    asset_id: &str,
+    original_asset: &OriginalAssetProof,
+    expected_path: &Path,
+) -> Result<(AnchoredOutput, OpenArtifact), AdjustedSourceError> {
+    validate_adjusted_source_proof_fields(proof, asset_id, original_asset, expected_path)?;
+    let output = AnchoredOutput::open(expected_path)?;
+    let artifact = output
+        .open_final()?
+        .ok_or(AdjustedSourceError::ProofLocalFileMissing)?;
+    if !has_single_link(&artifact.file)? {
+        return Err(AdjustedSourceError::UnsafeOutputPath);
+    }
+    if artifact.identity.size_bytes != proof.downloaded_size_bytes
+        || artifact.identity.sha256 != proof.downloaded_sha256
+    {
+        return Err(AdjustedSourceError::ProofLocalFileMismatch);
+    }
+    verify_jpeg(&artifact.file, proof.width, proof.height)?;
+    output.ensure_final_identity(&artifact.identity)?;
+    Ok((output, artifact))
 }
 
 #[cfg(unix)]
@@ -1381,6 +1731,18 @@ fn verified_timestamp() -> Result<u64, AdjustedSourceError> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|_| AdjustedSourceError::Clock)
+}
+
+#[cfg(test)]
+fn test_swap_original_after_materialization(source_path: &Path) -> Result<(), AdjustedSourceError> {
+    let replacement = TEST_MATERIALIZATION_SWAP_PATH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(replacement) = replacement {
+        std::fs::rename(replacement, source_path).map_err(|_| AdjustedSourceError::Filesystem)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

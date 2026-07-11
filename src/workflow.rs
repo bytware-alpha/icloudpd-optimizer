@@ -8,8 +8,10 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::adjusted_source::{
-    AdjustedSourceError, CloudKitAdjustedSourceProof, adjusted_source_proof_digest,
-    validate_installed_adjusted_source_proof,
+    AdjustedSourceError, CloudKitAdjustedSourceProof, MaterializedAdjustedSource,
+    adjusted_source_proof_digest,
+    materialize_adjusted_source_for_conversion as materialize_adjusted_source,
+    validate_adjusted_source_proof_lineage, validate_installed_adjusted_source_proof,
 };
 use crate::manifest::{AssetRecord, FailureKind, Manifest, ManifestError, State};
 use crate::proof::{
@@ -215,9 +217,13 @@ struct DeleteEligibilityProof {
     matched_raw_sha256: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct DeleteApprovalProof {
     operator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adjusted_source_proof_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adjusted_source_proof_digest: Option<String>,
 }
 
 struct PreDeleteFacts {
@@ -660,7 +666,7 @@ pub fn record_icloudpd_local_mirror_proof<'a>(
             &eligibility_proof,
         )?;
         if state == State::DeleteApproved {
-            validate_delete_approval_proof(&staged, asset_id)?;
+            validate_delete_approval_proof(&staged, asset_id, &facts)?;
         }
     }
 
@@ -838,15 +844,14 @@ pub fn approve_delete<'a>(
     let facts = validate_pre_delete_facts(manifest, asset_id)?;
     validate_delete_eligibility_chain(manifest, asset_id, &facts)?;
 
-    let proof = json!({ "operator": operator });
-    manifest
-        .transition(
-            asset_id,
-            State::DeleteApproved,
-            DELETE_APPROVAL_PROOF,
-            proof,
-        )
-        .map_err(WorkflowError::Manifest)
+    let proof = delete_approval_proof(operator, &facts);
+    transition_with_proof(
+        manifest,
+        asset_id,
+        State::DeleteApproved,
+        DELETE_APPROVAL_PROOF,
+        &proof,
+    )
 }
 
 pub fn record_delete_execution<'a>(
@@ -1222,7 +1227,7 @@ fn validate_stored_delete_plan_proofs(
 ) -> Result<PreDeleteFacts, WorkflowError> {
     let facts = validate_pre_delete_facts(manifest, asset_id)?;
     validate_delete_eligibility_chain(manifest, asset_id, &facts)?;
-    validate_delete_approval_proof(manifest, asset_id)?;
+    validate_delete_approval_proof(manifest, asset_id, &facts)?;
     Ok(facts)
 }
 
@@ -1232,7 +1237,8 @@ fn validate_pre_delete_facts(
 ) -> Result<PreDeleteFacts, WorkflowError> {
     let record = manifest.get(asset_id)?;
     let (nas, conversion) = load_conversion_context(manifest, asset_id)?;
-    let adjusted_source = validate_conversion_source_binding(manifest, asset_id, &conversion)?;
+    let adjusted_source =
+        validated_adjusted_source_for_conversion(manifest, asset_id, &conversion.heic_path)?;
 
     let heic = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
     require_matching_path(
@@ -1329,13 +1335,85 @@ fn validate_delete_eligibility_chain(
 fn validate_delete_approval_proof(
     manifest: &Manifest,
     asset_id: &str,
+    facts: &PreDeleteFacts,
 ) -> Result<(), WorkflowError> {
     let approval = stored_proof::<DeleteApprovalProof>(manifest, asset_id, DELETE_APPROVAL_PROOF)?;
     if approval.operator.trim().is_empty() {
         return Err(WorkflowError::EmptyOperator);
     }
 
+    let eligibility =
+        stored_proof::<DeleteEligibilityProof>(manifest, asset_id, DELETE_ELIGIBILITY_PROOF)?;
+    match &facts.adjusted_source {
+        Some(adjusted_source) => {
+            let digest = adjusted_source_proof_digest(adjusted_source);
+            if approval.adjusted_source_proof_key.as_deref() != Some(ADJUSTED_SOURCE_PROOF)
+                || eligibility.adjusted_source_proof_key.as_deref() != Some(ADJUSTED_SOURCE_PROOF)
+            {
+                return Err(WorkflowError::ProofMismatch {
+                    proof_key: DELETE_APPROVAL_PROOF,
+                    field: "adjusted_source_proof_key",
+                    expected: ADJUSTED_SOURCE_PROOF.to_string(),
+                    actual: approval
+                        .adjusted_source_proof_key
+                        .clone()
+                        .unwrap_or_else(|| "<missing>".to_string()),
+                });
+            }
+            require_matching_str(
+                DELETE_APPROVAL_PROOF,
+                "adjusted_source_proof_digest",
+                &digest,
+                approval
+                    .adjusted_source_proof_digest
+                    .as_deref()
+                    .unwrap_or("<missing>"),
+            )?;
+            require_matching_str(
+                DELETE_APPROVAL_PROOF,
+                "eligibility_adjusted_source_proof_digest",
+                approval
+                    .adjusted_source_proof_digest
+                    .as_deref()
+                    .unwrap_or("<missing>"),
+                eligibility
+                    .adjusted_source_proof_digest
+                    .as_deref()
+                    .unwrap_or("<missing>"),
+            )?;
+        }
+        None => {
+            if approval.adjusted_source_proof_key.is_some()
+                || approval.adjusted_source_proof_digest.is_some()
+            {
+                return Err(WorkflowError::InvalidProofField {
+                    proof_key: DELETE_APPROVAL_PROOF,
+                    field: "adjusted_source",
+                    reason: "embedded-preview conversion must not claim adjusted-source lineage",
+                });
+            }
+        }
+    }
+
     Ok(())
+}
+
+fn delete_approval_proof(operator: &str, facts: &PreDeleteFacts) -> DeleteApprovalProof {
+    let (adjusted_source_proof_key, adjusted_source_proof_digest) = facts
+        .adjusted_source
+        .as_ref()
+        .map(|proof| {
+            (
+                Some(ADJUSTED_SOURCE_PROOF.to_string()),
+                Some(adjusted_source_proof_digest(proof)),
+            )
+        })
+        .unwrap_or((None, None));
+    DeleteApprovalProof {
+        operator: operator.to_string(),
+        adjusted_source_proof_key,
+        adjusted_source_proof_digest,
+    }
 }
 
 fn delete_eligibility_proof(facts: &PreDeleteFacts) -> Value {
@@ -2072,6 +2150,23 @@ pub fn validated_adjusted_source_for_conversion(
     asset_id: &str,
     output_path: impl AsRef<Path>,
 ) -> Result<Option<CloudKitAdjustedSourceProof>, WorkflowError> {
+    let adjusted_source = stored_adjusted_source_for_conversion(manifest, asset_id, &output_path)?;
+    if let Some(proof) = &adjusted_source {
+        let original =
+            stored_proof::<OriginalAssetProof>(manifest, asset_id, ORIGINAL_ASSET_PROOF)?;
+        validate_installed_adjusted_source_proof(proof, asset_id, &original, output_path)
+            .map_err(WorkflowError::AdjustedSource)?;
+    }
+    Ok(adjusted_source)
+}
+
+/// Loads and validates durable adjusted-source lineage without reopening the
+/// source path. Pixel consumers must materialize it separately.
+pub fn stored_adjusted_source_for_conversion(
+    manifest: &Manifest,
+    asset_id: &str,
+    output_path: impl AsRef<Path>,
+) -> Result<Option<CloudKitAdjustedSourceProof>, WorkflowError> {
     let record = manifest.get(asset_id)?;
     let Some(proof) =
         optional_workflow_proof::<CloudKitAdjustedSourceProof>(record, ADJUSTED_SOURCE_PROOF)?
@@ -2079,9 +2174,27 @@ pub fn validated_adjusted_source_for_conversion(
         return Ok(None);
     };
     let original = stored_proof::<OriginalAssetProof>(manifest, asset_id, ORIGINAL_ASSET_PROOF)?;
-    validate_installed_adjusted_source_proof(&proof, asset_id, &original, output_path)
+    validate_adjusted_source_proof_lineage(&proof, asset_id, &original, output_path)
         .map_err(WorkflowError::AdjustedSource)?;
     Ok(Some(proof))
+}
+
+/// Creates the private, RAII-owned adjusted JPEG conversion input after the
+/// durable lineage has been checked. This is the only workflow path that turns
+/// an adjusted proof pathname into encoder input.
+pub fn materialize_adjusted_source_for_conversion(
+    manifest: &Manifest,
+    asset_id: &str,
+    output_path: impl AsRef<Path>,
+) -> Result<Option<MaterializedAdjustedSource>, WorkflowError> {
+    let Some(proof) = stored_adjusted_source_for_conversion(manifest, asset_id, &output_path)?
+    else {
+        return Ok(None);
+    };
+    let original = stored_proof::<OriginalAssetProof>(manifest, asset_id, ORIGINAL_ASSET_PROOF)?;
+    materialize_adjusted_source(&proof, asset_id, &original, output_path)
+        .map(Some)
+        .map_err(WorkflowError::AdjustedSource)
 }
 
 fn validate_conversion_source_binding(
@@ -2090,7 +2203,7 @@ fn validate_conversion_source_binding(
     conversion: &ConversionResultProof,
 ) -> Result<Option<CloudKitAdjustedSourceProof>, WorkflowError> {
     let adjusted_source =
-        validated_adjusted_source_for_conversion(manifest, asset_id, &conversion.heic_path)?;
+        stored_adjusted_source_for_conversion(manifest, asset_id, &conversion.heic_path)?;
     match (&adjusted_source, &conversion.source_binding) {
         (None, ConversionSourceBinding::EmbeddedPreview) => Ok(None),
         (None, ConversionSourceBinding::AdjustedSource { .. }) => {

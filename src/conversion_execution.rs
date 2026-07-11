@@ -23,8 +23,8 @@ use crate::manifest::{FailureKind, Manifest, ManifestError, State};
 use crate::proof::NasRawProof;
 use crate::workflow::{
     ConversionCommandTiming, ConversionPerformanceInput, ConversionResultProof,
-    ConversionSourceBinding, WorkflowError, record_conversion_performance,
-    record_conversion_result, validated_adjusted_source_for_conversion,
+    ConversionSourceBinding, WorkflowError, materialize_adjusted_source_for_conversion,
+    record_conversion_performance, record_conversion_result, stored_adjusted_source_for_conversion,
 };
 
 const DEFAULT_CHILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -233,11 +233,8 @@ fn execute_measured_conversion_for_target(
         });
     }
 
-    let adjusted_source = validated_adjusted_source_for_conversion(
-        manifest,
-        &request.asset_id,
-        &request.output_path,
-    )?;
+    let adjusted_source =
+        stored_adjusted_source_for_conversion(manifest, &request.asset_id, &request.output_path)?;
     refuse_preexisting_output(&request.output_path)?;
     let staged_raw = stage_raw_for_conversion(
         &request.asset_id,
@@ -246,11 +243,20 @@ fn execute_measured_conversion_for_target(
         &request.output_path,
     )?;
     let staged_raw_path = staged_raw.path();
-    let plan = if let Some(proof) = &adjusted_source {
+    let materialized_adjusted_source = if adjusted_source.is_some() {
+        materialize_adjusted_source_for_conversion(
+            manifest,
+            &request.asset_id,
+            &request.output_path,
+        )?
+    } else {
+        None
+    };
+    let plan = if let Some(materialized_source) = &materialized_adjusted_source {
         plan_adjusted_source_conversion_for_target(
             target,
             staged_raw_path,
-            &proof.local_path,
+            materialized_source.path(),
             &request.output_path,
             request.heic_quality,
         )?
@@ -290,8 +296,22 @@ fn execute_measured_conversion_for_target(
     let conversion_result = (|| {
         let total_started = Instant::now();
         let convert_started = Instant::now();
+        if let Some(materialized_source) = &materialized_adjusted_source {
+            materialized_source
+                .revalidate_for_command()
+                .map_err(|error| {
+                    ConversionExecutionError::Workflow(WorkflowError::AdjustedSource(error))
+                })?;
+        }
         let convert_outcome = run_planned_commands("conversion", &plan.conversion_commands)?;
         let convert_wall_time_millis = positive_millis(convert_started.elapsed());
+        if let Some(materialized_source) = &materialized_adjusted_source {
+            materialized_source
+                .revalidate_for_command()
+                .map_err(|error| {
+                    ConversionExecutionError::Workflow(WorkflowError::AdjustedSource(error))
+                })?;
+        }
         let metadata_usage = run_planned_command("metadata", &plan.metadata)?;
         let output = inspect_output(&request.output_path)?;
         let total_wall_time_millis = positive_millis(total_started.elapsed());
@@ -1580,7 +1600,8 @@ mod tests {
 
     use crate::adjusted_source::{
         ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION, CloudKitAdjustedSourceProof,
-        adjusted_source_path_for_output, adjusted_source_proof_digest,
+        TestMaterializationSwapGuard, adjusted_source_path_for_output,
+        adjusted_source_proof_digest,
     };
     use crate::proof::NasRawProof;
     use crate::workflow::{
@@ -1800,14 +1821,19 @@ mod tests {
 printf 'heif-enc\n' >> "$EXECUTION_LOG"
 out=""
 previous=""
+input=""
 for arg in "$@"; do
   if [ "$previous" = "-o" ]; then
     out="$arg"
   fi
+  if [ "$arg" != "-q" ] && [ "$arg" != "-o" ] && [ "$previous" != "-q" ] && [ "$previous" != "-o" ]; then
+    input="$arg"
+  fi
   previous="$arg"
 done
 [ -n "$out" ] || exit 43
-printf 'heic' > "$out"
+printf 'heif-input=%s\n' "$input" >> "$EXECUTION_LOG"
+/bin/cat "$input" > "$out"
 "#,
         );
         write_executable_script(
@@ -1833,12 +1859,16 @@ exit 67
             .join("out");
         fs::create_dir_all(&output_dir).expect("output directory should be created");
         let raw_path = tempdir.path().join("IMG_0001.dng");
-        let raw_bytes = b"raw-bytes";
-        fs::write(&raw_path, raw_bytes).expect("raw should be written");
+        let raw_bytes = vec![b'r'; 4_096];
+        fs::write(&raw_path, &raw_bytes).expect("raw should be written");
         let output_path = output_dir.join("IMG_0001.heic");
         let adjusted_path = adjusted_source_path_for_output(&output_path);
         let adjusted_bytes = adjusted_test_jpeg();
         fs::write(&adjusted_path, &adjusted_bytes).expect("adjusted JPEG should be written");
+        let replacement_path = tempdir.path().join("replacement.jpg");
+        let replacement_bytes = adjusted_test_jpeg_with_seed(197);
+        fs::write(&replacement_path, &replacement_bytes)
+            .expect("replacement JPEG should be written");
         let log_path = tempdir.path().join("commands.log");
         let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
         let mut manifest = nas_verified_manifest(&raw_path);
@@ -1850,7 +1880,7 @@ exit 67
             zone_name: "PrimarySync".to_string(),
             filename: "IMG_0001.dng".to_string(),
             size_bytes: raw_bytes.len() as u64,
-            matched_raw_sha256: format!("{:x}", Sha256::digest(raw_bytes)),
+            matched_raw_sha256: format!("{:x}", Sha256::digest(&raw_bytes)),
         };
         record_original_asset_proof(&mut manifest, "asset-1", original.clone())
             .expect("original asset proof should record");
@@ -1858,6 +1888,7 @@ exit 67
             adjusted_test_proof("asset-1", &original, adjusted_path.clone(), &adjusted_bytes);
         record_adjusted_source_proof(&mut manifest, "asset-1", &output_path, adjusted.clone())
             .expect("adjusted proof should record");
+        let _swap_guard = TestMaterializationSwapGuard::install(&replacement_path);
 
         let updated = execute_measured_conversion_for_target(
             &manifest,
@@ -1871,13 +1902,22 @@ exit 67
         )
         .expect("adjusted conversion should complete without an embedded preview");
 
-        assert_eq!(
-            fs::read_to_string(&log_path).expect("command log should be readable"),
-            "heif-enc\nexiftool-metadata\n"
+        let command_log = fs::read_to_string(&log_path).expect("command log should be readable");
+        assert!(command_log.starts_with("heif-enc\nheif-input="));
+        assert!(command_log.contains(".conversion-"));
+        assert!(
+            !command_log.contains(adjusted_path.to_string_lossy().as_ref()),
+            "encoder input must be the private materialization, not the proof pathname"
         );
+        assert!(command_log.ends_with("exiftool-metadata\n"));
         assert_eq!(
             fs::read(&adjusted_path).expect("source should survive"),
-            adjusted_bytes
+            replacement_bytes
+        );
+        assert_eq!(
+            fs::read(&output_path).expect("encoder output should be readable"),
+            adjusted_bytes,
+            "a source swap after materialization must not change encoder input"
         );
         assert!(!staged_raw_path_for_output(&output_path, &raw_path).exists());
         assert_eq!(
@@ -1892,6 +1932,99 @@ exit 67
                 adjusted_jpeg_sha256: adjusted.downloaded_sha256,
                 adjusted_jpeg_path: adjusted_path,
             }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_adjusted_conversion_uses_private_staged_jpeg_with_dng_metadata_copy() {
+        let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
+        write_executable_script(
+            &tool_dir.path().join("sips"),
+            r#"#!/bin/sh
+printf 'sips\n' >> "$EXECUTION_LOG"
+input="$7"
+out=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--out" ]; then
+    out="$arg"
+  fi
+  previous="$arg"
+done
+[ -n "$out" ] || exit 43
+printf 'sips-input=%s\n' "$input" >> "$EXECUTION_LOG"
+/bin/cat "$input" > "$out"
+"#,
+        );
+        write_executable_script(
+            &tool_dir.path().join("exiftool"),
+            r#"#!/bin/sh
+if [ "$1" = "-j" ] || [ "$1" = "-b" ]; then
+  exit 66
+fi
+if [ "$1" = "-TagsFromFile" ]; then
+  printf 'exiftool-metadata\n' >> "$EXECUTION_LOG"
+  exit 0
+fi
+exit 67
+"#,
+        );
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let output_dir = tempdir
+            .path()
+            .canonicalize()
+            .expect("tempdir should canonicalize")
+            .join("out");
+        fs::create_dir_all(&output_dir).expect("output directory should be created");
+        let raw_path = tempdir.path().join("IMG_0002.dng");
+        let raw_bytes = vec![b'r'; 4_096];
+        fs::write(&raw_path, &raw_bytes).expect("raw should be written");
+        let output_path = output_dir.join("IMG_0002.heic");
+        let adjusted_path = adjusted_source_path_for_output(&output_path);
+        let adjusted_bytes = adjusted_test_jpeg();
+        fs::write(&adjusted_path, &adjusted_bytes).expect("adjusted JPEG should be written");
+        let log_path = tempdir.path().join("commands.log");
+        let _log_guard = EnvVarGuard::install("EXECUTION_LOG", &log_path);
+        let mut manifest = nas_verified_manifest(&raw_path);
+        let original = OriginalAssetProof {
+            record_name: "original-record-2".to_string(),
+            record_change_tag: "original-tag-2".to_string(),
+            record_type: "CPLAsset".to_string(),
+            database_scope: Default::default(),
+            zone_name: "PrimarySync".to_string(),
+            filename: "IMG_0002.dng".to_string(),
+            size_bytes: raw_bytes.len() as u64,
+            matched_raw_sha256: format!("{:x}", Sha256::digest(&raw_bytes)),
+        };
+        record_original_asset_proof(&mut manifest, "asset-1", original.clone())
+            .expect("original asset proof should record");
+        let adjusted =
+            adjusted_test_proof("asset-1", &original, adjusted_path.clone(), &adjusted_bytes);
+        record_adjusted_source_proof(&mut manifest, "asset-1", &output_path, adjusted)
+            .expect("adjusted proof should record");
+
+        execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("macos", "aarch64"),
+        )
+        .expect("macOS adjusted conversion should complete without preview extraction");
+
+        let command_log = fs::read_to_string(&log_path).expect("command log should be readable");
+        assert!(command_log.starts_with("sips\nsips-input="));
+        assert!(command_log.contains(".conversion-"));
+        assert!(!command_log.contains(adjusted_path.to_string_lossy().as_ref()));
+        assert!(command_log.ends_with("exiftool-metadata\n"));
+        assert_eq!(
+            fs::read(&output_path).expect("output should be readable"),
+            adjusted_bytes
         );
     }
 
@@ -3284,12 +3417,17 @@ printf 'heic' > "$out"
 
     #[cfg(unix)]
     fn adjusted_test_jpeg() -> Vec<u8> {
+        adjusted_test_jpeg_with_seed(23)
+    }
+
+    #[cfg(unix)]
+    fn adjusted_test_jpeg_with_seed(seed: u8) -> Vec<u8> {
         use image::codecs::jpeg::JpegEncoder;
         use image::{DynamicImage, Rgb, RgbImage};
 
         let mut image = RgbImage::new(4, 3);
         for (x, y, pixel) in image.enumerate_pixels_mut() {
-            *pixel = Rgb([x as u8 * 50, y as u8 * 70, 23]);
+            *pixel = Rgb([x as u8 * 50, y as u8 * 70, seed]);
         }
         let mut bytes = Vec::new();
         JpegEncoder::new_with_quality(&mut bytes, 100)

@@ -7,6 +7,7 @@ use icloudpd_optimizer::adjusted_source::{
     AdjustedSourceError, CloudKitAdjustedSourceDownload, CloudKitAdjustedSourceProof,
     CloudKitAdjustedSourceResolveRequest, CloudKitAdjustedSourceResolver,
     CloudKitAdjustedSourceTransport, adjusted_source_path_for_output, adjusted_source_proof_digest,
+    materialize_adjusted_source_for_conversion, validate_adjusted_source_proof_lineage,
     validate_installed_adjusted_source_proof,
 };
 use icloudpd_optimizer::upload::{CloudKitDatabaseScope, CloudKitDeleteSession};
@@ -513,6 +514,258 @@ fn installed_adjusted_source_proof_has_stable_digest_and_requires_its_output_adj
     )
     .expect_err("a proof must not be reusable for a different output");
     assert!(matches!(error, AdjustedSourceError::ProofMismatch));
+}
+
+#[test]
+fn materialized_adjusted_source_is_a_private_verified_copy_that_cleans_up_without_touching_proof() {
+    let bytes = nonblank_jpeg(4, 3);
+    let mut transport = FakeTransport {
+        lookups: VecDeque::from([json!({"records": [direct_asset_record(&bytes, 4, 3)]})]),
+        downloads: VecDeque::from([bytes.clone()]),
+        ..Default::default()
+    };
+    let directory = tempdir().expect("test directory");
+    let output_path = safe_path(&directory, "IMG_0100.heic");
+    let adjusted_path = adjusted_source_path_for_output(&output_path);
+    let proof = CloudKitAdjustedSourceResolver::new(&mut transport)
+        .resolve(&session(), &resolve_request(adjusted_path.clone()))
+        .expect("adjusted JPEG should resolve");
+
+    let materialized = materialize_adjusted_source_for_conversion(
+        &proof,
+        "local-asset",
+        &original_proof(),
+        &output_path,
+    )
+    .expect("validated source should materialize into private conversion staging");
+    let staged_path = materialized.path().to_path_buf();
+    assert_ne!(staged_path, adjusted_path);
+    assert_eq!(
+        fs::read(&staged_path).expect("staged bytes should read"),
+        bytes
+    );
+    materialized
+        .revalidate_for_command()
+        .expect("staged path must remain descriptor-verified before launch");
+    drop(materialized);
+
+    assert!(!staged_path.exists(), "owned staging must clean up on drop");
+    assert_eq!(
+        fs::read(&adjusted_path).expect("original proof source must survive cleanup"),
+        bytes
+    );
+}
+
+#[test]
+fn durable_adjusted_proof_enforces_direct_and_master_resource_lineage() {
+    let bytes = nonblank_jpeg(4, 3);
+    let mut transport = FakeTransport {
+        lookups: VecDeque::from([json!({"records": [direct_asset_record(&bytes, 4, 3)]})]),
+        downloads: VecDeque::from([bytes]),
+        ..Default::default()
+    };
+    let directory = tempdir().expect("test directory");
+    let output_path = safe_path(&directory, "IMG_0101.heic");
+    let proof = CloudKitAdjustedSourceResolver::new(&mut transport)
+        .resolve(
+            &session(),
+            &resolve_request(adjusted_source_path_for_output(&output_path)),
+        )
+        .expect("direct proof should resolve");
+
+    validate_adjusted_source_proof_lineage(&proof, "local-asset", &original_proof(), &output_path)
+        .expect("direct resource must exactly match the asset identity");
+    for forged in [
+        CloudKitAdjustedSourceProof {
+            master_record_name: Some("master-record".to_string()),
+            ..proof.clone()
+        },
+        CloudKitAdjustedSourceProof {
+            resource_record_name: "other-asset".to_string(),
+            ..proof.clone()
+        },
+        CloudKitAdjustedSourceProof {
+            resource_record_change_tag: "other-tag".to_string(),
+            ..proof.clone()
+        },
+        CloudKitAdjustedSourceProof {
+            resource_record_type: "CPLMaster".to_string(),
+            ..proof.clone()
+        },
+    ] {
+        assert!(matches!(
+            validate_adjusted_source_proof_lineage(
+                &forged,
+                "local-asset",
+                &original_proof(),
+                &output_path,
+            ),
+            Err(AdjustedSourceError::InvalidProof | AdjustedSourceError::ProofMismatch)
+        ));
+    }
+
+    let master = CloudKitAdjustedSourceProof {
+        resource_record_name: "master-record".to_string(),
+        resource_record_change_tag: "master-tag".to_string(),
+        resource_record_type: "CPLMaster".to_string(),
+        master_record_name: Some("master-record".to_string()),
+        ..proof.clone()
+    };
+    validate_adjusted_source_proof_lineage(&master, "local-asset", &original_proof(), &output_path)
+        .expect("master resource must carry its exact master identity");
+    for forged in [
+        CloudKitAdjustedSourceProof {
+            master_record_name: None,
+            ..master.clone()
+        },
+        CloudKitAdjustedSourceProof {
+            master_record_name: Some("other-master".to_string()),
+            ..master.clone()
+        },
+        CloudKitAdjustedSourceProof {
+            resource_record_type: "CPLAsset".to_string(),
+            ..master.clone()
+        },
+        CloudKitAdjustedSourceProof {
+            resource_record_change_tag: "".to_string(),
+            ..master
+        },
+    ] {
+        assert!(matches!(
+            validate_adjusted_source_proof_lineage(
+                &forged,
+                "local-asset",
+                &original_proof(),
+                &output_path,
+            ),
+            Err(AdjustedSourceError::InvalidProof | AdjustedSourceError::ProofMismatch)
+        ));
+    }
+}
+
+#[test]
+fn resolver_canonicalizes_supported_jpeg_file_type_spellings_in_durable_proofs() {
+    for file_type in ["public.jpeg", "image/jpeg"] {
+        let bytes = nonblank_jpeg(4, 3);
+        let mut record = direct_asset_record(&bytes, 4, 3);
+        record["fields"]["resJPEGFullFileType"]["value"] = json!(file_type);
+        let mut transport = FakeTransport {
+            lookups: VecDeque::from([json!({"records": [record]})]),
+            downloads: VecDeque::from([bytes]),
+            ..Default::default()
+        };
+        let directory = tempdir().expect("test directory");
+        let output_path = safe_path(&directory, "IMG_0102.heic");
+        let proof = CloudKitAdjustedSourceResolver::new(&mut transport)
+            .resolve(
+                &session(),
+                &resolve_request(adjusted_source_path_for_output(&output_path)),
+            )
+            .expect("supported JPEG file type should resolve");
+
+        assert_eq!(proof.declared_file_type, "public.jpeg");
+        validate_adjusted_source_proof_lineage(
+            &proof,
+            "local-asset",
+            &original_proof(),
+            &output_path,
+        )
+        .expect("canonical durable file type should revalidate");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn materialized_adjusted_source_rejects_replaced_symlinked_hardlinked_and_wrong_path_inputs() {
+    use std::os::unix::fs::symlink;
+
+    let bytes = nonblank_jpeg(4, 3);
+    let mut transport = FakeTransport {
+        lookups: VecDeque::from([json!({"records": [direct_asset_record(&bytes, 4, 3)]})]),
+        downloads: VecDeque::from([bytes.clone()]),
+        ..Default::default()
+    };
+    let directory = tempdir().expect("test directory");
+    let output_path = safe_path(&directory, "IMG_0103.heic");
+    let adjusted_path = adjusted_source_path_for_output(&output_path);
+    let proof = CloudKitAdjustedSourceResolver::new(&mut transport)
+        .resolve(&session(), &resolve_request(adjusted_path.clone()))
+        .expect("adjusted JPEG should resolve");
+
+    let wrong_path = CloudKitAdjustedSourceProof {
+        local_path: safe_path(&directory, "other.adjusted-source.jpg"),
+        ..proof.clone()
+    };
+    assert!(matches!(
+        materialize_adjusted_source_for_conversion(
+            &wrong_path,
+            "local-asset",
+            &original_proof(),
+            &output_path,
+        ),
+        Err(AdjustedSourceError::ProofMismatch)
+    ));
+
+    fs::remove_file(&adjusted_path).expect("proof source should be removable in test");
+    fs::create_dir(&adjusted_path).expect("directory source should be created");
+    assert!(matches!(
+        materialize_adjusted_source_for_conversion(
+            &proof,
+            "local-asset",
+            &original_proof(),
+            &output_path,
+        ),
+        Err(AdjustedSourceError::UnsafeOutputPath)
+    ));
+    fs::remove_dir(&adjusted_path).expect("directory source should be removable");
+    fs::write(&adjusted_path, &bytes).expect("proof source should be restored");
+
+    let materialized = materialize_adjusted_source_for_conversion(
+        &proof,
+        "local-asset",
+        &original_proof(),
+        &output_path,
+    )
+    .expect("source should materialize");
+    let staged_path = materialized.path().to_path_buf();
+    fs::remove_file(&staged_path).expect("staged file should be removable in test");
+    fs::write(&staged_path, b"replacement").expect("replacement should be written");
+    assert!(matches!(
+        materialized.revalidate_for_command(),
+        Err(AdjustedSourceError::ProofLocalFileMismatch)
+    ));
+    drop(materialized);
+
+    let materialized = materialize_adjusted_source_for_conversion(
+        &proof,
+        "local-asset",
+        &original_proof(),
+        &output_path,
+    )
+    .expect("source should materialize again");
+    let staged_path = materialized.path().to_path_buf();
+    fs::remove_file(&staged_path).expect("staged file should be removable in test");
+    symlink(&adjusted_path, &staged_path).expect("staged symlink should be created");
+    assert!(matches!(
+        materialized.revalidate_for_command(),
+        Err(AdjustedSourceError::UnsafeOutputPath)
+    ));
+    drop(materialized);
+
+    let materialized = materialize_adjusted_source_for_conversion(
+        &proof,
+        "local-asset",
+        &original_proof(),
+        &output_path,
+    )
+    .expect("source should materialize a third time");
+    let staged_path = materialized.path().to_path_buf();
+    fs::remove_file(&staged_path).expect("staged file should be removable in test");
+    fs::hard_link(&adjusted_path, &staged_path).expect("staged hardlink should be created");
+    assert!(matches!(
+        materialized.revalidate_for_command(),
+        Err(AdjustedSourceError::ProofLocalFileMismatch)
+    ));
 }
 
 #[test]

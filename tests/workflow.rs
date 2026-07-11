@@ -647,6 +647,13 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
         adjusted_source_proof("asset-1", &original, adjusted_path.clone(), &adjusted_bytes);
     record_adjusted_source_proof(&mut manifest, "asset-1", &output_path, adjusted.clone())
         .expect("adjusted source proof should record while NAS-verified");
+    let error =
+        record_adjusted_source_proof(&mut manifest, "asset-1", &output_path, adjusted.clone())
+            .expect_err("adjusted source proof must not be overwritten");
+    assert!(matches!(
+        error,
+        WorkflowError::AdjustedSourceProofAlreadyRecorded { .. }
+    ));
 
     let unbound = ConversionResultProof {
         heic_path: output_path.clone(),
@@ -668,6 +675,40 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
         adjusted_jpeg_sha256: adjusted.downloaded_sha256.clone(),
         adjusted_jpeg_path: adjusted_path.clone(),
     };
+    for invalid_binding in [
+        ConversionSourceBinding::AdjustedSource {
+            adjusted_source_proof_digest: "a".repeat(64),
+            adjusted_jpeg_sha256: adjusted.downloaded_sha256.clone(),
+            adjusted_jpeg_path: adjusted_path.clone(),
+        },
+        ConversionSourceBinding::AdjustedSource {
+            adjusted_source_proof_digest: adjusted_source_proof_digest(&adjusted),
+            adjusted_jpeg_sha256: "b".repeat(64),
+            adjusted_jpeg_path: adjusted_path.clone(),
+        },
+        ConversionSourceBinding::AdjustedSource {
+            adjusted_source_proof_digest: adjusted_source_proof_digest(&adjusted),
+            adjusted_jpeg_sha256: adjusted.downloaded_sha256.clone(),
+            adjusted_jpeg_path: PathBuf::from("/other/IMG_0001.adjusted-source.jpg"),
+        },
+    ] {
+        let error = record_conversion_result(
+            &mut manifest,
+            "asset-1",
+            ConversionResultProof {
+                heic_path: output_path.clone(),
+                heic_sha256: "heic-sha256".to_string(),
+                size_bytes: 24,
+                source_binding: invalid_binding,
+            },
+        )
+        .expect_err("every adjusted binding field must match the durable proof");
+        assert!(matches!(
+            error,
+            WorkflowError::ConversionSourceBindingMismatch { .. }
+        ));
+        assert_eq!(manifest, before);
+    }
     record_conversion_result(
         &mut manifest,
         "asset-1",
@@ -726,6 +767,15 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
     mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
     approve_delete(&mut manifest, "asset-1", "operator").expect("approval should record");
 
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist").proofs["delete_approval"]["adjusted_source_proof_key"],
+        "adjusted_source"
+    );
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist").proofs["delete_approval"]["adjusted_source_proof_digest"],
+        adjusted_source_proof_digest(&adjusted)
+    );
+
     let plan = build_delete_plan(&manifest, "asset-1").expect("delete plan should build");
     assert!(
         plan.required_proof_keys
@@ -739,6 +789,25 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
         plan.proofs["conversion"]["source_binding"],
         serde_json::to_value(binding).unwrap()
     );
+
+    let prevalidated = prevalidate_approved_original_delete(&manifest, "asset-1")
+        .expect("adjusted delete should prevalidate with approval lineage");
+    let approval_original = manifest.get("asset-1").expect("asset should exist").clone();
+    let mut approval_tampered = approval_original.clone();
+    proof_mut(&mut approval_tampered, "delete_approval")["adjusted_source_proof_digest"] =
+        json!("e".repeat(64));
+    manifest.upsert(approval_tampered);
+    assert!(
+        build_delete_plan(&manifest, "asset-1").is_err(),
+        "approval lineage tampering must block delete planning"
+    );
+    let error = record_prevalidated_delete_execution(&mut manifest, prevalidated, delete_outcome())
+        .expect_err("approval lineage tampering must stale a prevalidated delete");
+    assert!(matches!(
+        error,
+        WorkflowError::PrevalidatedDeleteStale { field, .. } if field == "delete_approval"
+    ));
+    manifest.upsert(approval_original);
 
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     proof_mut(&mut record, "adjusted_source")["downloadedSha256"] = json!("f".repeat(64));
@@ -762,6 +831,18 @@ fn legacy_conversion_proof_deserializes_as_embedded_preview() {
         proof.source_binding,
         ConversionSourceBinding::EmbeddedPreview
     );
+}
+
+#[test]
+fn embedded_preview_delete_approval_remains_legacy_compatible_without_adjusted_fields() {
+    let (_tempdir, manifest, _) = real_delete_approved_manifest();
+    let approval = &manifest.get("asset-1").expect("asset should exist").proofs["delete_approval"];
+
+    assert_eq!(approval["operator"], "operator");
+    assert!(approval.get("adjusted_source_proof_key").is_none());
+    assert!(approval.get("adjusted_source_proof_digest").is_none());
+    build_delete_plan(&manifest, "asset-1")
+        .expect("legacy embedded-preview approval should remain delete-plan compatible");
 }
 
 #[test]
@@ -791,6 +872,49 @@ fn embedded_preview_workflow_rejects_an_unproven_adjusted_conversion_claim() {
     assert!(matches!(
         error,
         WorkflowError::ConversionSourceBindingMismatch { .. }
+    ));
+    assert_eq!(manifest, before);
+}
+
+#[test]
+fn adjusted_source_proof_rejects_discovered_or_unknown_assets_without_mutation() {
+    let mut manifest = Manifest::new();
+    discover_raw_asset(&mut manifest, "asset-1", "/nas/photos/IMG_0001.dng")
+        .expect("asset should be discovered");
+    let proof = adjusted_source_proof(
+        "asset-1",
+        &original_asset_proof(),
+        PathBuf::from("/staging/IMG_0001.adjusted-source.jpg"),
+        &nonblank_adjusted_jpeg(),
+    );
+    let before = manifest.clone();
+
+    let error = record_adjusted_source_proof(
+        &mut manifest,
+        "asset-1",
+        "/staging/IMG_0001.heic",
+        proof.clone(),
+    )
+    .expect_err("discovered asset must not accept adjusted proof");
+    assert!(matches!(
+        error,
+        WorkflowError::AdjustedSourceUnavailable {
+            state: State::Discovered,
+            ..
+        }
+    ));
+    assert_eq!(manifest, before);
+
+    let error = record_adjusted_source_proof(
+        &mut manifest,
+        "unknown-asset",
+        "/staging/IMG_0001.heic",
+        proof,
+    )
+    .expect_err("unknown asset must not accept adjusted proof");
+    assert!(matches!(
+        error,
+        WorkflowError::Manifest(ManifestError::UnknownAsset { .. })
     ));
     assert_eq!(manifest, before);
 }
