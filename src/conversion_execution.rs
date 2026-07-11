@@ -1075,6 +1075,9 @@ fn run_planned_adjusted_source_command(
     #[cfg(test)]
     test_wait_for_unrelated_child(unrelated_child)?;
     let outcome = outcome?;
+    source.revalidate_for_command().map_err(|error| {
+        ConversionExecutionError::Workflow(WorkflowError::AdjustedSource(error))
+    })?;
     if !outcome.status.success() {
         return Err(ConversionExecutionError::CommandFailed {
             stage,
@@ -2306,7 +2309,7 @@ exit 67
         );
         let _descriptor_leak_guard = TestAdjustedDescriptorLeakCheckGuard::install();
 
-        let updated = execute_measured_conversion_for_target(
+        let result = execute_measured_conversion_for_target(
             &manifest,
             ConversionExecutionRequest {
                 asset_id: "asset-1".to_string(),
@@ -2315,8 +2318,7 @@ exit 67
                 conversion_tool_version: None,
             },
             TargetPlatform::new("linux", "x86_64"),
-        )
-        .expect("adjusted conversion should complete without an embedded preview");
+        );
         _descriptor_leak_guard.assert_parent_descriptor_was_closed();
 
         let command_log = fs::read_to_string(&log_path).expect("command log should be readable");
@@ -2342,12 +2344,27 @@ exit 67
             fs::read(&adjusted_path).expect("source should survive"),
             replacement_bytes
         );
-        assert_eq!(
-            fs::read(&output_path).expect("encoder output should be readable"),
-            adjusted_bytes,
-            "a source swap after materialization must not change encoder input"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            assert!(matches!(
+                result,
+                Err(ConversionExecutionError::Workflow(
+                    WorkflowError::AdjustedSource(
+                        crate::adjusted_source::AdjustedSourceError::InvalidTemporaryFile
+                            | crate::adjusted_source::AdjustedSourceError::ProofLocalFileMismatch
+                    )
+                ))
+            ));
+            assert!(
+                !output_path.exists(),
+                "post-child source identity failure must remove the generated HEIC"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        let updated =
+            result.expect("adjusted conversion should complete without an embedded preview");
         assert!(!staged_raw_path_for_output(&output_path, &raw_path).exists());
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(
             serde_json::from_value::<ConversionSourceBinding>(
                 updated.get("asset-1").expect("asset should exist").proofs["conversion"]
@@ -4025,11 +4042,11 @@ exit 67
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_real_sips_accepts_a_sealed_file_descriptor_jpeg_when_available() {
+    fn macos_real_sips_accepts_a_sealed_lexical_jpeg_when_available() {
         use std::os::unix::fs::symlink;
 
         let Some(sips) = executable_on_path("sips") else {
-            eprintln!("skipping real sips descriptor smoke: sips is unavailable");
+            eprintln!("skipping real sips sealed lexical-source smoke: sips is unavailable");
             return;
         };
         let tool_dir = tempfile::tempdir().expect("tool tempdir should be created");
@@ -4093,7 +4110,7 @@ exit 67
             },
             TargetPlatform::new("macos", "aarch64"),
         )
-        .expect("real sips should encode the sealed /dev/fd file input");
+        .expect("real sips should encode the sealed lexical source");
 
         let dimensions = Command::new(sips)
             .args(["-g", "pixelWidth", "-g", "pixelHeight"])
@@ -4101,11 +4118,25 @@ exit 67
             .output()
             .expect("sips should inspect its output");
         assert!(dimensions.status.success());
-        let dimensions = String::from_utf8_lossy(&dimensions.stdout);
-        assert!(
-            dimensions.contains("64"),
-            "sips output must retain 64px dimensions"
+        let dimensions = parse_sips_dimensions(&dimensions.stdout)
+            .expect("sips output must report structural pixel dimensions");
+        assert_eq!(
+            dimensions,
+            (64, 64),
+            "sips output must retain dimensions exactly"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn parse_sips_dimensions(output: &[u8]) -> Option<(u32, u32)> {
+        let output = std::str::from_utf8(output).ok()?;
+        let property = |name| {
+            output.lines().find_map(|line| {
+                let (reported, value) = line.trim().split_once(':')?;
+                (reported == name).then(|| value.trim().parse::<u32>().ok())?
+            })
+        };
+        Some((property("pixelWidth")?, property("pixelHeight")?))
     }
 
     #[cfg(unix)]

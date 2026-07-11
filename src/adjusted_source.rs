@@ -4,6 +4,8 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(all(test, target_os = "macos"))]
+use std::collections::VecDeque;
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
 
@@ -353,6 +355,78 @@ pub(crate) struct TestMaterializationSwapGuard {
     _lock: MutexGuard<'static, ()>,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacosFchflagsTarget {
+    Source,
+    StagingDirectory,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[derive(Default)]
+struct TestMacosFchflagsState {
+    failures: VecDeque<MacosFchflagsTarget>,
+    calls: Vec<MacosFchflagsTarget>,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+static TEST_MACOS_FCHFLAGS_STATE: Mutex<TestMacosFchflagsState> =
+    Mutex::new(TestMacosFchflagsState {
+        failures: VecDeque::new(),
+        calls: Vec::new(),
+    });
+#[cfg(all(test, target_os = "macos"))]
+static TEST_MACOS_FCHFLAGS_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(all(test, target_os = "macos"))]
+struct TestMacosFchflagsFailureGuard {
+    previous: TestMacosFchflagsState,
+    _lock: MutexGuard<'static, ()>,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl TestMacosFchflagsFailureGuard {
+    fn install() -> Self {
+        let lock = TEST_MACOS_FCHFLAGS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = TEST_MACOS_FCHFLAGS_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::mem::take(&mut *state);
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+
+    fn arm(&self, failures: impl IntoIterator<Item = MacosFchflagsTarget>) {
+        let mut state = TEST_MACOS_FCHFLAGS_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.failures = failures.into_iter().collect();
+        state.calls.clear();
+    }
+
+    fn calls(&self) -> Vec<MacosFchflagsTarget> {
+        TEST_MACOS_FCHFLAGS_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .calls
+            .clone()
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for TestMacosFchflagsFailureGuard {
+    fn drop(&mut self) {
+        let mut state = TEST_MACOS_FCHFLAGS_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = std::mem::take(&mut self.previous);
+    }
+}
+
 #[cfg(test)]
 impl TestMaterializationSwapGuard {
     pub(crate) fn install(replacement_path: impl AsRef<Path>) -> Self {
@@ -652,7 +726,9 @@ struct ConversionSourceStaging {
     #[cfg(target_os = "macos")]
     staging_flags: u32,
     #[cfg(target_os = "macos")]
-    immutable: bool,
+    source_immutable: bool,
+    #[cfg(target_os = "macos")]
+    directory_immutable: bool,
 }
 
 #[cfg(unix)]
@@ -902,7 +978,8 @@ impl ConversionSourceStaging {
                         active: true,
                         private_tmp_identity,
                         staging_flags,
-                        immutable: false,
+                        source_immutable: false,
+                        directory_immutable: false,
                     });
                 }
                 Err(_) => {
@@ -1045,7 +1122,7 @@ impl ConversionSourceStaging {
         let sealed = self.has_sealed_source_identity(artifact);
         #[cfg(target_os = "macos")]
         {
-            sealed && self.immutable && artifact.identity.flags & libc::UF_IMMUTABLE != 0
+            sealed && self.source_immutable && artifact.identity.flags & libc::UF_IMMUTABLE != 0
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1089,7 +1166,10 @@ impl ConversionSourceStaging {
         {
             return Err(AdjustedSourceError::InvalidTemporaryFile);
         }
-        if self.immutable && macos_file_flags(&self.staging)? != self.staging_flags {
+        let staging_flags = macos_file_flags(&self.staging)?;
+        if staging_flags != self.staging_flags
+            || self.directory_immutable != (staging_flags & libc::UF_IMMUTABLE != 0)
+        {
             return Err(AdjustedSourceError::InvalidTemporaryFile);
         }
         Ok(())
@@ -1099,6 +1179,10 @@ impl ConversionSourceStaging {
     fn seal_macos_immutable(&mut self) -> Result<(), AdjustedSourceError> {
         use std::os::fd::AsRawFd;
 
+        // Same-EUID hostile processes are out of scope: they own workflow state and CloudKit credentials.
+        if self.source_immutable || self.directory_immutable {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
         let source =
             inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
         if !self.has_sealed_source_identity(&source) {
@@ -1109,21 +1193,22 @@ impl ConversionSourceStaging {
         if source_flags & libc::UF_IMMUTABLE != 0 || staging_flags & libc::UF_IMMUTABLE != 0 {
             return Err(AdjustedSourceError::InvalidTemporaryFile);
         }
-        if unsafe { libc::fchflags(source.file.as_raw_fd(), source_flags | libc::UF_IMMUTABLE) }
-            != 0
-        {
-            return Err(AdjustedSourceError::Filesystem);
-        }
+        set_macos_file_flags(
+            &source.file,
+            source_flags | libc::UF_IMMUTABLE,
+            MacosFchflagsTarget::Source,
+        )?;
+        self.source_immutable = true;
         if macos_file_flags(&source.file)? != source_flags | libc::UF_IMMUTABLE {
             return Err(AdjustedSourceError::InvalidTemporaryFile);
         }
-        if unsafe { libc::fchflags(self.staging.as_raw_fd(), staging_flags | libc::UF_IMMUTABLE) }
-            != 0
-        {
-            return Err(AdjustedSourceError::Filesystem);
-        }
+        set_macos_file_flags(
+            &self.staging,
+            staging_flags | libc::UF_IMMUTABLE,
+            MacosFchflagsTarget::StagingDirectory,
+        )?;
         self.staging_flags = staging_flags | libc::UF_IMMUTABLE;
-        self.immutable = true;
+        self.directory_immutable = true;
         self.staging
             .sync_all()
             .map_err(|_| AdjustedSourceError::Filesystem)?;
@@ -1137,40 +1222,82 @@ impl ConversionSourceStaging {
     fn unseal_macos_immutable(&mut self) -> Result<(), AdjustedSourceError> {
         use std::os::fd::AsRawFd;
 
-        if !self.immutable {
+        if !self.source_immutable && !self.directory_immutable {
             return Ok(());
         }
         let source =
             inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
         let source_flags = macos_file_flags(&source.file)?;
-        if source_flags & libc::UF_IMMUTABLE == 0
-            || unsafe {
-                libc::fchflags(source.file.as_raw_fd(), source_flags & !libc::UF_IMMUTABLE)
-            } != 0
-        {
-            return Err(AdjustedSourceError::Filesystem);
+        if !self.source_immutable || source_flags & libc::UF_IMMUTABLE == 0 {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
         }
-        if macos_file_flags(&source.file)? & libc::UF_IMMUTABLE != 0
-            || unsafe {
-                libc::fchflags(
-                    self.staging.as_raw_fd(),
-                    self.staging_flags & !libc::UF_IMMUTABLE,
-                )
-            } != 0
-        {
-            return Err(AdjustedSourceError::Filesystem);
+        if self.directory_immutable {
+            if set_macos_file_flags(
+                &self.staging,
+                self.staging_flags & !libc::UF_IMMUTABLE,
+                MacosFchflagsTarget::StagingDirectory,
+            )
+            .is_err()
+                || macos_file_flags(&self.staging)? & libc::UF_IMMUTABLE != 0
+            {
+                return Err(AdjustedSourceError::Filesystem);
+            }
+            self.staging_flags &= !libc::UF_IMMUTABLE;
+            self.directory_immutable = false;
         }
-        if macos_file_flags(&self.staging)? & libc::UF_IMMUTABLE != 0 {
-            return Err(AdjustedSourceError::Filesystem);
+        let source_clear_failed = set_macos_file_flags(
+            &source.file,
+            source_flags & !libc::UF_IMMUTABLE,
+            MacosFchflagsTarget::Source,
+        )
+        .is_err();
+        let source_remains_immutable = match macos_file_flags(&source.file) {
+            Ok(flags) => flags & libc::UF_IMMUTABLE != 0,
+            Err(_) => true,
+        };
+        if source_clear_failed || source_remains_immutable {
+            return self.rollback_macos_source_unseal_failure(&source.file, source_flags);
         }
-        self.staging_flags &= !libc::UF_IMMUTABLE;
-        self.immutable = false;
+        self.source_immutable = false;
         self.staging
             .sync_all()
             .map_err(|_| AdjustedSourceError::Filesystem)?;
         self.parent
             .sync_all()
             .map_err(|_| AdjustedSourceError::Filesystem)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn rollback_macos_source_unseal_failure(
+        &mut self,
+        source: &File,
+        source_flags: u32,
+    ) -> Result<(), AdjustedSourceError> {
+        let source_restored = macos_file_flags(source)
+            .is_ok_and(|flags| flags & libc::UF_IMMUTABLE != 0)
+            || (set_macos_file_flags(
+                source,
+                source_flags | libc::UF_IMMUTABLE,
+                MacosFchflagsTarget::Source,
+            )
+            .is_ok()
+                && macos_file_flags(source).is_ok_and(|flags| flags & libc::UF_IMMUTABLE != 0));
+        let directory_restored = macos_file_flags(&self.staging)
+            .is_ok_and(|flags| flags & libc::UF_IMMUTABLE != 0)
+            || (set_macos_file_flags(
+                &self.staging,
+                self.staging_flags | libc::UF_IMMUTABLE,
+                MacosFchflagsTarget::StagingDirectory,
+            )
+            .is_ok()
+                && macos_file_flags(&self.staging)
+                    .is_ok_and(|flags| flags & libc::UF_IMMUTABLE != 0));
+        self.source_immutable = source_restored;
+        self.directory_immutable = directory_restored;
+        if let Ok(flags) = macos_file_flags(&self.staging) {
+            self.staging_flags = flags;
+        }
+        Err(AdjustedSourceError::Filesystem)
     }
 
     fn cleanup(&mut self) -> Result<(), AdjustedSourceError> {
@@ -1716,6 +1843,33 @@ fn macos_file_flags(file: &File) -> Result<u32, AdjustedSourceError> {
         .map_err(|_| AdjustedSourceError::Filesystem)
 }
 
+#[cfg(target_os = "macos")]
+fn set_macos_file_flags(
+    file: &File,
+    flags: u32,
+    target: MacosFchflagsTarget,
+) -> Result<(), AdjustedSourceError> {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(not(test))]
+    let _ = target;
+    #[cfg(test)]
+    {
+        let mut state = TEST_MACOS_FCHFLAGS_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.calls.push(target);
+        if state.failures.front().copied() == Some(target) {
+            state.failures.pop_front();
+            return Err(AdjustedSourceError::Filesystem);
+        }
+    }
+    if unsafe { libc::fchflags(file.as_raw_fd(), flags) } != 0 {
+        return Err(AdjustedSourceError::Filesystem);
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn open_temp_at(dirfd: libc::c_int, name: &CStr) -> io::Result<File> {
     use std::os::fd::FromRawFd;
@@ -2186,6 +2340,165 @@ fn test_swap_original_after_materialization(source_path: &Path) -> Result<(), Ad
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(target_os = "macos")]
+    fn sealed_macos_staging_for_unseal_test() -> ConversionSourceStaging {
+        let source_directory = tempfile::tempdir().expect("source test directory");
+        let source_path = source_directory.path().join("source.jpg");
+        std::fs::write(&source_path, b"sealed adjusted test bytes")
+            .expect("source bytes should be written");
+        let source = inspect_open_file(File::open(&source_path).expect("source should open"))
+            .expect("source identity should inspect");
+        let output_directory = tempfile::tempdir().expect("output test directory");
+        let output_path = output_directory
+            .path()
+            .canonicalize()
+            .expect("output test directory should canonicalize")
+            .join("output.heic");
+        let expected_path = adjusted_source_path_for_output(&output_path);
+        let output = AnchoredOutput::open(&expected_path).expect("output should anchor");
+        let mut staging = ConversionSourceStaging::create(&output, &expected_path)
+            .expect("staging should create");
+        staging
+            .copy_from_descriptor(&source.file, &source.identity)
+            .expect("source should copy");
+        staging.seal().expect("staging should seal");
+        staging
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_staging_source_flags(staging: &ConversionSourceStaging) -> u32 {
+        use std::os::fd::AsRawFd;
+
+        let source = inspect_open_file(
+            open_regular_at(staging.staging.as_raw_fd(), &staging.file_name)
+                .expect("sealed source should open"),
+        )
+        .expect("sealed source should inspect");
+        macos_file_flags(&source.file).expect("sealed source flags should inspect")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_macos_unseal_failure_residual(
+        staging: &ConversionSourceStaging,
+        directory_is_immutable: bool,
+    ) {
+        assert_ne!(
+            macos_staging_source_flags(staging) & libc::UF_IMMUTABLE,
+            0,
+            "a failed unseal must leave immutable source bytes"
+        );
+        assert_eq!(
+            macos_file_flags(&staging.staging).expect("staging flags should inspect")
+                & libc::UF_IMMUTABLE
+                != 0,
+            directory_is_immutable,
+            "failed cleanup must leave an auditable staging directory state"
+        );
+        assert!(
+            staging.path.exists(),
+            "failed cleanup must retain the source"
+        );
+        assert!(
+            staging.path.parent().is_some_and(Path::exists),
+            "failed cleanup must retain the staging namespace"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unseal_directory_clear_failure_leaves_auditable_immutable_residual() {
+        let guard = TestMacosFchflagsFailureGuard::install();
+        let mut staging = sealed_macos_staging_for_unseal_test();
+        guard.arm([MacosFchflagsTarget::StagingDirectory]);
+
+        let cleanup = staging.cleanup();
+        assert!(
+            matches!(cleanup, Err(AdjustedSourceError::Filesystem)),
+            "unexpected cleanup result {cleanup:?}; calls: {:?}; source_immutable={}; directory_immutable={}",
+            guard.calls(),
+            staging.source_immutable,
+            staging.directory_immutable
+        );
+        assert_eq!(guard.calls(), vec![MacosFchflagsTarget::StagingDirectory]);
+        assert_macos_unseal_failure_residual(&staging, true);
+
+        drop(guard);
+        let retry = staging.cleanup();
+        assert!(
+            retry.is_ok(),
+            "retry result {retry:?}; source_flags={:x}; staging_flags={:x}; source_immutable={}; directory_immutable={}",
+            macos_staging_source_flags(&staging),
+            macos_file_flags(&staging.staging).expect("staging flags should inspect"),
+            staging.source_immutable,
+            staging.directory_immutable
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unseal_source_clear_failure_rolls_back_the_directory() {
+        let guard = TestMacosFchflagsFailureGuard::install();
+        let mut staging = sealed_macos_staging_for_unseal_test();
+        guard.arm([MacosFchflagsTarget::Source]);
+
+        let cleanup = staging.cleanup();
+        assert!(
+            matches!(cleanup, Err(AdjustedSourceError::Filesystem)),
+            "unexpected cleanup result {cleanup:?}; calls: {:?}; source_immutable={}; directory_immutable={}",
+            guard.calls(),
+            staging.source_immutable,
+            staging.directory_immutable
+        );
+        assert_eq!(
+            guard.calls(),
+            vec![
+                MacosFchflagsTarget::StagingDirectory,
+                MacosFchflagsTarget::Source,
+                MacosFchflagsTarget::StagingDirectory,
+            ]
+        );
+        assert_macos_unseal_failure_residual(&staging, true);
+
+        drop(guard);
+        staging
+            .cleanup()
+            .expect("retry should clean the rolled-back residual");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unseal_rollback_failure_keeps_immutable_source_and_residual() {
+        let guard = TestMacosFchflagsFailureGuard::install();
+        let mut staging = sealed_macos_staging_for_unseal_test();
+        guard.arm([
+            MacosFchflagsTarget::Source,
+            MacosFchflagsTarget::StagingDirectory,
+        ]);
+
+        let cleanup = staging.cleanup();
+        assert!(
+            matches!(cleanup, Err(AdjustedSourceError::Filesystem)),
+            "unexpected cleanup result {cleanup:?}; calls: {:?}; source_immutable={}; directory_immutable={}",
+            guard.calls(),
+            staging.source_immutable,
+            staging.directory_immutable
+        );
+        assert_eq!(
+            guard.calls(),
+            vec![
+                MacosFchflagsTarget::StagingDirectory,
+                MacosFchflagsTarget::Source,
+                MacosFchflagsTarget::StagingDirectory,
+            ]
+        );
+        assert_macos_unseal_failure_residual(&staging, false);
+
+        drop(guard);
+        staging
+            .cleanup()
+            .expect("retry should clean the retained residual");
+    }
 
     #[cfg(unix)]
     #[test]
