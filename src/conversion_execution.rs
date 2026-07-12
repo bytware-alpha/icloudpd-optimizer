@@ -1990,6 +1990,7 @@ impl ConversionExecutionError {
             Self::OutputUnreadable { .. } => Some(FailureKind::ConversionOutputUnreadable),
             Self::OutputAlreadyExists { .. } => Some(FailureKind::ConversionOutputAlreadyExists),
             Self::StagedRawAlreadyExists { .. } => Some(FailureKind::StagedRawAlreadyExists),
+            Self::ToolNotFound { .. } => Some(FailureKind::ConversionToolUnavailable),
             Self::CommandFailed {
                 stage: "metadata",
                 program,
@@ -2070,6 +2071,12 @@ mod tests {
                     status: "exit status: 1".to_string(),
                 },
                 FailureKind::ConversionMetadataFailed,
+            ),
+            (
+                ConversionExecutionError::ToolNotFound {
+                    program: "exiftool".to_string(),
+                },
+                FailureKind::ConversionToolUnavailable,
             ),
             (
                 ConversionExecutionError::EmbeddedPreviewUnavailable {

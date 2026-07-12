@@ -7326,6 +7326,11 @@ fn failed_retry_policy(kind: FailureKind) -> Option<FailedRetryPolicy> {
             retry_state: State::NasVerified,
             max_attempts: 1,
         }),
+        FailureKind::ConversionToolUnavailable => Some(FailedRetryPolicy {
+            bucket: "retryable_conversion_tool_unavailable",
+            retry_state: State::NasVerified,
+            max_attempts: 3,
+        }),
         FailureKind::ConversionTimedOut => Some(FailedRetryPolicy {
             bucket: "retryable_conversion_timed_out",
             retry_state: State::NasVerified,
@@ -8469,8 +8474,19 @@ fn legacy_failure_kind(record: &AssetRecord, failure: &FailureRecord) -> Option<
         ("conversion", "metadata command failed: exiftool exited with exit status: 1") => {
             Some(FailureKind::ConversionMetadataFailed)
         }
+        ("conversion", message) if legacy_tool_not_found_message(message) => {
+            Some(FailureKind::ConversionToolUnavailable)
+        }
         _ => legacy_path_bearing_failure_kind(record, failure),
     }
+}
+
+fn legacy_tool_not_found_message(message: &str) -> bool {
+    const PREFIX: &str = "conversion tool not found on sanitized PATH: ";
+    matches!(
+        message.strip_prefix(PREFIX),
+        Some("sips" | "heif-enc" | "heif-info" | "magick" | "exiftool" | "cp")
+    )
 }
 
 fn legacy_path_bearing_failure_kind(
@@ -17280,6 +17296,35 @@ esac
     }
 
     #[test]
+    fn tool_unavailable_category_resets_attempt_only_after_an_exact_proven_append() {
+        let policy = failed_retry_policy(FailureKind::ConversionToolUnavailable)
+            .expect("tool-unavailable failures should be retryable");
+        assert_eq!(policy.retry_state, State::NasVerified);
+        assert_eq!(policy.max_attempts, 3);
+
+        let mut manifest = admitted_timeout_manifest("tool-unavailable-transition");
+        policy_failed_again_at(
+            &mut manifest,
+            "tool-unavailable-transition",
+            "conversion",
+            "conversion tool not found on sanitized PATH: exiftool",
+            FailureKind::ConversionToolUnavailable,
+            "101.000000000Z",
+        );
+
+        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("proven category transition should admit");
+        assert_eq!(
+            admission.admitted_by_category["retryable_conversion_tool_unavailable"],
+            1
+        );
+        let proof =
+            &manifest.get("tool-unavailable-transition").unwrap().proofs[FAILURE_RETRY_PROOF];
+        assert_eq!(proof["attempt"], json!(1));
+        assert_eq!(proof["category"], json!("conversion_tool_unavailable"));
+    }
+
+    #[test]
     fn retry_blocking_proofs_and_missing_preview_never_admit() {
         let mut manifest = Manifest::new();
         for proof_key in RETRY_BLOCKING_PROOFS {
@@ -18392,6 +18437,52 @@ esac
                 "conversion",
                 "converted output is missing or unreadable at /output/asset.oriented-preview.jpg",
             ),
+        ] {
+            let record = policy_failed_record("asset", stage, message, None, "100.000000000Z");
+            assert_eq!(last_failure_kind(&record), None);
+        }
+    }
+
+    #[test]
+    fn legacy_tool_not_found_classification_is_exact_and_limited_to_required_tools() {
+        let exact = policy_failed_record(
+            "asset",
+            "conversion",
+            "conversion tool not found on sanitized PATH: exiftool",
+            None,
+            "100.000000000Z",
+        );
+        assert_eq!(
+            last_failure_kind(&exact),
+            Some(FailureKind::ConversionToolUnavailable)
+        );
+        let mut manifest = Manifest::new();
+        manifest.upsert(exact);
+        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("legacy exact tool-not-found failure should admit after backoff");
+        assert_eq!(
+            admission.admitted_by_category["retryable_conversion_tool_unavailable"],
+            1
+        );
+        assert_eq!(manifest.get("asset").unwrap().state, State::NasVerified);
+        for (stage, message) in [
+            (
+                "upload",
+                "conversion tool not found on sanitized PATH: exiftool",
+            ),
+            (
+                "conversion",
+                "conversion tool not found on sanitized PATH: unknown-tool",
+            ),
+            (
+                "conversion",
+                "conversion tool not found on sanitized PATH: /opt/homebrew/bin/exiftool",
+            ),
+            (
+                "conversion",
+                "conversion tool not found on sanitized PATH: exiftool ",
+            ),
+            ("conversion", "command not found: exiftool"),
         ] {
             let record = policy_failed_record("asset", stage, message, None, "100.000000000Z");
             assert_eq!(last_failure_kind(&record), None);

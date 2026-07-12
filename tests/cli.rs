@@ -4545,6 +4545,19 @@ fn macos_app_packaging_surface_is_documented() {
     assert!(app_source.contains("Live Log"));
     assert!(app_source.contains("Library/Logs/iCloudPD Optimizer/app.log"));
     assert!(app_source.contains("AppLogger.log"));
+    assert!(app_source.contains("let bundledHelperPath = \"/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin\""));
+    assert!(app_source.contains("func configureBundledHelperEnvironment(_ process: Process)"));
+    assert!(app_source.contains("process.environment = environment"));
+    assert!(app_source.contains("bundled_helper_environment_configured"));
+    assert_eq!(
+        app_source
+            .matches("configureBundledHelperEnvironment(process)")
+            .count(),
+        3,
+        "every bundled helper Process launch should receive the deterministic environment"
+    );
+    assert!(app_source.contains("bundledHelper: true"));
+    assert!(!app_source.contains("ProcessInfo.processInfo.environment[\"PATH\"]"));
     assert!(app_source.contains("private func startServiceHelper(args: [String])"));
     assert!(app_source.contains("serviceProcess?.isRunning != true"));
     assert!(app_source.contains("isMonitorRunArgs(args)"));

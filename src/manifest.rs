@@ -86,6 +86,7 @@ pub enum FailureKind {
     ConversionOutputAlreadyExists,
     StagedRawAlreadyExists,
     ConversionMetadataFailed,
+    ConversionToolUnavailable,
     EmbeddedPreviewUnavailable,
     AdjustedSourceResolveFailed,
 }
@@ -101,6 +102,7 @@ impl FailureKind {
             Self::ConversionOutputAlreadyExists => "conversion_output_already_exists",
             Self::StagedRawAlreadyExists => "staged_raw_already_exists",
             Self::ConversionMetadataFailed => "conversion_metadata_failed",
+            Self::ConversionToolUnavailable => "conversion_tool_unavailable",
             Self::EmbeddedPreviewUnavailable => "embedded_preview_unavailable",
             Self::AdjustedSourceResolveFailed => "adjusted_source_resolve_failed",
         }
@@ -601,6 +603,18 @@ mod tests {
         assert_eq!(
             adjusted_record.kind.unwrap().as_str(),
             "adjusted_source_resolve_failed"
+        );
+
+        let tool_unavailable = r#"{"stage":"conversion","message":"conversion tool not found on sanitized PATH: exiftool","recorded_at":"103.000000000Z","kind":"conversion_tool_unavailable"}"#;
+        let tool_unavailable_record: FailureRecord = serde_json::from_str(tool_unavailable)
+            .expect("tool-unavailable failure should deserialize");
+        assert_eq!(
+            tool_unavailable_record.kind,
+            Some(FailureKind::ConversionToolUnavailable)
+        );
+        assert_eq!(
+            tool_unavailable_record.kind.unwrap().as_str(),
+            "conversion_tool_unavailable"
         );
 
         let legacy_manifest = r#"{

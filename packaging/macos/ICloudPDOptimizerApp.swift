@@ -573,6 +573,15 @@ struct ProcessResult {
     let stderr: String
 }
 
+let bundledHelperPath = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+func configureBundledHelperEnvironment(_ process: Process) {
+    var environment = ProcessInfo.processInfo.environment
+    environment["PATH"] = bundledHelperPath
+    process.environment = environment
+    AppLogger.log("bundled_helper_environment_configured", fields: ["path": bundledHelperPath])
+}
+
 private final class ProcessOutputReader: @unchecked Sendable {
     private let handle: FileHandle
     private let queue: DispatchQueue
@@ -596,10 +605,17 @@ private final class ProcessOutputReader: @unchecked Sendable {
     }
 }
 
-func runCapturedProcess(executableURL: URL, arguments: [String]) throws -> ProcessResult {
+func runCapturedProcess(
+    executableURL: URL,
+    arguments: [String],
+    bundledHelper: Bool = false
+) throws -> ProcessResult {
     let process = Process()
     process.executableURL = executableURL
     process.arguments = arguments
+    if bundledHelper {
+        configureBundledHelperEnvironment(process)
+    }
     let stdout = Pipe()
     let stderr = Pipe()
     process.standardOutput = stdout
@@ -740,6 +756,7 @@ func runBundledHelperAndExit(args: [String]) -> Never {
     let process = Process()
     process.executableURL = helper
     process.arguments = args
+    configureBundledHelperEnvironment(process)
     process.standardInput = FileHandle.standardInput
     process.standardOutput = FileHandle.standardOutput
     process.standardError = FileHandle.standardError
@@ -1675,7 +1692,11 @@ final class DashboardViewModel: ObservableObject {
         guard let helper = Bundle.main.resourceURL?.appendingPathComponent("icloudpd-optimizer") else {
             throw PrimeError("missing bundled icloudpd-optimizer helper")
         }
-        return try runCapturedProcess(executableURL: helper, arguments: arguments)
+        return try runCapturedProcess(
+            executableURL: helper,
+            arguments: arguments,
+            bundledHelper: true
+        )
     }
 }
 
@@ -3002,6 +3023,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let process = Process()
         process.executableURL = helper
         process.arguments = args
+        configureBundledHelperEnvironment(process)
         process.standardInput = FileHandle.standardInput
         process.standardOutput = FileHandle.standardOutput
         process.standardError = FileHandle.standardError
