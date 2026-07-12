@@ -341,6 +341,7 @@ fn execute_measured_conversion_for_target(
             ConversionPerformanceInput {
                 measured_at_unix_seconds: current_unix_seconds(),
                 conversion_tool: conversion_tool_name(&plan),
+                conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
                 conversion_tool_version: request.conversion_tool_version,
                 heic_quality: request.heic_quality,
                 convert_wall_time_millis,

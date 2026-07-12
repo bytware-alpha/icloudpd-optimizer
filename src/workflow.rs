@@ -88,6 +88,7 @@ pub enum ConversionSourceBinding {
 pub struct ConversionPerformanceInput {
     pub measured_at_unix_seconds: u64,
     pub conversion_tool: String,
+    pub conversion_recipe_id: String,
     pub conversion_tool_version: Option<String>,
     pub heic_quality: u8,
     pub convert_wall_time_millis: u64,
@@ -462,7 +463,6 @@ pub fn record_conversion_result<'a>(
 ) -> Result<&'a AssetRecord, WorkflowError> {
     require_non_empty_path("heic_path", &proof.heic_path)?;
     require_non_empty("heic_sha256", &proof.heic_sha256)?;
-    require_current_conversion_recipe(CONVERSION_PROOF, &proof.conversion_recipe_id)?;
     validate_conversion_source_binding(manifest, asset_id, &proof)?;
     transition_with_proof(
         manifest,
@@ -493,7 +493,7 @@ pub fn record_conversion_performance<'a>(
         measured_at_unix_seconds: input.measured_at_unix_seconds,
         measurement_method: CONVERSION_PERFORMANCE_MEASUREMENT_METHOD.to_string(),
         conversion_tool: input.conversion_tool,
-        conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
+        conversion_recipe_id: input.conversion_recipe_id,
         conversion_tool_version: input.conversion_tool_version,
         heic_quality: input.heic_quality,
         raw_size_bytes: nas.size_bytes,
@@ -516,7 +516,7 @@ pub fn record_heic_verification<'a>(
 ) -> Result<&'a AssetRecord, WorkflowError> {
     require_non_empty_path("heic_path", &proof.heic_path)?;
     require_non_empty("heic_sha256", &proof.heic_sha256)?;
-    let (_, conversion) = require_valid_conversion_performance(manifest, asset_id)?;
+    let (_, conversion) = load_conversion_context(manifest, asset_id)?;
     require_matching_path(
         CONVERSION_PROOF,
         "heic_path",
@@ -535,7 +535,7 @@ pub fn record_heic_verification<'a>(
         conversion.size_bytes,
         proof.size_bytes,
     )?;
-    validate_heic_verification_flags(&proof)?;
+    validate_heic_verification_flags_legacy(&proof)?;
     transition_with_proof(
         manifest,
         asset_id,
@@ -2110,7 +2110,6 @@ fn validate_conversion_performance_proof(
         &proof.measurement_method,
     )?;
     require_non_empty("conversion_tool", &proof.conversion_tool)?;
-    require_current_conversion_recipe(CONVERSION_PERFORMANCE_PROOF, &proof.conversion_recipe_id)?;
     if proof.conversion_tool == UNSAFE_LEGACY_RAW_SENSOR_RENDER_TOOL {
         return Err(WorkflowError::InvalidProofField {
             proof_key: CONVERSION_PERFORMANCE_PROOF,
@@ -2526,6 +2525,10 @@ fn validate_stored_conversion_performance(
         manifest,
         asset_id,
         CONVERSION_PERFORMANCE_PROOF,
+    )?;
+    require_current_conversion_recipe(
+        CONVERSION_PERFORMANCE_PROOF,
+        &conversion_performance.conversion_recipe_id,
     )?;
     validate_conversion_performance_proof(&conversion_performance, nas, conversion)
 }

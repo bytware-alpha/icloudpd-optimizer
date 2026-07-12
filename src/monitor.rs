@@ -3541,6 +3541,7 @@ fn run_rolling_asset_verify(
     ) {
         Ok(verification) => {
             let visual_metrics = verification.visual_metrics;
+            let metadata_probe_wall_time_millis = verification.metadata_probe_wall_time_millis;
             let result = {
                 let mut manifest = lock_shared(manifest, "rolling lifecycle manifest")?;
                 let mut summary = lock_shared(summary, "rolling lifecycle summary")?;
@@ -3569,6 +3570,10 @@ fn run_rolling_asset_verify(
                         "mode": "rolling_asset_queue",
                     });
                     append_visual_verification_event_fields(&mut fields, visual_metrics);
+                    append_metadata_probe_event_fields(
+                        &mut fields,
+                        metadata_probe_wall_time_millis,
+                    );
                     log_monitor_event("heic_verify_finished", scan_started, fields);
                     Ok(RollingAssetStepOutcome::completed())
                 }
@@ -4244,6 +4249,8 @@ fn verify_converted_heics(
             match outcome.result {
                 Ok(verification) => {
                     let visual_metrics = verification.visual_metrics;
+                    let metadata_probe_wall_time_millis =
+                        verification.metadata_probe_wall_time_millis;
                     match record_heic_verification_or_failure(
                         manifest,
                         summary,
@@ -4258,6 +4265,10 @@ fn verify_converted_heics(
                                 "error": message,
                             });
                             append_visual_verification_event_fields(&mut fields, visual_metrics);
+                            append_metadata_probe_event_fields(
+                                &mut fields,
+                                metadata_probe_wall_time_millis,
+                            );
                             log_monitor_event(
                                 "heic_verify_finished",
                                 summary.started_unix_seconds,
@@ -4397,12 +4408,15 @@ fn record_heic_monitor_error_or_failure(
     asset_id: &str,
     error: &MonitorError,
 ) -> Result<(), MonitorError> {
-    let Some(kind) = monitor_failure_kind(error) else {
+    let Some(_kind) = monitor_failure_kind(error) else {
         return Ok(());
     };
     let message = error.to_string();
     record_monitor_failure(summary, error);
-    record_stage_failure_with_kind(manifest, asset_id, "heic_verify", &message, kind)
+    // Older manifests deserialize `FailureKind` strictly. Keep metadata failures untyped
+    // on disk just like the tool-unavailable compatibility path, then recover only these
+    // exact stage/message pairs in `legacy_failure_kind`.
+    record_stage_failure(manifest, asset_id, "heic_verify", &message)
         .map_err(MonitorError::Workflow)?;
     Ok(())
 }
@@ -8832,6 +8846,15 @@ fn legacy_failure_kind(record: &AssetRecord, failure: &FailureRecord) -> Option<
         ("heic_verify", "HEIC verification failed: visual_match_ok") => {
             Some(FailureKind::HeicVisualMatch)
         }
+        ("heic_verify", "HEIC metadata verification failed: ReferenceOrientationInvalid") => {
+            Some(FailureKind::HeicReferenceOrientationInvalid)
+        }
+        ("heic_verify", "HEIC metadata verification failed: FinalOrientationRotationInvalid") => {
+            Some(FailureKind::HeicFinalOrientationRotationInvalid)
+        }
+        ("heic_verify", "HEIC metadata verification failed: DimensionMismatch") => {
+            Some(FailureKind::HeicDimensionMismatch)
+        }
         ("conversion", "conversion command timed out after 120000 ms: heif-enc") => {
             Some(FailureKind::ConversionTimedOut)
         }
@@ -9357,6 +9380,7 @@ fn verify_converted_heic(
         timeout_seconds,
     )?;
     let oriented_preview = oriented_preview_path(&conversion.heic_path);
+    let metadata_probe_started = Instant::now();
     let reference_metadata = read_media_metadata(
         &oriented_preview,
         timeout_seconds,
@@ -9381,6 +9405,10 @@ fn verify_converted_heic(
             HeicMetadataFailure::DimensionMismatch,
         ));
     }
+    let metadata_probe_wall_time_millis =
+        u64::try_from(metadata_probe_started.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
     let metadata_copied = true;
     let visual_metrics =
         visual_metrics_for_conversion(&oriented_preview, &conversion.heic_path, timeout_seconds)?;
@@ -9407,6 +9435,7 @@ fn verify_converted_heic(
                 .map(|metrics| normalized_metric_ppm(metrics.mae)),
         },
         visual_metrics,
+        metadata_probe_wall_time_millis,
     })
 }
 
@@ -9701,10 +9730,20 @@ fn append_visual_verification_event_fields(fields: &mut serde_json::Value, metri
     );
 }
 
+fn append_metadata_probe_event_fields(fields: &mut serde_json::Value, wall_time_millis: u64) {
+    if let Some(fields) = fields.as_object_mut() {
+        fields.insert(
+            "metadata_probe_wall_time_millis".to_string(),
+            json!(wall_time_millis),
+        );
+    }
+}
+
 #[derive(Clone, Debug)]
 struct VerifiedHeic {
     proof: HeicVerificationProof,
     visual_metrics: VisualMetrics,
+    metadata_probe_wall_time_millis: u64,
 }
 
 fn visual_metrics_for_conversion(

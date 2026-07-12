@@ -5385,7 +5385,7 @@ fn workflow_nas_verified_rejects_min_age_below_floor_without_mutating_manifest()
 }
 
 #[test]
-fn workflow_conversion_result_performance_and_heic_verified_commands_complete_conversion_gate() {
+fn workflow_manual_conversion_proofs_are_untrusted_and_cannot_upload_or_delete() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let manifest_path = tempdir.path().join("manifest.json");
     manifest_with_nas_verified(&manifest_path);
@@ -5466,6 +5466,35 @@ fn workflow_conversion_result_performance_and_heic_verified_commands_complete_co
             > 0
     );
     assert_eq!(record.proofs["heic"]["heic_path"], "/staging/IMG_0001.heic");
+    for proof_key in ["conversion", "conversion_performance", "heic"] {
+        assert_eq!(record.proofs[proof_key]["conversion_recipe_id"], "");
+    }
+    binary()
+        .args([
+            "workflow",
+            "upload-heic",
+            "--manifest",
+            manifest_arg,
+            "--asset-id",
+            "asset-1",
+            "--session",
+            "/missing/session.json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("conversion recipe"));
+    binary()
+        .args([
+            "workflow",
+            "mark-delete-eligible",
+            "--manifest",
+            manifest_arg,
+            "--asset-id",
+            "asset-1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("conversion recipe"));
 }
 
 #[cfg(all(unix, target_os = "macos"))]
