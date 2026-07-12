@@ -27,6 +27,7 @@ fn heic_proof(path: PathBuf, bytes: &[u8]) -> HeicVerificationProof {
         heic_path: path,
         heic_sha256: sha256_hex(bytes),
         size_bytes: bytes.len() as u64,
+        conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
         heif_info_ok: true,
         metadata_copied: true,
         visual_content_ok: true,

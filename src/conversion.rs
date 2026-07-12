@@ -555,7 +555,13 @@ fn macos_orientation_commands(
                 vec![embedded_preview_arg, oriented_preview_arg.clone()],
             )
             .with_checked_output_file(oriented_preview_path.to_path_buf());
-            (vec![copy], oriented_preview_arg)
+            (
+                vec![
+                    copy,
+                    normalize_preview_orientation(oriented_preview_arg.clone()),
+                ],
+                oriented_preview_arg,
+            )
         }
         Some(orientation) if orientation.can_use_sips_orient() => {
             let degrees = orientation
@@ -572,7 +578,13 @@ fn macos_orientation_commands(
                 ],
             )
             .with_checked_output_file(oriented_preview_path.to_path_buf());
-            (vec![orient], oriented_preview_arg)
+            (
+                vec![
+                    orient,
+                    normalize_preview_orientation(oriented_preview_arg.clone()),
+                ],
+                oriented_preview_arg,
+            )
         }
         _ => {
             let copy_preview_orientation = CommandPlan::new(
@@ -595,11 +607,26 @@ fn macos_orientation_commands(
             )
             .with_stdout_file(oriented_preview_path.to_path_buf());
             (
-                vec![copy_preview_orientation, orient_preview_pixels],
+                vec![
+                    copy_preview_orientation,
+                    orient_preview_pixels,
+                    normalize_preview_orientation(oriented_preview_arg.clone()),
+                ],
                 oriented_preview_arg,
             )
         }
     }
+}
+
+fn normalize_preview_orientation(oriented_preview_arg: OsString) -> CommandPlan {
+    CommandPlan::new(
+        "exiftool",
+        vec![
+            OsString::from("-Orientation#=1"),
+            OsString::from("-overwrite_original"),
+            oriented_preview_arg,
+        ],
+    )
 }
 
 fn linux_conversion_plan(
@@ -654,6 +681,7 @@ fn linux_conversion_plan(
             extract_preview,
             copy_preview_orientation,
             orient_preview_pixels,
+            normalize_preview_orientation(oriented_preview_arg.clone()),
             encode,
         ],
         metadata: CommandPlan::new(

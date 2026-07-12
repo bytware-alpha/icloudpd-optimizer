@@ -51,12 +51,12 @@ use crate::upload::{
 #[cfg(test)]
 use crate::workflow::validate_current_icloudpd_local_mirror_proof;
 use crate::workflow::{
-    ConversionResultProof, DeleteReconciliation, HeicVerificationProof, IcloudpdLocalMirrorProof,
-    IcloudpdLocalMirrorProofDisposition, OriginalAssetProof, PrevalidatedDelete, SourceAgeProof,
-    UploadProof, WorkflowError, approve_delete, icloudpd_local_mirror_proof_disposition,
-    icloudpd_local_mirror_ready_proofs, mark_delete_eligible, prepare_delete_reconciliation,
-    prevalidate_approved_original_delete, prove_and_record_nas,
-    reconciliation_exact_state_is_consistent, record_adjusted_source_proof,
+    ConversionResultProof, DeleteReconciliation, EMBEDDED_PREVIEW_CONVERSION_RECIPE,
+    HeicVerificationProof, IcloudpdLocalMirrorProof, IcloudpdLocalMirrorProofDisposition,
+    OriginalAssetProof, PrevalidatedDelete, SourceAgeProof, UploadProof, WorkflowError,
+    approve_delete, icloudpd_local_mirror_proof_disposition, icloudpd_local_mirror_ready_proofs,
+    mark_delete_eligible, prepare_delete_reconciliation, prevalidate_approved_original_delete,
+    prove_and_record_nas, reconciliation_exact_state_is_consistent, record_adjusted_source_proof,
     record_heic_verification, record_icloudpd_local_mirror_proof,
     record_prevalidated_delete_execution, record_reconciled_delete_execution,
     record_source_age_proof, record_stage_failure, record_stage_failure_with_kind,
@@ -9267,14 +9267,25 @@ fn verify_converted_heic(
         &[conversion.heic_path.as_path()],
         timeout_seconds,
     )?;
-    let orientation = command_stdout(
-        "exiftool",
-        &["-s", "-s", "-s", "-n", "-Orientation"],
-        [conversion.heic_path.as_path()],
-        timeout_seconds,
-    )?;
-    let metadata_copied = orientation.trim() == "1";
     let oriented_preview = oriented_preview_path(&conversion.heic_path);
+    let reference_metadata = read_media_metadata(&oriented_preview, timeout_seconds)?;
+    if reference_metadata.orientation != 1 {
+        return Err(metadata_verification_error(
+            "oriented preview must have exactly one normal EXIF orientation",
+        ));
+    }
+    let final_metadata = read_media_metadata(&conversion.heic_path, timeout_seconds)?;
+    if final_metadata.orientation != 1 || final_metadata.quicktime_rotation != Some(0) {
+        return Err(metadata_verification_error(
+            "final HEIC must have exactly one normal EXIF orientation and QuickTime Rotation 0",
+        ));
+    }
+    if reference_metadata.dimensions != final_metadata.dimensions {
+        return Err(metadata_verification_error(
+            "oriented preview and final HEIC container dimensions differ",
+        ));
+    }
+    let metadata_copied = true;
     let visual_metrics =
         visual_metrics_for_conversion(&oriented_preview, &conversion.heic_path, timeout_seconds)?;
     let visual_match_ok = visual_metrics
@@ -9287,6 +9298,7 @@ fn verify_converted_heic(
             heic_path: conversion.heic_path,
             heic_sha256: conversion.heic_sha256,
             size_bytes: conversion.size_bytes,
+            conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
             heif_info_ok: true,
             metadata_copied,
             visual_content_ok,
@@ -9299,6 +9311,75 @@ fn verify_converted_heic(
                 .map(|metrics| normalized_metric_ppm(metrics.mae)),
         },
         visual_metrics,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MediaMetadata {
+    orientation: u64,
+    quicktime_rotation: Option<i64>,
+    dimensions: (u64, u64),
+}
+
+fn read_media_metadata(path: &Path, timeout_seconds: u64) -> Result<MediaMetadata, MonitorError> {
+    let output = command_stdout(
+        "exiftool",
+        &["-json", "-a", "-G1", "-s", "-n"],
+        [path],
+        timeout_seconds,
+    )?;
+    parse_media_metadata(&output).map_err(|message| metadata_verification_error(&message))
+}
+
+fn metadata_verification_error(message: &str) -> MonitorError {
+    MonitorError::CommandFailed {
+        program: "exiftool",
+        message: message.to_string(),
+    }
+}
+
+fn parse_media_metadata(output: &str) -> Result<MediaMetadata, String> {
+    let records: Vec<serde_json::Value> =
+        serde_json::from_str(output).map_err(|_| "metadata response was not JSON".to_string())?;
+    let fields = records
+        .first()
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "metadata response contained no record".to_string())?;
+    let orientations = fields
+        .iter()
+        .filter(|(key, _)| key.as_str() == "Orientation" || key.ends_with(":Orientation"))
+        .map(|(_, value)| {
+            value
+                .as_u64()
+                .ok_or_else(|| "orientation was not numeric".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if orientations.as_slice() != [1] {
+        return Err("orientation tags are missing, conflicting, or not normal".to_string());
+    }
+    let quicktime_rotation = fields
+        .get("QuickTime:Rotation")
+        .map(|value| {
+            value
+                .as_i64()
+                .ok_or_else(|| "QuickTime Rotation was not numeric".to_string())
+        })
+        .transpose()?;
+    let width = fields
+        .get("File:ImageWidth")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "container File:ImageWidth was missing or invalid".to_string())?;
+    let height = fields
+        .get("File:ImageHeight")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "container File:ImageHeight was missing or invalid".to_string())?;
+    if width == 0 || height == 0 {
+        return Err("container dimensions must be positive".to_string());
+    }
+    Ok(MediaMetadata {
+        orientation: 1,
+        quicktime_rotation,
+        dimensions: (width, height),
     })
 }
 
@@ -10202,6 +10283,26 @@ mod tests {
     use std::io::Write;
     use url::Url;
 
+    #[test]
+    fn media_metadata_requires_one_normal_orientation_and_container_dimensions() {
+        let valid = r#"[{"EXIF:Orientation":1,"File:ImageWidth":6048,"File:ImageHeight":8064,"QuickTime:Rotation":0,"EXIF:ExifImageWidth":8064,"EXIF:ExifImageHeight":6048}]"#;
+        assert_eq!(
+            parse_media_metadata(valid)
+                .expect("container dimensions must win over stale EXIF sizes"),
+            MediaMetadata {
+                orientation: 1,
+                quicktime_rotation: Some(0),
+                dimensions: (6048, 8064),
+            }
+        );
+        for invalid in [
+            r#"[{"EXIF:Orientation":6,"File:ImageWidth":6048,"File:ImageHeight":8064}]"#,
+            r#"[{"EXIF:Orientation":1,"XMP:Orientation":6,"File:ImageWidth":6048,"File:ImageHeight":8064}]"#,
+        ] {
+            assert!(parse_media_metadata(invalid).is_err());
+        }
+    }
+
     struct TestAdjustedSourceTransport {
         response: Value,
         bytes: Vec<u8>,
@@ -11004,6 +11105,7 @@ esac
             heic_path: PathBuf::from("/tmp/asset.heic"),
             heic_sha256: "sha".to_string(),
             size_bytes: 123,
+            conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
             heif_info_ok: true,
             metadata_copied: true,
             visual_content_ok: true,
@@ -13911,6 +14013,7 @@ esac
                 "measured_at_unix_seconds": 1_800_000_001u64,
                 "measurement_method": "monotonic_wall_clock",
                 "conversion_tool": "test-tool",
+                "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
                 "heic_quality": 90,
                 "raw_size_bytes": 100u64,
                 "heic_size_bytes": heic_bytes.len() as u64,
@@ -13924,6 +14027,7 @@ esac
                 "heic_path": uploaded_path,
                 "heic_sha256": heic_sha,
                 "size_bytes": heic_bytes.len() as u64,
+                "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
                 "heif_info_ok": true,
                 "metadata_copied": true,
                 "visual_content_ok": true,
@@ -14015,6 +14119,7 @@ esac
                 "measured_at_unix_seconds": 1_800_000_001u64,
                 "measurement_method": "monotonic_wall_clock",
                 "conversion_tool": "test-tool",
+                "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
                 "heic_quality": 90,
                 "raw_size_bytes": 100u64,
                 "heic_size_bytes": heic_bytes.len() as u64,
@@ -14028,6 +14133,7 @@ esac
                 "heic_path": uploaded_path,
                 "heic_sha256": heic_sha,
                 "size_bytes": heic_bytes.len() as u64,
+                "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
                 "heif_info_ok": true,
                 "metadata_copied": true,
                 "visual_content_ok": true,
@@ -16261,6 +16367,7 @@ esac
                 "measured_at_unix_seconds": 1_800_000_001u64,
                 "measurement_method": "monotonic_wall_clock",
                 "conversion_tool": "test-tool",
+                "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
                 "heic_quality": 90,
                 "raw_size_bytes": 100u64,
                 "heic_size_bytes": 10u64,
@@ -16274,6 +16381,7 @@ esac
                 "heic_path": heic_path,
                 "heic_sha256": heic_sha,
                 "size_bytes": 10u64,
+                "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
                 "heif_info_ok": true,
                 "metadata_copied": true,
                 "visual_content_ok": true,
@@ -20952,6 +21060,7 @@ esac
             heic_path: PathBuf::from("/heic/asset.HEIC"),
             heic_sha256: "heic-sha-asset".to_string(),
             size_bytes: 10,
+            conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
             heif_info_ok: true,
             metadata_copied: true,
             visual_content_ok: false,

@@ -781,7 +781,12 @@ impl Drop for StagedRaw {
 }
 
 fn conversion_tool_name(plan: &crate::conversion::ConversionPlan) -> String {
-    match plan.conversion_commands.as_slice() {
+    let commands = plan
+        .conversion_commands
+        .iter()
+        .filter(|command| !is_preview_metadata_normalizer(command))
+        .collect::<Vec<_>>();
+    match commands.as_slice() {
         [] => plan.convert.program.clone(),
         [command] => command.program.clone(),
         commands => commands
@@ -790,6 +795,14 @@ fn conversion_tool_name(plan: &crate::conversion::ConversionPlan) -> String {
             .collect::<Vec<_>>()
             .join("+"),
     }
+}
+
+fn is_preview_metadata_normalizer(command: &CommandPlan) -> bool {
+    command.program == "exiftool"
+        && command
+            .args
+            .first()
+            .is_some_and(|arg| arg == "-Orientation#=1")
 }
 
 fn refuse_preexisting_output(path: &Path) -> Result<(), ConversionExecutionError> {
@@ -970,10 +983,12 @@ fn run_planned_commands(
         let command_usage = run_planned_command(stage, plan)?;
         let wall_time_millis = positive_millis(started.elapsed());
         resource_usage = resource_usage.combine(command_usage);
-        command_timings.push(ConversionCommandTiming {
-            program: plan.program.clone(),
-            wall_time_millis,
-        });
+        if !is_preview_metadata_normalizer(plan) {
+            command_timings.push(ConversionCommandTiming {
+                program: plan.program.clone(),
+                wall_time_millis,
+            });
+        }
     }
     Ok(PlannedCommandsOutcome {
         resource_usage,
@@ -4208,6 +4223,12 @@ if [ "$1" = "-TagsFromFile" ] && [ "$3" = "-Orientation#" ]; then
   fi
   exit 0
 fi
+if [ "$1" = "-Orientation#=1" ]; then
+  if [ "${{FAIL_PREVIEW_NORMALIZATION:-}}" = "1" ]; then
+    exit 49
+  fi
+  exit 0
+fi
 printf 'exiftool-metadata\n' >> "$EXECUTION_LOG"
 exit 0
 "#
@@ -4263,6 +4284,9 @@ fi
 if [ "$1" = "-TagsFromFile" ] && [ "$3" = "-Orientation#" ]; then
   log_and_check_raw "$2"
   printf 'exiftool-preview-orientation\n' >> "$EXECUTION_LOG"
+  exit 0
+fi
+if [ "$1" = "-Orientation#=1" ]; then
   exit 0
 fi
 if [ "$1" = "-TagsFromFile" ]; then

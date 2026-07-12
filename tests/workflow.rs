@@ -72,6 +72,7 @@ fn heic_proof() -> HeicVerificationProof {
         heic_path: PathBuf::from("/staging/IMG_0001.heic"),
         heic_sha256: "heic-sha256".to_string(),
         size_bytes: 24,
+        conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
         heif_info_ok: true,
         metadata_copied: true,
         visual_content_ok: true,
@@ -95,6 +96,38 @@ fn heic_verification_proof_accepts_legacy_vipsheader_field() {
     .expect("legacy proof field should deserialize");
 
     assert!(proof.heif_info_ok);
+}
+
+#[test]
+fn current_conversion_recipe_is_required_before_upload() {
+    for recipe in [None, Some("embedded-preview-legacy-v0")] {
+        let mut manifest = conversion_verified_manifest();
+        let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+        let performance = record
+            .proofs
+            .get_mut("conversion_performance")
+            .expect("performance proof should exist");
+        match recipe {
+            Some(recipe) => performance["conversion_recipe_id"] = json!(recipe),
+            None => {
+                performance
+                    .as_object_mut()
+                    .expect("performance proof should be an object")
+                    .remove("conversion_recipe_id");
+            }
+        }
+        manifest.upsert(record);
+
+        let error = upload_ready_heic_proof(&manifest, "asset-1")
+            .expect_err("missing or old recipe must not be upload-ready");
+        assert!(matches!(
+            error,
+            WorkflowError::ConversionRecipeOutdated {
+                proof_key: "conversion_performance",
+                ..
+            }
+        ));
+    }
 }
 
 fn upload_proof() -> UploadProof {
@@ -356,6 +389,7 @@ fn two_asset_upload_verified_manifest() -> Manifest {
                 heic_path: PathBuf::from(heic_path),
                 heic_sha256: heic_sha256.to_string(),
                 size_bytes: heic_size,
+                conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
                 heif_info_ok: true,
                 metadata_copied: true,
                 visual_content_ok: true,
@@ -743,6 +777,7 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
             heic_path: output_path.clone(),
             heic_sha256: "heic-sha256".to_string(),
             size_bytes: 24,
+            conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
             heif_info_ok: true,
             metadata_copied: true,
             visual_content_ok: true,
@@ -2411,6 +2446,10 @@ fn conversion_performance_records_derived_sizes_and_metrics() {
     assert_eq!(proof["measurement_method"], "monotonic_wall_clock");
     assert_eq!(proof["conversion_tool"], "magick");
     assert_eq!(proof["conversion_tool_version"], "7.1.1-41");
+    assert_eq!(
+        proof["conversion_recipe_id"],
+        "embedded-preview-normalized-v1"
+    );
     assert_eq!(proof["heic_quality"], 90);
     assert_eq!(proof["raw_size_bytes"], 42);
     assert_eq!(proof["heic_size_bytes"], 24);

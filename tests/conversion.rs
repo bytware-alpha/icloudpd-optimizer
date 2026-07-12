@@ -46,7 +46,7 @@ fn plans_exact_sips_exiftool_and_verification_commands() {
         .collect();
     assert_eq!(
         conversion_programs,
-        vec!["exiftool", "exiftool", "magick", "sips"]
+        vec!["exiftool", "exiftool", "magick", "exiftool", "sips"]
     );
     assert_eq!(plan.convert.program, "exiftool");
     assert_eq!(
@@ -82,6 +82,14 @@ fn plans_exact_sips_exiftool_and_verification_commands() {
     );
     assert_eq!(
         args(&plan.conversion_commands[3]),
+        vec![
+            "-Orientation#=1",
+            "-overwrite_original",
+            "/staging/IMG_0001.oriented-preview.jpg"
+        ]
+    );
+    assert_eq!(
+        args(&plan.conversion_commands[4]),
         vec![
             "-s",
             "format",
@@ -188,7 +196,10 @@ fn macos_uses_sips_rotate_for_simple_exif_orientation_without_magick_auto_orient
         .iter()
         .map(|command| command.program.as_str())
         .collect();
-    assert_eq!(conversion_programs, vec!["exiftool", "sips", "sips"]);
+    assert_eq!(
+        conversion_programs,
+        vec!["exiftool", "sips", "exiftool", "sips"]
+    );
     assert_eq!(
         args(&plan.conversion_commands[1]),
         vec![
@@ -205,6 +216,14 @@ fn macos_uses_sips_rotate_for_simple_exif_orientation_without_magick_auto_orient
     );
     assert_eq!(
         args(&plan.conversion_commands[2]),
+        vec![
+            "-Orientation#=1",
+            "-overwrite_original",
+            "/staging/IMG_0001.oriented-preview.jpg"
+        ]
+    );
+    assert_eq!(
+        args(&plan.conversion_commands[3]),
         vec![
             "-s",
             "format",
@@ -239,7 +258,10 @@ fn macos_copies_normal_exif_orientation_preview_before_encoding() {
         .iter()
         .map(|command| command.program.as_str())
         .collect();
-    assert_eq!(conversion_programs, vec!["exiftool", "cp", "sips"]);
+    assert_eq!(
+        conversion_programs,
+        vec!["exiftool", "cp", "exiftool", "sips"]
+    );
     assert_eq!(
         args(&plan.conversion_commands[1]),
         vec![
@@ -253,6 +275,14 @@ fn macos_copies_normal_exif_orientation_preview_before_encoding() {
     );
     assert_eq!(
         args(&plan.conversion_commands[2]),
+        vec![
+            "-Orientation#=1",
+            "-overwrite_original",
+            "/staging/IMG_0001.oriented-preview.jpg"
+        ]
+    );
+    assert_eq!(
+        args(&plan.conversion_commands[3]),
         vec![
             "-s",
             "format",
@@ -286,7 +316,7 @@ fn macos_keeps_magick_auto_orient_for_unsupported_exif_orientation() {
         .collect();
     assert_eq!(
         conversion_programs,
-        vec!["exiftool", "exiftool", "magick", "sips"]
+        vec!["exiftool", "exiftool", "magick", "exiftool", "sips"]
     );
 }
 
@@ -301,7 +331,7 @@ fn includes_requested_heic_quality_in_sips_format_options() {
     .expect("conversion should plan");
 
     assert_eq!(
-        args(&plan.conversion_commands[3]),
+        args(&plan.conversion_commands[4]),
         vec![
             "-s",
             "format",
@@ -333,7 +363,7 @@ fn plans_linux_native_conversion_without_sips() {
         .collect();
     assert_eq!(
         conversion_programs,
-        vec!["exiftool", "exiftool", "magick", "heif-enc"]
+        vec!["exiftool", "exiftool", "magick", "exiftool", "heif-enc"]
     );
     assert_eq!(plan.convert.program, "exiftool");
     assert_eq!(
@@ -370,6 +400,14 @@ fn plans_linux_native_conversion_without_sips() {
     assert_eq!(
         args(&plan.conversion_commands[3]),
         vec![
+            "-Orientation#=1",
+            "-overwrite_original",
+            "/staging/IMG_0006.oriented-preview.jpg"
+        ]
+    );
+    assert_eq!(
+        args(&plan.conversion_commands[4]),
+        vec![
             "-q",
             "88",
             "/staging/IMG_0006.oriented-preview.jpg",
@@ -377,7 +415,7 @@ fn plans_linux_native_conversion_without_sips() {
             "/staging/IMG_0006.heic"
         ]
     );
-    assert_eq!(plan.conversion_commands[3].stdout_path, None);
+    assert_eq!(plan.conversion_commands[4].stdout_path, None);
     assert_eq!(plan.metadata.program, "exiftool");
     assert_eq!(
         args(&plan.metadata),

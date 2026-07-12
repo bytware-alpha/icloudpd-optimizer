@@ -38,6 +38,7 @@ const DELETE_APPROVAL_PROOF: &str = "delete_approval";
 const DELETE_EXECUTION_PROOF: &str = "delete";
 const CONVERSION_PERFORMANCE_SCHEMA_VERSION: u8 = 1;
 const CONVERSION_PERFORMANCE_MEASUREMENT_METHOD: &str = "monotonic_wall_clock";
+pub const EMBEDDED_PREVIEW_CONVERSION_RECIPE: &str = "embedded-preview-normalized-v1";
 const UNSAFE_LEGACY_RAW_SENSOR_RENDER_TOOL: &str = "dcraw_emu+magick+heif-enc";
 const BASE_DELETE_PLAN_PROOFS: [&str; 10] = [
     NAS_PROOF,
@@ -106,6 +107,8 @@ pub struct ConversionPerformanceProof {
     pub measured_at_unix_seconds: u64,
     pub measurement_method: String,
     pub conversion_tool: String,
+    #[serde(default)]
+    pub conversion_recipe_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversion_tool_version: Option<String>,
     pub heic_quality: u8,
@@ -128,6 +131,8 @@ pub struct HeicVerificationProof {
     pub heic_path: PathBuf,
     pub heic_sha256: String,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub conversion_recipe_id: String,
     #[serde(alias = "vipsheader_ok")]
     pub heif_info_ok: bool,
     pub metadata_copied: bool,
@@ -484,6 +489,7 @@ pub fn record_conversion_performance<'a>(
         measured_at_unix_seconds: input.measured_at_unix_seconds,
         measurement_method: CONVERSION_PERFORMANCE_MEASUREMENT_METHOD.to_string(),
         conversion_tool: input.conversion_tool,
+        conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
         conversion_tool_version: input.conversion_tool_version,
         heic_quality: input.heic_quality,
         raw_size_bytes: nas.size_bytes,
@@ -2059,6 +2065,13 @@ fn validate_uploaded_heic_delete_proof(
 }
 
 fn validate_heic_verification_flags(proof: &HeicVerificationProof) -> Result<(), WorkflowError> {
+    require_current_conversion_recipe(HEIC_PROOF, &proof.conversion_recipe_id)?;
+    validate_heic_verification_flags_legacy(proof)
+}
+
+fn validate_heic_verification_flags_legacy(
+    proof: &HeicVerificationProof,
+) -> Result<(), WorkflowError> {
     let required = [
         ("heif_info_ok", proof.heif_info_ok),
         ("metadata_copied", proof.metadata_copied),
@@ -2093,6 +2106,7 @@ fn validate_conversion_performance_proof(
         &proof.measurement_method,
     )?;
     require_non_empty("conversion_tool", &proof.conversion_tool)?;
+    require_current_conversion_recipe(CONVERSION_PERFORMANCE_PROOF, &proof.conversion_recipe_id)?;
     if proof.conversion_tool == UNSAFE_LEGACY_RAW_SENSOR_RENDER_TOOL {
         return Err(WorkflowError::InvalidProofField {
             proof_key: CONVERSION_PERFORMANCE_PROOF,
@@ -2332,7 +2346,7 @@ pub(crate) fn reconciliation_lifecycle_state(
         }
         return Ok(State::Converted);
     };
-    validate_heic_verification_flags(&heic)?;
+    validate_heic_verification_flags_legacy(&heic)?;
     if heic.heic_path.as_os_str().is_empty()
         || !is_sha256(&heic.heic_sha256)
         || heic.size_bytes == 0
@@ -2346,7 +2360,13 @@ pub(crate) fn reconciliation_lifecycle_state(
             reason: "HEIC proof must match the conversion output path, SHA-256, and size",
         });
     }
-    require_valid_conversion_performance(manifest, asset_id)?;
+    // Existing records are classified without implicitly rewriting or upgrading
+    // them; upload and delete admission independently require the current recipe.
+    let _ = stored_proof::<ConversionPerformanceProof>(
+        manifest,
+        asset_id,
+        CONVERSION_PERFORMANCE_PROOF,
+    )?;
 
     let Some(upload) = upload else {
         return Ok(State::ConversionVerified);
@@ -2573,6 +2593,20 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), WorkflowErr
     Ok(())
 }
 
+fn require_current_conversion_recipe(
+    proof_key: &'static str,
+    recipe_id: &str,
+) -> Result<(), WorkflowError> {
+    if recipe_id != EMBEDDED_PREVIEW_CONVERSION_RECIPE {
+        return Err(WorkflowError::ConversionRecipeOutdated {
+            proof_key,
+            expected: EMBEDDED_PREVIEW_CONVERSION_RECIPE,
+            actual: recipe_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn require_non_empty_path(field: &'static str, path: &Path) -> Result<(), WorkflowError> {
     if path.as_os_str().is_empty() {
         return Err(WorkflowError::EmptyProofField { field });
@@ -2790,4 +2824,10 @@ pub enum WorkflowError {
     },
     #[error("HEIC verification failed: {field}")]
     HeicVerificationFailed { field: &'static str },
+    #[error("proof {proof_key} uses conversion recipe {actual:?}; current recipe is {expected}")]
+    ConversionRecipeOutdated {
+        proof_key: &'static str,
+        expected: &'static str,
+        actual: String,
+    },
 }
