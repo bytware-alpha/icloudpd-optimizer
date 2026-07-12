@@ -4578,6 +4578,8 @@ fn macos_app_packaging_surface_is_documented() {
     assert!(justfile.contains("iCloudPD Optimizer Service.app"));
     assert!(justfile.contains("Library/Application Support/iCloudPD Optimizer/Service"));
     assert!(justfile.contains("ICLOUDPD_OPTIMIZER_SERVICE_APP_PATH"));
+    assert!(justfile.contains("dashboard_bin=\"$app/Contents/MacOS/ICloudPDOptimizerApp\""));
+    assert!(justfile.contains("\"$dashboard_bin\" --bundled-helper-environment-self-test"));
     assert!(
         justfile.contains("dashboard_host=\"$installed_app/Contents/MacOS/ICloudPDOptimizerApp\"")
     );

@@ -285,10 +285,12 @@ macos-app-verify:
     set -eu
     app="${ICLOUDPD_OPTIMIZER_APP_PATH:-$HOME/Applications/iCloudPD Optimizer.app}"
     service_app="${ICLOUDPD_OPTIMIZER_SERVICE_APP_PATH:-$HOME/Library/Application Support/iCloudPD Optimizer/Service/iCloudPD Optimizer Service.app}"
+    dashboard_bin="$app/Contents/MacOS/ICloudPDOptimizerApp"
     bin="$service_app/Contents/MacOS/ICloudPDOptimizerApp"
     helper="$app/Contents/Resources/icloudpd-optimizer"
     codesign --verify --deep --strict "$app"
     codesign --verify --deep --strict "$service_app"
+    "$dashboard_bin" --bundled-helper-environment-self-test
     "$helper" doctor --json
     "$bin" service status || true
     if [ -f "$HOME/Library/Logs/iCloudPD Optimizer/app.log" ]; then

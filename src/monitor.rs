@@ -7154,6 +7154,12 @@ struct FailedRetryAttempts {
     lineage_start_failure_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailedRetryAttemptError {
+    Malformed,
+    LegacyCategoryTransition,
+}
+
 const RETRY_BLOCKING_PROOFS: [&str; 7] = [
     "heic",
     "upload",
@@ -7192,6 +7198,7 @@ fn admit_failed_retryable_assets_with_budget(
     let mut admission = FailedRetryPolicyAdmission::default();
     let mut candidates = Vec::new();
     let mut exhausted = Vec::new();
+    let mut legacy_category_transitions = Vec::new();
     let terminalize = manifest
         .records()
         .values()
@@ -7245,9 +7252,16 @@ fn admit_failed_retryable_assets_with_budget(
             admission.blocked_source_proof = admission.blocked_source_proof.saturating_add(1);
             continue;
         }
-        let Ok(attempts) = failed_retry_attempt(record, kind, policy) else {
-            admission.unknown = admission.unknown.saturating_add(1);
-            continue;
+        let attempts = match failed_retry_attempt(record, kind, policy) {
+            Ok(attempts) => attempts,
+            Err(FailedRetryAttemptError::LegacyCategoryTransition) => {
+                legacy_category_transitions.push((record.asset_id.clone(), kind));
+                continue;
+            }
+            Err(FailedRetryAttemptError::Malformed) => {
+                admission.unknown = admission.unknown.saturating_add(1);
+                continue;
+            }
         };
         if attempts.category >= policy.max_attempts
             || attempts.cumulative >= FAILED_RETRY_MAX_CUMULATIVE_ATTEMPTS
@@ -7282,6 +7296,22 @@ fn admit_failed_retryable_assets_with_budget(
             attempts,
             policy,
         });
+    }
+
+    for (asset_id, kind) in legacy_category_transitions {
+        terminalize_failure_for_review(
+            manifest,
+            &asset_id,
+            kind,
+            "legacy_retry_category_transition",
+            0,
+            current_unix_seconds,
+        )?;
+        admission.exhausted = admission.exhausted.saturating_add(1);
+        increment_static_count(
+            &mut admission.terminalized_by_reason,
+            "legacy_retry_category_transition",
+        );
     }
 
     for (asset_id, kind, attempts) in exhausted {
@@ -8267,7 +8297,10 @@ pub fn failed_retry_queue_counts_at(
                                 "blocked_source_proof"
                             }
                             Ok(_) => "retryable_heic_visual_match_pending_integrity_check",
-                            Err(_) => "failed_unknown",
+                            Err(FailedRetryAttemptError::LegacyCategoryTransition) => {
+                                "terminalize_legacy_retry_category_transition"
+                            }
+                            Err(FailedRetryAttemptError::Malformed) => "failed_unknown",
                         }
                     }
                     Some(policy) => match failed_retry_attempt(record, kind, policy) {
@@ -8278,7 +8311,10 @@ pub fn failed_retry_queue_counts_at(
                             "terminalize_retry_attempts_exhausted"
                         }
                         Ok(_) => policy.bucket,
-                        Err(_) => "failed_unknown",
+                        Err(FailedRetryAttemptError::LegacyCategoryTransition) => {
+                            "terminalize_legacy_retry_category_transition"
+                        }
+                        Err(FailedRetryAttemptError::Malformed) => "failed_unknown",
                     },
                     None => "failed_unknown",
                 },
@@ -8360,15 +8396,16 @@ fn failed_retry_attempt(
     record: &AssetRecord,
     kind: FailureKind,
     policy: FailedRetryPolicy,
-) -> Result<FailedRetryAttempts, ()> {
+) -> Result<FailedRetryAttempts, FailedRetryAttemptError> {
     match (
         record.proofs.get(FAILURE_RETRY_V3_PROOF),
         record.proofs.get(FAILURE_RETRY_PROOF),
     ) {
         (Some(proof), legacy_proof) => {
-            let proof =
-                serde_json::from_value::<FailureRetryV3Proof>(proof.clone()).map_err(|_| ())?;
-            let proof_kind = FailureKind::from_str(&proof.category).ok_or(())?;
+            let proof = serde_json::from_value::<FailureRetryV3Proof>(proof.clone())
+                .map_err(|_| FailedRetryAttemptError::Malformed)?;
+            let proof_kind =
+                FailureKind::from_str(&proof.category).ok_or(FailedRetryAttemptError::Malformed)?;
             if proof.schema_version != FAILED_RETRY_POLICY_SCHEMA_VERSION
                 || proof.policy_generation != FAILED_RETRY_POLICY_GENERATION
                 || proof.category_attempt == 0
@@ -8385,31 +8422,40 @@ fn failed_retry_attempt(
                     != legacy_proof
                         .map(retry_proof_digest)
                         .transpose()
-                        .map_err(|_| ())?
+                        .map_err(|_| FailedRetryAttemptError::Malformed)?
             {
-                return Err(());
+                return Err(FailedRetryAttemptError::Malformed);
             }
-            let prior_policy = failed_retry_policy(proof_kind).ok_or(())?;
-            let expected_failure_count =
-                proof.failure_count_at_admission.checked_add(1).ok_or(())?;
+            let prior_policy =
+                failed_retry_policy(proof_kind).ok_or(FailedRetryAttemptError::Malformed)?;
+            let expected_failure_count = proof
+                .failure_count_at_admission
+                .checked_add(1)
+                .ok_or(FailedRetryAttemptError::Malformed)?;
             if proof.retry_state != prior_policy.retry_state
                 || (proof_kind == kind && proof.retry_state != policy.retry_state)
                 || proof.failure_count_at_admission == 0
                 || record.failures.len() != expected_failure_count
             {
-                return Err(());
+                return Err(FailedRetryAttemptError::Malformed);
             }
             let prior = record
                 .failures
                 .get(proof.failure_count_at_admission.saturating_sub(1))
-                .ok_or(())?;
+                .ok_or(FailedRetryAttemptError::Malformed)?;
             if prior.stage != proof.last_failure_stage
                 || prior.recorded_at != proof.last_failure_recorded_at
                 || failure_digest(prior) != proof.last_failure_digest
                 || failure_kind_for(record, prior) != Some(proof_kind)
-                || failure_kind_for(record, record.failures.last().ok_or(())?) != Some(kind)
+                || failure_kind_for(
+                    record,
+                    record
+                        .failures
+                        .last()
+                        .ok_or(FailedRetryAttemptError::Malformed)?,
+                ) != Some(kind)
             {
-                return Err(());
+                return Err(FailedRetryAttemptError::Malformed);
             }
             Ok(FailedRetryAttempts {
                 category: (proof_kind == kind)
@@ -8420,37 +8466,50 @@ fn failed_retry_attempt(
             })
         }
         (None, Some(proof)) => {
-            let proof =
-                serde_json::from_value::<FailureRetryProof>(proof.clone()).map_err(|_| ())?;
+            let proof = serde_json::from_value::<FailureRetryProof>(proof.clone())
+                .map_err(|_| FailedRetryAttemptError::Malformed)?;
             if proof.schema_version != LEGACY_FAILED_RETRY_POLICY_SCHEMA_VERSION
                 || proof.policy_generation != LEGACY_FAILED_RETRY_POLICY_GENERATION
                 || proof.attempt == 0
                 || proof.last_failure_kind != proof.category
-                || proof.category != kind
             {
-                return Err(());
+                return Err(FailedRetryAttemptError::Malformed);
             }
-            let prior_policy = failed_retry_policy(proof.category).ok_or(())?;
-            let expected_failure_count =
-                proof.failure_count_at_admission.checked_add(1).ok_or(())?;
+            let prior_policy =
+                failed_retry_policy(proof.category).ok_or(FailedRetryAttemptError::Malformed)?;
+            let expected_failure_count = proof
+                .failure_count_at_admission
+                .checked_add(1)
+                .ok_or(FailedRetryAttemptError::Malformed)?;
             if proof.retry_state != prior_policy.retry_state
-                || proof.retry_state != policy.retry_state
                 || proof.failure_count_at_admission == 0
                 || record.failures.len() != expected_failure_count
             {
-                return Err(());
+                return Err(FailedRetryAttemptError::Malformed);
             }
             let prior = record
                 .failures
                 .get(proof.failure_count_at_admission.saturating_sub(1))
-                .ok_or(())?;
+                .ok_or(FailedRetryAttemptError::Malformed)?;
             if prior.stage != proof.last_failure_stage
                 || prior.recorded_at != proof.last_failure_recorded_at
                 || failure_digest(prior) != proof.last_failure_digest
                 || failure_kind_for(record, prior) != Some(proof.last_failure_kind)
-                || failure_kind_for(record, record.failures.last().ok_or(())?) != Some(kind)
+                || failure_kind_for(
+                    record,
+                    record
+                        .failures
+                        .last()
+                        .ok_or(FailedRetryAttemptError::Malformed)?,
+                ) != Some(kind)
             {
-                return Err(());
+                return Err(FailedRetryAttemptError::Malformed);
+            }
+            if proof.category != kind {
+                return Err(FailedRetryAttemptError::LegacyCategoryTransition);
+            }
+            if proof.retry_state != policy.retry_state {
+                return Err(FailedRetryAttemptError::Malformed);
             }
             Ok(FailedRetryAttempts {
                 category: proof.attempt,
@@ -8459,7 +8518,7 @@ fn failed_retry_attempt(
                     .failures
                     .len()
                     .checked_sub(proof.attempt as usize)
-                    .ok_or(())?,
+                    .ok_or(FailedRetryAttemptError::Malformed)?,
             })
         }
         (None, None) => Ok(FailedRetryAttempts {
@@ -17540,7 +17599,7 @@ esac
     }
 
     #[test]
-    fn legacy_retry_proof_cannot_transition_categories_without_a_cumulative_lineage() {
+    fn exact_legacy_retry_category_transition_terminalizes_without_admission() {
         let mut manifest = admitted_timeout_manifest("legacy-transition");
         let mut record = manifest.get("legacy-transition").unwrap().clone();
         let failure = record.failures.last().unwrap();
@@ -17572,11 +17631,48 @@ esac
             "101.000000000Z",
         );
 
+        assert_eq!(
+            failed_retry_queue_counts(&manifest)["terminalize_legacy_retry_category_transition"],
+            1
+        );
         let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
-            .expect("legacy category transition should fail closed without mutation");
-        assert_eq!(admission.unknown, 1);
+            .expect("legacy category transition should terminalize without readmission");
+        assert_eq!(admission.unknown, 0);
+        assert_eq!(admission.exhausted, 1);
         assert_eq!(
             manifest.get("legacy-transition").unwrap().state,
+            State::NeedsReview
+        );
+        assert_eq!(
+            manifest.get("legacy-transition").unwrap().proofs[FAILURE_REVIEW_PROOF]["reason_code"],
+            json!("legacy_retry_category_transition")
+        );
+    }
+
+    #[test]
+    fn malformed_legacy_retry_proof_remains_failed_unknown() {
+        let mut manifest = admitted_timeout_manifest("malformed-legacy-transition");
+        let mut record = manifest.get("malformed-legacy-transition").unwrap().clone();
+        record.proofs.remove(FAILURE_RETRY_V3_PROOF);
+        record.proofs.insert(
+            FAILURE_RETRY_PROOF.to_string(),
+            json!({"schema_version": 2}),
+        );
+        manifest.upsert(record);
+        policy_failed_again_at(
+            &mut manifest,
+            "malformed-legacy-transition",
+            "conversion",
+            "conversion tool not found on sanitized PATH: exiftool",
+            FailureKind::ConversionToolUnavailable,
+            "101.000000000Z",
+        );
+
+        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("malformed legacy lineage should not mutate the record");
+        assert_eq!(admission.unknown, 1);
+        assert_eq!(
+            manifest.get("malformed-legacy-transition").unwrap().state,
             State::Failed
         );
     }
@@ -17638,6 +17734,10 @@ esac
             Some(FailureKind::ConversionToolUnavailable),
         )
         .expect("tool-unavailable failure should record");
+
+        let mut record = manifest.get("old-reader-safe").unwrap().clone();
+        record.failures.last_mut().unwrap().recorded_at = "100.000000000Z".to_string();
+        manifest.upsert(record);
 
         let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
             .expect("tool-unavailable retry should use the extension proof");
