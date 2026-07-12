@@ -3477,6 +3477,51 @@ exit 41
 
     #[cfg(unix)]
     #[test]
+    fn linux_preview_normalization_failure_cleans_owned_intermediates_without_proofs() {
+        let tool_dir = fake_linux_conversion_tools();
+        let _path_guard = PathGuard::install(tool_dir.path());
+        let _failure_guard =
+            EnvVarGuard::install_value("FAIL_PREVIEW_NORMALIZATION", OsString::from("1"));
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let output_path = tempdir.path().join("IMG_0001.heic");
+        let sentinel = tempdir.path().join("preexisting-sentinel");
+        fs::write(&sentinel, b"retain").expect("sentinel should be written");
+        let manifest = nas_verified_manifest(&raw_path);
+
+        let error = execute_measured_conversion_for_target(
+            &manifest,
+            ConversionExecutionRequest {
+                asset_id: "asset-1".to_string(),
+                output_path: output_path.clone(),
+                heic_quality: 91,
+                conversion_tool_version: None,
+            },
+            TargetPlatform::new("linux", "x86_64"),
+        )
+        .expect_err("normalization failure must fail conversion");
+
+        assert!(matches!(
+            error,
+            ConversionExecutionError::CommandFailed {
+                stage: "conversion",
+                program,
+                ..
+            } if program == "exiftool"
+        ));
+        assert!(!output_path.exists());
+        assert!(!embedded_preview_path(&output_path).exists());
+        assert!(!oriented_preview_path(&output_path).exists());
+        assert_eq!(fs::read(&sentinel).expect("sentinel should remain"), b"retain");
+        let record = manifest.get("asset-1").expect("asset should exist");
+        assert_eq!(record.state, State::NasVerified);
+        assert!(!record.proofs.contains_key("conversion"));
+        assert!(!record.proofs.contains_key("conversion_performance"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn linux_preview_probe_timeout_fails_closed_without_recording_proofs() {
         let tool_dir = fake_linux_conversion_tools_with_probe_preview_and_heif_enc(
             "/bin/sleep 5\n",

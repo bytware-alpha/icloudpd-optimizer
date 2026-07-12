@@ -181,61 +181,67 @@ fn macos_uses_sips_rotate_for_simple_exif_orientation_without_magick_auto_orient
     let raw = PathBuf::from("/nas/raw/IMG_0001.dng");
     let output = PathBuf::from("/staging/IMG_0001.heic");
 
-    let plan = plan_conversion_for_target_with_preview_tag_and_orientation(
-        TargetPlatform::new("macos", "aarch64"),
-        &raw,
-        &output,
-        90,
-        icloudpd_optimizer::conversion::EmbeddedPreviewTag::PreviewImage,
-        Some(ExifOrientation::Rotate90Cw),
-    )
-    .expect("conversion should plan");
+    for (orientation, degrees) in [
+        (ExifOrientation::Rotate180, "180"),
+        (ExifOrientation::Rotate90Cw, "90"),
+        (ExifOrientation::Rotate270Cw, "270"),
+    ] {
+        let plan = plan_conversion_for_target_with_preview_tag_and_orientation(
+            TargetPlatform::new("macos", "aarch64"),
+            &raw,
+            &output,
+            90,
+            icloudpd_optimizer::conversion::EmbeddedPreviewTag::PreviewImage,
+            Some(orientation),
+        )
+        .expect("conversion should plan");
 
-    let conversion_programs: Vec<_> = plan
-        .conversion_commands
-        .iter()
-        .map(|command| command.program.as_str())
-        .collect();
-    assert_eq!(
-        conversion_programs,
-        vec!["exiftool", "sips", "exiftool", "sips"]
-    );
-    assert_eq!(
-        args(&plan.conversion_commands[1]),
-        vec![
-            "--rotate",
-            "90",
-            "/staging/IMG_0001.embedded-preview.jpg",
-            "--out",
-            "/staging/IMG_0001.oriented-preview.jpg"
-        ]
-    );
-    assert_eq!(
-        plan.conversion_commands[1].checked_output_path,
-        Some(PathBuf::from("/staging/IMG_0001.oriented-preview.jpg"))
-    );
-    assert_eq!(
-        args(&plan.conversion_commands[2]),
-        vec![
-            "-Orientation#=1",
-            "-overwrite_original",
-            "/staging/IMG_0001.oriented-preview.jpg"
-        ]
-    );
-    assert_eq!(
-        args(&plan.conversion_commands[3]),
-        vec![
-            "-s",
-            "format",
-            "heic",
-            "-s",
-            "formatOptions",
-            "90",
-            "/staging/IMG_0001.oriented-preview.jpg",
-            "--out",
-            "/staging/IMG_0001.heic"
-        ]
-    );
+        let conversion_programs: Vec<_> = plan
+            .conversion_commands
+            .iter()
+            .map(|command| command.program.as_str())
+            .collect();
+        assert_eq!(
+            conversion_programs,
+            vec!["exiftool", "sips", "exiftool", "sips"]
+        );
+        assert_eq!(
+            args(&plan.conversion_commands[1]),
+            vec![
+                "--rotate",
+                degrees,
+                "/staging/IMG_0001.embedded-preview.jpg",
+                "--out",
+                "/staging/IMG_0001.oriented-preview.jpg"
+            ]
+        );
+        assert_eq!(
+            plan.conversion_commands[1].checked_output_path,
+            Some(PathBuf::from("/staging/IMG_0001.oriented-preview.jpg"))
+        );
+        assert_eq!(
+            args(&plan.conversion_commands[2]),
+            vec![
+                "-Orientation#=1",
+                "-overwrite_original",
+                "/staging/IMG_0001.oriented-preview.jpg"
+            ]
+        );
+        assert_eq!(
+            args(&plan.conversion_commands[3]),
+            vec![
+                "-s",
+                "format",
+                "heic",
+                "-s",
+                "formatOptions",
+                "90",
+                "/staging/IMG_0001.oriented-preview.jpg",
+                "--out",
+                "/staging/IMG_0001.heic"
+            ]
+        );
+    }
 }
 
 #[test]

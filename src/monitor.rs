@@ -9463,7 +9463,7 @@ fn read_media_metadata(
 ) -> Result<MediaMetadata, MonitorError> {
     let output = command_stdout(
         "exiftool",
-        &["-json", "-a", "-G4", "-s", "-n"],
+        &["-json", "-a", "-G1:4", "-s", "-n"],
         [path],
         timeout_seconds,
     )?;
@@ -9502,7 +9502,7 @@ fn parse_media_metadata(output: &str) -> Result<MediaMetadata, String> {
         .ok_or_else(|| "metadata response contained no record".to_string())?;
     let orientations = fields
         .iter()
-        .filter(|(key, _)| key == "Orientation" || key.ends_with(":Orientation"))
+        .filter(|(key, _)| metadata_field_is(key, "Orientation"))
         .map(|(_, value)| {
             value
                 .as_u64()
@@ -9511,7 +9511,7 @@ fn parse_media_metadata(output: &str) -> Result<MediaMetadata, String> {
         .collect::<Result<Vec<_>, _>>()?;
     let rotations = fields
         .iter()
-        .filter(|(key, _)| key.contains("QuickTime") && key.ends_with(":Rotation"))
+        .filter(|(key, _)| key.contains("QuickTime") && metadata_field_is(key, "Rotation"))
         .map(|(_, value)| {
             value
                 .as_i64()
@@ -9536,6 +9536,21 @@ fn parse_media_metadata(output: &str) -> Result<MediaMetadata, String> {
         rotations,
         dimensions: (width, height),
     })
+}
+
+fn metadata_field_is(key: &str, field: &str) -> bool {
+    let Some(name) = key.rsplit(':').next() else {
+        return false;
+    };
+    name == field
+        || name
+            .strip_prefix(field)
+            .is_some_and(|suffix| {
+                suffix
+                    .strip_prefix('#')
+                    .is_some_and(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+                    || (suffix.starts_with(" (") && suffix.ends_with(')'))
+            })
 }
 
 fn original_asset_resolve_target(
@@ -10442,7 +10457,7 @@ mod tests {
 
     #[test]
     fn media_metadata_requires_one_normal_orientation_and_container_dimensions() {
-        let valid = r#"[{"EXIF:Orientation":1,"File:ImageWidth":6048,"File:ImageHeight":8064,"QuickTime:Rotation":0,"EXIF:ExifImageWidth":8064,"EXIF:ExifImageHeight":6048}]"#;
+        let valid = r#"[{"IFD0:Orientation":1,"QuickTime:Rotation":0,"File:ImageWidth":6048,"File:ImageHeight":8064,"EXIF:ExifImageWidth":8064,"EXIF:ExifImageHeight":6048}]"#;
         assert_eq!(
             parse_media_metadata(valid)
                 .expect("container dimensions must win over stale EXIF sizes"),
@@ -10453,8 +10468,8 @@ mod tests {
             }
         );
         for invalid in [
-            r#"[{"EXIF:Orientation":6,"File:ImageWidth":6048,"File:ImageHeight":8064}]"#,
-            r#"[{"EXIF:Orientation":1,"XMP:Orientation":6,"File:ImageWidth":6048,"File:ImageHeight":8064}]"#,
+            r#"[{"IFD0:Orientation":6,"File:ImageWidth":6048,"File:ImageHeight":8064}]"#,
+            r#"[{"IFD0:Orientation":1,"XMP:Orientation":6,"File:ImageWidth":6048,"File:ImageHeight":8064}]"#,
         ] {
             let metadata = parse_media_metadata(invalid).expect("metadata should parse");
             assert!(
@@ -10466,7 +10481,7 @@ mod tests {
             );
         }
         let duplicate_group = parse_media_metadata(
-            r#"[{"EXIF:Orientation":6,"EXIF:Orientation":1,"File:ImageWidth":6048,"File:ImageHeight":8064}]"#,
+            r#"[{"IFD0:Orientation":1,"IFD0:Orientation#1":6,"File:ImageWidth":6048,"File:ImageHeight":8064}]"#,
         )
         .expect("duplicate fields must remain visible to validation");
         assert!(
