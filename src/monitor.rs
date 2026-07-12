@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -13,7 +14,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -3586,8 +3588,27 @@ fn run_rolling_asset_verify(
         Err(error) => {
             let message = error.to_string();
             {
+                let mut manifest = lock_shared(manifest, "rolling lifecycle manifest")?;
                 let mut summary = lock_shared(summary, "rolling lifecycle summary")?;
-                record_monitor_failure(&mut summary, error);
+                let previous = manifest.get(asset_id)?.clone();
+                record_heic_monitor_error_or_failure(
+                    &mut manifest,
+                    &mut summary,
+                    asset_id,
+                    &error,
+                )?;
+                if monitor_failure_kind(&error).is_some() {
+                    persist_asset_record(
+                        state_store,
+                        &mut manifest,
+                        previous,
+                        asset_id,
+                        scan_started,
+                        "heic_verification",
+                    )?;
+                } else {
+                    record_monitor_failure(&mut summary, error);
+                }
             }
             log_monitor_event(
                 "heic_verify_finished",
@@ -4217,6 +4238,7 @@ fn verify_converted_heics(
             verify_converted_heic(&manifest_snapshot, &asset_id, timeout_seconds)
         });
         let mut should_stop = false;
+        let mut manifest_changed = false;
         let mut verified_assets = Vec::new();
         for outcome in outcomes {
             match outcome.result {
@@ -4246,6 +4268,14 @@ fn verify_converted_heics(
                 }
                 Err(error) => {
                     let message = error.to_string();
+                    let metadata_failure = monitor_failure_kind(&error).is_some();
+                    record_heic_monitor_error_or_failure(
+                        manifest,
+                        summary,
+                        &outcome.asset_id,
+                        &error,
+                    )?;
+                    manifest_changed |= metadata_failure;
                     log_monitor_event(
                         "heic_verify_finished",
                         summary.started_unix_seconds,
@@ -4256,11 +4286,13 @@ fn verify_converted_heics(
                         }),
                     );
                     should_stop |= matches!(error, MonitorError::CommandTimeout { .. });
-                    record_monitor_failure(summary, error);
+                    if monitor_failure_kind(&error).is_none() {
+                        record_monitor_failure(summary, error);
+                    }
                 }
             }
         }
-        if !verified_assets.is_empty() {
+        if manifest_changed || !verified_assets.is_empty() {
             checkpoint_manifest_state(state_store, manifest)?;
             for (asset_id, visual_metrics) in verified_assets {
                 let mut fields = json!({
@@ -4342,6 +4374,37 @@ fn workflow_failure_kind(error: &WorkflowError) -> Option<FailureKind> {
         } => Some(FailureKind::HeicVisualMatch),
         _ => None,
     }
+}
+
+fn monitor_failure_kind(error: &MonitorError) -> Option<FailureKind> {
+    match error {
+        MonitorError::HeicMetadataVerification {
+            kind: HeicMetadataFailure::ReferenceOrientationInvalid,
+        } => Some(FailureKind::HeicReferenceOrientationInvalid),
+        MonitorError::HeicMetadataVerification {
+            kind: HeicMetadataFailure::FinalOrientationRotationInvalid,
+        } => Some(FailureKind::HeicFinalOrientationRotationInvalid),
+        MonitorError::HeicMetadataVerification {
+            kind: HeicMetadataFailure::DimensionMismatch,
+        } => Some(FailureKind::HeicDimensionMismatch),
+        _ => None,
+    }
+}
+
+fn record_heic_monitor_error_or_failure(
+    manifest: &mut Manifest,
+    summary: &mut MonitorScanSummary,
+    asset_id: &str,
+    error: &MonitorError,
+) -> Result<(), MonitorError> {
+    let Some(kind) = monitor_failure_kind(error) else {
+        return Ok(());
+    };
+    let message = error.to_string();
+    record_monitor_failure(summary, error);
+    record_stage_failure_with_kind(manifest, asset_id, "heic_verify", &message, kind)
+        .map_err(MonitorError::Workflow)?;
+    Ok(())
 }
 
 fn resolve_original_assets(
@@ -7449,6 +7512,21 @@ fn failed_retry_policy(kind: FailureKind) -> Option<FailedRetryPolicy> {
             retry_state: State::Converted,
             max_attempts: 1,
         }),
+        FailureKind::HeicReferenceOrientationInvalid => Some(FailedRetryPolicy {
+            bucket: "retryable_heic_reference_orientation_invalid",
+            retry_state: State::Converted,
+            max_attempts: 1,
+        }),
+        FailureKind::HeicFinalOrientationRotationInvalid => Some(FailedRetryPolicy {
+            bucket: "retryable_heic_final_orientation_rotation_invalid",
+            retry_state: State::Converted,
+            max_attempts: 1,
+        }),
+        FailureKind::HeicDimensionMismatch => Some(FailedRetryPolicy {
+            bucket: "retryable_heic_dimension_mismatch",
+            retry_state: State::Converted,
+            max_attempts: 1,
+        }),
         FailureKind::ConversionOutputUnreadable => Some(FailedRetryPolicy {
             bucket: "retryable_conversion_output_unreadable",
             retry_state: State::NasVerified,
@@ -9279,21 +9357,28 @@ fn verify_converted_heic(
         timeout_seconds,
     )?;
     let oriented_preview = oriented_preview_path(&conversion.heic_path);
-    let reference_metadata = read_media_metadata(&oriented_preview, timeout_seconds)?;
-    if reference_metadata.orientation != 1 {
-        return Err(metadata_verification_error(
-            "oriented preview must have exactly one normal EXIF orientation",
-        ));
-    }
-    let final_metadata = read_media_metadata(&conversion.heic_path, timeout_seconds)?;
-    if final_metadata.orientation != 1 || final_metadata.quicktime_rotation != Some(0) {
-        return Err(metadata_verification_error(
-            "final HEIC must have exactly one normal EXIF orientation and QuickTime Rotation 0",
-        ));
-    }
+    let reference_metadata = read_media_metadata(
+        &oriented_preview,
+        timeout_seconds,
+        HeicMetadataFailure::ReferenceOrientationInvalid,
+    )?;
+    validate_normal_orientation(
+        &reference_metadata,
+        HeicMetadataFailure::ReferenceOrientationInvalid,
+    )?;
+    let final_metadata = read_media_metadata(
+        &conversion.heic_path,
+        timeout_seconds,
+        HeicMetadataFailure::FinalOrientationRotationInvalid,
+    )?;
+    validate_normal_orientation(
+        &final_metadata,
+        HeicMetadataFailure::FinalOrientationRotationInvalid,
+    )?;
+    validate_zero_rotation(&final_metadata)?;
     if reference_metadata.dimensions != final_metadata.dimensions {
         return Err(metadata_verification_error(
-            "oriented preview and final HEIC container dimensions differ",
+            HeicMetadataFailure::DimensionMismatch,
         ));
     }
     let metadata_copied = true;
@@ -9325,71 +9410,130 @@ fn verify_converted_heic(
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct MediaMetadata {
-    orientation: u64,
-    quicktime_rotation: Option<i64>,
+    orientations: Vec<u64>,
+    rotations: Vec<i64>,
     dimensions: (u64, u64),
 }
 
-fn read_media_metadata(path: &Path, timeout_seconds: u64) -> Result<MediaMetadata, MonitorError> {
-    let output = command_stdout(
-        "exiftool",
-        &["-json", "-a", "-G1", "-s", "-n"],
-        [path],
-        timeout_seconds,
-    )?;
-    parse_media_metadata(&output).map_err(|message| metadata_verification_error(&message))
-}
+struct MetadataJsonRecord(Vec<(String, Value)>);
 
-fn metadata_verification_error(message: &str) -> MonitorError {
-    MonitorError::CommandFailed {
-        program: "exiftool",
-        message: message.to_string(),
+impl<'de> Deserialize<'de> for MetadataJsonRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RecordVisitor;
+
+        impl<'de> Visitor<'de> for RecordVisitor {
+            type Value = MetadataJsonRecord;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an ExifTool metadata object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut fields = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, Value>()? {
+                    fields.push((key, value));
+                }
+                Ok(MetadataJsonRecord(fields))
+            }
+        }
+
+        deserializer.deserialize_map(RecordVisitor)
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeicMetadataFailure {
+    ReferenceOrientationInvalid,
+    FinalOrientationRotationInvalid,
+    DimensionMismatch,
+}
+
+fn read_media_metadata(
+    path: &Path,
+    timeout_seconds: u64,
+    invalid_metadata_kind: HeicMetadataFailure,
+) -> Result<MediaMetadata, MonitorError> {
+    let output = command_stdout(
+        "exiftool",
+        &["-json", "-a", "-G4", "-s", "-n"],
+        [path],
+        timeout_seconds,
+    )?;
+    parse_media_metadata(&output).map_err(|_| metadata_verification_error(invalid_metadata_kind))
+}
+
+fn metadata_verification_error(kind: HeicMetadataFailure) -> MonitorError {
+    MonitorError::HeicMetadataVerification { kind }
+}
+
+fn validate_normal_orientation(
+    metadata: &MediaMetadata,
+    failure: HeicMetadataFailure,
+) -> Result<(), MonitorError> {
+    if metadata.orientations.is_empty() || metadata.orientations.iter().any(|value| *value != 1) {
+        return Err(metadata_verification_error(failure));
+    }
+    Ok(())
+}
+
+fn validate_zero_rotation(metadata: &MediaMetadata) -> Result<(), MonitorError> {
+    if metadata.rotations.is_empty() || metadata.rotations.iter().any(|value| *value != 0) {
+        return Err(metadata_verification_error(
+            HeicMetadataFailure::FinalOrientationRotationInvalid,
+        ));
+    }
+    Ok(())
+}
+
 fn parse_media_metadata(output: &str) -> Result<MediaMetadata, String> {
-    let records: Vec<serde_json::Value> =
+    let records: Vec<MetadataJsonRecord> =
         serde_json::from_str(output).map_err(|_| "metadata response was not JSON".to_string())?;
     let fields = records
         .first()
-        .and_then(serde_json::Value::as_object)
+        .map(|record| &record.0)
         .ok_or_else(|| "metadata response contained no record".to_string())?;
     let orientations = fields
         .iter()
-        .filter(|(key, _)| key.as_str() == "Orientation" || key.ends_with(":Orientation"))
+        .filter(|(key, _)| key == "Orientation" || key.ends_with(":Orientation"))
         .map(|(_, value)| {
             value
                 .as_u64()
                 .ok_or_else(|| "orientation was not numeric".to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if orientations.as_slice() != [1] {
-        return Err("orientation tags are missing, conflicting, or not normal".to_string());
-    }
-    let quicktime_rotation = fields
-        .get("QuickTime:Rotation")
-        .map(|value| {
+    let rotations = fields
+        .iter()
+        .filter(|(key, _)| key.contains("QuickTime") && key.ends_with(":Rotation"))
+        .map(|(_, value)| {
             value
                 .as_i64()
-                .ok_or_else(|| "QuickTime Rotation was not numeric".to_string())
+                .ok_or_else(|| "rotation was not numeric".to_string())
         })
-        .transpose()?;
+        .collect::<Result<Vec<_>, _>>()?;
     let width = fields
-        .get("File:ImageWidth")
+        .iter()
+        .find_map(|(key, value)| (key == "File:ImageWidth").then_some(value))
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "container File:ImageWidth was missing or invalid".to_string())?;
     let height = fields
-        .get("File:ImageHeight")
+        .iter()
+        .find_map(|(key, value)| (key == "File:ImageHeight").then_some(value))
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "container File:ImageHeight was missing or invalid".to_string())?;
     if width == 0 || height == 0 {
         return Err("container dimensions must be positive".to_string());
     }
     Ok(MediaMetadata {
-        orientation: 1,
-        quicktime_rotation,
+        orientations,
+        rotations,
         dimensions: (width, height),
     })
 }
@@ -10254,6 +10398,8 @@ pub enum MonitorError {
         program: &'static str,
         timeout_seconds: u64,
     },
+    #[error("HEIC metadata verification failed: {kind:?}")]
+    HeicMetadataVerification { kind: HeicMetadataFailure },
     #[error("failed to decode visual preview {path}: {source}")]
     PreviewDecode {
         path: PathBuf,
@@ -10301,8 +10447,8 @@ mod tests {
             parse_media_metadata(valid)
                 .expect("container dimensions must win over stale EXIF sizes"),
             MediaMetadata {
-                orientation: 1,
-                quicktime_rotation: Some(0),
+                orientations: vec![1],
+                rotations: vec![0],
                 dimensions: (6048, 8064),
             }
         );
@@ -10310,7 +10456,68 @@ mod tests {
             r#"[{"EXIF:Orientation":6,"File:ImageWidth":6048,"File:ImageHeight":8064}]"#,
             r#"[{"EXIF:Orientation":1,"XMP:Orientation":6,"File:ImageWidth":6048,"File:ImageHeight":8064}]"#,
         ] {
-            assert!(parse_media_metadata(invalid).is_err());
+            let metadata = parse_media_metadata(invalid).expect("metadata should parse");
+            assert!(
+                validate_normal_orientation(
+                    &metadata,
+                    HeicMetadataFailure::ReferenceOrientationInvalid,
+                )
+                .is_err()
+            );
+        }
+        let duplicate_group = parse_media_metadata(
+            r#"[{"EXIF:Orientation":6,"EXIF:Orientation":1,"File:ImageWidth":6048,"File:ImageHeight":8064}]"#,
+        )
+        .expect("duplicate fields must remain visible to validation");
+        assert!(
+            validate_normal_orientation(
+                &duplicate_group,
+                HeicMetadataFailure::ReferenceOrientationInvalid,
+            )
+            .is_err()
+        );
+
+        let nonzero_rotation = MediaMetadata {
+            orientations: vec![1],
+            rotations: vec![90],
+            dimensions: (6048, 8064),
+        };
+        assert!(validate_zero_rotation(&nonzero_rotation).is_err());
+    }
+
+    #[test]
+    fn typed_metadata_failure_persists_and_uses_one_retry_converted_policy() {
+        for (failure, expected_kind) in [
+            (
+                HeicMetadataFailure::ReferenceOrientationInvalid,
+                FailureKind::HeicReferenceOrientationInvalid,
+            ),
+            (
+                HeicMetadataFailure::FinalOrientationRotationInvalid,
+                FailureKind::HeicFinalOrientationRotationInvalid,
+            ),
+            (
+                HeicMetadataFailure::DimensionMismatch,
+                FailureKind::HeicDimensionMismatch,
+            ),
+        ] {
+            let mut manifest = Manifest::new();
+            manifest.upsert(lifecycle_record("asset", State::Converted));
+            let mut summary = MonitorScanSummary::default();
+            let error = metadata_verification_error(failure);
+
+            record_heic_monitor_error_or_failure(&mut manifest, &mut summary, "asset", &error)
+                .expect("typed metadata failures must be durable");
+
+            let record = manifest.get("asset").expect("asset should exist");
+            assert_eq!(record.state, State::Failed);
+            assert_eq!(
+                record.failures.last().and_then(|failure| failure.kind),
+                Some(expected_kind)
+            );
+            let policy = failed_retry_policy(expected_kind).expect("metadata failure is retryable");
+            assert_eq!(policy.retry_state, State::Converted);
+            assert_eq!(policy.max_attempts, 1);
         }
     }
 

@@ -80,6 +80,9 @@ pub struct FailureRecord {
 pub enum FailureKind {
     HeicVisualContent,
     HeicVisualMatch,
+    HeicReferenceOrientationInvalid,
+    HeicFinalOrientationRotationInvalid,
+    HeicDimensionMismatch,
     ConversionTimedOut,
     RawStagingTimedOut,
     ConversionOutputUnreadable,
@@ -96,6 +99,9 @@ impl FailureKind {
         match self {
             Self::HeicVisualContent => "heic_visual_content",
             Self::HeicVisualMatch => "heic_visual_match",
+            Self::HeicReferenceOrientationInvalid => "heic_reference_orientation_invalid",
+            Self::HeicFinalOrientationRotationInvalid => "heic_final_orientation_rotation_invalid",
+            Self::HeicDimensionMismatch => "heic_dimension_mismatch",
             Self::ConversionTimedOut => "conversion_timed_out",
             Self::RawStagingTimedOut => "raw_staging_timed_out",
             Self::ConversionOutputUnreadable => "conversion_output_unreadable",
@@ -112,6 +118,11 @@ impl FailureKind {
         match value {
             "heic_visual_content" => Some(Self::HeicVisualContent),
             "heic_visual_match" => Some(Self::HeicVisualMatch),
+            "heic_reference_orientation_invalid" => Some(Self::HeicReferenceOrientationInvalid),
+            "heic_final_orientation_rotation_invalid" => {
+                Some(Self::HeicFinalOrientationRotationInvalid)
+            }
+            "heic_dimension_mismatch" => Some(Self::HeicDimensionMismatch),
             "conversion_timed_out" => Some(Self::ConversionTimedOut),
             "raw_staging_timed_out" => Some(Self::RawStagingTimedOut),
             "conversion_output_unreadable" => Some(Self::ConversionOutputUnreadable),
