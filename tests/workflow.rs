@@ -162,6 +162,71 @@ fn current_conversion_recipe_is_required_before_upload() {
     }
 }
 
+#[test]
+fn conversion_and_heic_recipe_gate_matrix_blocks_upload_and_delete_admission() {
+    for (proof_key, recipe) in [
+        ("conversion", None),
+        ("conversion", Some("embedded-preview-legacy-v0")),
+        ("heic", None),
+        ("heic", Some("embedded-preview-legacy-v0")),
+    ] {
+        let mut conversion_verified = conversion_verified_manifest();
+        let mut record = conversion_verified
+            .get("asset-1")
+            .expect("asset should exist")
+            .clone();
+        let proof = record
+            .proofs
+            .get_mut(proof_key)
+            .expect("proof should exist");
+        match recipe {
+            Some(recipe) => proof["conversion_recipe_id"] = json!(recipe),
+            None => {
+                proof
+                    .as_object_mut()
+                    .expect("proof should be an object")
+                    .remove("conversion_recipe_id");
+            }
+        }
+        conversion_verified.upsert(record);
+        assert!(matches!(
+            upload_ready_heic_proof(&conversion_verified, "asset-1"),
+            Err(WorkflowError::ConversionRecipeOutdated { .. })
+        ));
+
+        let mut upload_verified = upload_verified_manifest();
+        let mut record = upload_verified
+            .get("asset-1")
+            .expect("asset should exist")
+            .clone();
+        let proof = record
+            .proofs
+            .get_mut(proof_key)
+            .expect("proof should exist");
+        match recipe {
+            Some(recipe) => proof["conversion_recipe_id"] = json!(recipe),
+            None => {
+                proof
+                    .as_object_mut()
+                    .expect("proof should be an object")
+                    .remove("conversion_recipe_id");
+            }
+        }
+        upload_verified.upsert(record);
+        assert!(matches!(
+            mark_delete_eligible(&mut upload_verified, "asset-1"),
+            Err(WorkflowError::ConversionRecipeOutdated { .. })
+        ));
+        assert!(build_delete_plan(&upload_verified, "asset-1").is_err());
+    }
+
+    let mut current = upload_verified_manifest();
+    mark_delete_eligible(&mut current, "asset-1").expect("current recipe should be eligible");
+    approve_delete(&mut current, "asset-1", "operator")
+        .expect("current recipe should be approvable");
+    assert!(build_delete_plan(&current, "asset-1").is_ok());
+}
+
 fn upload_proof() -> UploadProof {
     UploadProof {
         uploaded_heic_asset_id: "icloud-heic-asset-1".to_string(),

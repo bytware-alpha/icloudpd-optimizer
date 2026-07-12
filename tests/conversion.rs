@@ -768,7 +768,11 @@ fn macos_real_sips_and_exiftool_normalize_oriented_preview_before_heic_encode() 
             .map(|(_, value)| value.as_u64())
             .collect::<Option<Vec<_>>>()
             .expect("orientation values must be numeric");
-        assert!(!orientations.is_empty() && orientations.iter().all(|value| *value == 1));
+        assert_eq!(
+            orientations,
+            vec![1],
+            "intermediate must have one normal orientation"
+        );
         assert!(
             Command::new("sips")
                 .args(["-s", "format", "heic", "-s", "formatOptions", "100"])
@@ -810,18 +814,20 @@ fn macos_real_sips_and_exiftool_normalize_oriented_preview_before_heic_encode() 
         let final_json: serde_json::Value =
             serde_json::from_slice(&final_metadata.stdout).expect("final metadata must be JSON");
         let final_fields = final_json[0].as_object().expect("final metadata record");
-        assert!(
-            final_fields
-                .iter()
-                .filter(|(key, _)| key.ends_with(":Orientation"))
-                .all(|(_, value)| value.as_u64() == Some(1))
-        );
-        assert!(
-            final_fields
-                .iter()
-                .filter(|(key, _)| key.contains("QuickTime") && key.ends_with(":Rotation"))
-                .all(|(_, value)| value.as_i64() == Some(0))
-        );
+        let final_orientations = final_fields
+            .iter()
+            .filter(|(key, _)| key.ends_with(":Orientation"))
+            .map(|(_, value)| value.as_u64())
+            .collect::<Option<Vec<_>>>()
+            .expect("final orientation values must be numeric");
+        let final_rotations = final_fields
+            .iter()
+            .filter(|(key, _)| key.contains("QuickTime") && key.ends_with(":Rotation"))
+            .map(|(_, value)| value.as_i64())
+            .collect::<Option<Vec<_>>>()
+            .expect("final rotation values must be numeric");
+        assert_eq!(final_orientations, vec![1]);
+        assert_eq!(final_rotations, vec![0]);
         assert_eq!(
             final_fields
                 .get("File:ImageWidth")

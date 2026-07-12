@@ -10575,6 +10575,212 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn invalid_orientation_verifier_tools() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tools = tempfile::tempdir().expect("tool directory should be created");
+        for (name, body) in [
+            ("heif-info", "#!/bin/sh\nexit 0\n"),
+            (
+                "exiftool",
+                "#!/bin/sh\necho '[{\"IFD0:Orientation\":6,\"File:ImageWidth\":4,\"File:ImageHeight\":3}]'\n",
+            ),
+        ] {
+            let path = tools.path().join(name);
+            fs::write(&path, body).expect("fake verifier tool should be written");
+            let mut permissions = fs::metadata(&path)
+                .expect("fake verifier tool metadata should be readable")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions)
+                .expect("fake verifier tool should be executable");
+        }
+        tools
+    }
+
+    #[cfg(unix)]
+    fn converted_record_for_invalid_orientation(asset_id: &str, output: &Path) -> AssetRecord {
+        let mut record = lifecycle_record(asset_id, State::Converted);
+        record.proofs.insert(
+            "conversion".to_string(),
+            json!({
+                "heic_path": output,
+                "heic_sha256": "a".repeat(64),
+                "size_bytes": 1u64,
+                "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
+            }),
+        );
+        record
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn phased_metadata_failure_checkpoints_retries_then_terminalizes_without_starving_capacity() {
+        const CHILD_ENV: &str = "ICLOUDPD_OPTIMIZER_PHASED_METADATA_FAILURE_TEST";
+        if env::var_os(CHILD_ENV).is_none() {
+            let tools = invalid_orientation_verifier_tools();
+            let status = Command::new(env::current_exe().expect("test binary path should resolve"))
+                .args([
+                    "--exact",
+                    "monitor::tests::phased_metadata_failure_checkpoints_retries_then_terminalizes_without_starving_capacity",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("PATH", tools.path())
+                .status()
+                .expect("isolated verifier test should run");
+            assert!(status.success());
+            return;
+        }
+
+        let temporary = tempfile::tempdir().expect("temporary directory should exist");
+        let output = temporary.path().join("invalid.heic");
+        fs::write(&output, b"x").expect("output fixture should exist");
+        let state_store = AssetStateStore::open_writer(
+            temporary.path().join("state.json"),
+            "metadata-test",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+        let mut config = MonitorConfig::new(
+            temporary.path(),
+            temporary.path().join("state.json"),
+            temporary.path(),
+        );
+        config.max_lifecycle_per_scan = 1;
+        let mut manifest = Manifest::new();
+        manifest.upsert(converted_record_for_invalid_orientation("bad", &output));
+        let mut summary = MonitorScanSummary {
+            started_unix_seconds: 1,
+            ..MonitorScanSummary::default()
+        };
+
+        verify_converted_heics(
+            &config,
+            &state_store,
+            &mut manifest,
+            &mut summary,
+            &["bad".to_string()],
+        )
+        .expect("typed metadata failure should be checkpointed");
+        assert_eq!(summary.failures, 1);
+        assert_eq!(manifest.get("bad").unwrap().state, State::Failed);
+        assert_eq!(
+            manifest
+                .get("bad")
+                .unwrap()
+                .failures
+                .last()
+                .and_then(|failure| failure.kind),
+            Some(FailureKind::HeicReferenceOrientationInvalid)
+        );
+        assert_eq!(
+            failed_retry_queue_counts(&manifest)["retryable_heic_reference_orientation_invalid"],
+            1
+        );
+        assert_eq!(
+            state_store
+                .load_or_import()
+                .expect("checkpoint should load")
+                .get("bad")
+                .unwrap()
+                .state,
+            State::Failed
+        );
+
+        admit_failed_retryable_assets(&mut manifest, 1, 1, 0, 1)
+            .expect("typed failure should admit exactly one retry");
+        assert_eq!(manifest.get("bad").unwrap().state, State::Converted);
+        verify_converted_heics(
+            &config,
+            &state_store,
+            &mut manifest,
+            &mut summary,
+            &["bad".to_string()],
+        )
+        .expect("repeated typed failure should checkpoint");
+        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 0, 1)
+            .expect("exhausted retry should terminalize");
+        assert_eq!(admission.exhausted, 1);
+        assert_eq!(manifest.get("bad").unwrap().state, State::NeedsReview);
+
+        manifest.upsert(lifecycle_record("healthy", State::NasVerified));
+        assert_eq!(active_lifecycle_asset_ids(&manifest, 1), vec!["healthy"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rolling_metadata_failure_checkpoints_typed_failure_and_releases_worker() {
+        const CHILD_ENV: &str = "ICLOUDPD_OPTIMIZER_ROLLING_METADATA_FAILURE_TEST";
+        if env::var_os(CHILD_ENV).is_none() {
+            let tools = invalid_orientation_verifier_tools();
+            let status = Command::new(env::current_exe().expect("test binary path should resolve"))
+                .args([
+                    "--exact",
+                    "monitor::tests::rolling_metadata_failure_checkpoints_typed_failure_and_releases_worker",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("PATH", tools.path())
+                .status()
+                .expect("isolated rolling verifier test should run");
+            assert!(status.success());
+            return;
+        }
+
+        let temporary = tempfile::tempdir().expect("temporary directory should exist");
+        let output = temporary.path().join("invalid.heic");
+        fs::write(&output, b"x").expect("output fixture should exist");
+        let state_store = AssetStateStore::open_writer(
+            temporary.path().join("state.json"),
+            "metadata-test",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+        let config = MonitorConfig::new(
+            temporary.path(),
+            temporary.path().join("state.json"),
+            temporary.path(),
+        );
+        let mut initial = Manifest::new();
+        initial.upsert(converted_record_for_invalid_orientation("bad", &output));
+        let manifest = Arc::new(Mutex::new(initial));
+        let summary = Arc::new(Mutex::new(MonitorScanSummary {
+            started_unix_seconds: 1,
+            ..MonitorScanSummary::default()
+        }));
+
+        let outcome = run_rolling_asset_verify(&config, &state_store, "bad", &manifest, &summary)
+            .expect("rolling verifier should handle typed metadata failure");
+        assert!(outcome.attempted && outcome.failed);
+        assert_eq!(summary.lock().expect("summary lock").failures, 1);
+        assert_eq!(
+            manifest
+                .lock()
+                .expect("manifest lock")
+                .get("bad")
+                .unwrap()
+                .state,
+            State::Failed
+        );
+        assert_eq!(
+            state_store
+                .load_or_import()
+                .expect("checkpoint should load")
+                .get("bad")
+                .unwrap()
+                .failures
+                .last()
+                .and_then(|failure| failure.kind),
+            Some(FailureKind::HeicReferenceOrientationInvalid)
+        );
+        let follow_up =
+            run_parallel_asset_job_chunk(&["healthy".to_string()], |_| Ok::<_, MonitorError>(()));
+        assert!(
+            follow_up[0].result.is_ok(),
+            "failed verifier must not strand the worker pool"
+        );
+    }
+
     struct TestAdjustedSourceTransport {
         response: Value,
         bytes: Vec<u8>,
