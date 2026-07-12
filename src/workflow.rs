@@ -778,6 +778,17 @@ pub fn icloudpd_local_mirror_ready_proofs(
     Ok((upload, heic))
 }
 
+/// Validates the stored local-mirror proof against the current upload and HEIC
+/// lineage without reading or hashing the mirrored file.
+pub fn validate_current_icloudpd_local_mirror_proof(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<(), WorkflowError> {
+    let proof =
+        stored_proof::<IcloudpdLocalMirrorProof>(manifest, asset_id, ICLOUDPD_LOCAL_MIRROR_PROOF)?;
+    validate_candidate_icloudpd_local_mirror(manifest, asset_id, &proof)
+}
+
 pub fn record_source_age_proof<'a>(
     manifest: &'a mut Manifest,
     asset_id: &str,

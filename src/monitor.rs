@@ -57,7 +57,8 @@ use crate::workflow::{
     record_heic_verification, record_icloudpd_local_mirror_proof,
     record_prevalidated_delete_execution, record_reconciled_delete_execution,
     record_source_age_proof, record_stage_failure, record_stage_failure_with_kind,
-    record_upload_proof, upload_ready_heic_proof, validated_adjusted_source_for_conversion,
+    record_upload_proof, upload_ready_heic_proof, validate_current_icloudpd_local_mirror_proof,
+    validated_adjusted_source_for_conversion,
 };
 
 static MONITOR_FAILURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -674,6 +675,7 @@ pub fn run_monitor_once(
         config.failed_retry_min_age_seconds,
         config.max_original_resolver_retries_per_scan,
         config.original_resolver_retry_min_age_seconds,
+        config.auto_delete,
         started,
     )?;
     let failed_retry_admission = retry_admissions.failed_retry;
@@ -736,7 +738,7 @@ pub fn run_monitor_once(
             "lifecycle_started",
             started,
             json!({
-                "pending_lifecycle": pending_lifecycle_count(&manifest),
+                "pending_lifecycle": pending_lifecycle_count_for_config(&manifest, config),
                 "position": "before_discovery",
             }),
         );
@@ -846,7 +848,7 @@ pub fn run_monitor_once(
                 "reason": new_work_skip_reason.unwrap_or("unknown"),
                 "active_lifecycle": active_lifecycle_ids.len(),
                 "max_lifecycle_per_scan": config.max_lifecycle_per_scan,
-                "pending_lifecycle_after_lifecycle": pending_lifecycle_count(&manifest),
+                "pending_lifecycle_after_lifecycle": pending_lifecycle_count_for_config(&manifest, config),
             }),
         );
     }
@@ -859,7 +861,7 @@ pub fn run_monitor_once(
             started,
             json!({
                 "active_lifecycle": active_lifecycle_ids.len(),
-                "pending_lifecycle": pending_lifecycle_count(&manifest),
+                "pending_lifecycle": pending_lifecycle_count_for_config(&manifest, config),
                 "position": "before_conversions",
             }),
         );
@@ -916,7 +918,7 @@ pub fn run_monitor_once(
                 started,
                 json!({
                     "active_lifecycle": active_lifecycle_ids.len(),
-                    "pending_lifecycle": pending_lifecycle_count(&manifest),
+                    "pending_lifecycle": pending_lifecycle_count_for_config(&manifest, config),
                     "position": "after_conversions",
                 }),
             );
@@ -1872,7 +1874,7 @@ where
         let Some(record) = manifest.records().get(asset_id) else {
             continue;
         };
-        if rolling_lifecycle_next_worker_step(record, config, true)
+        if rolling_lifecycle_next_worker_step(manifest, record, config, true)
             == Some(RollingAssetStep::ResolveAdjustedSource)
             && resolver_capacity > 0
         {
@@ -2110,7 +2112,18 @@ fn rolling_lifecycle_worker_stage_sequence(
     record: &AssetRecord,
     config: &MonitorConfig,
 ) -> Vec<RollingAssetStep> {
-    let Some(first_step) = rolling_lifecycle_next_worker_step(record, config, true) else {
+    let mut manifest = Manifest::new();
+    manifest.upsert(record.clone());
+    rolling_lifecycle_worker_stage_sequence_for_manifest(&manifest, record, config)
+}
+
+fn rolling_lifecycle_worker_stage_sequence_for_manifest(
+    manifest: &Manifest,
+    record: &AssetRecord,
+    config: &MonitorConfig,
+) -> Vec<RollingAssetStep> {
+    let Some(first_step) = rolling_lifecycle_next_worker_step(manifest, record, config, true)
+    else {
         return Vec::new();
     };
     rolling_lifecycle_worker_stage_sequence_from(first_step, config.auto_delete)
@@ -2515,7 +2528,9 @@ fn rolling_lifecycle_worker_asset_ids(
         .filter(|asset_id| !deferred_worker_asset_ids.contains(asset_id.as_str()))
         .filter_map(|asset_id| manifest.records().get(asset_id))
         .filter(|record| active_lifecycle_allows(active_set, &record.asset_id))
-        .filter(|record| rolling_lifecycle_record_can_run_worker_stage(record, config, true))
+        .filter(|record| {
+            rolling_lifecycle_record_can_run_worker_stage(manifest, record, config, true)
+        })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         lifecycle_continuation_priority(left)
@@ -2526,7 +2541,7 @@ fn rolling_lifecycle_worker_asset_ids(
     let mut conversion_capacity = remaining_conversion_capacity;
     let mut selected = Vec::with_capacity(limit);
     for record in candidates {
-        let Some(step) = rolling_lifecycle_next_worker_step(record, config, true) else {
+        let Some(step) = rolling_lifecycle_next_worker_step(manifest, record, config, true) else {
             continue;
         };
         if matches!(
@@ -2547,11 +2562,13 @@ fn rolling_lifecycle_worker_asset_ids(
 }
 
 fn rolling_lifecycle_record_can_run_worker_stage(
+    manifest: &Manifest,
     record: &AssetRecord,
     config: &MonitorConfig,
     conversion_capacity_available: bool,
 ) -> bool {
-    rolling_lifecycle_next_worker_step(record, config, conversion_capacity_available).is_some()
+    rolling_lifecycle_next_worker_step(manifest, record, config, conversion_capacity_available)
+        .is_some()
 }
 
 fn rolling_lifecycle_should_resolve_before_workers(
@@ -2573,6 +2590,7 @@ fn rolling_lifecycle_should_resolve_before_workers(
 }
 
 fn rolling_lifecycle_next_worker_step(
+    manifest: &Manifest,
     record: &AssetRecord,
     config: &MonitorConfig,
     conversion_capacity_available: bool,
@@ -2604,7 +2622,10 @@ fn rolling_lifecycle_next_worker_step(
         State::ConversionVerified if record.proofs.contains_key("original_asset") => {
             Some(RollingAssetStep::UploadVerifiedHeics)
         }
-        State::UploadVerified if !record.proofs.contains_key("icloudpd_local_mirror") => {
+        State::UploadVerified
+            if validate_current_icloudpd_local_mirror_proof(manifest, &record.asset_id)
+                .is_err() =>
+        {
             Some(RollingAssetStep::RecordLocalMirrors)
         }
         _ => None,
@@ -2742,7 +2763,7 @@ fn run_rolling_asset_lifecycle<T: CloudKitAdjustedSourceTransport>(
     let steps = {
         let snapshot = lock_shared(execution.manifest, "rolling lifecycle manifest")?;
         let record = snapshot.get(asset_id)?;
-        rolling_lifecycle_worker_stage_sequence(record, execution.config)
+        rolling_lifecycle_worker_stage_sequence_for_manifest(&snapshot, record, execution.config)
     };
     for step in steps {
         let resolver_reservations = (step == RollingAssetStep::ResolveAdjustedSource)
@@ -3775,7 +3796,8 @@ fn rolling_asset_local_mirror_request(
     asset_id: &str,
 ) -> Result<Option<IcloudpdLocalMirrorRequest>, MonitorError> {
     let record = manifest.get(asset_id)?;
-    if record.state != State::UploadVerified || record.proofs.contains_key("icloudpd_local_mirror")
+    if record.state != State::UploadVerified
+        || validate_current_icloudpd_local_mirror_proof(manifest, asset_id).is_ok()
     {
         return Ok(None);
     }
@@ -5065,7 +5087,7 @@ fn record_local_mirrors(
     let asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
         active_lifecycle_allows(Some(active_lifecycle_asset_ids), &record.asset_id)
             && record.state == State::UploadVerified
-            && !record.proofs.contains_key("icloudpd_local_mirror")
+            && validate_current_icloudpd_local_mirror_proof(manifest, &record.asset_id).is_err()
     });
     let mirror_root = config.mirror_root.as_ref().unwrap_or(&config.download_root);
     for chunk in asset_ids.chunks(config.jobs.max(1)) {
@@ -6304,10 +6326,18 @@ fn pending_conversion_count(manifest: &Manifest, config: &MonitorConfig) -> usiz
 }
 
 fn pending_lifecycle_count(manifest: &Manifest) -> usize {
+    pending_lifecycle_count_with_auto_delete(manifest, true)
+}
+
+fn pending_lifecycle_count_for_config(manifest: &Manifest, config: &MonitorConfig) -> usize {
+    pending_lifecycle_count_with_auto_delete(manifest, config.auto_delete)
+}
+
+fn pending_lifecycle_count_with_auto_delete(manifest: &Manifest, auto_delete: bool) -> usize {
     manifest
         .records()
         .values()
-        .filter(|record| is_lifecycle_candidate(record))
+        .filter(|record| lifecycle_candidate_has_runnable_stage(manifest, record, auto_delete))
         .count()
 }
 
@@ -6319,6 +6349,14 @@ struct LifecycleAdmissionBudget {
 
 impl LifecycleAdmissionBudget {
     fn for_scan(manifest: &Manifest, max_lifecycle_per_scan: usize) -> Self {
+        Self::for_scan_with_auto_delete(manifest, max_lifecycle_per_scan, true)
+    }
+
+    fn for_scan_with_auto_delete(
+        manifest: &Manifest,
+        max_lifecycle_per_scan: usize,
+        auto_delete: bool,
+    ) -> Self {
         let marker_reservations = manifest
             .records()
             .values()
@@ -6326,7 +6364,8 @@ impl LifecycleAdmissionBudget {
             .count();
         Self {
             max_slots: max_lifecycle_per_scan,
-            occupied_slots: pending_lifecycle_count(manifest).saturating_add(marker_reservations),
+            occupied_slots: pending_lifecycle_count_with_auto_delete(manifest, auto_delete)
+                .saturating_add(marker_reservations),
         }
     }
 
@@ -7701,9 +7740,14 @@ fn admit_scan_retry_policies(
     failed_retry_min_age_seconds: u64,
     max_original_resolver_retries_per_scan: usize,
     original_resolver_retry_min_age_seconds: u64,
+    auto_delete: bool,
     current_unix_seconds: u64,
 ) -> Result<ScanRetryAdmissions, ManifestError> {
-    let mut lifecycle_budget = LifecycleAdmissionBudget::for_scan(manifest, max_lifecycle_per_scan);
+    let mut lifecycle_budget = LifecycleAdmissionBudget::for_scan_with_auto_delete(
+        manifest,
+        max_lifecycle_per_scan,
+        auto_delete,
+    );
     let failed_retry = admit_failed_retryable_assets_with_budget(
         manifest,
         &mut lifecycle_budget,
@@ -8823,21 +8867,30 @@ pub(crate) fn active_lifecycle_asset_ids_for_config(
 ) -> Vec<String> {
     let limit = config.max_lifecycle_per_scan;
     if !config.rolling_lifecycle {
-        return active_lifecycle_asset_ids(manifest, limit);
+        return active_lifecycle_asset_ids_with_auto_delete(manifest, limit, config.auto_delete);
     }
     active_lifecycle_asset_ids_with_conversion_reserve(
         manifest,
         limit,
         rolling_lifecycle_active_conversion_reserve(config, limit),
+        config.auto_delete,
     )
 }
 
 fn active_lifecycle_asset_ids(manifest: &Manifest, limit: usize) -> Vec<String> {
+    active_lifecycle_asset_ids_with_auto_delete(manifest, limit, true)
+}
+
+fn active_lifecycle_asset_ids_with_auto_delete(
+    manifest: &Manifest,
+    limit: usize,
+    auto_delete: bool,
+) -> Vec<String> {
     if limit == 0 {
         return Vec::new();
     }
 
-    let mut active_ids = lifecycle_continuation_asset_ids(manifest, limit);
+    let mut active_ids = lifecycle_continuation_asset_ids(manifest, limit, auto_delete);
     let remaining = limit.saturating_sub(active_ids.len());
     if remaining == 0 {
         return active_ids;
@@ -8855,18 +8908,19 @@ fn active_lifecycle_asset_ids_with_conversion_reserve(
     manifest: &Manifest,
     limit: usize,
     conversion_reserve: usize,
+    auto_delete: bool,
 ) -> Vec<String> {
     if limit == 0 {
         return Vec::new();
     }
     let conversion_reserve = conversion_reserve.min(limit);
     if conversion_reserve == 0 {
-        return active_lifecycle_asset_ids(manifest, limit);
+        return active_lifecycle_asset_ids_with_auto_delete(manifest, limit, auto_delete);
     }
 
     let conversion_ids = conversion_ready_lifecycle_asset_ids(manifest, conversion_reserve);
     if conversion_ids.is_empty() {
-        return active_lifecycle_asset_ids(manifest, limit);
+        return active_lifecycle_asset_ids_with_auto_delete(manifest, limit, auto_delete);
     }
 
     let conversion_id_set = conversion_ids.iter().cloned().collect::<BTreeSet<_>>();
@@ -8875,6 +8929,7 @@ fn active_lifecycle_asset_ids_with_conversion_reserve(
         manifest,
         non_conversion_limit,
         &conversion_id_set,
+        auto_delete,
     );
     active_ids.extend(conversion_ids);
 
@@ -8915,32 +8970,58 @@ fn is_lifecycle_candidate(record: &AssetRecord) -> bool {
     )
 }
 
-fn is_lifecycle_continuation_candidate(record: &AssetRecord) -> bool {
-    (record.state == State::Failed && adjusted_source_required_proof(record).is_ok())
-        || matches!(
-            record.state,
-            State::Converted
-                | State::ConversionVerified
-                | State::UploadVerified
-                | State::DeleteEligible
-                | State::DeleteApproved
-        )
-        || (record.state == State::NasVerified && record.proofs.contains_key("original_asset"))
+fn lifecycle_candidate_has_runnable_stage(
+    manifest: &Manifest,
+    record: &AssetRecord,
+    auto_delete: bool,
+) -> bool {
+    if !is_lifecycle_candidate(record) {
+        return false;
+    }
+    if auto_delete {
+        return true;
+    }
+    match record.state {
+        State::UploadVerified => {
+            validate_current_icloudpd_local_mirror_proof(manifest, &record.asset_id).is_err()
+        }
+        State::DeleteEligible | State::DeleteApproved => false,
+        _ => true,
+    }
 }
 
-fn lifecycle_continuation_asset_ids(manifest: &Manifest, limit: usize) -> Vec<String> {
-    lifecycle_continuation_asset_ids_excluding(manifest, limit, &BTreeSet::new())
+fn is_lifecycle_continuation_candidate(
+    manifest: &Manifest,
+    record: &AssetRecord,
+    auto_delete: bool,
+) -> bool {
+    (record.state == State::Failed && adjusted_source_required_proof(record).is_ok())
+        || matches!(record.state, State::Converted | State::ConversionVerified)
+        || (record.state == State::NasVerified && record.proofs.contains_key("original_asset"))
+        || matches!(
+            record.state,
+            State::UploadVerified | State::DeleteEligible | State::DeleteApproved
+        ) && lifecycle_candidate_has_runnable_stage(manifest, record, auto_delete)
+}
+
+fn lifecycle_continuation_asset_ids(
+    manifest: &Manifest,
+    limit: usize,
+    auto_delete: bool,
+) -> Vec<String> {
+    lifecycle_continuation_asset_ids_excluding(manifest, limit, &BTreeSet::new(), auto_delete)
 }
 
 fn lifecycle_continuation_asset_ids_excluding(
     manifest: &Manifest,
     limit: usize,
     excluded_asset_ids: &BTreeSet<String>,
+    auto_delete: bool,
 ) -> Vec<String> {
     let mut candidates = manifest
         .records()
         .values()
-        .filter(|record| is_lifecycle_continuation_candidate(record))
+        .filter(|record| is_lifecycle_continuation_candidate(manifest, record, auto_delete))
         .filter(|record| !excluded_asset_ids.contains(&record.asset_id))
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
@@ -12054,9 +12135,9 @@ esac
                     .expect("terminal state check should succeed")
             );
             assert!(!rolling_lifecycle_record_can_run_worker_stage(
-                record, &config, true,
+                &manifest, record, &config, true,
             ));
-            assert!(rolling_lifecycle_next_worker_step(record, &config, true).is_none());
+            assert!(rolling_lifecycle_next_worker_step(&manifest, record, &config, true).is_none());
         }
     }
 
@@ -12206,6 +12287,7 @@ esac
 
         assert!(
             rolling_lifecycle_next_worker_step(
+                &manifest,
                 manifest.get("resolver-a").expect("resolver record"),
                 &config,
                 false,
@@ -12573,7 +12655,7 @@ esac
             "1600.000000000Z",
         );
 
-        let admissions = admit_scan_retry_policies(&mut manifest, 1, 1, 300, 1, 300, 2_000)
+        let admissions = admit_scan_retry_policies(&mut manifest, 1, 1, 300, 1, 300, true, 2_000)
             .expect("exhausted resolver lineage should be terminalized before worker selection");
         assert_eq!(admissions.adjusted_source_required.exhausted, 1);
         assert_eq!(
@@ -16029,6 +16111,14 @@ esac
         record
     }
 
+    fn make_local_mirror_proof_current(record: &mut AssetRecord) {
+        let heic_sha = "a".repeat(64);
+        for proof_key in ["conversion", "heic", "upload", "icloudpd_local_mirror"] {
+            record.proofs.get_mut(proof_key).unwrap()["uploaded_heic_sha256"] = json!(heic_sha);
+            record.proofs.get_mut(proof_key).unwrap()["heic_sha256"] = json!(heic_sha);
+        }
+    }
+
     fn test_delete_session() -> CloudKitDeleteSession {
         CloudKitDeleteSession::from_json(
             &json!({
@@ -18553,7 +18643,7 @@ esac
         ));
 
         let admissions =
-            admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, 1_000_000)
+            admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, true, 1_000_000)
                 .expect("shared lifecycle budget should preserve the marker reservation");
 
         assert!(admissions.failed_retry.admitted_by_category.is_empty());
@@ -18563,8 +18653,9 @@ esac
             State::Failed
         );
 
-        let repeated = admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, 1_000_000)
-            .expect("the same marker must reserve exactly one slot on later scans");
+        let repeated =
+            admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, true, 1_000_000)
+                .expect("the same marker must reserve exactly one slot on later scans");
         assert!(repeated.failed_retry.admitted_by_category.is_empty());
         assert_eq!(manifest.get("generic-retry").unwrap().state, State::Failed);
     }
@@ -18588,7 +18679,7 @@ esac
         ));
 
         let admissions =
-            admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, 1_000_000)
+            admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, true, 1_000_000)
                 .expect("generic recovery should consume the scan's only lifecycle slot");
 
         assert_eq!(
@@ -18620,7 +18711,7 @@ esac
         ));
 
         let admissions =
-            admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, 1_000_000)
+            admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, true, 1_000_000)
                 .expect("new adjusted marker should consume the scan's only lifecycle slot");
 
         assert_eq!(admissions.adjusted_source_required.first_ready, 1);
@@ -18666,8 +18757,11 @@ esac
             "050.000000000Z",
         ));
 
-        let admissions = admit_scan_retry_policies(&mut manifest, 1, 1, 300, 16, 86_400, 1_000_000)
-            .expect("reserved retry should remain eligible when new first markers have no slot");
+        let admissions =
+            admit_scan_retry_policies(&mut manifest, 1, 1, 300, 16, 86_400, true, 1_000_000)
+                .expect(
+                    "reserved retry should remain eligible when new first markers have no slot",
+                );
 
         assert_eq!(admissions.adjusted_source_required.resolver_retry_ready, 1);
         assert_eq!(admissions.adjusted_source_required.first_ready, 0);
@@ -19917,6 +20011,159 @@ esac
         }
 
         assert_eq!(pending_lifecycle_count(&manifest), 6);
+    }
+
+    #[test]
+    fn deletion_disabled_valid_mirror_does_not_occupy_lifecycle_capacity() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path(),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        config.full_lifecycle = true;
+        config.auto_delete = false;
+        config.max_lifecycle_per_scan = 1;
+
+        let mut conversion = lifecycle_record("conversion", State::NasVerified);
+        add_original_asset_proof(&mut conversion);
+        let mut manifest = Manifest::new();
+        let mut mirrored = upload_verified_delete_ready_record("mirrored", tempdir.path());
+        make_local_mirror_proof_current(&mut mirrored);
+        manifest.upsert(mirrored);
+        manifest.upsert(conversion);
+
+        assert_eq!(pending_lifecycle_count_for_config(&manifest, &config), 1);
+        assert_eq!(
+            LifecycleAdmissionBudget::for_scan_with_auto_delete(&manifest, 1, false)
+                .remaining_slots(),
+            0
+        );
+        assert_eq!(
+            active_lifecycle_asset_ids_for_config(&config, &manifest),
+            vec!["conversion"]
+        );
+    }
+
+    #[test]
+    fn deletion_disabled_invalid_mirror_proofs_remain_mirror_candidates() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path(),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        config.full_lifecycle = true;
+        config.auto_delete = false;
+        config.max_lifecycle_per_scan = 1;
+
+        for (name, field, value) in [
+            ("missing", None, Value::Null),
+            ("malformed", Some("size_bytes"), json!("ten")),
+            ("zero-size", Some("size_bytes"), json!(0)),
+            (
+                "wrong-asset",
+                Some("uploaded_heic_asset_id"),
+                json!("wrong"),
+            ),
+            (
+                "wrong-path",
+                Some("uploaded_heic_path"),
+                json!("/wrong.HEIC"),
+            ),
+            ("wrong-size", Some("size_bytes"), json!(11)),
+            ("wrong-sha", Some("uploaded_heic_sha256"), json!("wrong")),
+        ] {
+            let asset_id = format!("mirror-{name}");
+            let mut record = upload_verified_delete_ready_record(&asset_id, tempdir.path());
+            make_local_mirror_proof_current(&mut record);
+            if let Some(field) = field {
+                record.proofs.get_mut("icloudpd_local_mirror").unwrap()[field] = value;
+            } else {
+                record.proofs.remove("icloudpd_local_mirror");
+            }
+            let mut manifest = Manifest::new();
+            manifest.upsert(record);
+
+            assert_eq!(
+                pending_lifecycle_count_for_config(&manifest, &config),
+                1,
+                "{name}"
+            );
+            assert_eq!(
+                active_lifecycle_asset_ids_for_config(&config, &manifest),
+                vec![asset_id.clone()],
+                "{name}"
+            );
+            assert!(
+                rolling_asset_local_mirror_request(&config, &manifest, &asset_id)
+                    .expect("invalid mirror proof should be repairable")
+                    .is_some(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn deletion_disabled_excludes_delete_only_states_from_pending_and_selection() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path(),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        config.full_lifecycle = true;
+        config.auto_delete = false;
+        config.max_lifecycle_per_scan = 10;
+        let mut manifest = Manifest::new();
+        for (asset_id, state) in [
+            ("mirrored", State::UploadVerified),
+            ("eligible", State::DeleteEligible),
+            ("approved", State::DeleteApproved),
+        ] {
+            let mut record = upload_verified_delete_ready_record(asset_id, tempdir.path());
+            make_local_mirror_proof_current(&mut record);
+            record.state = state;
+            manifest.upsert(record);
+        }
+
+        assert_eq!(pending_lifecycle_count_for_config(&manifest, &config), 0);
+        assert_eq!(
+            LifecycleAdmissionBudget::for_scan_with_auto_delete(&manifest, 10, false)
+                .occupied_slots,
+            0
+        );
+        assert!(active_lifecycle_asset_ids_for_config(&config, &manifest).is_empty());
+    }
+
+    #[test]
+    fn deletion_enabled_keeps_existing_lifecycle_candidate_order_and_occupancy() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path(),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        config.full_lifecycle = true;
+        config.auto_delete = true;
+        config.max_lifecycle_per_scan = 3;
+        let mut manifest = Manifest::new();
+        for (asset_id, state) in [
+            ("mirrored", State::UploadVerified),
+            ("eligible", State::DeleteEligible),
+            ("approved", State::DeleteApproved),
+        ] {
+            let mut record = upload_verified_delete_ready_record(asset_id, tempdir.path());
+            make_local_mirror_proof_current(&mut record);
+            record.state = state;
+            manifest.upsert(record);
+        }
+
+        assert_eq!(pending_lifecycle_count_for_config(&manifest, &config), 3);
+        assert_eq!(
+            active_lifecycle_asset_ids_for_config(&config, &manifest),
+            vec!["approved", "eligible", "mirrored"]
+        );
     }
 
     #[test]

@@ -64,6 +64,7 @@ use crate::workflow::{
     record_original_asset_batch_proofs, record_original_asset_proof, record_source_age_proof,
     record_stage_failure, record_upload_proof, record_uploaded_heic_delete,
     upload_ready_heic_proof, uploaded_heic_delete_request,
+    validate_current_icloudpd_local_mirror_proof,
 };
 
 const DAY_SECONDS: u64 = 24 * 60 * 60;
@@ -3697,7 +3698,7 @@ fn queue_counts(
         active_lifecycle.len() as u64,
     );
     for record in manifest.records().values() {
-        match queue_next_stage(record, config) {
+        match queue_next_stage(manifest, record, config) {
             "none" => {}
             stage => increment_count(&mut counts, stage),
         }
@@ -3717,7 +3718,7 @@ fn queue_active_lifecycle_assets(config: &MonitorConfig, manifest: &Manifest) ->
     crate::monitor::active_lifecycle_asset_ids_for_config(config, manifest)
         .into_iter()
         .filter_map(|asset_id| manifest.records().get(&asset_id))
-        .map(|record| queue_asset(record, "continue_lifecycle"))
+        .map(|record| queue_asset(manifest, record, config, "continue_lifecycle"))
         .collect()
 }
 
@@ -3761,16 +3762,25 @@ fn queue_rolling_asset_stage_sequence(
         .unwrap_or_else(|| vec![next_stage])
 }
 
-fn queue_asset(record: &AssetRecord, fallback_stage: &'static str) -> QueueAsset {
+fn queue_asset(
+    manifest: &Manifest,
+    record: &AssetRecord,
+    config: &MonitorConfig,
+    fallback_stage: &'static str,
+) -> QueueAsset {
     QueueAsset {
         asset_id: record.asset_id.clone(),
         state: record.state.as_str().to_string(),
-        next_stage: queue_next_stage_for_record(record).unwrap_or(fallback_stage),
+        next_stage: queue_next_stage_for_record(manifest, record, config).unwrap_or(fallback_stage),
         raw_size_bytes: queue_raw_size_bytes(record),
     }
 }
 
-fn queue_next_stage(record: &AssetRecord, config: &MonitorConfig) -> &'static str {
+fn queue_next_stage(
+    manifest: &Manifest,
+    record: &AssetRecord,
+    config: &MonitorConfig,
+) -> &'static str {
     if !config.full_lifecycle {
         return match record.state {
             State::NasVerified => "convert_heic",
@@ -3778,17 +3788,30 @@ fn queue_next_stage(record: &AssetRecord, config: &MonitorConfig) -> &'static st
             _ => "none",
         };
     }
-    queue_next_stage_for_record(record).unwrap_or("none")
+    queue_next_stage_for_record(manifest, record, config).unwrap_or("none")
 }
 
-fn queue_next_stage_for_record(record: &AssetRecord) -> Option<&'static str> {
+fn queue_next_stage_for_record(
+    manifest: &Manifest,
+    record: &AssetRecord,
+    config: &MonitorConfig,
+) -> Option<&'static str> {
     match record.state {
-        State::DeleteApproved => Some("delete_original_assets"),
-        State::DeleteEligible => Some("delete_original_assets"),
-        State::UploadVerified if record.proofs.contains_key("icloudpd_local_mirror") => {
+        State::DeleteApproved | State::DeleteEligible if config.auto_delete => {
             Some("delete_original_assets")
         }
-        State::UploadVerified => Some("record_local_mirrors"),
+        State::UploadVerified
+            if validate_current_icloudpd_local_mirror_proof(manifest, &record.asset_id).is_ok()
+                && config.auto_delete =>
+        {
+            Some("delete_original_assets")
+        }
+        State::UploadVerified
+            if validate_current_icloudpd_local_mirror_proof(manifest, &record.asset_id)
+                .is_err() =>
+        {
+            Some("record_local_mirrors")
+        }
         State::ConversionVerified if record.proofs.contains_key("original_asset") => {
             Some("upload_verified_heics")
         }
@@ -3814,6 +3837,34 @@ fn queue_raw_size_bytes(record: &AssetRecord) -> u64 {
         .and_then(|proof| proof.get("size_bytes"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    #[test]
+    fn deletion_disabled_queue_hides_delete_only_records_in_json_and_human_status() {
+        let mut config = MonitorConfig::new("/download", "/manifest.json", "/heic");
+        config.full_lifecycle = true;
+        config.auto_delete = false;
+        let mut manifest = Manifest::new();
+        for (asset_id, state) in [
+            ("eligible", State::DeleteEligible),
+            ("approved", State::DeleteApproved),
+        ] {
+            let mut record = AssetRecord::new(asset_id, format!("/raw/{asset_id}.DNG"));
+            record.state = state;
+            manifest.upsert(record);
+        }
+
+        let report = MonitorQueueReport::from_manifest(&config, &manifest, 10);
+        assert_eq!(report.queue_counts["active_lifecycle"], 0);
+        assert!(!report.queue_counts.contains_key("delete_original_assets"));
+        let json = serde_json::to_value(&report).expect("queue report should serialize");
+        assert_eq!(json["queue_counts"]["active_lifecycle"], 0);
+        assert!(!render_queue_report(&report).contains("delete_original_assets"));
+    }
 }
 
 fn render_queue_report(report: &MonitorQueueReport) -> String {
