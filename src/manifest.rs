@@ -108,7 +108,7 @@ impl FailureKind {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "heic_visual_content" => Some(Self::HeicVisualContent),
             "heic_visual_match" => Some(Self::HeicVisualMatch),

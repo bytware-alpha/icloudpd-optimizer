@@ -668,17 +668,19 @@ pub fn run_monitor_once(
     };
     let retry_admissions = admit_scan_retry_policies(
         &mut manifest,
-        if config.full_lifecycle {
-            config.max_lifecycle_per_scan
-        } else {
-            0
+        ScanRetryPolicyConfig {
+            max_lifecycle_per_scan: if config.full_lifecycle {
+                config.max_lifecycle_per_scan
+            } else {
+                0
+            },
+            max_failed_retry_admissions_per_scan: config.max_failed_retry_admissions_per_scan,
+            failed_retry_min_age_seconds: config.failed_retry_min_age_seconds,
+            max_original_resolver_retries_per_scan: config.max_original_resolver_retries_per_scan,
+            original_resolver_retry_min_age_seconds: config.original_resolver_retry_min_age_seconds,
+            auto_delete: config.auto_delete,
+            current_unix_seconds: started,
         },
-        config.max_failed_retry_admissions_per_scan,
-        config.failed_retry_min_age_seconds,
-        config.max_original_resolver_retries_per_scan,
-        config.original_resolver_retry_min_age_seconds,
-        config.auto_delete,
-        started,
     )?;
     let failed_retry_admission = retry_admissions.failed_retry;
     let adjusted_source_required_admission = retry_admissions.adjusted_source_required;
@@ -7752,8 +7754,8 @@ struct ScanRetryAdmissions {
     original_asset_resolver: OriginalAssetResolverRetryAdmission,
 }
 
-fn admit_scan_retry_policies(
-    manifest: &mut Manifest,
+#[derive(Clone, Copy)]
+struct ScanRetryPolicyConfig {
     max_lifecycle_per_scan: usize,
     max_failed_retry_admissions_per_scan: usize,
     failed_retry_min_age_seconds: u64,
@@ -7761,27 +7763,34 @@ fn admit_scan_retry_policies(
     original_resolver_retry_min_age_seconds: u64,
     auto_delete: bool,
     current_unix_seconds: u64,
+}
+
+fn admit_scan_retry_policies(
+    manifest: &mut Manifest,
+    config: ScanRetryPolicyConfig,
 ) -> Result<ScanRetryAdmissions, ManifestError> {
     let mut lifecycle_budget = LifecycleAdmissionBudget::for_scan_with_auto_delete(
         manifest,
-        max_lifecycle_per_scan,
-        auto_delete,
+        config.max_lifecycle_per_scan,
+        config.auto_delete,
     );
     let failed_retry = admit_failed_retryable_assets_with_budget(
         manifest,
         &mut lifecycle_budget,
-        max_failed_retry_admissions_per_scan,
-        failed_retry_min_age_seconds,
-        current_unix_seconds,
+        config.max_failed_retry_admissions_per_scan,
+        config.failed_retry_min_age_seconds,
+        config.current_unix_seconds,
     )?;
     let mut adjusted_source_required = admit_adjusted_source_required_assets_with_budget(
         manifest,
         &mut lifecycle_budget,
-        max_failed_retry_admissions_per_scan,
-        current_unix_seconds,
+        config.max_failed_retry_admissions_per_scan,
+        config.current_unix_seconds,
     )?;
-    let terminalized_exhausted =
-        terminalize_exhausted_adjusted_source_required_assets(manifest, current_unix_seconds)?;
+    let terminalized_exhausted = terminalize_exhausted_adjusted_source_required_assets(
+        manifest,
+        config.current_unix_seconds,
+    )?;
     if terminalized_exhausted > 0 {
         adjusted_source_required.manifest_changed = true;
         lifecycle_budget.release(terminalized_exhausted);
@@ -7789,9 +7798,9 @@ fn admit_scan_retry_policies(
     let original_asset_resolver = recover_original_asset_resolver_retries_with_budget(
         manifest,
         &mut lifecycle_budget,
-        max_original_resolver_retries_per_scan,
-        original_resolver_retry_min_age_seconds,
-        current_unix_seconds,
+        config.max_original_resolver_retries_per_scan,
+        config.original_resolver_retry_min_age_seconds,
+        config.current_unix_seconds,
     )?;
     Ok(ScanRetryAdmissions {
         failed_retry,
@@ -8468,7 +8477,7 @@ fn failed_retry_attempt(
             let proof = serde_json::from_value::<FailureRetryV3Proof>(proof.clone())
                 .map_err(|_| FailedRetryAttemptError::Malformed)?;
             let proof_kind =
-                FailureKind::from_str(&proof.category).ok_or(FailedRetryAttemptError::Malformed)?;
+                FailureKind::parse(&proof.category).ok_or(FailedRetryAttemptError::Malformed)?;
             if proof.schema_version != FAILED_RETRY_POLICY_SCHEMA_VERSION
                 || proof.policy_generation != FAILED_RETRY_POLICY_GENERATION
                 || proof.category_attempt == 0
@@ -8521,9 +8530,11 @@ fn failed_retry_attempt(
                 return Err(FailedRetryAttemptError::Malformed);
             }
             Ok(FailedRetryAttempts {
-                category: (proof_kind == kind)
-                    .then_some(proof.category_attempt)
-                    .unwrap_or(0),
+                category: if proof_kind == kind {
+                    proof.category_attempt
+                } else {
+                    0
+                },
                 cumulative: proof.cumulative_attempt,
                 lineage_start_failure_count: proof.lineage_start_failure_count,
             })
@@ -12804,8 +12815,19 @@ esac
             "1600.000000000Z",
         );
 
-        let admissions = admit_scan_retry_policies(&mut manifest, 1, 1, 300, 1, 300, true, 2_000)
-            .expect("exhausted resolver lineage should be terminalized before worker selection");
+        let admissions = admit_scan_retry_policies(
+            &mut manifest,
+            ScanRetryPolicyConfig {
+                max_lifecycle_per_scan: 1,
+                max_failed_retry_admissions_per_scan: 1,
+                failed_retry_min_age_seconds: 300,
+                max_original_resolver_retries_per_scan: 1,
+                original_resolver_retry_min_age_seconds: 300,
+                auto_delete: true,
+                current_unix_seconds: 2_000,
+            },
+        )
+        .expect("exhausted resolver lineage should be terminalized before worker selection");
         assert_eq!(admissions.adjusted_source_required.exhausted, 1);
         assert_eq!(
             manifest
@@ -18959,9 +18981,19 @@ esac
             "100.000000000Z",
         ));
 
-        let admissions =
-            admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, true, 1_000_000)
-                .expect("shared lifecycle budget should preserve the marker reservation");
+        let admissions = admit_scan_retry_policies(
+            &mut manifest,
+            ScanRetryPolicyConfig {
+                max_lifecycle_per_scan: 1,
+                max_failed_retry_admissions_per_scan: 16,
+                failed_retry_min_age_seconds: 300,
+                max_original_resolver_retries_per_scan: 16,
+                original_resolver_retry_min_age_seconds: 86_400,
+                auto_delete: true,
+                current_unix_seconds: 1_000_000,
+            },
+        )
+        .expect("shared lifecycle budget should preserve the marker reservation");
 
         assert!(admissions.failed_retry.admitted_by_category.is_empty());
         assert_eq!(manifest.get("generic-retry").unwrap().state, State::Failed);
@@ -18970,9 +19002,19 @@ esac
             State::Failed
         );
 
-        let repeated =
-            admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, true, 1_000_000)
-                .expect("the same marker must reserve exactly one slot on later scans");
+        let repeated = admit_scan_retry_policies(
+            &mut manifest,
+            ScanRetryPolicyConfig {
+                max_lifecycle_per_scan: 1,
+                max_failed_retry_admissions_per_scan: 16,
+                failed_retry_min_age_seconds: 300,
+                max_original_resolver_retries_per_scan: 16,
+                original_resolver_retry_min_age_seconds: 86_400,
+                auto_delete: true,
+                current_unix_seconds: 1_000_000,
+            },
+        )
+        .expect("the same marker must reserve exactly one slot on later scans");
         assert!(repeated.failed_retry.admitted_by_category.is_empty());
         assert_eq!(manifest.get("generic-retry").unwrap().state, State::Failed);
     }
@@ -18995,9 +19037,19 @@ esac
             "200.000000000Z",
         ));
 
-        let admissions =
-            admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, true, 1_000_000)
-                .expect("generic recovery should consume the scan's only lifecycle slot");
+        let admissions = admit_scan_retry_policies(
+            &mut manifest,
+            ScanRetryPolicyConfig {
+                max_lifecycle_per_scan: 1,
+                max_failed_retry_admissions_per_scan: 16,
+                failed_retry_min_age_seconds: 300,
+                max_original_resolver_retries_per_scan: 16,
+                original_resolver_retry_min_age_seconds: 86_400,
+                auto_delete: true,
+                current_unix_seconds: 1_000_000,
+            },
+        )
+        .expect("generic recovery should consume the scan's only lifecycle slot");
 
         assert_eq!(
             admissions.failed_retry.admitted_by_category["retryable_conversion_timed_out"],
@@ -19027,9 +19079,19 @@ esac
             "100.000000000Z",
         ));
 
-        let admissions =
-            admit_scan_retry_policies(&mut manifest, 1, 16, 300, 16, 86_400, true, 1_000_000)
-                .expect("new adjusted marker should consume the scan's only lifecycle slot");
+        let admissions = admit_scan_retry_policies(
+            &mut manifest,
+            ScanRetryPolicyConfig {
+                max_lifecycle_per_scan: 1,
+                max_failed_retry_admissions_per_scan: 16,
+                failed_retry_min_age_seconds: 300,
+                max_original_resolver_retries_per_scan: 16,
+                original_resolver_retry_min_age_seconds: 86_400,
+                auto_delete: true,
+                current_unix_seconds: 1_000_000,
+            },
+        )
+        .expect("new adjusted marker should consume the scan's only lifecycle slot");
 
         assert_eq!(admissions.adjusted_source_required.first_ready, 1);
         assert_eq!(admissions.original_asset_resolver.recovered_now, 0);
@@ -19074,11 +19136,19 @@ esac
             "050.000000000Z",
         ));
 
-        let admissions =
-            admit_scan_retry_policies(&mut manifest, 1, 1, 300, 16, 86_400, true, 1_000_000)
-                .expect(
-                    "reserved retry should remain eligible when new first markers have no slot",
-                );
+        let admissions = admit_scan_retry_policies(
+            &mut manifest,
+            ScanRetryPolicyConfig {
+                max_lifecycle_per_scan: 1,
+                max_failed_retry_admissions_per_scan: 1,
+                failed_retry_min_age_seconds: 300,
+                max_original_resolver_retries_per_scan: 16,
+                original_resolver_retry_min_age_seconds: 86_400,
+                auto_delete: true,
+                current_unix_seconds: 1_000_000,
+            },
+        )
+        .expect("reserved retry should remain eligible when new first markers have no slot");
 
         assert_eq!(admissions.adjusted_source_required.resolver_retry_ready, 1);
         assert_eq!(admissions.adjusted_source_required.first_ready, 0);
