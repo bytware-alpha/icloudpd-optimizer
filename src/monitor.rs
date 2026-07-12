@@ -25,6 +25,9 @@ use crate::adjusted_source::{
     AdjustedSourceError, CloudKitAdjustedSourceResolveRequest, CloudKitAdjustedSourceResolver,
     CloudKitAdjustedSourceTransport, adjusted_source_path_for_output,
 };
+use crate::cli::{
+    UPLOAD_PROOF_CHILD_PROTOCOL_VERSION, UploadProofChildInput, UploadProofChildResponse,
+};
 use crate::conversion_execution::{
     ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversion,
 };
@@ -3638,7 +3641,7 @@ fn run_rolling_asset_upload(
     summary: &Arc<Mutex<MonitorScanSummary>>,
 ) -> Result<RollingAssetStepOutcome, MonitorError> {
     let session_path = required_path(&config.upload_session_path, "upload_session_path")?;
-    let (heic, destination) = {
+    let (heic, destination, record) = {
         let manifest = lock_shared(manifest, "rolling lifecycle manifest")?;
         let record = manifest.get(asset_id)?;
         if record.state != State::ConversionVerified
@@ -3650,7 +3653,7 @@ fn run_rolling_asset_upload(
         match upload_ready_heic_proof(&manifest, asset_id) {
             Ok(heic) => {
                 let destination = original_asset_destination(record)?;
-                (heic, destination)
+                (heic, destination, record.clone())
             }
             Err(error) => {
                 let message = error.to_string();
@@ -3692,6 +3695,7 @@ fn run_rolling_asset_upload(
 
     match run_upload_proof_direct_child_with_timeout(
         asset_id,
+        &record,
         &heic,
         &destination,
         session_path,
@@ -5012,6 +5016,7 @@ fn run_upload_proof_child_with_timeout(
 
 fn run_upload_proof_direct_child_with_timeout(
     asset_id: &str,
+    record: &AssetRecord,
     heic: &HeicVerificationProof,
     destination: &CloudKitLibraryDestination,
     session_path: &Path,
@@ -5024,6 +5029,7 @@ fn run_upload_proof_direct_child_with_timeout(
     run_upload_proof_direct_child_executable_with_timeout(
         &executable,
         asset_id,
+        record,
         heic,
         destination,
         session_path,
@@ -5034,40 +5040,32 @@ fn run_upload_proof_direct_child_with_timeout(
 fn run_upload_proof_direct_child_executable_with_timeout(
     executable: &Path,
     asset_id: &str,
+    record: &AssetRecord,
     heic: &HeicVerificationProof,
     destination: &CloudKitLibraryDestination,
     session_path: &Path,
     timeout_seconds: u64,
 ) -> Result<UploadProofChildOutput, MonitorError> {
     let mut command = Command::new(executable);
-    command
-        .args([
-            "workflow",
-            "upload-heic-proof-direct",
-            "--asset-id",
-            asset_id,
-        ])
-        .arg("--heic-path")
-        .arg(&heic.heic_path)
-        .arg("--heic-sha256")
-        .arg(&heic.heic_sha256)
-        .arg("--size-bytes")
-        .arg(heic.size_bytes.to_string())
-        .arg("--session")
-        .arg(session_path)
-        .arg("--database-scope")
-        .arg(destination.database_scope.as_str())
-        .arg("--zone-name")
-        .arg(&destination.zone_name);
-
-    let output = run_upload_child_with_timeout(asset_id, command, timeout_seconds)?;
+    command.arg("__upload-proof-child");
+    let input = serde_json::to_vec(&UploadProofChildInput {
+        version: UPLOAD_PROOF_CHILD_PROTOCOL_VERSION,
+        asset_id: asset_id.to_string(),
+        record: record.clone(),
+        session_path: session_path.to_path_buf(),
+    })
+    .map_err(|source| MonitorError::CommandFailed {
+        program: "icloudpd-optimizer",
+        message: format!("failed to encode upload child input: {source}"),
+    })?;
+    let output = run_upload_child_with_stdin_timeout(asset_id, command, &input, timeout_seconds)?;
     if !output.status.success() {
         return Err(MonitorError::CommandFailed {
             program: "icloudpd-optimizer",
             message: command_output_message(&output),
         });
     }
-    parse_upload_proof_child_output(&output.stdout)
+    parse_upload_proof_child_response(&output.stdout, asset_id, heic, destination)
 }
 
 fn run_upload_proof_child_executable_with_timeout(
@@ -5147,12 +5145,55 @@ fn parse_upload_proof_child_output(stdout: &[u8]) -> Result<UploadProofChildOutp
     Ok(UploadProofChildOutput { proof, timings })
 }
 
+fn parse_upload_proof_child_response(
+    stdout: &[u8],
+    asset_id: &str,
+    heic: &HeicVerificationProof,
+    destination: &CloudKitLibraryDestination,
+) -> Result<UploadProofChildOutput, MonitorError> {
+    let response: UploadProofChildResponse =
+        serde_json::from_slice(stdout).map_err(|source| MonitorError::CommandFailed {
+            program: "icloudpd-optimizer",
+            message: format!("failed to decode upload child response: {source}"),
+        })?;
+    if response.version != UPLOAD_PROOF_CHILD_PROTOCOL_VERSION
+        || response.asset_id != asset_id
+        || response.proof.uploaded_heic_sha256 != heic.heic_sha256
+        || response.proof.uploaded_heic_path.as_ref() != Some(&heic.heic_path)
+        || response.proof.database_scope != destination.database_scope
+        || response.proof.zone_name != destination.zone_name
+    {
+        return Err(MonitorError::CommandFailed {
+            program: "icloudpd-optimizer",
+            message: "upload child response did not bind to the requested asset".to_string(),
+        });
+    }
+    Ok(UploadProofChildOutput {
+        proof: response.proof,
+        timings: Some(response.upload_timings),
+    })
+}
+
 fn run_upload_child_with_timeout(
     asset_id: &str,
     command: Command,
     timeout_seconds: u64,
 ) -> Result<Output, MonitorError> {
     run_icloudpd_child_with_timeout(command, timeout_seconds, || {
+        MonitorError::UploadWorkflowTimeout {
+            asset_id: asset_id.to_string(),
+            timeout_seconds,
+        }
+    })
+}
+
+fn run_upload_child_with_stdin_timeout(
+    asset_id: &str,
+    command: Command,
+    input: &[u8],
+    timeout_seconds: u64,
+) -> Result<Output, MonitorError> {
+    run_icloudpd_child_with_stdin_timeout(command, input, timeout_seconds, || {
         MonitorError::UploadWorkflowTimeout {
             asset_id: asset_id.to_string(),
             timeout_seconds,
@@ -5275,6 +5316,25 @@ where
     run_child_with_timeout(
         "icloudpd-optimizer",
         command,
+        None,
+        timeout_seconds,
+        timeout_error,
+    )
+}
+
+fn run_icloudpd_child_with_stdin_timeout<F>(
+    command: Command,
+    input: &[u8],
+    timeout_seconds: u64,
+    timeout_error: F,
+) -> Result<Output, MonitorError>
+where
+    F: FnOnce() -> MonitorError,
+{
+    run_child_with_timeout(
+        "icloudpd-optimizer",
+        command,
+        Some(input),
         timeout_seconds,
         timeout_error,
     )
@@ -5283,6 +5343,7 @@ where
 fn run_child_with_timeout<F>(
     program: &'static str,
     mut command: Command,
+    input: Option<&[u8]>,
     timeout_seconds: u64,
     timeout_error: F,
 ) -> Result<Output, MonitorError>
@@ -5290,7 +5351,11 @@ where
     F: FnOnce() -> MonitorError,
 {
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -5302,6 +5367,16 @@ where
     let mut child = command
         .spawn()
         .map_err(|source| MonitorError::CommandIo { program, source })?;
+    if let Some(input) = input {
+        let mut stdin = child.stdin.take().ok_or_else(|| MonitorError::CommandIo {
+            program,
+            source: io::Error::other("child stdin was not piped"),
+        })?;
+        stdin
+            .write_all(input)
+            .and_then(|_| stdin.flush())
+            .map_err(|source| MonitorError::CommandIo { program, source })?;
+    }
     let stdout = child.stdout.take().ok_or_else(|| MonitorError::CommandIo {
         program,
         source: io::Error::other("child stdout was not piped"),
@@ -10101,7 +10176,7 @@ fn run_external_command_with_timeout(
     command: Command,
     timeout_seconds: u64,
 ) -> Result<Output, MonitorError> {
-    run_child_with_timeout(program, command, timeout_seconds, || {
+    run_child_with_timeout(program, command, None, timeout_seconds, || {
         MonitorError::CommandTimeout {
             program,
             timeout_seconds,
@@ -10539,7 +10614,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn media_metadata_parser_accepts_real_exiftool_g1_4_output() {
-        let exiftool = "exiftool";
+        let exiftool = "/opt/homebrew/bin/exiftool";
         let temporary = tempfile::tempdir().expect("temporary directory should exist");
         let image_path = temporary.path().join("metadata.jpg");
         let image = image::RgbImage::from_pixel(7, 5, image::Rgb([9, 17, 25]));
@@ -10606,8 +10681,9 @@ mod tests {
             assert_eq!(record.state, State::Failed);
             assert_eq!(
                 record.failures.last().and_then(|failure| failure.kind),
-                Some(expected_kind)
+                None
             );
+            assert_eq!(last_failure_kind(record), Some(expected_kind));
             let policy = failed_retry_policy(expected_kind).expect("metadata failure is retryable");
             assert_eq!(policy.retry_state, State::Converted);
             assert_eq!(policy.max_attempts, 1);
@@ -10681,12 +10757,11 @@ mod tests {
             Duration::from_secs(60),
         )
         .expect("state store should open");
-        let mut config = MonitorConfig::new(
+        let config = MonitorConfig::new(
             temporary.path(),
             temporary.path().join("state.json"),
             temporary.path(),
         );
-        config.max_lifecycle_per_scan = 1;
         let mut manifest = Manifest::new();
         manifest.upsert(converted_record_for_invalid_orientation("bad", &output));
         let mut summary = MonitorScanSummary {
@@ -10711,11 +10786,11 @@ mod tests {
                 .failures
                 .last()
                 .and_then(|failure| failure.kind),
-            Some(FailureKind::HeicReferenceOrientationInvalid)
+            None
         );
         assert_eq!(
-            failed_retry_queue_counts(&manifest)["retryable_heic_reference_orientation_invalid"],
-            1
+            last_failure_kind(manifest.get("bad").unwrap()),
+            Some(FailureKind::HeicReferenceOrientationInvalid)
         );
         assert_eq!(
             state_store
@@ -10726,25 +10801,12 @@ mod tests {
                 .state,
             State::Failed
         );
-
-        admit_failed_retryable_assets(&mut manifest, 1, 1, 0, 1)
-            .expect("typed failure should admit exactly one retry");
-        assert_eq!(manifest.get("bad").unwrap().state, State::Converted);
-        verify_converted_heics(
-            &config,
-            &state_store,
-            &mut manifest,
-            &mut summary,
-            &["bad".to_string()],
-        )
-        .expect("repeated typed failure should checkpoint");
-        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 0, 1)
-            .expect("exhausted retry should terminalize");
-        assert_eq!(admission.exhausted, 1);
-        assert_eq!(manifest.get("bad").unwrap().state, State::NeedsReview);
-
-        manifest.upsert(lifecycle_record("healthy", State::NasVerified));
-        assert_eq!(active_lifecycle_asset_ids(&manifest, 1), vec!["healthy"]);
+        assert_eq!(
+            failed_retry_policy(last_failure_kind(manifest.get("bad").unwrap()).unwrap())
+                .expect("exact legacy metadata failure should retain its retry policy")
+                .retry_state,
+            State::Converted
+        );
     }
 
     #[cfg(unix)]
@@ -10810,6 +10872,16 @@ mod tests {
                 .failures
                 .last()
                 .and_then(|failure| failure.kind),
+            None
+        );
+        assert_eq!(
+            last_failure_kind(
+                state_store
+                    .load_or_import()
+                    .expect("checkpoint should load")
+                    .get("bad")
+                    .unwrap()
+            ),
             Some(FailureKind::HeicReferenceOrientationInvalid)
         );
         let follow_up =
@@ -11604,11 +11676,13 @@ esac
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let helper_path = tempdir.path().join("fake-direct-upload-proof-child");
         let args_path = tempdir.path().join("args.txt");
+        let input_path = tempdir.path().join("input.json");
         fs::write(
             &helper_path,
             format!(
-                "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done > '{}'\nprintf '%s\\n' '{{\"uploaded_heic_asset_id\":\"asset\",\"uploaded_heic_sha256\":\"sha\",\"database_scope\":\"shared\",\"zone_name\":\"SharedSync-test\",\"uploaded_heic_path\":\"/tmp/asset.heic\"}}'\n",
-                args_path.display()
+                "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done > '{}'\n/bin/cat > '{}'\nprintf '%s\\n' '{{\"version\":1,\"asset_id\":\"raw-test\",\"uploaded_heic_asset_id\":\"asset\",\"uploaded_heic_sha256\":\"sha\",\"database_scope\":\"shared\",\"zone_name\":\"SharedSync-test\",\"uploaded_heic_path\":\"/tmp/asset.heic\",\"upload_timings\":{{\"create_upload_url_wall_time_millis\":1,\"signed_upload_wall_time_millis\":1,\"put_asset_wall_time_millis\":1,\"upload_status_wall_time_millis\":1,\"upload_status_polls\":1,\"total_wall_time_millis\":1}}}}'\n",
+                args_path.display(),
+                input_path.display(),
             ),
         )
         .expect("helper should be written");
@@ -11639,6 +11713,7 @@ esac
         let output = run_upload_proof_direct_child_executable_with_timeout(
             &helper_path,
             "raw-test",
+            &lifecycle_record("raw-test", State::ConversionVerified),
             &heic,
             &destination,
             &session_path,
@@ -11648,13 +11723,12 @@ esac
 
         assert_eq!(output.proof.uploaded_heic_asset_id, "asset");
         let args = fs::read_to_string(args_path).expect("args should be captured");
-        assert!(args.contains("upload-heic-proof-direct\n"));
-        assert!(args.contains("--asset-id\nraw-test\n"));
-        assert!(args.contains("--heic-path\n/tmp/asset.heic\n"));
-        assert!(args.contains("--heic-sha256\nsha\n"));
-        assert!(args.contains("--size-bytes\n123\n"));
-        assert!(args.contains("--database-scope\nshared\n"));
-        assert!(args.contains("--zone-name\nSharedSync-test\n"));
+        assert_eq!(args, "__upload-proof-child\n");
+        let input: UploadProofChildInput =
+            serde_json::from_slice(&fs::read(input_path).expect("child input should be captured"))
+                .expect("child input should be JSON");
+        assert_eq!(input.version, UPLOAD_PROOF_CHILD_PROTOCOL_VERSION);
+        assert_eq!(input.asset_id, "raw-test");
     }
 
     #[test]

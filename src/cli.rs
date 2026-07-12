@@ -56,15 +56,15 @@ use crate::upload::{
 };
 use crate::workflow::{
     ConversionPerformanceInput, ConversionResultProof, ConversionSourceBinding,
-    EMBEDDED_PREVIEW_CONVERSION_RECIPE, HeicVerificationProof, IcloudpdLocalMirrorProofDisposition,
-    OriginalAssetProof, SourceAgeProof, UploadProof, WorkflowError, approve_delete,
-    approved_original_delete_request, build_delete_plan, icloudpd_local_mirror_proof_disposition,
-    icloudpd_local_mirror_ready_proofs, mark_delete_eligible, prove_and_record_nas,
-    record_conversion_performance, record_conversion_result, record_delete_execution,
-    record_heic_verification, record_icloudpd_local_mirror_proof,
-    record_original_asset_batch_proofs, record_original_asset_proof, record_source_age_proof,
-    record_stage_failure, record_upload_proof, record_uploaded_heic_delete,
-    upload_ready_heic_proof, uploaded_heic_delete_request,
+    HeicVerificationProof, IcloudpdLocalMirrorProofDisposition, OriginalAssetProof, SourceAgeProof,
+    UploadProof, WorkflowError, approve_delete, approved_original_delete_request,
+    build_delete_plan, icloudpd_local_mirror_proof_disposition, icloudpd_local_mirror_ready_proofs,
+    mark_delete_eligible, prove_and_record_nas, record_conversion_performance,
+    record_conversion_result, record_delete_execution, record_heic_verification,
+    record_icloudpd_local_mirror_proof, record_original_asset_batch_proofs,
+    record_original_asset_proof, record_source_age_proof, record_stage_failure,
+    record_upload_proof, record_uploaded_heic_delete, upload_ready_heic_proof,
+    uploaded_heic_delete_request,
 };
 
 const DAY_SECONDS: u64 = 24 * 60 * 60;
@@ -73,6 +73,24 @@ const FAILED_ASSETS_QUARANTINE_TARGET_SET_FINGERPRINT_VERSION: &[u8] =
     b"failed-assets-quarantine-target-set-v2";
 const LEGACY_FAILURES_CLASSIFY_TARGET_SET_FINGERPRINT_VERSION: &[u8] =
     b"legacy-failures-classify-target-set-v1";
+pub(crate) const UPLOAD_PROOF_CHILD_PROTOCOL_VERSION: u8 = 1;
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct UploadProofChildInput {
+    pub version: u8,
+    pub asset_id: String,
+    pub record: AssetRecord,
+    pub session_path: PathBuf,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct UploadProofChildResponse {
+    pub version: u8,
+    pub asset_id: String,
+    #[serde(flatten)]
+    pub proof: UploadProof,
+    pub upload_timings: crate::upload::UploadTimings,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -928,6 +946,8 @@ pub enum CliError {
     PrimeAccessIo { path: PathBuf, source: io::Error },
     #[error("macOS access prime failed: {message}")]
     PrimeAccess { message: String },
+    #[error("invalid private upload child protocol")]
+    InvalidPrivateChildProtocol,
     #[error("failed to write JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("failed to write output: {0}")]
@@ -981,10 +1001,48 @@ impl fmt::Display for OriginalAssetsReconcileCloudKitFailureKind {
 }
 
 pub fn run() -> Result<(), CliError> {
+    if env::args().nth(1).as_deref() == Some("__upload-proof-child") {
+        return run_upload_proof_child_protocol(&mut io::stdin(), &mut io::stdout());
+    }
     if should_run_default_app_prime() {
         return run_default_app_prime(&mut io::stdout());
     }
     run_with_writer(Cli::parse(), &mut io::stdout())
+}
+
+fn run_upload_proof_child_protocol<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<(), CliError> {
+    let input: UploadProofChildInput = serde_json::from_reader(reader)?;
+    if input.version != UPLOAD_PROOF_CHILD_PROTOCOL_VERSION
+        || input.record.asset_id != input.asset_id
+    {
+        return Err(CliError::InvalidPrivateChildProtocol);
+    }
+    let mut manifest = Manifest::new();
+    manifest.upsert(input.record);
+    let heic = upload_ready_heic_proof(&manifest, &input.asset_id)?;
+    verify_local_heic(&heic)?;
+    load_upload_session(&input.session_path)?;
+    let destination = upload_destination_for_asset(&manifest, &input.asset_id)?;
+    let response = run_icloud_upload(&IcloudUploadRequest {
+        session_path: input.session_path,
+        heic_path: heic.heic_path.clone(),
+        destination,
+    })?;
+    let proof = build_upload_proof(&heic, &response)?;
+    serde_json::to_writer(
+        &mut *writer,
+        &UploadProofChildResponse {
+            version: UPLOAD_PROOF_CHILD_PROTOCOL_VERSION,
+            asset_id: input.asset_id,
+            proof,
+            upload_timings: response.timings,
+        },
+    )?;
+    writeln!(writer)?;
+    Ok(())
 }
 
 fn run_with_writer<W: Write>(cli: Cli, writer: &mut W) -> Result<(), CliError> {
@@ -3813,6 +3871,7 @@ fn queue_raw_size_bytes(record: &AssetRecord) -> u64 {
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+    use crate::workflow::EMBEDDED_PREVIEW_CONVERSION_RECIPE;
 
     fn upload_verified_record(asset_id: &str, mirror_size_bytes: u64) -> AssetRecord {
         let heic_sha = "a".repeat(64);
