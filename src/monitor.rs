@@ -48,6 +48,8 @@ use crate::upload::{
     CloudKitOriginalAssetResolveTarget, ReqwestCloudKitDeleteTransport,
     ReqwestCloudKitReadTransport, UploadError, UploadTimings, load_cloudkit_delete_session,
 };
+#[cfg(test)]
+use crate::workflow::validate_current_icloudpd_local_mirror_proof;
 use crate::workflow::{
     ConversionResultProof, DeleteReconciliation, HeicVerificationProof, IcloudpdLocalMirrorProof,
     IcloudpdLocalMirrorProofDisposition, OriginalAssetProof, PrevalidatedDelete, SourceAgeProof,
@@ -58,8 +60,7 @@ use crate::workflow::{
     record_heic_verification, record_icloudpd_local_mirror_proof,
     record_prevalidated_delete_execution, record_reconciled_delete_execution,
     record_source_age_proof, record_stage_failure, record_stage_failure_with_kind,
-    record_upload_proof, upload_ready_heic_proof, validate_current_icloudpd_local_mirror_proof,
-    validated_adjusted_source_for_conversion,
+    record_upload_proof, upload_ready_heic_proof, validated_adjusted_source_for_conversion,
 };
 
 static MONITOR_FAILURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -2109,6 +2110,7 @@ impl RollingAssetStep {
     }
 }
 
+#[cfg(test)]
 fn rolling_lifecycle_worker_stage_sequence(
     record: &AssetRecord,
     config: &MonitorConfig,
@@ -2562,6 +2564,7 @@ fn rolling_lifecycle_worker_asset_ids(
     selected
 }
 
+#[cfg(test)]
 fn rolling_lifecycle_record_can_run_worker_stage(
     manifest: &Manifest,
     record: &AssetRecord,
@@ -6328,6 +6331,7 @@ fn pending_conversion_count(manifest: &Manifest, config: &MonitorConfig) -> usiz
         .count()
 }
 
+#[cfg(test)]
 fn pending_lifecycle_count(manifest: &Manifest) -> usize {
     pending_lifecycle_count_with_auto_delete(manifest, true)
 }
@@ -8892,6 +8896,7 @@ pub(crate) fn active_lifecycle_asset_ids_for_config(
     )
 }
 
+#[cfg(test)]
 fn active_lifecycle_asset_ids(manifest: &Manifest, limit: usize) -> Vec<String> {
     active_lifecycle_asset_ids_with_auto_delete(manifest, limit, true)
 }
