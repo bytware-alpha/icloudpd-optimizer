@@ -531,8 +531,6 @@ enum WorkflowCommand {
     UploadHeic(WorkflowUploadHeicArgs),
     #[command(name = "upload-heic-proof", hide = true)]
     UploadHeicProof(WorkflowUploadHeicArgs),
-    #[command(name = "upload-heic-proof-direct", hide = true)]
-    UploadHeicProofDirect(WorkflowUploadHeicProofDirectArgs),
     UploadVerified(WorkflowUploadVerifiedArgs),
     #[command(
         name = "uploaded-heic-delete-plan",
@@ -695,28 +693,6 @@ struct WorkflowUploadHeicArgs {
         help = "External Photos upload session JSON; not produced by icloudpd"
     )]
     session: PathBuf,
-}
-
-#[derive(Debug, Args)]
-struct WorkflowUploadHeicProofDirectArgs {
-    #[arg(long)]
-    asset_id: String,
-    #[arg(long, value_name = "PATH")]
-    heic_path: PathBuf,
-    #[arg(long)]
-    heic_sha256: String,
-    #[arg(long)]
-    size_bytes: u64,
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "External Photos upload session JSON; not produced by icloudpd"
-    )]
-    session: PathBuf,
-    #[arg(long, value_enum)]
-    database_scope: WorkflowCloudKitDatabaseScopeArg,
-    #[arg(long)]
-    zone_name: String,
 }
 
 #[derive(Debug, Args)]
@@ -1095,9 +1071,6 @@ fn run_workflow<W: Write>(args: WorkflowArgs, writer: &mut W) -> Result<(), CliE
         WorkflowCommand::HeicVerified(args) => workflow_heic_verified(args),
         WorkflowCommand::UploadHeic(args) => workflow_upload_heic(args),
         WorkflowCommand::UploadHeicProof(args) => workflow_upload_heic_proof(args, writer),
-        WorkflowCommand::UploadHeicProofDirect(args) => {
-            workflow_upload_heic_proof_direct(args, writer)
-        }
         WorkflowCommand::UploadVerified(args) => workflow_upload_verified(args),
         WorkflowCommand::UploadedHeicDeletePlan(args) => {
             workflow_uploaded_heic_delete_plan(args, writer)
@@ -4303,40 +4276,6 @@ fn workflow_upload_heic_proof<W: Write>(
     verify_local_heic(&heic)?;
     load_upload_session(&args.session)?;
     let destination = upload_destination_for_asset(&manifest, &args.asset_id)?;
-    let response = run_icloud_upload(&IcloudUploadRequest {
-        session_path: args.session,
-        heic_path: heic.heic_path.clone(),
-        destination,
-    })?;
-    let proof = build_upload_proof(&heic, &response)?;
-    write_upload_proof_output(writer, &proof, &response.timings)
-}
-
-fn workflow_upload_heic_proof_direct<W: Write>(
-    args: WorkflowUploadHeicProofDirectArgs,
-    writer: &mut W,
-) -> Result<(), CliError> {
-    if args.asset_id.trim().is_empty() {
-        return Err(WorkflowError::EmptyProofField { field: "asset_id" }.into());
-    }
-    let heic = HeicVerificationProof {
-        heic_path: args.heic_path,
-        heic_sha256: args.heic_sha256,
-        size_bytes: args.size_bytes,
-        conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
-        heif_info_ok: true,
-        metadata_copied: true,
-        visual_content_ok: true,
-        visual_match_ok: true,
-        visual_rmse_ppm: None,
-        visual_mae_ppm: None,
-    };
-    verify_local_heic(&heic)?;
-    load_upload_session(&args.session)?;
-    let destination = validate_cli_library_destination(CloudKitLibraryDestination {
-        database_scope: args.database_scope.into(),
-        zone_name: args.zone_name,
-    })?;
     let response = run_icloud_upload(&IcloudUploadRequest {
         session_path: args.session,
         heic_path: heic.heic_path.clone(),

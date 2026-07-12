@@ -57,6 +57,7 @@ fn conversion_performance_input() -> ConversionPerformanceInput {
     ConversionPerformanceInput {
         measured_at_unix_seconds: 1_800_000_100,
         conversion_tool: "magick".to_string(),
+        conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
         conversion_tool_version: Some("7.1.1-41".to_string()),
         heic_quality: 90,
         convert_wall_time_millis: 1_250,
