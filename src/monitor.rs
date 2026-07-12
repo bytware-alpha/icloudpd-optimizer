@@ -13830,6 +13830,110 @@ esac
     }
 
     #[test]
+    fn rolling_local_mirror_proof_is_persisted_before_delete_batch() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        fs::create_dir_all(&config.download_root).expect("download root should be created");
+        fs::create_dir_all(&config.heic_output_dir).expect("output dir should be created");
+        let mirror_root = tempdir.path().join("mirror");
+        fs::create_dir_all(&mirror_root).expect("mirror root should be created");
+        config.full_lifecycle = true;
+        config.rolling_lifecycle = true;
+        config.mirror_root = Some(mirror_root.clone());
+        config.local_mirror_timeout_seconds = 10;
+        let uploaded_path = tempdir.path().join("uploaded.heic");
+        let heic_bytes = b"uploaded heic bytes";
+        fs::write(&uploaded_path, heic_bytes).expect("uploaded HEIC should be written");
+        let heic_sha = format!("{:x}", Sha256::digest(heic_bytes));
+        let mut record = upload_verified_delete_ready_record("asset-a", &config.download_root);
+        record.proofs.remove("icloudpd_local_mirror");
+        record.proofs.remove("original_asset");
+        record.proofs.insert(
+            "conversion".to_string(),
+            json!({
+                "heic_path": uploaded_path,
+                "heic_sha256": heic_sha,
+                "size_bytes": heic_bytes.len() as u64,
+            }),
+        );
+        record.proofs.insert(
+            "conversion_performance".to_string(),
+            json!({
+                "schema_version": 1,
+                "measured_at_unix_seconds": 1_800_000_001u64,
+                "measurement_method": "monotonic_wall_clock",
+                "conversion_tool": "test-tool",
+                "heic_quality": 90,
+                "raw_size_bytes": 100u64,
+                "heic_size_bytes": heic_bytes.len() as u64,
+                "convert_wall_time_millis": 10u64,
+                "total_wall_time_millis": 11u64,
+            }),
+        );
+        record.proofs.insert(
+            "heic".to_string(),
+            json!({
+                "heic_path": uploaded_path,
+                "heic_sha256": heic_sha,
+                "size_bytes": heic_bytes.len() as u64,
+                "heif_info_ok": true,
+                "metadata_copied": true,
+                "visual_content_ok": true,
+                "visual_match_ok": true,
+            }),
+        );
+        record.proofs.insert(
+            "upload".to_string(),
+            json!({
+                "uploaded_heic_asset_id": "uploaded-asset-a",
+                "uploaded_heic_sha256": heic_sha,
+                "uploaded_heic_path": uploaded_path,
+            }),
+        );
+        let mut manifest = Manifest::new();
+        manifest.upsert(record);
+        let mut summary = MonitorScanSummary {
+            started_unix_seconds: 1,
+            ..MonitorScanSummary::default()
+        };
+        let proof = crate::local_mirror::ensure_icloudpd_local_mirror(IcloudpdLocalMirrorRequest {
+            uploaded_heic_asset_id: "uploaded-asset-a".to_string(),
+            uploaded_heic_sha256: heic_sha,
+            uploaded_heic_path: uploaded_path,
+            size_bytes: heic_bytes.len() as u64,
+            icloudpd_download_path: mirror_root.join("asset-a.HEIC"),
+        })
+        .expect("local mirror proof should be produced");
+        let store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+
+        record_rolling_asset_local_mirror_proof(
+            &store,
+            &mut manifest,
+            &mut summary,
+            "asset-a",
+            proof,
+        )
+        .expect("local mirror proof should record and save");
+
+        assert_eq!(summary.mirrors_recorded, 1);
+        assert!(!config.manifest_path.exists());
+        let persisted = store.load_or_import().expect("state store should reload");
+        let persisted_record = persisted.get("asset-a").expect("asset should persist");
+        assert_eq!(persisted_record.state, State::UploadVerified);
+        assert!(validate_current_icloudpd_local_mirror_proof(&persisted, "asset-a").is_ok());
+        assert!(mirror_root.join("asset-a.HEIC").exists());
+    }
+
+    #[test]
     fn rolling_worker_fails_closed_for_invalid_present_proof_when_helper_is_unavailable() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let mut config = MonitorConfig::new(
