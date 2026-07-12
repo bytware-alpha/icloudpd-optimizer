@@ -5367,16 +5367,18 @@ where
     let mut child = command
         .spawn()
         .map_err(|source| MonitorError::CommandIo { program, source })?;
-    if let Some(input) = input {
+    let mut stdin_writer = if let Some(input) = input {
         let mut stdin = child.stdin.take().ok_or_else(|| MonitorError::CommandIo {
             program,
             source: io::Error::other("child stdin was not piped"),
         })?;
-        stdin
-            .write_all(input)
-            .and_then(|_| stdin.flush())
-            .map_err(|source| MonitorError::CommandIo { program, source })?;
-    }
+        let input = input.to_vec();
+        Some(thread::spawn(move || {
+            stdin.write_all(&input).and_then(|_| stdin.flush())
+        }))
+    } else {
+        None
+    };
     let stdout = child.stdout.take().ok_or_else(|| MonitorError::CommandIo {
         program,
         source: io::Error::other("child stdout was not piped"),
@@ -5407,6 +5409,15 @@ where
         }
         match (status, stdout.take(), stderr.take()) {
             (Some(status), Some(stdout), Some(stderr)) => {
+                if let Some(writer) = stdin_writer.take() {
+                    writer
+                        .join()
+                        .map_err(|_| MonitorError::CommandIo {
+                            program,
+                            source: io::Error::other("child stdin writer panicked"),
+                        })?
+                        .map_err(|source| MonitorError::CommandIo { program, source })?;
+                }
                 return Ok(Output {
                     status,
                     stdout,
@@ -11568,6 +11579,18 @@ esac
                 timeout_seconds: 1
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_timeout_covers_undrained_stdin() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "/bin/sleep 5"]);
+        let started = Instant::now();
+        let error = run_upload_child_with_stdin_timeout("asset", command, &vec![b'x'; 1 << 20], 1)
+            .expect_err("undrained child stdin must time out");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(matches!(error, MonitorError::UploadWorkflowTimeout { .. }));
     }
 
     #[cfg(unix)]
