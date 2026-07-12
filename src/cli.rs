@@ -3863,6 +3863,7 @@ mod queue_tests {
                 "heic_path": heic_path,
                 "heic_sha256": heic_sha,
                 "size_bytes": 10u64,
+                "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
             }),
         );
         record.proofs.insert(
@@ -4223,6 +4224,7 @@ fn workflow_conversion_result(args: WorkflowConversionResultArgs) -> Result<(), 
             heic_path: args.heic_path,
             heic_sha256: args.heic_sha256,
             size_bytes: args.size_bytes,
+            conversion_recipe_id: crate::workflow::EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
             source_binding: ConversionSourceBinding::EmbeddedPreview,
         },
     )?;

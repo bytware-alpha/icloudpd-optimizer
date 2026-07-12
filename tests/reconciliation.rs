@@ -214,6 +214,7 @@ fn failed_resolver_record_at_strength(asset_id: &str, strength: State) -> AssetR
             heic_path: PathBuf::from("/staging/IMG_0001.heic"),
             heic_sha256: HEIC_SHA256.to_string(),
             size_bytes: 24,
+            conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
             source_binding: ConversionSourceBinding::EmbeddedPreview,
         })
         .unwrap(),

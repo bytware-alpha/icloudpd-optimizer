@@ -65,6 +65,9 @@ pub struct ConversionResultProof {
     pub heic_path: PathBuf,
     pub heic_sha256: String,
     pub size_bytes: u64,
+    /// Missing values deliberately remain legacy/untrusted; do not default this to current.
+    #[serde(default)]
+    pub conversion_recipe_id: String,
     #[serde(default)]
     pub source_binding: ConversionSourceBinding,
 }
@@ -459,6 +462,7 @@ pub fn record_conversion_result<'a>(
 ) -> Result<&'a AssetRecord, WorkflowError> {
     require_non_empty_path("heic_path", &proof.heic_path)?;
     require_non_empty("heic_sha256", &proof.heic_sha256)?;
+    require_current_conversion_recipe(CONVERSION_PROOF, &proof.conversion_recipe_id)?;
     validate_conversion_source_binding(manifest, asset_id, &proof)?;
     transition_with_proof(
         manifest,
@@ -2517,6 +2521,7 @@ fn validate_stored_conversion_performance(
     nas: &NasRawProof,
     conversion: &ConversionResultProof,
 ) -> Result<(), WorkflowError> {
+    require_current_conversion_recipe(CONVERSION_PROOF, &conversion.conversion_recipe_id)?;
     let conversion_performance = stored_proof::<ConversionPerformanceProof>(
         manifest,
         asset_id,

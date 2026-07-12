@@ -48,6 +48,7 @@ fn conversion_proof() -> ConversionResultProof {
         heic_path: PathBuf::from("/staging/IMG_0001.heic"),
         heic_sha256: "heic-sha256".to_string(),
         size_bytes: 24,
+        conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
         source_binding: ConversionSourceBinding::EmbeddedPreview,
     }
 }
@@ -96,6 +97,37 @@ fn heic_verification_proof_accepts_legacy_vipsheader_field() {
     .expect("legacy proof field should deserialize");
 
     assert!(proof.heif_info_ok);
+}
+
+#[test]
+fn conversion_and_heic_proofs_keep_legacy_recipe_missing_and_write_current_recipe() {
+    let legacy_conversion: ConversionResultProof = serde_json::from_value(json!({
+        "heic_path": "/staging/IMG_0001.heic",
+        "heic_sha256": "heic-sha256",
+        "size_bytes": 24
+    }))
+    .expect("legacy conversion proof should deserialize");
+    assert!(legacy_conversion.conversion_recipe_id.is_empty());
+    assert_eq!(
+        serde_json::to_value(conversion_proof()).expect("current conversion should serialize")["conversion_recipe_id"],
+        "embedded-preview-normalized-v1"
+    );
+
+    let legacy_heic: HeicVerificationProof = serde_json::from_value(json!({
+        "heic_path": "/staging/IMG_0001.heic",
+        "heic_sha256": "heic-sha256",
+        "size_bytes": 24,
+        "heif_info_ok": true,
+        "metadata_copied": true,
+        "visual_content_ok": true,
+        "visual_match_ok": true
+    }))
+    .expect("legacy HEIC proof should deserialize");
+    assert!(legacy_heic.conversion_recipe_id.is_empty());
+    assert_eq!(
+        serde_json::to_value(heic_proof()).expect("current HEIC proof should serialize")["conversion_recipe_id"],
+        "embedded-preview-normalized-v1"
+    );
 }
 
 #[test]
@@ -376,6 +408,7 @@ fn two_asset_upload_verified_manifest() -> Manifest {
                 heic_path: PathBuf::from(heic_path),
                 heic_sha256: heic_sha256.to_string(),
                 size_bytes: heic_size,
+                conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
                 source_binding: ConversionSourceBinding::EmbeddedPreview,
             },
         )
@@ -707,6 +740,7 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
         heic_path: output_path.clone(),
         heic_sha256: "heic-sha256".to_string(),
         size_bytes: 24,
+        conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
         source_binding: ConversionSourceBinding::EmbeddedPreview,
     };
     let before = manifest.clone();
@@ -747,6 +781,7 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
                 heic_path: output_path.clone(),
                 heic_sha256: "heic-sha256".to_string(),
                 size_bytes: 24,
+                conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
                 source_binding: invalid_binding,
             },
         )
@@ -764,6 +799,7 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
             heic_path: output_path.clone(),
             heic_sha256: "heic-sha256".to_string(),
             size_bytes: 24,
+            conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
             source_binding: binding.clone(),
         },
     )
@@ -909,6 +945,7 @@ fn embedded_preview_workflow_rejects_an_unproven_adjusted_conversion_claim() {
             heic_path: PathBuf::from("/staging/IMG_0001.heic"),
             heic_sha256: "heic-sha256".to_string(),
             size_bytes: 24,
+            conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
             source_binding: ConversionSourceBinding::AdjustedSource {
                 adjusted_source_proof_digest: "a".repeat(64),
                 adjusted_jpeg_sha256: "b".repeat(64),

@@ -24,8 +24,9 @@ use crate::manifest::{FailureKind, Manifest, ManifestError, State};
 use crate::proof::NasRawProof;
 use crate::workflow::{
     ConversionCommandTiming, ConversionPerformanceInput, ConversionResultProof,
-    ConversionSourceBinding, WorkflowError, materialize_adjusted_source_for_conversion,
-    record_conversion_performance, record_conversion_result, stored_adjusted_source_for_conversion,
+    ConversionSourceBinding, EMBEDDED_PREVIEW_CONVERSION_RECIPE, WorkflowError,
+    materialize_adjusted_source_for_conversion, record_conversion_performance,
+    record_conversion_result, stored_adjusted_source_for_conversion,
 };
 
 const DEFAULT_CHILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -330,6 +331,7 @@ fn execute_measured_conversion_for_target(
                 heic_path: request.output_path.clone(),
                 heic_sha256: output.sha256,
                 size_bytes: output.size_bytes,
+                conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
                 source_binding,
             },
         )?;
@@ -3513,7 +3515,10 @@ exit 41
         assert!(!output_path.exists());
         assert!(!embedded_preview_path(&output_path).exists());
         assert!(!oriented_preview_path(&output_path).exists());
-        assert_eq!(fs::read(&sentinel).expect("sentinel should remain"), b"retain");
+        assert_eq!(
+            fs::read(&sentinel).expect("sentinel should remain"),
+            b"retain"
+        );
         let record = manifest.get("asset-1").expect("asset should exist");
         assert_eq!(record.state, State::NasVerified);
         assert!(!record.proofs.contains_key("conversion"));

@@ -9543,14 +9543,11 @@ fn metadata_field_is(key: &str, field: &str) -> bool {
         return false;
     };
     name == field
-        || name
-            .strip_prefix(field)
-            .is_some_and(|suffix| {
-                suffix
-                    .strip_prefix('#')
-                    .is_some_and(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
-                    || (suffix.starts_with(" (") && suffix.ends_with(')'))
-            })
+        || name.strip_prefix(field).is_some_and(|suffix| {
+            suffix.strip_prefix('#').is_some_and(|number| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            }) || (suffix.starts_with(" (") && suffix.ends_with(')'))
+        })
 }
 
 fn original_asset_resolve_target(
@@ -10498,6 +10495,48 @@ mod tests {
             dimensions: (6048, 8064),
         };
         assert!(validate_zero_rotation(&nonzero_rotation).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn media_metadata_parser_accepts_real_exiftool_g1_4_output() {
+        let exiftool = "exiftool";
+        let temporary = tempfile::tempdir().expect("temporary directory should exist");
+        let image_path = temporary.path().join("metadata.jpg");
+        let image = image::RgbImage::from_pixel(7, 5, image::Rgb([9, 17, 25]));
+        image.save(&image_path).expect("fixture JPEG should save");
+        assert!(
+            Command::new(exiftool)
+                .args(["-Orientation#=1", "-overwrite_original"])
+                .arg(&image_path)
+                .status()
+                .expect("ExifTool should start")
+                .success()
+        );
+        let output = Command::new(exiftool)
+            .args([
+                "-json",
+                "-a",
+                "-G1:4",
+                "-s",
+                "-n",
+                "-Orientation",
+                "-ImageWidth",
+                "-ImageHeight",
+            ])
+            .arg(&image_path)
+            .output()
+            .expect("ExifTool should probe the real fixture");
+        assert!(output.status.success());
+        assert_eq!(
+            parse_media_metadata(&String::from_utf8(output.stdout).expect("JSON must be UTF-8"))
+                .expect("real G1:4 output should parse"),
+            MediaMetadata {
+                orientations: vec![1],
+                rotations: Vec::new(),
+                dimensions: (7, 5),
+            }
+        );
     }
 
     #[test]
@@ -14248,6 +14287,7 @@ esac
                 "heic_path": uploaded_path,
                 "heic_sha256": heic_sha,
                 "size_bytes": heic_bytes.len() as u64,
+                "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
             }),
         );
         record.proofs.insert(
@@ -14354,6 +14394,7 @@ esac
                 "heic_path": uploaded_path,
                 "heic_sha256": heic_sha,
                 "size_bytes": heic_bytes.len() as u64,
+                "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
             }),
         );
         record.proofs.insert(
@@ -16602,6 +16643,7 @@ esac
                 "heic_path": heic_path,
                 "heic_sha256": heic_sha,
                 "size_bytes": 10u64,
+                "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
             }),
         );
         record.proofs.insert(
