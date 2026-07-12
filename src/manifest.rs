@@ -107,6 +107,23 @@ impl FailureKind {
             Self::AdjustedSourceResolveFailed => "adjusted_source_resolve_failed",
         }
     }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "heic_visual_content" => Some(Self::HeicVisualContent),
+            "heic_visual_match" => Some(Self::HeicVisualMatch),
+            "conversion_timed_out" => Some(Self::ConversionTimedOut),
+            "raw_staging_timed_out" => Some(Self::RawStagingTimedOut),
+            "conversion_output_unreadable" => Some(Self::ConversionOutputUnreadable),
+            "conversion_output_already_exists" => Some(Self::ConversionOutputAlreadyExists),
+            "staged_raw_already_exists" => Some(Self::StagedRawAlreadyExists),
+            "conversion_metadata_failed" => Some(Self::ConversionMetadataFailed),
+            "conversion_tool_unavailable" => Some(Self::ConversionToolUnavailable),
+            "embedded_preview_unavailable" => Some(Self::EmbeddedPreviewUnavailable),
+            "adjusted_source_resolve_failed" => Some(Self::AdjustedSourceResolveFailed),
+            _ => None,
+        }
+    }
 }
 
 pub const FAILURE_QUARANTINE_PROOF_NAME: &str = "failure_quarantine";

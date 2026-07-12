@@ -4549,14 +4549,11 @@ fn macos_app_packaging_surface_is_documented() {
     assert!(app_source.contains("func configureBundledHelperEnvironment(_ process: Process)"));
     assert!(app_source.contains("process.environment = environment"));
     assert!(app_source.contains("bundled_helper_environment_configured"));
-    assert_eq!(
-        app_source
-            .matches("configureBundledHelperEnvironment(process)")
-            .count(),
-        3,
-        "every bundled helper Process launch should receive the deterministic environment"
-    );
-    assert!(app_source.contains("bundledHelper: true"));
+    assert!(app_source.contains("enum BundledHelperLaunchMode:"));
+    assert!(app_source.contains("--bundled-helper-environment-self-test"));
+    assert!(app_source.contains("bundledHelperEnvironmentSelfTest()"));
+    assert!(app_source.contains("BundledHelperLaunchMode.allCases.allSatisfy"));
+    assert!(app_source.contains("ICLOUDPD_OPTIMIZER_HELPER_ENV_SENTINEL"));
     assert!(!app_source.contains("ProcessInfo.processInfo.environment[\"PATH\"]"));
     assert!(app_source.contains("private func startServiceHelper(args: [String])"));
     assert!(app_source.contains("serviceProcess?.isRunning != true"));

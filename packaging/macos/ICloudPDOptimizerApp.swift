@@ -575,11 +575,30 @@ struct ProcessResult {
 
 let bundledHelperPath = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+enum BundledHelperLaunchMode: String, CaseIterable {
+    case proxy
+    case dashboard
+    case service
+}
+
 func configureBundledHelperEnvironment(_ process: Process) {
     var environment = ProcessInfo.processInfo.environment
     environment["PATH"] = bundledHelperPath
     process.environment = environment
     AppLogger.log("bundled_helper_environment_configured", fields: ["path": bundledHelperPath])
+}
+
+func bundledHelperProcess(
+    executableURL: URL,
+    arguments: [String],
+    mode: BundledHelperLaunchMode
+) -> Process {
+    let process = Process()
+    process.executableURL = executableURL
+    process.arguments = arguments
+    configureBundledHelperEnvironment(process)
+    AppLogger.log("bundled_helper_process_configured", fields: ["mode": mode.rawValue])
+    return process
 }
 
 private final class ProcessOutputReader: @unchecked Sendable {
@@ -608,13 +627,19 @@ private final class ProcessOutputReader: @unchecked Sendable {
 func runCapturedProcess(
     executableURL: URL,
     arguments: [String],
-    bundledHelper: Bool = false
+    bundledHelperLaunchMode: BundledHelperLaunchMode? = nil
 ) throws -> ProcessResult {
-    let process = Process()
-    process.executableURL = executableURL
-    process.arguments = arguments
-    if bundledHelper {
-        configureBundledHelperEnvironment(process)
+    let process: Process
+    if let bundledHelperLaunchMode {
+        process = bundledHelperProcess(
+            executableURL: executableURL,
+            arguments: arguments,
+            mode: bundledHelperLaunchMode
+        )
+    } else {
+        process = Process()
+        process.executableURL = executableURL
+        process.arguments = arguments
     }
     let stdout = Pipe()
     let stderr = Pipe()
@@ -753,10 +778,7 @@ func runBundledHelperAndExit(args: [String]) -> Never {
         fputs("missing bundled icloudpd-optimizer helper\n", stderr)
         exit(1)
     }
-    let process = Process()
-    process.executableURL = helper
-    process.arguments = args
-    configureBundledHelperEnvironment(process)
+    let process = bundledHelperProcess(executableURL: helper, arguments: args, mode: .proxy)
     process.standardInput = FileHandle.standardInput
     process.standardOutput = FileHandle.standardOutput
     process.standardError = FileHandle.standardError
@@ -1695,7 +1717,7 @@ final class DashboardViewModel: ObservableObject {
         return try runCapturedProcess(
             executableURL: helper,
             arguments: arguments,
-            bundledHelper: true
+            bundledHelperLaunchMode: .dashboard
         )
     }
 }
@@ -3020,10 +3042,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             exit(1)
         }
 
-        let process = Process()
-        process.executableURL = helper
-        process.arguments = args
-        configureBundledHelperEnvironment(process)
+        let process = bundledHelperProcess(executableURL: helper, arguments: args, mode: .service)
         process.standardInput = FileHandle.standardInput
         process.standardOutput = FileHandle.standardOutput
         process.standardError = FileHandle.standardError
@@ -3487,6 +3506,8 @@ struct PrimeError: Error, CustomStringConvertible {
 }
 
 private let dashboardProcessSelfTestBytes = 256 * 1024
+private let bundledHelperEnvironmentSelfTestSentinel = "ICLOUDPD_OPTIMIZER_HELPER_ENV_SENTINEL"
+private let bundledHelperEnvironmentSelfTestValue = "preserved-by-helper-self-test"
 
 private func emitDashboardProcessSelfTestOutputAndExit() -> Never {
     FileHandle.standardOutput.write(Data(repeating: 111, count: dashboardProcessSelfTestBytes))
@@ -3504,6 +3525,46 @@ private func dashboardProcessCaptureSelfTest() -> Bool {
     return result.status == 0
         && result.stdout.utf8.count == dashboardProcessSelfTestBytes
         && result.stderr.utf8.count == dashboardProcessSelfTestBytes
+}
+
+private func emitBundledHelperEnvironmentSelfTestChildAndExit() -> Never {
+    let environment = ProcessInfo.processInfo.environment
+    print(environment["PATH"] ?? "")
+    print(environment[bundledHelperEnvironmentSelfTestSentinel] ?? "")
+    exit(0)
+}
+
+private func bundledHelperEnvironmentSelfTest() -> Bool {
+    let priorPath = getenv("PATH").map { String(cString: $0) }
+    let priorSentinel = getenv(bundledHelperEnvironmentSelfTestSentinel).map { String(cString: $0) }
+    setenv("PATH", "/poisoned-parent-path", 1)
+    setenv(bundledHelperEnvironmentSelfTestSentinel, bundledHelperEnvironmentSelfTestValue, 1)
+    defer {
+        if let priorPath {
+            setenv("PATH", priorPath, 1)
+        } else {
+            unsetenv("PATH")
+        }
+        if let priorSentinel {
+            setenv(bundledHelperEnvironmentSelfTestSentinel, priorSentinel, 1)
+        } else {
+            unsetenv(bundledHelperEnvironmentSelfTestSentinel)
+        }
+    }
+
+    let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+    return BundledHelperLaunchMode.allCases.allSatisfy { mode in
+        guard let result = try? runCapturedProcess(
+            executableURL: executableURL,
+            arguments: ["--bundled-helper-environment-child-self-test"],
+            bundledHelperLaunchMode: mode
+        ) else {
+            return false
+        }
+        return result.status == 0
+            && result.stdout == "\(bundledHelperPath)\n\(bundledHelperEnvironmentSelfTestValue)\n"
+            && result.stderr.isEmpty
+    }
 }
 
 private func runDashboardMetricsSelfTestAndExit() -> Never {
@@ -3728,6 +3789,12 @@ private func runDashboardMetricsSelfTestAndExit() -> Never {
 let launchArgs = Array(CommandLine.arguments.dropFirst())
 if launchArgs == ["--dashboard-process-output-self-test"] {
     emitDashboardProcessSelfTestOutputAndExit()
+}
+if launchArgs == ["--bundled-helper-environment-child-self-test"] {
+    emitBundledHelperEnvironmentSelfTestChildAndExit()
+}
+if launchArgs == ["--bundled-helper-environment-self-test"] {
+    exit(bundledHelperEnvironmentSelfTest() ? 0 : 2)
 }
 if launchArgs == ["--dashboard-metrics-self-test"] {
     runDashboardMetricsSelfTestAndExit()

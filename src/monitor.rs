@@ -83,9 +83,13 @@ const DEFAULT_MAX_ORIGINAL_RESOLVER_RETRIES_PER_SCAN: usize = 16;
 const DEFAULT_ORIGINAL_RESOLVER_RETRY_MIN_AGE_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_MAX_FAILED_RETRY_ADMISSIONS_PER_SCAN: usize = 16;
 const DEFAULT_FAILED_RETRY_MIN_AGE_SECONDS: u64 = 300;
-const FAILED_RETRY_POLICY_SCHEMA_VERSION: u64 = 2;
-const FAILED_RETRY_POLICY_GENERATION: &str = "codec_normalized_v1";
+const LEGACY_FAILED_RETRY_POLICY_SCHEMA_VERSION: u64 = 2;
+const LEGACY_FAILED_RETRY_POLICY_GENERATION: &str = "codec_normalized_v1";
+const FAILED_RETRY_POLICY_SCHEMA_VERSION: u64 = 3;
+const FAILED_RETRY_POLICY_GENERATION: &str = "cumulative_v1";
+const FAILED_RETRY_MAX_CUMULATIVE_ATTEMPTS: u64 = 3;
 const FAILURE_RETRY_PROOF: &str = "failure_retry";
+const FAILURE_RETRY_V3_PROOF: &str = "failure_retry_v3";
 const FAILURE_REVIEW_PROOF: &str = "failure_review";
 pub const ADJUSTED_SOURCE_REQUIRED_PROOF: &str = "adjusted_source_required";
 pub const ADJUSTED_SOURCE_REQUIRED_SCHEMA_VERSION: u64 = 1;
@@ -4286,6 +4290,12 @@ fn record_conversion_execution_failure(
     kind: Option<FailureKind>,
 ) -> Result<(), WorkflowError> {
     match kind {
+        // Keep this exact message untyped on disk until every deployed reader understands the
+        // new enum value. New readers classify it exactly and keep retry lineage in the
+        // extension proof that older readers ignore.
+        Some(FailureKind::ConversionToolUnavailable) => {
+            record_stage_failure(manifest, asset_id, "conversion", message)
+        }
         Some(kind) => {
             record_stage_failure_with_kind(manifest, asset_id, "conversion", message, kind)
         }
@@ -7089,6 +7099,24 @@ struct FailureRetryProof {
     retry_state: State,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct FailureRetryV3Proof {
+    schema_version: u64,
+    policy_generation: String,
+    category: String,
+    category_attempt: u64,
+    cumulative_attempt: u64,
+    lineage_start_failure_count: usize,
+    last_failure_stage: String,
+    last_failure_kind: String,
+    last_failure_recorded_at: String,
+    last_failure_digest: String,
+    failure_count_at_admission: usize,
+    admitted_at_unix_seconds: u64,
+    retry_state: State,
+    legacy_failure_retry_proof_digest: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct FailureReviewProof {
     schema_version: u64,
@@ -7115,8 +7143,15 @@ struct FailedRetryCandidate {
     asset_id: String,
     failure_timestamp: (u64, u32),
     kind: FailureKind,
-    attempt: u64,
+    attempts: FailedRetryAttempts,
     policy: FailedRetryPolicy,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FailedRetryAttempts {
+    category: u64,
+    cumulative: u64,
+    lineage_start_failure_count: usize,
 }
 
 const RETRY_BLOCKING_PROOFS: [&str; 7] = [
@@ -7210,12 +7245,14 @@ fn admit_failed_retryable_assets_with_budget(
             admission.blocked_source_proof = admission.blocked_source_proof.saturating_add(1);
             continue;
         }
-        let Ok(attempt) = failed_retry_attempt(record, kind, policy) else {
+        let Ok(attempts) = failed_retry_attempt(record, kind, policy) else {
             admission.unknown = admission.unknown.saturating_add(1);
             continue;
         };
-        if attempt >= policy.max_attempts {
-            exhausted.push((record.asset_id.clone(), kind, attempt));
+        if attempts.category >= policy.max_attempts
+            || attempts.cumulative >= FAILED_RETRY_MAX_CUMULATIVE_ATTEMPTS
+        {
+            exhausted.push((record.asset_id.clone(), kind, attempts));
             continue;
         }
         if kind == FailureKind::HeicVisualMatch && !conversion_output_still_matches_proof(record) {
@@ -7242,18 +7279,24 @@ fn admit_failed_retryable_assets_with_budget(
             asset_id: record.asset_id.clone(),
             failure_timestamp,
             kind,
-            attempt,
+            attempts,
             policy,
         });
     }
 
-    for (asset_id, kind, attempt) in exhausted {
+    for (asset_id, kind, attempts) in exhausted {
+        let (reason_code, attempts_exhausted) =
+            if attempts.cumulative >= FAILED_RETRY_MAX_CUMULATIVE_ATTEMPTS {
+                ("retry_cumulative_attempts_exhausted", attempts.cumulative)
+            } else {
+                ("retry_attempts_exhausted", attempts.category)
+            };
         terminalize_failure_for_review(
             manifest,
             &asset_id,
             kind,
-            "retry_attempts_exhausted",
-            attempt,
+            reason_code,
+            attempts_exhausted,
             current_unix_seconds,
         )?;
         admission.exhausted = admission.exhausted.saturating_add(1);
@@ -7943,8 +7986,7 @@ fn validate_adjusted_source_required_queue_common(
         || marker.original_record_change_tag != original.record_change_tag
         || marker.original_database_scope != original.database_scope
         || marker.original_zone_name != original.zone_name
-        || marker.failure_retry_proof_digest.is_some()
-            != record.proofs.contains_key(FAILURE_RETRY_PROOF)
+        || marker.failure_retry_proof_digest.is_some() != retry_proof_value(record).is_some()
     {
         return Err(AdjustedSourceRequiredProofError::SourceProof);
     }
@@ -8092,11 +8134,7 @@ fn adjusted_source_recovery_source_context(
         nas_proof_digest: value_digest(nas)?,
         original_asset_proof_digest: value_digest(original_value)?,
         original,
-        failure_retry_proof_digest: record
-            .proofs
-            .get(FAILURE_RETRY_PROOF)
-            .map(value_digest)
-            .transpose()?,
+        failure_retry_proof_digest: retry_proof_value(record).map(value_digest).transpose()?,
     })
 }
 
@@ -8218,7 +8256,11 @@ pub fn failed_retry_queue_counts_at(
                     }
                     Some(policy) if kind == FailureKind::HeicVisualMatch => {
                         match failed_retry_attempt(record, kind, policy) {
-                            Ok(attempt) if attempt >= policy.max_attempts => {
+                            Ok(attempts)
+                                if attempts.category >= policy.max_attempts
+                                    || attempts.cumulative
+                                        >= FAILED_RETRY_MAX_CUMULATIVE_ATTEMPTS =>
+                            {
                                 "terminalize_retry_attempts_exhausted"
                             }
                             Ok(_) if !conversion_proof_has_expected_shape(record) => {
@@ -8229,7 +8271,10 @@ pub fn failed_retry_queue_counts_at(
                         }
                     }
                     Some(policy) => match failed_retry_attempt(record, kind, policy) {
-                        Ok(attempt) if attempt >= policy.max_attempts => {
+                        Ok(attempts)
+                            if attempts.category >= policy.max_attempts
+                                || attempts.cumulative >= FAILED_RETRY_MAX_CUMULATIVE_ATTEMPTS =>
+                        {
                             "terminalize_retry_attempts_exhausted"
                         }
                         Ok(_) => policy.bucket,
@@ -8258,22 +8303,53 @@ fn admit_failed_retry(
         .ok_or_else(|| ManifestError::UnknownAsset {
             asset_id: candidate.asset_id.clone(),
         })?;
-    let proof = FailureRetryProof {
+    if candidate.kind != FailureKind::ConversionToolUnavailable {
+        let legacy_proof = FailureRetryProof {
+            schema_version: LEGACY_FAILED_RETRY_POLICY_SCHEMA_VERSION,
+            policy_generation: LEGACY_FAILED_RETRY_POLICY_GENERATION.to_string(),
+            category: candidate.kind,
+            // Older readers only understand a single category counter. Give them the
+            // cumulative value so rollback is conservative across newer transitions.
+            attempt: candidate.attempts.cumulative.saturating_add(1),
+            last_failure_stage: failure.stage.clone(),
+            last_failure_kind: candidate.kind,
+            last_failure_recorded_at: failure.recorded_at.clone(),
+            last_failure_digest: failure_digest(&failure),
+            failure_count_at_admission: manifest.get(&candidate.asset_id)?.failures.len(),
+            admitted_at_unix_seconds,
+            retry_state: candidate.policy.retry_state,
+        };
+        manifest.record_proof(
+            &candidate.asset_id,
+            FAILURE_RETRY_PROOF,
+            serde_json::to_value(legacy_proof)?,
+        )?;
+    }
+    let legacy_failure_retry_proof_digest = manifest
+        .get(&candidate.asset_id)?
+        .proofs
+        .get(FAILURE_RETRY_PROOF)
+        .map(retry_proof_digest)
+        .transpose()?;
+    let proof = FailureRetryV3Proof {
         schema_version: FAILED_RETRY_POLICY_SCHEMA_VERSION,
         policy_generation: FAILED_RETRY_POLICY_GENERATION.to_string(),
-        category: candidate.kind,
-        attempt: candidate.attempt.saturating_add(1),
+        category: candidate.kind.as_str().to_string(),
+        category_attempt: candidate.attempts.category.saturating_add(1),
+        cumulative_attempt: candidate.attempts.cumulative.saturating_add(1),
+        lineage_start_failure_count: candidate.attempts.lineage_start_failure_count,
         last_failure_stage: failure.stage.clone(),
-        last_failure_kind: candidate.kind,
+        last_failure_kind: candidate.kind.as_str().to_string(),
         last_failure_recorded_at: failure.recorded_at.clone(),
         last_failure_digest: failure_digest(&failure),
         failure_count_at_admission: manifest.get(&candidate.asset_id)?.failures.len(),
         admitted_at_unix_seconds,
         retry_state: candidate.policy.retry_state,
+        legacy_failure_retry_proof_digest,
     };
     manifest.record_proof(
         &candidate.asset_id,
-        FAILURE_RETRY_PROOF,
+        FAILURE_RETRY_V3_PROOF,
         serde_json::to_value(proof)?,
     )?;
     manifest.recover_failed_for_retry(&candidate.asset_id, candidate.policy.retry_state)?;
@@ -8284,45 +8360,125 @@ fn failed_retry_attempt(
     record: &AssetRecord,
     kind: FailureKind,
     policy: FailedRetryPolicy,
-) -> Result<u64, ()> {
-    let Some(proof) = record.proofs.get(FAILURE_RETRY_PROOF) else {
-        return Ok(0);
-    };
-    let proof = serde_json::from_value::<FailureRetryProof>(proof.clone()).map_err(|_| ())?;
-    if proof.schema_version != FAILED_RETRY_POLICY_SCHEMA_VERSION
-        || proof.policy_generation != FAILED_RETRY_POLICY_GENERATION
-        || proof.attempt == 0
-        || proof.last_failure_kind != proof.category
-    {
-        return Err(());
+) -> Result<FailedRetryAttempts, ()> {
+    match (
+        record.proofs.get(FAILURE_RETRY_V3_PROOF),
+        record.proofs.get(FAILURE_RETRY_PROOF),
+    ) {
+        (Some(proof), legacy_proof) => {
+            let proof =
+                serde_json::from_value::<FailureRetryV3Proof>(proof.clone()).map_err(|_| ())?;
+            let proof_kind = FailureKind::from_str(&proof.category).ok_or(())?;
+            if proof.schema_version != FAILED_RETRY_POLICY_SCHEMA_VERSION
+                || proof.policy_generation != FAILED_RETRY_POLICY_GENERATION
+                || proof.category_attempt == 0
+                || proof.cumulative_attempt == 0
+                || proof.cumulative_attempt > FAILED_RETRY_MAX_CUMULATIVE_ATTEMPTS
+                || proof
+                    .failure_count_at_admission
+                    .checked_sub(proof.lineage_start_failure_count)
+                    .and_then(|delta| delta.checked_add(1))
+                    .and_then(|attempt| u64::try_from(attempt).ok())
+                    != Some(proof.cumulative_attempt)
+                || proof.last_failure_kind != proof.category
+                || proof.legacy_failure_retry_proof_digest
+                    != legacy_proof
+                        .map(retry_proof_digest)
+                        .transpose()
+                        .map_err(|_| ())?
+            {
+                return Err(());
+            }
+            let prior_policy = failed_retry_policy(proof_kind).ok_or(())?;
+            let expected_failure_count =
+                proof.failure_count_at_admission.checked_add(1).ok_or(())?;
+            if proof.retry_state != prior_policy.retry_state
+                || (proof_kind == kind && proof.retry_state != policy.retry_state)
+                || proof.failure_count_at_admission == 0
+                || record.failures.len() != expected_failure_count
+            {
+                return Err(());
+            }
+            let prior = record
+                .failures
+                .get(proof.failure_count_at_admission.saturating_sub(1))
+                .ok_or(())?;
+            if prior.stage != proof.last_failure_stage
+                || prior.recorded_at != proof.last_failure_recorded_at
+                || failure_digest(prior) != proof.last_failure_digest
+                || failure_kind_for(record, prior) != Some(proof_kind)
+                || failure_kind_for(record, record.failures.last().ok_or(())?) != Some(kind)
+            {
+                return Err(());
+            }
+            Ok(FailedRetryAttempts {
+                category: (proof_kind == kind)
+                    .then_some(proof.category_attempt)
+                    .unwrap_or(0),
+                cumulative: proof.cumulative_attempt,
+                lineage_start_failure_count: proof.lineage_start_failure_count,
+            })
+        }
+        (None, Some(proof)) => {
+            let proof =
+                serde_json::from_value::<FailureRetryProof>(proof.clone()).map_err(|_| ())?;
+            if proof.schema_version != LEGACY_FAILED_RETRY_POLICY_SCHEMA_VERSION
+                || proof.policy_generation != LEGACY_FAILED_RETRY_POLICY_GENERATION
+                || proof.attempt == 0
+                || proof.last_failure_kind != proof.category
+                || proof.category != kind
+            {
+                return Err(());
+            }
+            let prior_policy = failed_retry_policy(proof.category).ok_or(())?;
+            let expected_failure_count =
+                proof.failure_count_at_admission.checked_add(1).ok_or(())?;
+            if proof.retry_state != prior_policy.retry_state
+                || proof.retry_state != policy.retry_state
+                || proof.failure_count_at_admission == 0
+                || record.failures.len() != expected_failure_count
+            {
+                return Err(());
+            }
+            let prior = record
+                .failures
+                .get(proof.failure_count_at_admission.saturating_sub(1))
+                .ok_or(())?;
+            if prior.stage != proof.last_failure_stage
+                || prior.recorded_at != proof.last_failure_recorded_at
+                || failure_digest(prior) != proof.last_failure_digest
+                || failure_kind_for(record, prior) != Some(proof.last_failure_kind)
+                || failure_kind_for(record, record.failures.last().ok_or(())?) != Some(kind)
+            {
+                return Err(());
+            }
+            Ok(FailedRetryAttempts {
+                category: proof.attempt,
+                cumulative: proof.attempt,
+                lineage_start_failure_count: record
+                    .failures
+                    .len()
+                    .checked_sub(proof.attempt as usize)
+                    .ok_or(())?,
+            })
+        }
+        (None, None) => Ok(FailedRetryAttempts {
+            category: 0,
+            cumulative: 0,
+            lineage_start_failure_count: record.failures.len(),
+        }),
     }
-    let prior_policy = failed_retry_policy(proof.category).ok_or(())?;
-    let expected_failure_count = proof.failure_count_at_admission.checked_add(1).ok_or(())?;
-    if proof.retry_state != prior_policy.retry_state
-        || proof.failure_count_at_admission == 0
-        || record.failures.len() != expected_failure_count
-    {
-        return Err(());
-    }
-    let prior = record
-        .failures
-        .get(proof.failure_count_at_admission.saturating_sub(1))
-        .ok_or(())?;
-    if prior.stage != proof.last_failure_stage
-        || prior.recorded_at != proof.last_failure_recorded_at
-        || failure_digest(prior) != proof.last_failure_digest
-        || failure_kind_for(record, prior) != Some(proof.last_failure_kind)
-        || failure_kind_for(record, record.failures.last().ok_or(())?) != Some(kind)
-    {
-        return Err(());
-    }
-    if proof.category == kind {
-        (proof.retry_state == policy.retry_state)
-            .then_some(proof.attempt)
-            .ok_or(())
-    } else {
-        Ok(0)
-    }
+}
+
+fn retry_proof_digest(proof: &Value) -> Result<String, serde_json::Error> {
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(proof)?)))
+}
+
+fn retry_proof_value(record: &AssetRecord) -> Option<&Value> {
+    record
+        .proofs
+        .get(FAILURE_RETRY_V3_PROOF)
+        .or_else(|| record.proofs.get(FAILURE_RETRY_PROOF))
 }
 
 fn has_retry_blocking_proof(record: &AssetRecord) -> bool {
@@ -16809,7 +16965,10 @@ esac
         );
         let record = manifest.get("visual-match").expect("record should remain");
         assert_eq!(record.state, State::Converted);
-        assert_eq!(record.proofs["failure_retry"]["attempt"], json!(1));
+        assert_eq!(
+            record.proofs[FAILURE_RETRY_V3_PROOF]["category_attempt"],
+            json!(1)
+        );
 
         policy_failed_again_at(
             &mut manifest,
@@ -16879,7 +17038,7 @@ esac
                 .expect("retry should admit before budget exhaustion");
             assert_eq!(manifest.get("oldest").unwrap().state, State::NasVerified);
             assert_eq!(
-                manifest.get("oldest").unwrap().proofs["failure_retry"]["attempt"],
+                manifest.get("oldest").unwrap().proofs[FAILURE_RETRY_V3_PROOF]["category_attempt"],
                 json!(expected_attempt)
             );
         }
@@ -16933,7 +17092,7 @@ esac
                 .expect("first retry should admit");
             assert_eq!(manifest.get(asset_id).unwrap().state, State::NasVerified);
             assert_eq!(
-                manifest.get(asset_id).unwrap().proofs["failure_retry"]["attempt"],
+                manifest.get(asset_id).unwrap().proofs[FAILURE_RETRY_V3_PROOF]["category_attempt"],
                 json!(1)
             );
 
@@ -16968,7 +17127,7 @@ esac
         assert_eq!(first.backoff, 1);
         assert_eq!(manifest.get("recent").unwrap().state, State::Failed);
         assert_eq!(
-            manifest.get("admitted").unwrap().proofs["failure_retry"]["attempt"],
+            manifest.get("admitted").unwrap().proofs[FAILURE_RETRY_V3_PROOF]["category_attempt"],
             json!(1)
         );
 
@@ -16976,7 +17135,7 @@ esac
             .expect("interrupted admitted state should continue without readmission");
         assert!(resumed.admitted_by_category.is_empty());
         assert_eq!(
-            manifest.get("admitted").unwrap().proofs["failure_retry"]["attempt"],
+            manifest.get("admitted").unwrap().proofs[FAILURE_RETRY_V3_PROOF]["category_attempt"],
             json!(1)
         );
     }
@@ -17223,7 +17382,7 @@ esac
         let mut record = wrong_state.get("wrong-state").unwrap().clone();
         record
             .proofs
-            .get_mut(FAILURE_RETRY_PROOF)
+            .get_mut(FAILURE_RETRY_V3_PROOF)
             .and_then(Value::as_object_mut)
             .expect("retry proof should be an object")
             .insert("retry_state".to_string(), json!("converted"));
@@ -17257,9 +17416,10 @@ esac
             1
         );
         let record = valid.get("valid").unwrap();
-        let proof = &record.proofs[FAILURE_RETRY_PROOF];
-        assert_eq!(proof["schema_version"], json!(2));
-        assert_eq!(proof["attempt"], json!(2));
+        let proof = &record.proofs[FAILURE_RETRY_V3_PROOF];
+        assert_eq!(proof["schema_version"], json!(3));
+        assert_eq!(proof["category_attempt"], json!(2));
+        assert_eq!(proof["cumulative_attempt"], json!(2));
         assert_eq!(proof["last_failure_stage"], json!("conversion"));
         assert_eq!(proof["last_failure_kind"], json!("conversion_timed_out"));
         assert_eq!(proof["last_failure_recorded_at"], json!("101.000000000Z"));
@@ -17290,8 +17450,8 @@ esac
             admission.admitted_by_category["retryable_conversion_metadata_failed"],
             1
         );
-        let proof = &manifest.get("new-category").unwrap().proofs[FAILURE_RETRY_PROOF];
-        assert_eq!(proof["attempt"], json!(1));
+        let proof = &manifest.get("new-category").unwrap().proofs[FAILURE_RETRY_V3_PROOF];
+        assert_eq!(proof["category_attempt"], json!(1));
         assert_eq!(proof["category"], json!("conversion_metadata_failed"));
     }
 
@@ -17319,9 +17479,243 @@ esac
             1
         );
         let proof =
-            &manifest.get("tool-unavailable-transition").unwrap().proofs[FAILURE_RETRY_PROOF];
-        assert_eq!(proof["attempt"], json!(1));
+            &manifest.get("tool-unavailable-transition").unwrap().proofs[FAILURE_RETRY_V3_PROOF];
+        assert_eq!(proof["category_attempt"], json!(1));
         assert_eq!(proof["category"], json!("conversion_tool_unavailable"));
+    }
+
+    #[test]
+    fn retry_category_alternation_exhausts_the_proof_bound_cumulative_cap() {
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "alternating-categories",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            Some(FailureKind::ConversionTimedOut),
+            "100.000000000Z",
+        ));
+
+        for (kind, message, timestamp) in [
+            (
+                FailureKind::ConversionToolUnavailable,
+                "conversion tool not found on sanitized PATH: exiftool",
+                "101.000000000Z",
+            ),
+            (
+                FailureKind::ConversionTimedOut,
+                "conversion command timed out after 120000 ms: heif-enc",
+                "102.000000000Z",
+            ),
+        ] {
+            admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+                .expect("retry before the cumulative cap should admit");
+            policy_failed_again_at(
+                &mut manifest,
+                "alternating-categories",
+                "conversion",
+                message,
+                kind,
+                timestamp,
+            );
+        }
+
+        admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("third cumulative retry should admit");
+        policy_failed_again_at(
+            &mut manifest,
+            "alternating-categories",
+            "conversion",
+            "conversion tool not found on sanitized PATH: exiftool",
+            FailureKind::ConversionToolUnavailable,
+            "103.000000000Z",
+        );
+
+        let exhausted = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("the fourth alternating failure should be terminalized");
+        assert_eq!(exhausted.exhausted, 1);
+        assert_eq!(
+            manifest.get("alternating-categories").unwrap().state,
+            State::NeedsReview
+        );
+    }
+
+    #[test]
+    fn legacy_retry_proof_cannot_transition_categories_without_a_cumulative_lineage() {
+        let mut manifest = admitted_timeout_manifest("legacy-transition");
+        let mut record = manifest.get("legacy-transition").unwrap().clone();
+        let failure = record.failures.last().unwrap();
+        record.proofs.remove(FAILURE_RETRY_V3_PROOF);
+        record.proofs.insert(
+            FAILURE_RETRY_PROOF.to_string(),
+            serde_json::to_value(FailureRetryProof {
+                schema_version: LEGACY_FAILED_RETRY_POLICY_SCHEMA_VERSION,
+                policy_generation: LEGACY_FAILED_RETRY_POLICY_GENERATION.to_string(),
+                category: FailureKind::ConversionTimedOut,
+                attempt: 1,
+                last_failure_stage: failure.stage.clone(),
+                last_failure_kind: FailureKind::ConversionTimedOut,
+                last_failure_recorded_at: failure.recorded_at.clone(),
+                last_failure_digest: failure_digest(failure),
+                failure_count_at_admission: 1,
+                admitted_at_unix_seconds: 1_000,
+                retry_state: State::NasVerified,
+            })
+            .unwrap(),
+        );
+        manifest.upsert(record);
+        policy_failed_again_at(
+            &mut manifest,
+            "legacy-transition",
+            "conversion",
+            "conversion tool not found on sanitized PATH: exiftool",
+            FailureKind::ConversionToolUnavailable,
+            "101.000000000Z",
+        );
+
+        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("legacy category transition should fail closed without mutation");
+        assert_eq!(admission.unknown, 1);
+        assert_eq!(
+            manifest.get("legacy-transition").unwrap().state,
+            State::Failed
+        );
+    }
+
+    #[test]
+    fn cumulative_retry_lineage_tampering_fails_closed() {
+        let mut manifest = admitted_timeout_manifest("tampered-cumulative");
+        let mut record = manifest.get("tampered-cumulative").unwrap().clone();
+        record.proofs.get_mut(FAILURE_RETRY_V3_PROOF).unwrap()["cumulative_attempt"] = json!(2);
+        manifest.upsert(record);
+        policy_failed_again_at(
+            &mut manifest,
+            "tampered-cumulative",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            FailureKind::ConversionTimedOut,
+            "101.000000000Z",
+        );
+
+        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("tampered lineage should not mutate the failed record");
+        assert_eq!(admission.unknown, 1);
+        assert_eq!(
+            manifest.get("tampered-cumulative").unwrap().state,
+            State::Failed
+        );
+    }
+
+    #[test]
+    fn tool_unavailable_failure_is_persisted_in_an_old_reader_safe_shape() {
+        #[derive(serde::Deserialize)]
+        struct OldFailureRecord {
+            kind: Option<OldFailureKind>,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldFailureKind {
+            ConversionTimedOut,
+            ConversionMetadataFailed,
+        }
+
+        let mut record = policy_failed_record(
+            "old-reader-safe",
+            "conversion",
+            "conversion tool not found on sanitized PATH: exiftool",
+            None,
+            "100.000000000Z",
+        );
+        record.state = State::NasVerified;
+        record.failures.clear();
+        let mut manifest = Manifest::new();
+        manifest.upsert(record);
+        record_conversion_execution_failure(
+            &mut manifest,
+            "old-reader-safe",
+            "conversion tool not found on sanitized PATH: exiftool",
+            Some(FailureKind::ConversionToolUnavailable),
+        )
+        .expect("tool-unavailable failure should record");
+
+        let admission = admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("tool-unavailable retry should use the extension proof");
+        assert_eq!(
+            admission.admitted_by_category["retryable_conversion_tool_unavailable"],
+            1
+        );
+        #[derive(serde::Deserialize)]
+        struct OldAssetRecord {
+            failures: Vec<OldFailureRecord>,
+            proofs: BTreeMap<String, Value>,
+        }
+
+        let encoded = serde_json::to_value(manifest.get("old-reader-safe").unwrap())
+            .expect("record should serialize");
+        let old_reader: OldAssetRecord = serde_json::from_value(encoded)
+            .expect("previous reader should deserialize failures and extension proofs");
+        assert!(old_reader.failures.last().unwrap().kind.is_none());
+        assert!(old_reader.proofs.contains_key(FAILURE_RETRY_V3_PROOF));
+    }
+
+    #[test]
+    fn rollback_compatibility_proof_uses_the_cumulative_cap_after_a_tool_transition() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldFailureKind {
+            ConversionTimedOut,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct OldRetryProof {
+            category: OldFailureKind,
+            attempt: u64,
+        }
+
+        let mut manifest = Manifest::new();
+        manifest.upsert(policy_failed_record(
+            "rollback-compatible",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            Some(FailureKind::ConversionTimedOut),
+            "100.000000000Z",
+        ));
+        admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("first timeout retry should admit");
+        policy_failed_again_at(
+            &mut manifest,
+            "rollback-compatible",
+            "conversion",
+            "conversion tool not found on sanitized PATH: exiftool",
+            FailureKind::ConversionToolUnavailable,
+            "101.000000000Z",
+        );
+        let mut record = manifest.get("rollback-compatible").unwrap().clone();
+        record.failures.last_mut().unwrap().kind = None;
+        manifest.upsert(record);
+        admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("tool retry should use only the extension proof");
+        policy_failed_again_at(
+            &mut manifest,
+            "rollback-compatible",
+            "conversion",
+            "conversion command timed out after 120000 ms: heif-enc",
+            FailureKind::ConversionTimedOut,
+            "102.000000000Z",
+        );
+        admit_failed_retryable_assets(&mut manifest, 1, 1, 300, 3_000_000)
+            .expect("third cumulative retry should write the conservative legacy proof");
+
+        let legacy: OldRetryProof = serde_json::from_value(
+            manifest.get("rollback-compatible").unwrap().proofs[FAILURE_RETRY_PROOF].clone(),
+        )
+        .expect("previous reader should parse the legacy retry proof");
+        assert!(matches!(
+            legacy.category,
+            OldFailureKind::ConversionTimedOut
+        ));
+        assert_eq!(legacy.attempt, FAILED_RETRY_MAX_CUMULATIVE_ATTEMPTS);
     }
 
     #[test]
@@ -18585,7 +18979,10 @@ esac
             .expect("asset should reload");
         assert_eq!(reloaded_record.state, State::NasVerified);
         assert_eq!(reloaded_record.updated_at, recovered.updated_at);
-        assert_eq!(reloaded_record.proofs["failure_retry"]["attempt"], json!(1));
+        assert_eq!(
+            reloaded_record.proofs[FAILURE_RETRY_V3_PROOF]["category_attempt"],
+            json!(1)
+        );
 
         let mut reloaded_for_retry = store.load().expect("state store should reload");
         policy_failed_again_at(
@@ -18603,7 +19000,7 @@ esac
             1
         );
         assert_eq!(
-            reloaded_for_retry.get("conversion-timeout").unwrap().proofs[FAILURE_RETRY_PROOF]["attempt"],
+            reloaded_for_retry.get("conversion-timeout").unwrap().proofs[FAILURE_RETRY_V3_PROOF]["category_attempt"],
             json!(2)
         );
     }
