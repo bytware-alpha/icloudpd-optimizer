@@ -6329,7 +6329,10 @@ fn pending_lifecycle_count(manifest: &Manifest) -> usize {
     pending_lifecycle_count_with_auto_delete(manifest, true)
 }
 
-fn pending_lifecycle_count_for_config(manifest: &Manifest, config: &MonitorConfig) -> usize {
+pub(crate) fn pending_lifecycle_count_for_config(
+    manifest: &Manifest,
+    config: &MonitorConfig,
+) -> usize {
     pending_lifecycle_count_with_auto_delete(manifest, config.auto_delete)
 }
 
@@ -13827,7 +13830,7 @@ esac
     }
 
     #[test]
-    fn rolling_local_mirror_proof_is_persisted_before_delete_batch() {
+    fn rolling_worker_fails_closed_for_invalid_present_proof_when_helper_is_unavailable() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let mut config = MonitorConfig::new(
             tempdir.path().join("download"),
@@ -13891,20 +13894,22 @@ esac
                 "uploaded_heic_path": uploaded_path,
             }),
         );
+        record.proofs.insert(
+            "icloudpd_local_mirror".to_string(),
+            json!({
+                "uploaded_heic_asset_id": "uploaded-asset-a",
+                "uploaded_heic_sha256": heic_sha,
+                "uploaded_heic_path": uploaded_path,
+                "icloudpd_download_path": mirror_root.join("asset-a.HEIC"),
+                "size_bytes": 0u64,
+            }),
+        );
         let mut manifest = Manifest::new();
         manifest.upsert(record);
-        let mut summary = MonitorScanSummary {
+        let summary = Arc::new(Mutex::new(MonitorScanSummary {
             started_unix_seconds: 1,
             ..MonitorScanSummary::default()
-        };
-        let proof = crate::local_mirror::ensure_icloudpd_local_mirror(IcloudpdLocalMirrorRequest {
-            uploaded_heic_asset_id: "uploaded-asset-a".to_string(),
-            uploaded_heic_sha256: heic_sha,
-            uploaded_heic_path: uploaded_path,
-            size_bytes: heic_bytes.len() as u64,
-            icloudpd_download_path: mirror_root.join("asset-a.HEIC"),
-        })
-        .expect("local mirror proof should be produced");
+        }));
         let store = AssetStateStore::open_writer(
             &config.manifest_path,
             "test-writer",
@@ -13912,26 +13917,82 @@ esac
         )
         .expect("state store should open");
 
-        record_rolling_asset_local_mirror_proof(
+        let shared_manifest = Arc::new(Mutex::new(manifest));
+        {
+            let snapshot = shared_manifest.lock().unwrap();
+            assert_eq!(
+                rolling_lifecycle_next_worker_step(
+                    &snapshot,
+                    snapshot.get("asset-a").unwrap(),
+                    &config,
+                    true,
+                ),
+                Some(RollingAssetStep::RecordLocalMirrors)
+            );
+        }
+        let outcome = run_rolling_asset_local_mirror(
+            &config,
+            &store,
+            "asset-a",
+            &shared_manifest,
+            &summary,
+        )
+        .expect("rolling worker should fail closed when its test fixture cannot invoke the helper");
+
+        assert!(outcome.attempted);
+        assert!(outcome.failed);
+        assert!(!outcome.changed);
+        assert_eq!(summary.lock().unwrap().failures, 1);
+        assert!(!config.manifest_path.exists());
+        let snapshot = shared_manifest.lock().unwrap();
+        assert_eq!(
+            snapshot.get("asset-a").unwrap().state,
+            State::UploadVerified
+        );
+        assert!(validate_current_icloudpd_local_mirror_proof(&snapshot, "asset-a").is_err());
+        assert!(!mirror_root.join("asset-a.HEIC").exists());
+    }
+
+    #[test]
+    fn phased_mirror_stage_fails_closed_for_invalid_present_proof_when_helper_is_unavailable() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        fs::create_dir_all(&config.download_root).expect("download root should be created");
+        config.full_lifecycle = true;
+        config.auto_delete = false;
+        config.max_lifecycle_per_scan = 1;
+        let mut record = upload_verified_delete_ready_record("asset-a", &config.download_root);
+        make_local_mirror_proof_current(&mut record);
+        record.proofs.get_mut("icloudpd_local_mirror").unwrap()["size_bytes"] = json!(0);
+        let mut manifest = Manifest::new();
+        manifest.upsert(record);
+        let mut summary = MonitorScanSummary {
+            started_unix_seconds: 1,
+            ..MonitorScanSummary::default()
+        };
+        let store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+
+        record_local_mirrors(
+            &config,
             &store,
             &mut manifest,
             &mut summary,
-            "asset-a",
-            proof,
+            &["asset-a".to_string()],
         )
-        .expect("local mirror proof should record and save");
+        .expect("phased mirror stage should retain the failure in the scan summary");
 
-        assert_eq!(summary.mirrors_recorded, 1);
-        assert!(!config.manifest_path.exists());
-        let persisted = store.load_or_import().expect("state store should reload");
-        let persisted_record = persisted.get("asset-a").expect("asset should persist");
-        assert_eq!(persisted_record.state, State::UploadVerified);
-        assert!(
-            persisted_record
-                .proofs
-                .contains_key("icloudpd_local_mirror")
-        );
-        assert!(mirror_root.join("asset-a.HEIC").exists());
+        assert_eq!(summary.mirrors_recorded, 0);
+        assert_eq!(summary.failures, 1);
+        assert!(validate_current_icloudpd_local_mirror_proof(&manifest, "asset-a").is_err());
     }
 
     #[test]

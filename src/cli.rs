@@ -3843,6 +3843,77 @@ fn queue_raw_size_bytes(record: &AssetRecord) -> u64 {
 mod queue_tests {
     use super::*;
 
+    fn upload_verified_record(asset_id: &str, mirror_size_bytes: u64) -> AssetRecord {
+        let heic_sha = "a".repeat(64);
+        let heic_path = format!("/heic/{asset_id}.HEIC");
+        let mut record = AssetRecord::new(asset_id, format!("/raw/{asset_id}.DNG"));
+        record.state = State::UploadVerified;
+        record.proofs.insert(
+            "nas".to_string(),
+            serde_json::json!({
+                "canonical_path": format!("/raw/{asset_id}.DNG"),
+                "relative_path": format!("{asset_id}.DNG"),
+                "size_bytes": 100u64,
+                "modified_unix_seconds": 1_700_000_000u64,
+                "age_seconds": 2_592_000u64,
+                "sha256": "b".repeat(64),
+            }),
+        );
+        record.proofs.insert(
+            "conversion".to_string(),
+            serde_json::json!({
+                "heic_path": heic_path,
+                "heic_sha256": heic_sha,
+                "size_bytes": 10u64,
+            }),
+        );
+        record.proofs.insert(
+            "conversion_performance".to_string(),
+            serde_json::json!({
+                "schema_version": 1,
+                "measured_at_unix_seconds": 1_800_000_001u64,
+                "measurement_method": "monotonic_wall_clock",
+                "conversion_tool": "test-tool",
+                "heic_quality": 90,
+                "raw_size_bytes": 100u64,
+                "heic_size_bytes": 10u64,
+                "convert_wall_time_millis": 10u64,
+                "total_wall_time_millis": 11u64,
+            }),
+        );
+        record.proofs.insert(
+            "heic".to_string(),
+            serde_json::json!({
+                "heic_path": heic_path,
+                "heic_sha256": heic_sha,
+                "size_bytes": 10u64,
+                "heif_info_ok": true,
+                "metadata_copied": true,
+                "visual_content_ok": true,
+                "visual_match_ok": true,
+            }),
+        );
+        record.proofs.insert(
+            "upload".to_string(),
+            serde_json::json!({
+                "uploaded_heic_asset_id": format!("uploaded-{asset_id}"),
+                "uploaded_heic_sha256": heic_sha,
+                "uploaded_heic_path": heic_path,
+            }),
+        );
+        record.proofs.insert(
+            "icloudpd_local_mirror".to_string(),
+            serde_json::json!({
+                "uploaded_heic_asset_id": format!("uploaded-{asset_id}"),
+                "uploaded_heic_sha256": heic_sha,
+                "uploaded_heic_path": heic_path,
+                "icloudpd_download_path": format!("/mirror/{asset_id}.HEIC"),
+                "size_bytes": mirror_size_bytes,
+            }),
+        );
+        record
+    }
+
     #[test]
     fn deletion_disabled_queue_hides_delete_only_records_in_json_and_human_status() {
         let mut config = MonitorConfig::new("/download", "/manifest.json", "/heic");
@@ -3864,6 +3935,44 @@ mod queue_tests {
         let json = serde_json::to_value(&report).expect("queue report should serialize");
         assert_eq!(json["queue_counts"]["active_lifecycle"], 0);
         assert!(!render_queue_report(&report).contains("delete_original_assets"));
+    }
+
+    #[test]
+    fn deletion_disabled_queue_matches_runtime_for_valid_and_invalid_mirror_proofs_at_cap_one() {
+        let mut config = MonitorConfig::new("/download", "/manifest.json", "/heic");
+        config.full_lifecycle = true;
+        config.auto_delete = false;
+        config.max_lifecycle_per_scan = 1;
+        let mut manifest = Manifest::new();
+        manifest.upsert(upload_verified_record("terminal-mirror", 10));
+        manifest.upsert(upload_verified_record("repair-mirror", 0));
+
+        let runtime_active =
+            crate::monitor::active_lifecycle_asset_ids_for_config(&config, &manifest);
+        assert_eq!(
+            crate::monitor::pending_lifecycle_count_for_config(&manifest, &config),
+            1
+        );
+        assert_eq!(runtime_active, vec!["repair-mirror"]);
+
+        let report = MonitorQueueReport::from_manifest(&config, &manifest, 10);
+        assert_eq!(report.queue_counts["active_lifecycle"], 1);
+        assert_eq!(report.queue_counts["record_local_mirrors"], 1);
+        assert_eq!(
+            report
+                .active_lifecycle
+                .iter()
+                .map(|asset| asset.asset_id.as_str())
+                .collect::<Vec<_>>(),
+            runtime_active
+        );
+        let json = serde_json::to_value(&report).expect("queue report should serialize");
+        assert_eq!(json["queue_counts"]["active_lifecycle"], 1);
+        assert_eq!(json["queue_counts"]["record_local_mirrors"], 1);
+        let human = render_queue_report(&report);
+        assert!(human.contains("repair-mirror"));
+        assert!(!human.contains("terminal-mirror"));
+        assert!(human.contains("record_local_mirrors"));
     }
 }
 
