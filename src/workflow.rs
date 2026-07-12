@@ -52,6 +52,13 @@ const BASE_DELETE_PLAN_PROOFS: [&str; 10] = [
     DELETE_APPROVAL_PROOF,
 ];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IcloudpdLocalMirrorProofDisposition {
+    Current,
+    Repairable,
+    Blocked,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConversionResultProof {
     pub heic_path: PathBuf,
@@ -787,6 +794,30 @@ pub fn validate_current_icloudpd_local_mirror_proof(
     let proof =
         stored_proof::<IcloudpdLocalMirrorProof>(manifest, asset_id, ICLOUDPD_LOCAL_MIRROR_PROOF)?;
     validate_candidate_icloudpd_local_mirror(manifest, asset_id, &proof)
+}
+
+/// Classifies local-mirror work from one manifest snapshot without reading or
+/// hashing media. Only a complete upstream conversion/HEIC/upload lineage can
+/// make an absent or invalid mirror proof repairable.
+pub fn icloudpd_local_mirror_proof_disposition(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> IcloudpdLocalMirrorProofDisposition {
+    let Ok((upload, heic, uploaded_heic_path)) =
+        validate_icloudpd_local_mirror_inputs(manifest, asset_id)
+    else {
+        return IcloudpdLocalMirrorProofDisposition::Blocked;
+    };
+    let Ok(proof) =
+        stored_proof::<IcloudpdLocalMirrorProof>(manifest, asset_id, ICLOUDPD_LOCAL_MIRROR_PROOF)
+    else {
+        return IcloudpdLocalMirrorProofDisposition::Repairable;
+    };
+    if validate_icloudpd_local_mirror_proof(&proof, &upload, &uploaded_heic_path, &heic).is_ok() {
+        IcloudpdLocalMirrorProofDisposition::Current
+    } else {
+        IcloudpdLocalMirrorProofDisposition::Repairable
+    }
 }
 
 pub fn record_source_age_proof<'a>(

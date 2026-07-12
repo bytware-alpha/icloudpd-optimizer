@@ -56,15 +56,15 @@ use crate::upload::{
 };
 use crate::workflow::{
     ConversionPerformanceInput, ConversionResultProof, ConversionSourceBinding,
-    HeicVerificationProof, OriginalAssetProof, SourceAgeProof, UploadProof, WorkflowError,
-    approve_delete, approved_original_delete_request, build_delete_plan,
-    icloudpd_local_mirror_ready_proofs, mark_delete_eligible, prove_and_record_nas,
-    record_conversion_performance, record_conversion_result, record_delete_execution,
-    record_heic_verification, record_icloudpd_local_mirror_proof,
-    record_original_asset_batch_proofs, record_original_asset_proof, record_source_age_proof,
-    record_stage_failure, record_upload_proof, record_uploaded_heic_delete,
-    upload_ready_heic_proof, uploaded_heic_delete_request,
-    validate_current_icloudpd_local_mirror_proof,
+    HeicVerificationProof, IcloudpdLocalMirrorProofDisposition, OriginalAssetProof, SourceAgeProof,
+    UploadProof, WorkflowError, approve_delete, approved_original_delete_request,
+    build_delete_plan, icloudpd_local_mirror_proof_disposition, icloudpd_local_mirror_ready_proofs,
+    mark_delete_eligible, prove_and_record_nas, record_conversion_performance,
+    record_conversion_result, record_delete_execution, record_heic_verification,
+    record_icloudpd_local_mirror_proof, record_original_asset_batch_proofs,
+    record_original_asset_proof, record_source_age_proof, record_stage_failure,
+    record_upload_proof, record_uploaded_heic_delete, upload_ready_heic_proof,
+    uploaded_heic_delete_request,
 };
 
 const DAY_SECONDS: u64 = 24 * 60 * 60;
@@ -3796,21 +3796,19 @@ fn queue_next_stage_for_record(
     record: &AssetRecord,
     config: &MonitorConfig,
 ) -> Option<&'static str> {
+    if record.state == State::UploadVerified {
+        return match icloudpd_local_mirror_proof_disposition(manifest, &record.asset_id) {
+            IcloudpdLocalMirrorProofDisposition::Current if config.auto_delete => {
+                Some("delete_original_assets")
+            }
+            IcloudpdLocalMirrorProofDisposition::Current => None,
+            IcloudpdLocalMirrorProofDisposition::Repairable => Some("record_local_mirrors"),
+            IcloudpdLocalMirrorProofDisposition::Blocked => Some("blocked_local_mirror"),
+        };
+    }
     match record.state {
         State::DeleteApproved | State::DeleteEligible if config.auto_delete => {
             Some("delete_original_assets")
-        }
-        State::UploadVerified
-            if validate_current_icloudpd_local_mirror_proof(manifest, &record.asset_id).is_ok()
-                && config.auto_delete =>
-        {
-            Some("delete_original_assets")
-        }
-        State::UploadVerified
-            if validate_current_icloudpd_local_mirror_proof(manifest, &record.asset_id)
-                .is_err() =>
-        {
-            Some("record_local_mirrors")
         }
         State::ConversionVerified if record.proofs.contains_key("original_asset") => {
             Some("upload_verified_heics")
@@ -3973,6 +3971,34 @@ mod queue_tests {
         assert!(human.contains("repair-mirror"));
         assert!(!human.contains("terminal-mirror"));
         assert!(human.contains("record_local_mirrors"));
+    }
+
+    #[test]
+    fn deletion_disabled_queue_surfaces_blocked_upstream_mirror_without_admitting_it() {
+        let mut config = MonitorConfig::new("/download", "/manifest.json", "/heic");
+        config.full_lifecycle = true;
+        config.auto_delete = false;
+        config.max_lifecycle_per_scan = 1;
+        let mut blocked = upload_verified_record("blocked-mirror", 10);
+        blocked.proofs.remove("upload");
+        let mut manifest = Manifest::new();
+        manifest.upsert(blocked);
+
+        assert_eq!(
+            crate::monitor::pending_lifecycle_count_for_config(&manifest, &config),
+            0
+        );
+        assert!(
+            crate::monitor::active_lifecycle_asset_ids_for_config(&config, &manifest).is_empty()
+        );
+        let report = MonitorQueueReport::from_manifest(&config, &manifest, 10);
+        assert_eq!(report.queue_counts["active_lifecycle"], 0);
+        assert_eq!(report.queue_counts["blocked_local_mirror"], 1);
+        let json = serde_json::to_value(&report).expect("queue report should serialize");
+        assert_eq!(json["queue_counts"]["blocked_local_mirror"], 1);
+        let human = render_queue_report(&report);
+        assert!(human.contains("blocked_local_mirror"));
+        assert!(!human.contains("record_local_mirrors"));
     }
 }
 

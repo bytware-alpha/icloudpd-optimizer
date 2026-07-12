@@ -50,9 +50,10 @@ use crate::upload::{
 };
 use crate::workflow::{
     ConversionResultProof, DeleteReconciliation, HeicVerificationProof, IcloudpdLocalMirrorProof,
-    OriginalAssetProof, PrevalidatedDelete, SourceAgeProof, UploadProof, WorkflowError,
-    approve_delete, icloudpd_local_mirror_ready_proofs, mark_delete_eligible,
-    prepare_delete_reconciliation, prevalidate_approved_original_delete, prove_and_record_nas,
+    IcloudpdLocalMirrorProofDisposition, OriginalAssetProof, PrevalidatedDelete, SourceAgeProof,
+    UploadProof, WorkflowError, approve_delete, icloudpd_local_mirror_proof_disposition,
+    icloudpd_local_mirror_ready_proofs, mark_delete_eligible, prepare_delete_reconciliation,
+    prevalidate_approved_original_delete, prove_and_record_nas,
     reconciliation_exact_state_is_consistent, record_adjusted_source_proof,
     record_heic_verification, record_icloudpd_local_mirror_proof,
     record_prevalidated_delete_execution, record_reconciled_delete_execution,
@@ -2528,22 +2529,22 @@ fn rolling_lifecycle_worker_asset_ids(
         .filter(|asset_id| !deferred_worker_asset_ids.contains(asset_id.as_str()))
         .filter_map(|asset_id| manifest.records().get(asset_id))
         .filter(|record| active_lifecycle_allows(active_set, &record.asset_id))
-        .filter(|record| {
-            rolling_lifecycle_record_can_run_worker_stage(manifest, record, config, true)
+        .filter_map(|record| {
+            rolling_lifecycle_next_worker_step(manifest, record, config, true)
+                .map(|step| (record, step))
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
-        lifecycle_continuation_priority(left)
-            .cmp(&lifecycle_continuation_priority(right))
-            .then_with(|| raw_size_bytes_from_record(right).cmp(&raw_size_bytes_from_record(left)))
-            .then_with(|| left.asset_id.cmp(&right.asset_id))
+        lifecycle_continuation_priority(left.0)
+            .cmp(&lifecycle_continuation_priority(right.0))
+            .then_with(|| {
+                raw_size_bytes_from_record(right.0).cmp(&raw_size_bytes_from_record(left.0))
+            })
+            .then_with(|| left.0.asset_id.cmp(&right.0.asset_id))
     });
     let mut conversion_capacity = remaining_conversion_capacity;
     let mut selected = Vec::with_capacity(limit);
-    for record in candidates {
-        let Some(step) = rolling_lifecycle_next_worker_step(manifest, record, config, true) else {
-            continue;
-        };
+    for (record, step) in candidates {
         if matches!(
             step,
             RollingAssetStep::ResolveAdjustedSource | RollingAssetStep::ConvertHeic
@@ -2623,8 +2624,8 @@ fn rolling_lifecycle_next_worker_step(
             Some(RollingAssetStep::UploadVerifiedHeics)
         }
         State::UploadVerified
-            if validate_current_icloudpd_local_mirror_proof(manifest, &record.asset_id)
-                .is_err() =>
+            if local_mirror_work_disposition(manifest, record)
+                == LocalMirrorWorkDisposition::Repairable =>
         {
             Some(RollingAssetStep::RecordLocalMirrors)
         }
@@ -3797,7 +3798,7 @@ fn rolling_asset_local_mirror_request(
 ) -> Result<Option<IcloudpdLocalMirrorRequest>, MonitorError> {
     let record = manifest.get(asset_id)?;
     if record.state != State::UploadVerified
-        || validate_current_icloudpd_local_mirror_proof(manifest, asset_id).is_ok()
+        || local_mirror_work_disposition(manifest, record) != LocalMirrorWorkDisposition::Repairable
     {
         return Ok(None);
     }
@@ -5087,7 +5088,8 @@ fn record_local_mirrors(
     let asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
         active_lifecycle_allows(Some(active_lifecycle_asset_ids), &record.asset_id)
             && record.state == State::UploadVerified
-            && validate_current_icloudpd_local_mirror_proof(manifest, &record.asset_id).is_err()
+            && local_mirror_work_disposition(manifest, record)
+                == LocalMirrorWorkDisposition::Repairable
     });
     let mirror_root = config.mirror_root.as_ref().unwrap_or(&config.download_root);
     for chunk in asset_ids.chunks(config.jobs.max(1)) {
@@ -5359,8 +5361,9 @@ fn delete_original_assets(
     Ok(())
 }
 
-fn is_upload_verified_delete_candidate(record: &AssetRecord) -> bool {
-    record.state == State::UploadVerified && record.proofs.contains_key("icloudpd_local_mirror")
+fn is_upload_verified_delete_candidate(manifest: &Manifest, record: &AssetRecord) -> bool {
+    record.state == State::UploadVerified
+        && local_mirror_work_disposition(manifest, record) == LocalMirrorWorkDisposition::Current
 }
 
 struct PreparedDeleteItem {
@@ -6193,7 +6196,7 @@ fn delete_lifecycle_asset_ids(
 ) -> Vec<String> {
     let mut asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
         active_lifecycle_allows(Some(active_lifecycle_asset_ids), &record.asset_id)
-            && is_upload_verified_delete_candidate(record)
+            && is_upload_verified_delete_candidate(manifest, record)
     });
     asset_ids.extend(asset_ids_matching(
         manifest,
@@ -6391,16 +6394,18 @@ impl LifecycleAdmissionBudget {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct StartupDeleteAudit {
-    upload_verified_missing_mirror: usize,
-    upload_verified_with_mirror: usize,
+    upload_verified_current_mirror: usize,
+    upload_verified_repairable_mirror: usize,
+    upload_verified_blocked_mirror: usize,
     delete_eligible: usize,
     delete_approved: usize,
 }
 
 impl StartupDeleteAudit {
     fn uploaded_not_deleted_total(self) -> usize {
-        self.upload_verified_missing_mirror
-            .saturating_add(self.upload_verified_with_mirror)
+        self.upload_verified_current_mirror
+            .saturating_add(self.upload_verified_repairable_mirror)
+            .saturating_add(self.upload_verified_blocked_mirror)
             .saturating_add(self.delete_eligible)
             .saturating_add(self.delete_approved)
     }
@@ -6410,14 +6415,20 @@ fn startup_delete_audit(manifest: &Manifest) -> StartupDeleteAudit {
     let mut audit = StartupDeleteAudit::default();
     for record in manifest.records().values() {
         match record.state {
-            State::UploadVerified if record.proofs.contains_key("icloudpd_local_mirror") => {
-                audit.upload_verified_with_mirror =
-                    audit.upload_verified_with_mirror.saturating_add(1);
-            }
-            State::UploadVerified => {
-                audit.upload_verified_missing_mirror =
-                    audit.upload_verified_missing_mirror.saturating_add(1);
-            }
+            State::UploadVerified => match local_mirror_work_disposition(manifest, record) {
+                LocalMirrorWorkDisposition::Current => {
+                    audit.upload_verified_current_mirror =
+                        audit.upload_verified_current_mirror.saturating_add(1);
+                }
+                LocalMirrorWorkDisposition::Repairable => {
+                    audit.upload_verified_repairable_mirror =
+                        audit.upload_verified_repairable_mirror.saturating_add(1);
+                }
+                LocalMirrorWorkDisposition::Blocked => {
+                    audit.upload_verified_blocked_mirror =
+                        audit.upload_verified_blocked_mirror.saturating_add(1);
+                }
+            },
             State::DeleteEligible => {
                 audit.delete_eligible = audit.delete_eligible.saturating_add(1);
             }
@@ -6436,8 +6447,9 @@ fn startup_delete_audit_fields(
 ) -> serde_json::Value {
     json!({
         "uploaded_not_deleted_total": audit.uploaded_not_deleted_total(),
-        "upload_verified_missing_mirror": audit.upload_verified_missing_mirror,
-        "upload_verified_with_mirror": audit.upload_verified_with_mirror,
+        "upload_verified_current_mirror": audit.upload_verified_current_mirror,
+        "upload_verified_repairable_mirror": audit.upload_verified_repairable_mirror,
+        "upload_verified_blocked_mirror": audit.upload_verified_blocked_mirror,
         "delete_eligible": audit.delete_eligible,
         "delete_approved": audit.delete_approved,
         "active_lifecycle_capacity": active_lifecycle_capacity,
@@ -8981,16 +8993,24 @@ fn lifecycle_candidate_has_runnable_stage(
     if !is_lifecycle_candidate(record) {
         return false;
     }
-    if auto_delete {
-        return true;
-    }
     match record.state {
-        State::UploadVerified => {
-            validate_current_icloudpd_local_mirror_proof(manifest, &record.asset_id).is_err()
-        }
-        State::DeleteEligible | State::DeleteApproved => false,
+        State::UploadVerified => match local_mirror_work_disposition(manifest, record) {
+            LocalMirrorWorkDisposition::Current => auto_delete,
+            LocalMirrorWorkDisposition::Repairable => true,
+            LocalMirrorWorkDisposition::Blocked => false,
+        },
+        State::DeleteEligible | State::DeleteApproved => auto_delete,
         _ => true,
     }
+}
+
+type LocalMirrorWorkDisposition = IcloudpdLocalMirrorProofDisposition;
+
+fn local_mirror_work_disposition(
+    manifest: &Manifest,
+    record: &AssetRecord,
+) -> LocalMirrorWorkDisposition {
+    icloudpd_local_mirror_proof_disposition(manifest, &record.asset_id)
 }
 
 fn is_lifecycle_continuation_candidate(
@@ -11176,14 +11196,22 @@ esac
 
     #[test]
     fn upload_verified_delete_candidate_requires_local_mirror_proof() {
-        let mut record = lifecycle_record("asset-1", State::UploadVerified);
-        assert!(!is_upload_verified_delete_candidate(&record));
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let missing = lifecycle_record("missing", State::UploadVerified);
+        let mut manifest = Manifest::new();
+        manifest.upsert(missing.clone());
+        assert!(!is_upload_verified_delete_candidate(
+            &manifest,
+            manifest.get("missing").unwrap()
+        ));
 
-        record.proofs.insert(
-            "icloudpd_local_mirror".to_string(),
-            json!({"sha256": "heic"}),
-        );
-        assert!(is_upload_verified_delete_candidate(&record));
+        let mut current = upload_verified_delete_ready_record("current", tempdir.path());
+        make_local_mirror_proof_current(&mut current);
+        manifest.upsert(current);
+        assert!(is_upload_verified_delete_candidate(
+            &manifest,
+            manifest.get("current").unwrap()
+        ));
     }
 
     #[test]
@@ -11207,8 +11235,9 @@ esac
 
         let audit = startup_delete_audit(&manifest);
 
-        assert_eq!(audit.upload_verified_missing_mirror, 1);
-        assert_eq!(audit.upload_verified_with_mirror, 1);
+        assert_eq!(audit.upload_verified_current_mirror, 0);
+        assert_eq!(audit.upload_verified_repairable_mirror, 0);
+        assert_eq!(audit.upload_verified_blocked_mirror, 2);
         assert_eq!(audit.delete_eligible, 1);
         assert_eq!(audit.delete_approved, 1);
         assert_eq!(audit.uploaded_not_deleted_total(), 4);
@@ -11217,17 +11246,19 @@ esac
     #[test]
     fn startup_delete_audit_fields_are_readable() {
         let audit = StartupDeleteAudit {
-            upload_verified_missing_mirror: 2,
-            upload_verified_with_mirror: 3,
+            upload_verified_current_mirror: 2,
+            upload_verified_repairable_mirror: 3,
+            upload_verified_blocked_mirror: 4,
             delete_eligible: 5,
             delete_approved: 7,
         };
 
         let fields = startup_delete_audit_fields(&audit, 100);
 
-        assert_eq!(fields["uploaded_not_deleted_total"], 17);
-        assert_eq!(fields["upload_verified_missing_mirror"], 2);
-        assert_eq!(fields["upload_verified_with_mirror"], 3);
+        assert_eq!(fields["uploaded_not_deleted_total"], 21);
+        assert_eq!(fields["upload_verified_current_mirror"], 2);
+        assert_eq!(fields["upload_verified_repairable_mirror"], 3);
+        assert_eq!(fields["upload_verified_blocked_mirror"], 4);
         assert_eq!(fields["delete_eligible"], 5);
         assert_eq!(fields["delete_approved"], 7);
         assert_eq!(fields["active_lifecycle_capacity"], 100);
@@ -12146,12 +12177,20 @@ esac
 
     #[test]
     fn rolling_lifecycle_worker_queue_skips_assets_deferred_for_scan() {
-        let mut config = MonitorConfig::new("/download", "/manifest.json", "/heic");
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path(),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
         config.full_lifecycle = true;
         config.rolling_lifecycle = true;
 
         let mut manifest = Manifest::new();
-        manifest.upsert(lifecycle_record("a-waiting-mirror", State::UploadVerified));
+        let mut waiting = upload_verified_delete_ready_record("a-waiting-mirror", tempdir.path());
+        make_local_mirror_proof_current(&mut waiting);
+        waiting.proofs.remove("icloudpd_local_mirror");
+        manifest.upsert(waiting);
         let mut ready = lifecycle_record("b-ready-nas", State::NasVerified);
         add_original_asset_proof(&mut ready);
         manifest.upsert(ready);
@@ -19790,6 +19829,7 @@ esac
 
     #[test]
     fn active_lifecycle_asset_ids_selects_bounded_continuation_candidates() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let mut manifest = Manifest::new();
         for (asset_id, state) in [
             ("a-discovered", State::Discovered),
@@ -19807,6 +19847,10 @@ esac
             record.state = state;
             manifest.upsert(record);
         }
+        let mut uploaded = upload_verified_delete_ready_record("e-uploaded", tempdir.path());
+        make_local_mirror_proof_current(&mut uploaded);
+        uploaded.proofs.remove("icloudpd_local_mirror");
+        manifest.upsert(uploaded);
 
         assert_eq!(
             active_lifecycle_asset_ids(&manifest, 4),
@@ -19911,6 +19955,7 @@ esac
 
     #[test]
     fn active_lifecycle_asset_ids_prioritizes_terminal_work_before_cloudkit_resolution() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let mut manifest = Manifest::new();
         for (asset_id, state) in [
             ("a-needs-original-resolution", State::ConversionVerified),
@@ -19919,6 +19964,11 @@ esac
         ] {
             manifest.upsert(lifecycle_record(asset_id, state));
         }
+        let mut uploaded =
+            upload_verified_delete_ready_record("c-uploaded-needs-mirror", tempdir.path());
+        make_local_mirror_proof_current(&mut uploaded);
+        uploaded.proofs.remove("icloudpd_local_mirror");
+        manifest.upsert(uploaded);
         let mut converted = lifecycle_record("d-converted-needs-local-verify", State::Converted);
         converted.proofs.insert(
             "original_asset".to_string(),
@@ -19945,12 +19995,14 @@ esac
 
     #[test]
     fn rolling_active_lifecycle_reserves_conversion_ready_assets() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let mut manifest = Manifest::new();
         for index in 0..20 {
-            manifest.upsert(lifecycle_record(
-                &format!("uploaded-needs-mirror-{index:02}"),
-                State::UploadVerified,
-            ));
+            let asset_id = format!("uploaded-needs-mirror-{index:02}");
+            let mut record = upload_verified_delete_ready_record(&asset_id, tempdir.path());
+            make_local_mirror_proof_current(&mut record);
+            record.proofs.remove("icloudpd_local_mirror");
+            manifest.upsert(record);
         }
         for (index, size_bytes) in [10u64, 90, 40, 80, 30].into_iter().enumerate() {
             let asset_id = format!("convert-ready-{index}");
@@ -20157,6 +20209,7 @@ esac
 
     #[test]
     fn pending_lifecycle_count_includes_nas_verified_work() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let mut manifest = Manifest::new();
         for (asset_id, state) in [
             ("discovered", State::Discovered),
@@ -20174,6 +20227,10 @@ esac
             record.state = state;
             manifest.upsert(record);
         }
+        let mut uploaded = upload_verified_delete_ready_record("uploaded", tempdir.path());
+        make_local_mirror_proof_current(&mut uploaded);
+        uploaded.proofs.remove("icloudpd_local_mirror");
+        manifest.upsert(uploaded);
 
         assert_eq!(pending_lifecycle_count(&manifest), 6);
     }
@@ -20267,6 +20324,63 @@ esac
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn deletion_disabled_blocked_upstream_mirror_does_not_consume_cap_or_run_workers() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path(),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        config.full_lifecycle = true;
+        config.rolling_lifecycle = true;
+        config.auto_delete = false;
+        config.max_lifecycle_per_scan = 1;
+
+        let mut blocked = upload_verified_delete_ready_record("blocked", tempdir.path());
+        make_local_mirror_proof_current(&mut blocked);
+        blocked.proofs.remove("upload");
+        let mut conversion = lifecycle_record("conversion", State::NasVerified);
+        add_original_asset_proof(&mut conversion);
+        let mut manifest = Manifest::new();
+        manifest.upsert(blocked);
+        manifest.upsert(conversion);
+
+        assert_eq!(
+            local_mirror_work_disposition(&manifest, manifest.get("blocked").unwrap()),
+            LocalMirrorWorkDisposition::Blocked
+        );
+        assert_eq!(pending_lifecycle_count_for_config(&manifest, &config), 1);
+        let active = active_lifecycle_asset_ids_for_config(&config, &manifest);
+        assert_eq!(active, vec!["conversion"]);
+        assert_eq!(
+            rolling_lifecycle_worker_asset_ids(
+                &manifest,
+                &config,
+                &active,
+                config.max_lifecycle_per_scan,
+                1,
+                &BTreeSet::new(),
+            ),
+            vec!["conversion"]
+        );
+        let store = AssetStateStore::open_writer(
+            tempdir.path().join("manifest.json"),
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+        let mut summary = MonitorScanSummary::default();
+        record_local_mirrors(&config, &store, &mut manifest, &mut summary, &active)
+            .expect("blocked mirror must not abort the phased stage");
+        assert_eq!(summary.mirrors_recorded, 0);
+        assert_eq!(summary.failures, 0);
+        assert_eq!(
+            local_mirror_work_disposition(&manifest, manifest.get("blocked").unwrap()),
+            LocalMirrorWorkDisposition::Blocked
+        );
     }
 
     #[test]
