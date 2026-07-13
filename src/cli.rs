@@ -1903,10 +1903,25 @@ fn monitor_upload_verified_reverify_with_reverifier<W: Write, R: UploadVerifiedA
     writer: &mut W,
 ) -> Result<UploadVerifiedReverifyReport, CliError> {
     let mut candidates = Vec::with_capacity(input.ids.len());
+    let mut candidate_ids = BTreeSet::new();
     for id in input.ids {
-        candidates.push(reverifier.reverify(input.manifest, id, input.timeout_seconds)?);
+        let candidate = reverifier.reverify(input.manifest, id, input.timeout_seconds)?;
+        if !candidate_ids.insert(candidate.asset_id.clone()) {
+            return Err(CliError::OriginalAssetsReconcileGate {
+                message:
+                    "upload-verified-reverify reverifier returned a duplicate candidate asset ID"
+                        .to_string(),
+            });
+        }
+        if candidate.asset_id != *id {
+            return Err(CliError::OriginalAssetsReconcileGate {
+                message: "upload-verified-reverify reverifier returned a candidate for a different asset ID"
+                    .to_string(),
+            });
+        }
+        candidates.push(candidate);
     }
-    let updated = reverify_changed_records(input.expected, candidates);
+    let updated = reverify_changed_records(input.expected, candidates)?;
     let would_change_count = updated.len() as u64;
     let mut commit = ProductionReverifyCommitBoundary::new(input.config, input.state_store);
     let changed_count =
@@ -2063,15 +2078,23 @@ fn apply_verified_reverify_updates<B: ReverifyCommitBoundary>(
     if !reverify_needs_writer(true, updated.len()) {
         return Ok(0);
     }
+    let exact_updates = updated
+        .iter()
+        .map(|updated| {
+            expected
+                .get(&updated.asset_id)
+                .map(|expected| AssetRecordExactCasUpdate { expected, updated })
+                .ok_or_else(|| CliError::OriginalAssetsReconcileGate {
+                    message:
+                        "upload-verified-reverify candidate was missing from the target snapshot"
+                            .to_string(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let writer_store = boundary.acquire_writer()?;
     let current = writer_store.load()?;
     reverify_exact_snapshot_still_current(&current, expected)?;
-    writer_store.persist_records_exact_cas_atomic_trusted(updated.iter().map(|updated| {
-        AssetRecordExactCasUpdate {
-            expected: expected.get(&updated.asset_id).expect("target snapshot"),
-            updated,
-        }
-    }))?;
+    writer_store.persist_records_exact_cas_atomic_trusted(exact_updates)?;
     writer_store.export_json()?;
     Ok(updated.len() as u64)
 }
@@ -2156,10 +2179,20 @@ fn upload_verified_reverify_target_set_sha256(ids: &BTreeSet<String>) -> String 
 fn reverify_changed_records(
     expected: &BTreeMap<String, AssetRecord>,
     candidates: Vec<AssetRecord>,
-) -> Vec<AssetRecord> {
+) -> Result<Vec<AssetRecord>, CliError> {
     candidates
         .into_iter()
-        .filter(|candidate| expected.get(&candidate.asset_id) != Some(candidate))
+        .map(|candidate| {
+            let expected_record = expected.get(&candidate.asset_id).ok_or_else(|| {
+                CliError::OriginalAssetsReconcileGate {
+                    message:
+                        "upload-verified-reverify candidate was missing from the target snapshot"
+                            .to_string(),
+                }
+            })?;
+            Ok((expected_record != &candidate).then_some(candidate))
+        })
+        .filter_map(Result::transpose)
         .collect()
 }
 
@@ -2265,7 +2298,8 @@ mod upload_verified_reverify_tests {
             (legacy.asset_id.clone(), legacy.clone()),
         ]);
 
-        let changed = reverify_changed_records(&expected, vec![current.clone(), upgraded.clone()]);
+        let changed = reverify_changed_records(&expected, vec![current.clone(), upgraded.clone()])
+            .expect("selected candidates");
         assert_eq!(changed, vec![upgraded]);
         assert_eq!(expected["current"], current);
         assert_eq!(changed.len() as u64, 1);
@@ -2276,7 +2310,11 @@ mod upload_verified_reverify_tests {
     fn reverify_changed_records_is_empty_for_an_idempotent_rerun() {
         let current = record("current", "unchanged");
         let expected = BTreeMap::from([(current.asset_id.clone(), current.clone())]);
-        assert!(reverify_changed_records(&expected, vec![current]).is_empty());
+        assert!(
+            reverify_changed_records(&expected, vec![current])
+                .expect("selected candidate")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2366,6 +2404,94 @@ mod upload_verified_reverify_tests {
             Err(CliError::OriginalAssetsReconcileGate { .. })
         ));
         assert_eq!(fake.calls, vec!["a", "b"]);
+        assert!(output.is_empty());
+        assert!(!lock_path.exists());
+        assert_eq!(persisted_bytes(&config), before);
+    }
+
+    #[test]
+    fn command_executor_rejects_wrong_candidate_id_without_report_or_write() {
+        let selected = record("selected", "100.000000000Z");
+        let wrong = record("wrong", "300.000000000Z");
+        let (_tempdir, config, expected) = persisted_fixture(vec![selected]);
+        let before = persisted_bytes(&config);
+        let lock_path = crate::monitor::monitor_run_lock_path(&config);
+        let store =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("store");
+        let manifest = store.load().expect("manifest");
+        let ids = BTreeSet::from(["selected".to_string()]);
+        let mut reverifier = FakeReverifier {
+            records: BTreeMap::from([("selected".to_string(), wrong)]),
+            calls: Vec::new(),
+            fail_on: None,
+        };
+        let mut output = Vec::new();
+
+        let result = monitor_upload_verified_reverify_with_reverifier(
+            UploadVerifiedReverifyExecutorInput {
+                config: &config,
+                state_store: &store,
+                manifest: &manifest,
+                expected: &expected,
+                ids: &ids,
+                apply: true,
+                timeout_seconds: 1,
+                target_set_sha256: "x".repeat(64),
+                started: Instant::now(),
+            },
+            &mut reverifier,
+            &mut output,
+        );
+
+        assert!(matches!(
+            result,
+            Err(CliError::OriginalAssetsReconcileGate { .. })
+        ));
+        assert_eq!(reverifier.calls, vec!["selected"]);
+        assert!(output.is_empty());
+        assert!(!lock_path.exists());
+        assert_eq!(persisted_bytes(&config), before);
+    }
+
+    #[test]
+    fn command_executor_rejects_duplicate_candidate_ids_without_report_or_write() {
+        let a = record("a", "100.000000000Z");
+        let b = record("b", "100.000000000Z");
+        let (_tempdir, config, expected) = persisted_fixture(vec![a.clone(), b]);
+        let before = persisted_bytes(&config);
+        let lock_path = crate::monitor::monitor_run_lock_path(&config);
+        let store =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("store");
+        let manifest = store.load().expect("manifest");
+        let ids = BTreeSet::from(["a".to_string(), "b".to_string()]);
+        let mut reverifier = FakeReverifier {
+            records: BTreeMap::from([("a".to_string(), a.clone()), ("b".to_string(), a)]),
+            calls: Vec::new(),
+            fail_on: None,
+        };
+        let mut output = Vec::new();
+
+        let result = monitor_upload_verified_reverify_with_reverifier(
+            UploadVerifiedReverifyExecutorInput {
+                config: &config,
+                state_store: &store,
+                manifest: &manifest,
+                expected: &expected,
+                ids: &ids,
+                apply: true,
+                timeout_seconds: 1,
+                target_set_sha256: "x".repeat(64),
+                started: Instant::now(),
+            },
+            &mut reverifier,
+            &mut output,
+        );
+
+        assert!(matches!(
+            result,
+            Err(CliError::OriginalAssetsReconcileGate { .. })
+        ));
+        assert_eq!(reverifier.calls, vec!["a", "b"]);
         assert!(output.is_empty());
         assert!(!lock_path.exists());
         assert_eq!(persisted_bytes(&config), before);
