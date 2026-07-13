@@ -1816,6 +1816,22 @@ struct UploadVerifiedReverifyReport {
     unchanged_count: u64,
     applied: bool,
     elapsed_millis: u128,
+    targets: Vec<UploadVerifiedReverifyTargetReport>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct UploadVerifiedReverifyTargetReport {
+    asset_ref: String,
+    disposition: UploadVerifiedReverifyTargetDisposition,
+    verification_elapsed_millis: Option<u128>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum UploadVerifiedReverifyTargetDisposition {
+    Unchanged,
+    WouldChange,
+    Changed,
 }
 
 fn monitor_upload_verified_reverify<W: Write>(
@@ -1906,6 +1922,7 @@ fn monitor_upload_verified_reverify_with_reverifier<W: Write, R: UploadVerifiedA
     let mut candidates = Vec::with_capacity(input.ids.len());
     let mut candidate_ids = BTreeSet::new();
     for id in input.ids {
+        let verification_started = Instant::now();
         let candidate = reverifier.reverify(input.manifest, id, input.timeout_seconds)?;
         if !candidate_ids.insert(candidate.asset_id.clone()) {
             return Err(CliError::OriginalAssetsReconcileGate {
@@ -1920,13 +1937,41 @@ fn monitor_upload_verified_reverify_with_reverifier<W: Write, R: UploadVerifiedA
                     .to_string(),
             });
         }
-        candidates.push(candidate);
+        candidates.push((candidate, verification_started.elapsed().as_millis()));
     }
-    let updated = reverify_changed_records(input.expected, candidates)?;
+    let updated = reverify_changed_records(
+        input.expected,
+        candidates
+            .iter()
+            .map(|(candidate, _)| candidate.clone())
+            .collect(),
+    )?;
     let would_change_count = updated.len() as u64;
+    let updated_ids = updated
+        .iter()
+        .map(|record| record.asset_id.as_str())
+        .collect::<BTreeSet<_>>();
     let mut commit = ProductionReverifyCommitBoundary::new(input.config, input.state_store);
     let changed_count =
         apply_verified_reverify_updates(&mut commit, input.expected, &updated, input.apply)?;
+    let targets = candidates
+        .into_iter()
+        .map(
+            |(candidate, verification_elapsed_millis)| UploadVerifiedReverifyTargetReport {
+                asset_ref: upload_verified_reverify_asset_ref(&candidate.asset_id),
+                disposition: if updated_ids.contains(candidate.asset_id.as_str()) {
+                    if input.apply {
+                        UploadVerifiedReverifyTargetDisposition::Changed
+                    } else {
+                        UploadVerifiedReverifyTargetDisposition::WouldChange
+                    }
+                } else {
+                    UploadVerifiedReverifyTargetDisposition::Unchanged
+                },
+                verification_elapsed_millis: Some(verification_elapsed_millis),
+            },
+        )
+        .collect();
     let report = UploadVerifiedReverifyReport {
         target_set_sha256: input.target_set_sha256,
         target_count: input.ids.len() as u64,
@@ -1936,6 +1981,7 @@ fn monitor_upload_verified_reverify_with_reverifier<W: Write, R: UploadVerifiedA
         unchanged_count: input.ids.len() as u64 - would_change_count,
         applied: input.apply,
         elapsed_millis: input.started.elapsed().as_millis(),
+        targets,
     };
     serde_json::to_writer_pretty(&mut *writer, &report)?;
     writeln!(writer)?;
@@ -2224,6 +2270,15 @@ fn upload_verified_reverify_target_set_sha256(ids: &BTreeSet<String>) -> String 
         hasher.update(id.as_bytes());
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn upload_verified_reverify_asset_ref(asset_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"upload-verified-reverify-asset-ref-v1\0");
+    hasher.update((asset_id.len() as u64).to_be_bytes());
+    hasher.update(asset_id.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    format!("asset-{}", &digest[..16])
 }
 
 fn reverify_changed_records(
@@ -2979,6 +3034,29 @@ mod upload_verified_reverify_tests {
         assert_eq!(dry_run_report.unchanged_count, 1);
         assert_eq!(dry_run_report.changed_count, 0);
         assert!(!dry_run_report.applied);
+        assert_eq!(
+            dry_run_report.targets,
+            vec![
+                UploadVerifiedReverifyTargetReport {
+                    asset_ref: upload_verified_reverify_asset_ref("current"),
+                    disposition: UploadVerifiedReverifyTargetDisposition::Unchanged,
+                    verification_elapsed_millis: dry_run_report.targets[0]
+                        .verification_elapsed_millis,
+                },
+                UploadVerifiedReverifyTargetReport {
+                    asset_ref: upload_verified_reverify_asset_ref("legacy"),
+                    disposition: UploadVerifiedReverifyTargetDisposition::WouldChange,
+                    verification_elapsed_millis: dry_run_report.targets[1]
+                        .verification_elapsed_millis,
+                },
+            ]
+        );
+        assert!(
+            dry_run_report
+                .targets
+                .iter()
+                .all(|target| target.verification_elapsed_millis.is_some())
+        );
         assert!(!lock_path.exists());
         assert_eq!(persisted_bytes(&config), before_dry_run);
 
@@ -3018,12 +3096,109 @@ mod upload_verified_reverify_tests {
         assert_eq!(apply_report.unchanged_count, 1);
         assert_eq!(apply_report.changed_count, 1);
         assert!(apply_report.applied);
+        assert_eq!(
+            apply_report
+                .targets
+                .iter()
+                .map(|target| (target.asset_ref.clone(), target.disposition))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    upload_verified_reverify_asset_ref("current"),
+                    UploadVerifiedReverifyTargetDisposition::Unchanged,
+                ),
+                (
+                    upload_verified_reverify_asset_ref("legacy"),
+                    UploadVerifiedReverifyTargetDisposition::Changed,
+                ),
+            ]
+        );
         let persisted = AssetStateStore::open_read_only(&config.manifest_path)
             .expect("persisted state")
             .load()
             .expect("persisted manifest");
         assert_eq!(persisted.get("current").expect("current"), &current);
         assert_eq!(persisted.get("legacy").expect("legacy"), &upgraded);
+    }
+
+    #[test]
+    fn command_executor_report_redacts_target_and_proof_sentinels() {
+        let first_id = "ASSET_SECRET_ALPHA_9f1e";
+        let second_id = "ASSET_SECRET_BETA_4a7c";
+        let mut first = record(first_id, "100.000000000Z");
+        let mut second = record(second_id, "100.000000000Z");
+        for record in [&mut first, &mut second] {
+            record.proofs.insert(
+                "sentinel".to_string(),
+                serde_json::json!({
+                    "path": "/private/SENTINEL_LOCAL_PATH",
+                    "cookie": "SENTINEL_COOKIE_TOKEN",
+                    "record_name": "SENTINEL_CLOUDKIT_RECORD",
+                    "hash": "SENTINEL_HASH_VALUE",
+                }),
+            );
+        }
+        let (_tempdir, config, expected) = persisted_fixture(vec![first.clone(), second.clone()]);
+        let store =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("store");
+        let manifest = store.load().expect("manifest");
+        let ids = BTreeSet::from([second_id.to_string(), first_id.to_string()]);
+        let mut reverifier = FakeReverifier {
+            records: BTreeMap::from([
+                (first_id.to_string(), first),
+                (second_id.to_string(), second),
+            ]),
+            calls: Vec::new(),
+            fail_on: None,
+        };
+        let mut output = Vec::new();
+        monitor_upload_verified_reverify_with_reverifier(
+            UploadVerifiedReverifyExecutorInput {
+                config: &config,
+                state_store: &store,
+                manifest: &manifest,
+                expected: &expected,
+                ids: &ids,
+                apply: false,
+                timeout_seconds: 1,
+                target_set_sha256: "x".repeat(64),
+                started: Instant::now(),
+            },
+            &mut reverifier,
+            &mut output,
+        )
+        .expect("dry run");
+        let report: UploadVerifiedReverifyReport =
+            serde_json::from_slice(&output).expect("serialized report");
+        assert_eq!(report.targets.len(), 2);
+        assert_eq!(
+            report
+                .targets
+                .iter()
+                .map(|target| target.asset_ref.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                upload_verified_reverify_asset_ref(first_id),
+                upload_verified_reverify_asset_ref(second_id),
+            ]
+        );
+        assert!(report.targets.iter().all(|target| {
+            target.asset_ref.starts_with("asset-")
+                && target.asset_ref.len() == "asset-".len() + 16
+                && target.disposition == UploadVerifiedReverifyTargetDisposition::Unchanged
+        }));
+        assert_ne!(report.targets[0].asset_ref, report.targets[1].asset_ref);
+        let stdout = String::from_utf8(output).expect("utf8 report");
+        for sentinel in [
+            first_id,
+            second_id,
+            "SENTINEL_LOCAL_PATH",
+            "SENTINEL_COOKIE_TOKEN",
+            "SENTINEL_CLOUDKIT_RECORD",
+            "SENTINEL_HASH_VALUE",
+        ] {
+            assert!(!stdout.contains(sentinel), "report leaked {sentinel}");
+        }
     }
 
     #[test]
