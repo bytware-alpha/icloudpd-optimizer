@@ -5397,7 +5397,12 @@ mod original_assets_audit_tests {
         let deadline = Instant::now() + RECORDING_SERVER_TIMEOUT;
         loop {
             match listener.accept() {
-                Ok((stream, _)) => return stream,
+                Ok((stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("accepted recording stream should become blocking");
+                    return stream;
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     assert!(
                         Instant::now() < deadline,
@@ -5408,6 +5413,33 @@ mod original_assets_audit_tests {
                 Err(error) => panic!("recording server accept failed: {error}"),
             }
         }
+    }
+
+    #[test]
+    fn recording_server_accepted_stream_is_blocking_under_parallel_test_load() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("listener should become nonblocking");
+        let address = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("client should connect");
+            thread::sleep(Duration::from_millis(25));
+            stream.write_all(b"request").expect("client should write");
+        });
+
+        let mut stream = accept_recording_connection(&listener);
+        stream
+            .set_read_timeout(Some(RECORDING_SERVER_TIMEOUT))
+            .expect("request read timeout should set");
+        let mut request = [0_u8; 7];
+        stream
+            .read_exact(&mut request)
+            .expect("accepted stream should wait for the request");
+        assert_eq!(request, *b"request");
+        client.join().expect("client should complete");
     }
 
     fn read_recording_request(stream: &mut TcpStream) -> String {
