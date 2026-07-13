@@ -327,6 +327,27 @@ pub struct MaterializedAdjustedSource {
     staged: OpenArtifact,
 }
 
+/// Descriptor-backed, sealed inputs for HEIC reverification. The source files
+/// remain separately held and validated; external tools receive only the
+/// private staged paths.
+#[cfg(unix)]
+pub(crate) struct ReverifyHeicSnapshot {
+    reference_source: AnchoredInput,
+    final_source: AnchoredInput,
+    mirror_source: AnchoredInput,
+    reference_staging: ConversionSourceStaging,
+    final_staging: ConversionSourceStaging,
+    reference_staged: OpenArtifact,
+    final_staged: OpenArtifact,
+}
+
+#[cfg(unix)]
+struct AnchoredInput {
+    parent: File,
+    name: CString,
+    artifact: OpenArtifact,
+}
+
 /// A CLOEXEC duplicate of an immutable staged capability, intended solely for
 /// the encoder child that explicitly opts into inheriting it.
 #[cfg(unix)]
@@ -348,6 +369,133 @@ impl MaterializedAdjustedSource {
     pub fn revalidate_for_command(&self) -> Result<(), AdjustedSourceError> {
         Err(AdjustedSourceError::Filesystem)
     }
+}
+
+#[cfg(unix)]
+impl ReverifyHeicSnapshot {
+    pub(crate) fn reference_path(&self) -> &Path {
+        &self.reference_staging.path
+    }
+
+    pub(crate) fn final_path(&self) -> &Path {
+        &self.final_staging.path
+    }
+
+    pub(crate) fn final_sha256(&self) -> &str {
+        &self.final_source.artifact.identity.sha256
+    }
+
+    pub(crate) fn final_size_bytes(&self) -> u64 {
+        self.final_source.artifact.identity.size_bytes
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), AdjustedSourceError> {
+        self.reference_source.revalidate()?;
+        self.final_source.revalidate()?;
+        self.mirror_source.revalidate()?;
+        validate_staged_file(&self.reference_staging, &self.reference_staged)?;
+        validate_staged_file(&self.final_staging, &self.final_staged)
+    }
+
+    pub(crate) fn cleanup(&mut self) -> Result<(), AdjustedSourceError> {
+        self.final_staging.cleanup()?;
+        self.reference_staging.cleanup()
+    }
+}
+
+#[cfg(unix)]
+impl AnchoredInput {
+    fn revalidate(&self) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        let held = inspect_open_file(
+            self.artifact
+                .file
+                .try_clone()
+                .map_err(|_| AdjustedSourceError::Filesystem)?,
+        )?;
+        if held.identity != self.artifact.identity {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        let named = inspect_open_file(open_regular_at(self.parent.as_raw_fd(), &self.name)?)?;
+        if named.identity != self.artifact.identity {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn validate_staged_file(
+    staging: &ConversionSourceStaging,
+    artifact: &OpenArtifact,
+) -> Result<(), AdjustedSourceError> {
+    let held = inspect_open_file(
+        artifact
+            .file
+            .try_clone()
+            .map_err(|_| AdjustedSourceError::Filesystem)?,
+    )?;
+    if held.identity != artifact.identity {
+        return Err(AdjustedSourceError::ProofLocalFileMismatch);
+    }
+    staging.validate_file_exact(&artifact.identity)
+}
+
+/// Opens all source files with anchored no-follow semantics, validates final
+/// and mirror bytes against durable proofs, and materializes only reference and
+/// final from their held descriptors into sealed private staging.
+#[cfg(unix)]
+pub(crate) fn materialize_reverify_heic_snapshot(
+    reference_path: &Path,
+    final_path: &Path,
+    mirror_path: &Path,
+    expected_final_sha256: &str,
+    expected_final_size_bytes: u64,
+) -> Result<ReverifyHeicSnapshot, AdjustedSourceError> {
+    let reference_source = open_anchored_regular(reference_path)?;
+    let final_source = open_anchored_regular(final_path)?;
+    let mirror_source = open_anchored_regular(mirror_path)?;
+    if final_source.artifact.identity.sha256 != expected_final_sha256
+        || final_source.artifact.identity.size_bytes != expected_final_size_bytes
+        || mirror_source.artifact.identity.sha256 != expected_final_sha256
+        || mirror_source.artifact.identity.size_bytes != expected_final_size_bytes
+    {
+        return Err(AdjustedSourceError::ProofLocalFileMismatch);
+    }
+    let output = AnchoredOutput::open(reference_path)?;
+    let (reference_staging, reference_staged) = materialize_open_artifact(
+        &output,
+        reference_path,
+        c"reference.jpg",
+        &reference_source.artifact,
+    )?;
+    let (final_staging, final_staged) = materialize_open_artifact(
+        &output,
+        reference_path,
+        c"final.heic",
+        &final_source.artifact,
+    )?;
+    Ok(ReverifyHeicSnapshot {
+        reference_source,
+        final_source,
+        mirror_source,
+        reference_staging,
+        final_staging,
+        reference_staged,
+        final_staged,
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn materialize_reverify_heic_snapshot(
+    _reference_path: &Path,
+    _final_path: &Path,
+    _mirror_path: &Path,
+    _expected_final_sha256: &str,
+    _expected_final_size_bytes: u64,
+) -> Result<MaterializedAdjustedSource, AdjustedSourceError> {
+    Err(AdjustedSourceError::Filesystem)
 }
 
 #[cfg(test)]
@@ -817,54 +965,89 @@ struct ConversionSourceStaging {
 }
 
 #[cfg(unix)]
-impl AnchoredOutput {
-    fn open(path: &Path) -> Result<Self, AdjustedSourceError> {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::ffi::OsStrExt;
+fn open_parent_and_name(path: &Path) -> Result<(File, CString), AdjustedSourceError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
 
-        let file_name = path
-            .file_name()
-            .filter(|name| !name.is_empty())
-            .filter(|_name| path.extension() == Some(std::ffi::OsStr::new("jpg")))
-            .ok_or(AdjustedSourceError::UnsafeOutputPath)?;
-        let final_name = CString::new(file_name.as_bytes())
-            .map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
-        let mut parent = if path.is_absolute() {
-            open_directory_at(libc::AT_FDCWD, c"/")?
-        } else {
-            open_directory_at(libc::AT_FDCWD, c".")?
-        };
-        let components = path.components().collect::<Vec<_>>();
-        let final_position = components
-            .iter()
-            .rposition(|component| matches!(component, Component::Normal(_)))
-            .ok_or(AdjustedSourceError::UnsafeOutputPath)?;
-        if final_position != components.len().saturating_sub(1) {
-            return Err(AdjustedSourceError::UnsafeOutputPath);
-        }
-        for component in &components[..final_position] {
-            match component {
-                Component::RootDir => {
-                    if !path.is_absolute() {
-                        return Err(AdjustedSourceError::UnsafeOutputPath);
-                    }
-                }
-                Component::Normal(name) => {
-                    let name = CString::new(name.as_bytes())
-                        .map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
-                    parent = open_directory_at(parent.as_raw_fd(), &name)?;
-                }
-                Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
-                    return Err(AdjustedSourceError::UnsafeOutputPath);
-                }
+    let file_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or(AdjustedSourceError::UnsafeOutputPath)?;
+    let name =
+        CString::new(file_name.as_bytes()).map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
+    let mut parent = if path.is_absolute() {
+        open_directory_at(libc::AT_FDCWD, c"/")?
+    } else {
+        open_directory_at(libc::AT_FDCWD, c".")?
+    };
+    let components = path.components().collect::<Vec<_>>();
+    let final_position = components
+        .iter()
+        .rposition(|component| matches!(component, Component::Normal(_)))
+        .ok_or(AdjustedSourceError::UnsafeOutputPath)?;
+    if final_position != components.len().saturating_sub(1) {
+        return Err(AdjustedSourceError::UnsafeOutputPath);
+    }
+    for component in &components[..final_position] {
+        match component {
+            Component::RootDir if path.is_absolute() => {}
+            Component::Normal(component) => {
+                let component = CString::new(component.as_bytes())
+                    .map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
+                parent = open_directory_at(parent.as_raw_fd(), &component)?;
+            }
+            Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir
+            | Component::Prefix(_) => {
+                return Err(AdjustedSourceError::UnsafeOutputPath);
             }
         }
-        let metadata = parent
-            .metadata()
-            .map_err(|_| AdjustedSourceError::Filesystem)?;
-        if !metadata.is_dir() {
+    }
+    if !parent
+        .metadata()
+        .map_err(|_| AdjustedSourceError::Filesystem)?
+        .is_dir()
+    {
+        return Err(AdjustedSourceError::UnsafeOutputPath);
+    }
+    Ok((parent, name))
+}
+
+#[cfg(unix)]
+fn open_anchored_regular(path: &Path) -> Result<AnchoredInput, AdjustedSourceError> {
+    use std::os::fd::AsRawFd;
+
+    let (parent, name) = open_parent_and_name(path)?;
+    let artifact = inspect_open_file(open_regular_at(parent.as_raw_fd(), &name)?)?;
+    Ok(AnchoredInput {
+        parent,
+        name,
+        artifact,
+    })
+}
+
+#[cfg(unix)]
+fn materialize_open_artifact(
+    output: &AnchoredOutput,
+    expected_path: &Path,
+    file_name: &CStr,
+    source: &OpenArtifact,
+) -> Result<(ConversionSourceStaging, OpenArtifact), AdjustedSourceError> {
+    let mut staging = ConversionSourceStaging::create_named(output, expected_path, file_name)?;
+    staging.copy_from_descriptor(&source.file, &source.identity)?;
+    staging.seal()?;
+    let staged = staging.capture_file_exact(&source.identity)?;
+    Ok((staging, staged))
+}
+
+#[cfg(unix)]
+impl AnchoredOutput {
+    fn open(path: &Path) -> Result<Self, AdjustedSourceError> {
+        if path.extension() != Some(std::ffi::OsStr::new("jpg")) {
             return Err(AdjustedSourceError::UnsafeOutputPath);
         }
+        let (parent, final_name) = open_parent_and_name(path)?;
         Ok(Self { parent, final_name })
     }
 
@@ -959,10 +1142,18 @@ impl AnchoredOutput {
 #[cfg(unix)]
 impl ConversionSourceStaging {
     fn create(output: &AnchoredOutput, expected_path: &Path) -> Result<Self, AdjustedSourceError> {
+        Self::create_named(output, expected_path, c"source.jpg")
+    }
+
+    fn create_named(
+        output: &AnchoredOutput,
+        expected_path: &Path,
+        file_name: &CStr,
+    ) -> Result<Self, AdjustedSourceError> {
         #[cfg(target_os = "macos")]
         {
             let _ = (output, expected_path);
-            Self::create_macos_private_tmp()
+            Self::create_macos_private_tmp(file_name)
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -989,8 +1180,8 @@ impl ConversionSourceStaging {
                     Err(_) => return Err(AdjustedSourceError::Filesystem),
                 };
                 let staging_identity = inspect_staging_directory(&staging)?;
-                let file_name =
-                    CString::new("source.jpg").map_err(|_| AdjustedSourceError::Filesystem)?;
+                let file_name = CString::new(file_name.to_bytes())
+                    .map_err(|_| AdjustedSourceError::Filesystem)?;
                 match open_temp_at(staging.as_raw_fd(), &file_name) {
                     Ok(file) => {
                         let (source_device, source_inode) = file_location(&file)?;
@@ -1026,7 +1217,7 @@ impl ConversionSourceStaging {
     }
 
     #[cfg(target_os = "macos")]
-    fn create_macos_private_tmp() -> Result<Self, AdjustedSourceError> {
+    fn create_macos_private_tmp(file_name: &CStr) -> Result<Self, AdjustedSourceError> {
         use std::os::fd::AsRawFd;
 
         let (parent, private_tmp_identity) = open_macos_private_tmp()?;
@@ -1046,7 +1237,10 @@ impl ConversionSourceStaging {
             let staging_identity = inspect_staging_directory(&staging)?;
             let staging_flags = macos_file_flags(&staging)?;
             let file_name =
-                CString::new("source.jpg").map_err(|_| AdjustedSourceError::Filesystem)?;
+                CString::new(file_name.to_bytes()).map_err(|_| AdjustedSourceError::Filesystem)?;
+            let path_component = std::str::from_utf8(file_name.to_bytes())
+                .map_err(|_| AdjustedSourceError::Filesystem)?
+                .to_owned();
             match open_temp_at(staging.as_raw_fd(), &file_name) {
                 Ok(file) => {
                     let (source_device, source_inode) = file_location(&file)?;
@@ -1059,7 +1253,9 @@ impl ConversionSourceStaging {
                         file: Some(file),
                         source_device,
                         source_inode,
-                        path: PathBuf::from("/private/tmp").join(name).join("source.jpg"),
+                        path: PathBuf::from("/private/tmp")
+                            .join(name)
+                            .join(path_component),
                         active: true,
                         private_tmp_identity,
                         staging_flags,
@@ -1161,6 +1357,27 @@ impl ConversionSourceStaging {
         Ok(artifact)
     }
 
+    fn capture_file_exact(
+        &self,
+        source_identity: &FileIdentity,
+    ) -> Result<OpenArtifact, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        self.validate_named_staging()?;
+        let artifact =
+            inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
+        if !self.is_sealed_source(&artifact) || !artifact.identity.matches_bytes(source_identity) {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        let named_staging = open_directory_at(self.parent.as_raw_fd(), &self.staging_name)?;
+        let named =
+            inspect_open_file(open_regular_at(named_staging.as_raw_fd(), &self.file_name)?)?;
+        if named.identity != artifact.identity {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        Ok(artifact)
+    }
+
     fn validate_file(
         &self,
         expected: &FileIdentity,
@@ -1176,6 +1393,24 @@ impl ConversionSourceStaging {
             return Err(AdjustedSourceError::ProofLocalFileMismatch);
         }
         verify_jpeg(&artifact.file, width, height)?;
+        let named_staging = open_directory_at(self.parent.as_raw_fd(), &self.staging_name)?;
+        let named =
+            inspect_open_file(open_regular_at(named_staging.as_raw_fd(), &self.file_name)?)?;
+        if named.identity != *expected {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_file_exact(&self, expected: &FileIdentity) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        self.validate_named_staging()?;
+        let artifact =
+            inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
+        if !self.is_sealed_source(&artifact) || artifact.identity != *expected {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
         let named_staging = open_directory_at(self.parent.as_raw_fd(), &self.staging_name)?;
         let named =
             inspect_open_file(open_regular_at(named_staging.as_raw_fd(), &self.file_name)?)?;
@@ -2942,6 +3177,172 @@ mod tests {
             b"existing output"
         );
         temp.cleanup().expect("cleanup staging directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reverify_snapshot_rejects_symlink_and_nonregular_sources() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let reference = root.join("reference.jpg");
+        let final_path = root.join("final.heic");
+        let mirror = root.join("mirror.heic");
+        std::fs::write(&reference, b"reference").expect("reference");
+        std::fs::write(&final_path, b"final").expect("final");
+        std::fs::write(&mirror, b"final").expect("mirror");
+        let hash = format!("{:x}", Sha256::digest(b"final"));
+
+        std::fs::remove_file(&reference).expect("remove reference");
+        std::os::unix::fs::symlink(&final_path, &reference).expect("reference symlink");
+        assert!(
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &hash, 5).is_err()
+        );
+        std::fs::remove_file(&reference).expect("remove symlink");
+        std::fs::write(&reference, b"reference").expect("restore reference");
+
+        std::fs::remove_file(&final_path).expect("remove final");
+        std::fs::create_dir(&final_path).expect("final directory");
+        assert!(
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &hash, 5).is_err()
+        );
+        std::fs::remove_dir(&final_path).expect("remove final directory");
+        std::fs::write(&final_path, b"final").expect("restore final");
+
+        std::fs::remove_file(&mirror).expect("remove mirror");
+        std::os::unix::fs::symlink(&final_path, &mirror).expect("mirror symlink");
+        assert!(
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &hash, 5).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reverify_snapshot_holds_staged_bytes_and_cleans_only_owned_namespaces() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let reference = root.join("reference.jpg");
+        let final_path = root.join("final.heic");
+        let mirror = root.join("mirror.heic");
+        let reference_bytes = b"reference before";
+        let final_bytes = b"final before";
+        std::fs::write(&reference, reference_bytes).expect("reference");
+        std::fs::write(&final_path, final_bytes).expect("final");
+        std::fs::write(&mirror, final_bytes).expect("mirror");
+        let hash = format!("{:x}", Sha256::digest(final_bytes));
+
+        let mut snapshot = materialize_reverify_heic_snapshot(
+            &reference,
+            &final_path,
+            &mirror,
+            &hash,
+            final_bytes.len() as u64,
+        )
+        .expect("snapshot");
+        let staged_reference = snapshot.reference_path().to_path_buf();
+        let staged_final = snapshot.final_path().to_path_buf();
+        let parked_final = root.join("parked-final.heic");
+        std::fs::rename(&final_path, &parked_final).expect("park original final");
+        std::fs::write(&final_path, b"attacker final").expect("replacement final");
+        std::fs::remove_file(&final_path).expect("remove replacement final");
+        std::fs::rename(&parked_final, &final_path).expect("restore original final");
+
+        assert_eq!(
+            std::fs::read(&staged_reference).expect("staged reference"),
+            reference_bytes
+        );
+        assert_eq!(
+            std::fs::read(&staged_final).expect("staged final"),
+            final_bytes
+        );
+        snapshot
+            .revalidate()
+            .expect("restored source must not change staged bytes");
+        std::fs::write(&reference, b"reference after").expect("replace reference");
+        assert!(snapshot.revalidate().is_err());
+        snapshot.cleanup().expect("owned staging cleanup");
+        assert!(!staged_reference.exists());
+        assert!(!staged_final.exists());
+        assert!(reference.exists());
+        assert!(final_path.exists());
+        assert!(mirror.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reverify_snapshot_rejects_final_or_mirror_proof_mismatch() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let reference = root.join("reference.jpg");
+        let final_path = root.join("final.heic");
+        let mirror = root.join("mirror.heic");
+        std::fs::write(&reference, b"reference").expect("reference");
+        std::fs::write(&final_path, b"final").expect("final");
+        std::fs::write(&mirror, b"mirror").expect("mirror");
+        let final_hash = format!("{:x}", Sha256::digest(b"final"));
+
+        assert!(
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &final_hash, 5)
+                .is_err()
+        );
+        std::fs::write(&mirror, b"final").expect("restore mirror");
+        assert!(
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &final_hash, 6)
+                .is_err()
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn reverify_snapshot_rejects_replaced_staged_path() {
+        use std::os::fd::AsRawFd;
+
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let reference = root.join("reference.jpg");
+        let final_path = root.join("final.heic");
+        let mirror = root.join("mirror.heic");
+        std::fs::write(&reference, b"reference").expect("reference");
+        std::fs::write(&final_path, b"final").expect("final");
+        std::fs::write(&mirror, b"final").expect("mirror");
+        let hash = format!("{:x}", Sha256::digest(b"final"));
+        let mut snapshot =
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &hash, 5)
+                .expect("snapshot");
+        assert_eq!(
+            unsafe { libc::fchmod(snapshot.reference_staging.staging.as_raw_fd(), 0o700) },
+            0
+        );
+        std::fs::remove_file(snapshot.reference_path()).expect("remove staged file");
+        std::os::unix::fs::symlink(&reference, snapshot.reference_path())
+            .expect("replace staged path");
+        assert!(snapshot.revalidate().is_err());
+        let _ = snapshot.cleanup();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reverify_snapshot_staging_is_immutable() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let reference = root.join("reference.jpg");
+        let final_path = root.join("final.heic");
+        let mirror = root.join("mirror.heic");
+        std::fs::write(&reference, b"reference").expect("reference");
+        std::fs::write(&final_path, b"final").expect("final");
+        std::fs::write(&mirror, b"final").expect("mirror");
+        let hash = format!("{:x}", Sha256::digest(b"final"));
+        let mut snapshot =
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &hash, 5)
+                .expect("snapshot");
+        assert_ne!(
+            snapshot.reference_staged.identity.flags & libc::UF_IMMUTABLE,
+            0
+        );
+        assert_ne!(snapshot.final_staged.identity.flags & libc::UF_IMMUTABLE, 0);
+        snapshot
+            .revalidate()
+            .expect("immutable identity revalidation");
+        snapshot.cleanup().expect("cleanup");
     }
 
     #[cfg(unix)]

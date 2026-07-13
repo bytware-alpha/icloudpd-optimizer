@@ -9512,15 +9512,48 @@ fn verify_converted_heic(
 ) -> Result<VerifiedHeic, MonitorError> {
     let record = manifest.get(asset_id)?;
     let conversion = decode_monitor_proof::<ConversionResultProof>(record, "conversion")?;
-    command_status_ok(
-        "heif-info",
-        &[conversion.heic_path.as_path()],
-        timeout_seconds,
-    )?;
     let oriented_preview = oriented_preview_path(&conversion.heic_path);
+    verify_heic_paths(
+        &oriented_preview,
+        &conversion.heic_path,
+        conversion.heic_path.clone(),
+        conversion.heic_sha256,
+        conversion.size_bytes,
+        timeout_seconds,
+    )
+}
+
+pub(crate) fn reverify_upload_verified_heic_staged(
+    staged_reference_path: &Path,
+    staged_final_path: &Path,
+    logical_final_path: PathBuf,
+    logical_final_sha256: String,
+    logical_final_size_bytes: u64,
+    timeout_seconds: u64,
+) -> Result<HeicVerificationInput, MonitorError> {
+    Ok(verify_heic_paths(
+        staged_reference_path,
+        staged_final_path,
+        logical_final_path,
+        logical_final_sha256,
+        logical_final_size_bytes,
+        timeout_seconds,
+    )?
+    .proof)
+}
+
+fn verify_heic_paths(
+    reference_path: &Path,
+    final_path: &Path,
+    logical_final_path: PathBuf,
+    logical_final_sha256: String,
+    logical_final_size_bytes: u64,
+    timeout_seconds: u64,
+) -> Result<VerifiedHeic, MonitorError> {
+    command_status_ok("heif-info", &[final_path], timeout_seconds)?;
     let metadata_probe_started = Instant::now();
     let reference_metadata = read_media_metadata(
-        &oriented_preview,
+        reference_path,
         timeout_seconds,
         HeicMetadataFailure::ReferenceOrientationInvalid,
     )
@@ -9531,7 +9564,7 @@ fn verify_converted_heic(
     )
     .map_err(|error| timed_metadata_probe_error(error, metadata_probe_started))?;
     let final_metadata = read_media_metadata(
-        &conversion.heic_path,
+        final_path,
         timeout_seconds,
         HeicMetadataFailure::FinalOrientationRotationInvalid,
     )
@@ -9552,7 +9585,7 @@ fn verify_converted_heic(
     let metadata_probe_wall_time_millis = metadata_probe_elapsed_millis(metadata_probe_started);
     let metadata_copied = true;
     let visual_metrics =
-        visual_metrics_for_conversion(&oriented_preview, &conversion.heic_path, timeout_seconds)?;
+        visual_metrics_for_conversion(reference_path, final_path, timeout_seconds)?;
     let visual_match_ok = visual_metrics
         .reference_error
         .is_some_and(visual_match_is_within_bounds);
@@ -9560,9 +9593,9 @@ fn verify_converted_heic(
 
     Ok(VerifiedHeic {
         proof: HeicVerificationInput {
-            heic_path: conversion.heic_path,
-            heic_sha256: conversion.heic_sha256,
-            size_bytes: conversion.size_bytes,
+            heic_path: logical_final_path,
+            heic_sha256: logical_final_sha256,
+            size_bytes: logical_final_size_bytes,
             heif_info_ok: true,
             metadata_copied,
             visual_content_ok,
@@ -9577,14 +9610,6 @@ fn verify_converted_heic(
         visual_metrics,
         metadata_probe_wall_time_millis,
     })
-}
-
-pub(crate) fn reverify_upload_verified_heic(
-    manifest: &Manifest,
-    asset_id: &str,
-    timeout_seconds: u64,
-) -> Result<HeicVerificationInput, MonitorError> {
-    Ok(verify_converted_heic(manifest, asset_id, timeout_seconds)?.proof)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

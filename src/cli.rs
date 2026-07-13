@@ -5,7 +5,7 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::ErrorKind;
 use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::thread;
@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::adjusted_source::{ReverifyHeicSnapshot, materialize_reverify_heic_snapshot};
 use crate::conversion_backend::{
     TargetPlatform, current_backend_report, required_tools_for_target,
 };
@@ -34,7 +35,7 @@ use crate::metrics::VerifiedMetrics;
 use crate::monitor::{
     LegacyEmbeddedPreviewMigrationClassification, MonitorConfig, MonitorError, MonitorScanSummary,
     MonitorStats, acquire_monitor_run_guard, classify_legacy_embedded_preview_migration,
-    launchd_plist, log_monitor_failure_event, render_tui, reverify_upload_verified_heic,
+    launchd_plist, log_monitor_failure_event, render_tui, reverify_upload_verified_heic_staged,
     run_monitor_once, run_scan_root_preflight_probe, write_launchd_plist,
 };
 use crate::proof::NasRawProof;
@@ -1955,6 +1956,68 @@ struct ProductionUploadVerifiedAssetReverifier {
     transport: ReqwestCloudKitReadTransport,
 }
 
+trait UploadVerifiedHeicVerifier {
+    fn reverify(
+        &mut self,
+        staged_reference_path: &Path,
+        staged_final_path: &Path,
+        logical_final_path: PathBuf,
+        logical_final_sha256: String,
+        logical_final_size_bytes: u64,
+        timeout_seconds: u64,
+    ) -> Result<HeicVerificationInput, CliError>;
+}
+
+struct ProductionUploadVerifiedHeicVerifier;
+
+impl UploadVerifiedHeicVerifier for ProductionUploadVerifiedHeicVerifier {
+    fn reverify(
+        &mut self,
+        staged_reference_path: &Path,
+        staged_final_path: &Path,
+        logical_final_path: PathBuf,
+        logical_final_sha256: String,
+        logical_final_size_bytes: u64,
+        timeout_seconds: u64,
+    ) -> Result<HeicVerificationInput, CliError> {
+        reverify_upload_verified_heic_staged(
+            staged_reference_path,
+            staged_final_path,
+            logical_final_path,
+            logical_final_sha256,
+            logical_final_size_bytes,
+            timeout_seconds,
+        )
+        .map_err(CliError::Monitor)
+    }
+}
+
+#[cfg(unix)]
+fn reverify_sealed_snapshot_with<V: UploadVerifiedHeicVerifier>(
+    snapshot: &ReverifyHeicSnapshot,
+    verifier: &mut V,
+    logical_final_path: PathBuf,
+    logical_final_sha256: String,
+    logical_final_size_bytes: u64,
+    timeout_seconds: u64,
+) -> Result<HeicVerificationInput, CliError> {
+    let heic = verifier.reverify(
+        snapshot.reference_path(),
+        snapshot.final_path(),
+        logical_final_path,
+        logical_final_sha256,
+        logical_final_size_bytes,
+        timeout_seconds,
+    )?;
+    snapshot
+        .revalidate()
+        .map_err(|_| CliError::OriginalAssetsReconcileGate {
+            message: "upload-verified-reverify staged files changed during verification"
+                .to_string(),
+        })?;
+    Ok(heic)
+}
+
 impl ProductionUploadVerifiedAssetReverifier {
     fn new(
         session: crate::upload::CloudKitDeleteSession,
@@ -1994,37 +2057,55 @@ impl UploadVerifiedAssetReverifier for ProductionUploadVerifiedAssetReverifier {
         })?;
         let mut reference_path = final_path.clone();
         reference_path.set_extension("oriented-preview.jpg");
-        let before = [
-            no_follow_file_witness(&reference_path)?,
-            no_follow_file_witness(final_path)?,
-            no_follow_file_witness(&mirror.icloudpd_download_path)?,
-        ];
-        if before[1].sha256 != upload.uploaded_heic_sha256
-            || before[1].size_bytes != mirror.size_bytes
-            || before[2].sha256 != upload.uploaded_heic_sha256
-            || before[2].size_bytes != mirror.size_bytes
+        #[cfg(not(unix))]
         {
-            return Err(CliError::OriginalAssetsReconcileGate { message: "upload-verified-reverify local final or mirror bytes did not match upload proof".to_string() });
-        }
-        let heic = reverify_upload_verified_heic(manifest, asset_id, timeout_seconds)?;
-        let after = [
-            no_follow_file_witness(&reference_path)?,
-            no_follow_file_witness(final_path)?,
-            no_follow_file_witness(&mirror.icloudpd_download_path)?,
-        ];
-        if before != after {
+            let _ = (reference_path, final_path, mirror, timeout_seconds);
             return Err(CliError::OriginalAssetsReconcileGate {
-                message: "upload-verified-reverify detected a local file swap during verification"
+                message: "upload-verified-reverify requires supported descriptor-safe staging"
                     .to_string(),
             });
         }
-        let updated = reverify_upload_verified_record(manifest, asset_id, heic)?;
-        let mut staged = Manifest::new();
-        staged.upsert_trusted(updated.clone());
-        let request = uploaded_heic_delete_request(&staged, asset_id)?;
-        CloudKitUploadedHeicReadClient::new(&mut self.transport)
-            .resolve_uploaded_heic_asset(&self.session, &request)?;
-        Ok(updated)
+        #[cfg(unix)]
+        {
+            let mut snapshot = materialize_reverify_heic_snapshot(
+                &reference_path,
+                final_path,
+                &mirror.icloudpd_download_path,
+                &upload.uploaded_heic_sha256,
+                mirror.size_bytes,
+            )
+            .map_err(|_| CliError::OriginalAssetsReconcileGate {
+                message: "upload-verified-reverify local source files failed descriptor-safe proof validation"
+                    .to_string(),
+            })?;
+            let result = (|| {
+                let mut verifier = ProductionUploadVerifiedHeicVerifier;
+                let heic = reverify_sealed_snapshot_with(
+                    &snapshot,
+                    &mut verifier,
+                    final_path.clone(),
+                    snapshot.final_sha256().to_string(),
+                    snapshot.final_size_bytes(),
+                    timeout_seconds,
+                )?;
+                let updated = reverify_upload_verified_record(manifest, asset_id, heic)?;
+                let mut staged = Manifest::new();
+                staged.upsert_trusted(updated.clone());
+                let request = uploaded_heic_delete_request(&staged, asset_id)?;
+                CloudKitUploadedHeicReadClient::new(&mut self.transport)
+                    .resolve_uploaded_heic_asset(&self.session, &request)?;
+                Ok(updated)
+            })();
+            let cleanup = snapshot.cleanup().map_err(|_| CliError::OriginalAssetsReconcileGate {
+                message: "upload-verified-reverify could not safely clean private verification staging"
+                    .to_string(),
+            });
+            match (result, cleanup) {
+                (Ok(updated), Ok(())) => Ok(updated),
+                (Err(error), Ok(())) | (Err(error), Err(_)) => Err(error),
+                (Ok(_), Err(error)) => Err(error),
+            }
+        }
     }
 }
 
@@ -2116,56 +2197,6 @@ fn reverify_exact_snapshot_still_current(
     Ok(())
 }
 
-#[derive(Eq, PartialEq)]
-struct NoFollowFileWitness {
-    device: u64,
-    inode: u64,
-    size_bytes: u64,
-    sha256: String,
-}
-
-fn no_follow_file_witness(path: &Path) -> Result<NoFollowFileWitness, CliError> {
-    let metadata = fs::symlink_metadata(path).map_err(CliError::Output)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(CliError::OriginalAssetsReconcileGate {
-            message: "upload-verified-reverify requires regular non-symlink local evidence files"
-                .to_string(),
-        });
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-    let mut file = options.open(path).map_err(CliError::Output)?;
-    let opened = file.metadata().map_err(CliError::Output)?;
-    if !opened.is_file() || opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
-        return Err(CliError::OriginalAssetsReconcileGate {
-            message: "upload-verified-reverify detected unsafe local evidence identity".to_string(),
-        });
-    }
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
-    loop {
-        let count = file.read(&mut buffer).map_err(CliError::Output)?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    let after = file.metadata().map_err(CliError::Output)?;
-    if after.dev() != opened.dev() || after.ino() != opened.ino() || after.len() != opened.len() {
-        return Err(CliError::OriginalAssetsReconcileGate {
-            message: "upload-verified-reverify detected a local evidence swap".to_string(),
-        });
-    }
-    Ok(NoFollowFileWitness {
-        device: opened.dev(),
-        inode: opened.ino(),
-        size_bytes: opened.len(),
-        sha256: format!("{:x}", hasher.finalize()),
-    })
-}
-
 fn upload_verified_reverify_target_set_sha256(ids: &BTreeSet<String>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"upload-verified-reverify-target-set-v1\\0");
@@ -2221,6 +2252,145 @@ mod upload_verified_reverify_tests {
             }
             Ok(self.records.get(asset_id).expect("fake record").clone())
         }
+    }
+
+    #[cfg(unix)]
+    struct ObservingHeicVerifier {
+        observed_paths: Option<(PathBuf, PathBuf)>,
+        result: HeicVerificationInput,
+    }
+
+    #[cfg(unix)]
+    impl UploadVerifiedHeicVerifier for ObservingHeicVerifier {
+        fn reverify(
+            &mut self,
+            staged_reference_path: &Path,
+            staged_final_path: &Path,
+            _logical_final_path: PathBuf,
+            _logical_final_sha256: String,
+            _logical_final_size_bytes: u64,
+            _timeout_seconds: u64,
+        ) -> Result<HeicVerificationInput, CliError> {
+            self.observed_paths = Some((
+                staged_reference_path.to_path_buf(),
+                staged_final_path.to_path_buf(),
+            ));
+            Ok(self.result.clone())
+        }
+    }
+
+    #[cfg(unix)]
+    struct FailingHeicVerifier;
+
+    #[cfg(unix)]
+    impl UploadVerifiedHeicVerifier for FailingHeicVerifier {
+        fn reverify(
+            &mut self,
+            _staged_reference_path: &Path,
+            _staged_final_path: &Path,
+            _logical_final_path: PathBuf,
+            _logical_final_sha256: String,
+            _logical_final_size_bytes: u64,
+            _timeout_seconds: u64,
+        ) -> Result<HeicVerificationInput, CliError> {
+            Err(CliError::OriginalAssetsReconcileGate {
+                message: "injected staged verifier failure".to_string(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sealed_snapshot_inner_verifier_sees_only_staged_paths_and_retains_logical_proof() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().canonicalize().expect("root");
+        let reference = root.join("final.oriented-preview.jpg");
+        let final_path = root.join("final.heic");
+        let mirror = root.join("mirror.heic");
+        fs::write(&reference, b"reference").expect("reference");
+        fs::write(&final_path, b"final").expect("final");
+        fs::write(&mirror, b"final").expect("mirror");
+        let sha256 = format!("{:x}", Sha256::digest(b"final"));
+        let mut snapshot =
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &sha256, 5)
+                .expect("snapshot");
+        let expected = HeicVerificationInput {
+            heic_path: final_path.clone(),
+            heic_sha256: sha256.clone(),
+            size_bytes: 5,
+            heif_info_ok: true,
+            metadata_copied: true,
+            visual_content_ok: true,
+            visual_match_ok: true,
+            visual_rmse_ppm: Some(1),
+            visual_mae_ppm: Some(1),
+        };
+        let mut verifier = ObservingHeicVerifier {
+            observed_paths: None,
+            result: expected.clone(),
+        };
+
+        let proof = reverify_sealed_snapshot_with(
+            &snapshot,
+            &mut verifier,
+            final_path.clone(),
+            sha256,
+            5,
+            1,
+        )
+        .expect("staged verification");
+
+        let (observed_reference, observed_final) = verifier.observed_paths.expect("paths");
+        assert_ne!(observed_reference, reference);
+        assert_ne!(observed_final, final_path);
+        assert_eq!(
+            fs::read(&observed_reference).expect("staged reference"),
+            b"reference"
+        );
+        assert_eq!(fs::read(&observed_final).expect("staged final"), b"final");
+        assert_eq!(proof, expected);
+        let cleanup_paths = (observed_reference, observed_final);
+        snapshot.cleanup().expect("cleanup");
+        assert!(!cleanup_paths.0.exists());
+        assert!(!cleanup_paths.1.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sealed_snapshot_verifier_failure_cleans_only_owned_staging() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().canonicalize().expect("root");
+        let reference = root.join("final.oriented-preview.jpg");
+        let final_path = root.join("final.heic");
+        let mirror = root.join("mirror.heic");
+        fs::write(&reference, b"reference").expect("reference");
+        fs::write(&final_path, b"final").expect("final");
+        fs::write(&mirror, b"final").expect("mirror");
+        let sha256 = format!("{:x}", Sha256::digest(b"final"));
+        let mut snapshot =
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &sha256, 5)
+                .expect("snapshot");
+        let staged_reference = snapshot.reference_path().to_path_buf();
+        let staged_final = snapshot.final_path().to_path_buf();
+        let error = reverify_sealed_snapshot_with(
+            &snapshot,
+            &mut FailingHeicVerifier,
+            final_path.clone(),
+            sha256,
+            5,
+            1,
+        )
+        .expect_err("failure");
+        assert!(matches!(
+            error,
+            CliError::OriginalAssetsReconcileGate { .. }
+        ));
+        snapshot.cleanup().expect("cleanup");
+        assert!(!staged_reference.exists());
+        assert!(!staged_final.exists());
+        assert!(reference.exists());
+        assert!(final_path.exists());
+        assert!(mirror.exists());
     }
 
     fn record(asset_id: &str, updated_at: &str) -> AssetRecord {
