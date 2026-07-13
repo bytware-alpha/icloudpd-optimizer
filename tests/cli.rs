@@ -743,6 +743,47 @@ fn record_conversion_performance_cli(manifest_arg: &str) {
         .success();
 }
 
+/// Test-only fixture setup for states produced by the trusted conversion worker.
+/// Manual workflow commands deliberately persist empty recipe claims.
+fn persist_current_conversion_recipe_claims_for_test(path: &std::path::Path, proof_names: &[&str]) {
+    let mut persisted: Value = serde_json::from_str(
+        &fs::read_to_string(path).expect("manifest fixture should be readable"),
+    )
+    .expect("manifest fixture should be valid JSON");
+    let proofs = persisted["records"][0]["proofs"]
+        .as_object_mut()
+        .expect("fixture should contain one record with proofs");
+    for proof_name in proof_names {
+        proofs
+            .get_mut(*proof_name)
+            .expect("production-completed fixture should contain recipe proof")["conversion_recipe_id"] =
+            Value::String("embedded-preview-normalized-v1".to_string());
+    }
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&persisted).expect("manifest fixture should serialize"),
+    )
+    .expect("manifest fixture should save");
+
+    let loaded = Manifest::load(path).expect("persisted production fixture should load normally");
+    for proof_name in proof_names {
+        assert_eq!(
+            loaded
+                .get("asset-1")
+                .expect("fixture asset should load")
+                .proofs[*proof_name]["conversion_recipe_id"],
+            "embedded-preview-normalized-v1"
+        );
+    }
+}
+
+fn persist_current_conversion_recipe_fixture(path: &std::path::Path) {
+    persist_current_conversion_recipe_claims_for_test(
+        path,
+        &["conversion", "conversion_performance", "heic"],
+    );
+}
+
 fn manifest_with_nas_verified(path: &std::path::Path) {
     let mut manifest = Manifest::new();
     discover_raw_asset(
@@ -882,11 +923,18 @@ fn manifest_with_conversion_verified(path: &std::path::Path) {
         .expect("conversion should record");
     record_conversion_performance(&mut manifest, "asset-1", conversion_performance_input())
         .expect("conversion performance should record");
+    manifest.save_atomic(path).expect("manifest should save");
+    persist_current_conversion_recipe_claims_for_test(
+        path,
+        &["conversion", "conversion_performance"],
+    );
+    let mut manifest = Manifest::load(path).expect("trusted fixture should load normally");
     record_heic_verification(&mut manifest, "asset-1", heic_proof())
         .expect("heic verification should record");
     record_source_age_proof(&mut manifest, "asset-1", old_source_age_proof())
         .expect("source age proof should record");
     manifest.save_atomic(path).expect("manifest should save");
+    persist_current_conversion_recipe_fixture(path);
 }
 
 fn manifest_with_real_conversion_verified(path: &std::path::Path, heic_path: PathBuf, body: &[u8]) {
@@ -911,6 +959,12 @@ fn manifest_with_real_conversion_verified(path: &std::path::Path, heic_path: Pat
     .expect("conversion should record");
     record_conversion_performance(&mut manifest, "asset-1", conversion_performance_input())
         .expect("conversion performance should record");
+    manifest.save_atomic(path).expect("manifest should save");
+    persist_current_conversion_recipe_claims_for_test(
+        path,
+        &["conversion", "conversion_performance"],
+    );
+    let mut manifest = Manifest::load(path).expect("trusted fixture should load normally");
     record_heic_verification(
         &mut manifest,
         "asset-1",
@@ -930,6 +984,7 @@ fn manifest_with_real_conversion_verified(path: &std::path::Path, heic_path: Pat
     record_source_age_proof(&mut manifest, "asset-1", old_source_age_proof())
         .expect("source age proof should record");
     manifest.save_atomic(path).expect("manifest should save");
+    persist_current_conversion_recipe_fixture(path);
 }
 
 fn manifest_with_real_delete_approval(tempdir: &std::path::Path) -> (PathBuf, PathBuf, u64) {
@@ -996,6 +1051,10 @@ fn manifest_with_real_delete_approval(tempdir: &std::path::Path) -> (PathBuf, Pa
         .assert()
         .success();
     record_conversion_performance_cli(manifest_arg);
+    persist_current_conversion_recipe_claims_for_test(
+        &manifest_path,
+        &["conversion", "conversion_performance"],
+    );
     binary()
         .args([
             "workflow",
@@ -1017,6 +1076,7 @@ fn manifest_with_real_delete_approval(tempdir: &std::path::Path) -> (PathBuf, Pa
         ])
         .assert()
         .success();
+    persist_current_conversion_recipe_fixture(&manifest_path);
     binary()
         .args([
             "workflow",
@@ -5408,6 +5468,10 @@ fn workflow_manual_conversion_proofs_are_untrusted_and_cannot_upload_or_delete()
         .assert()
         .success();
     record_conversion_performance_cli(manifest_arg);
+    persist_current_conversion_recipe_claims_for_test(
+        &manifest_path,
+        &["conversion", "conversion_performance"],
+    );
     binary()
         .args([
             "workflow",
@@ -5462,7 +5526,13 @@ fn workflow_manual_conversion_proofs_are_untrusted_and_cannot_upload_or_delete()
             > 0
     );
     assert_eq!(record.proofs["heic"]["heic_path"], "/staging/IMG_0001.heic");
-    for proof_key in ["conversion", "conversion_performance", "heic"] {
+    for proof_key in ["conversion", "conversion_performance"] {
+        assert_eq!(
+            record.proofs[proof_key]["conversion_recipe_id"],
+            "embedded-preview-normalized-v1"
+        );
+    }
+    for proof_key in ["heic"] {
         assert_eq!(record.proofs[proof_key]["conversion_recipe_id"], "");
     }
     binary()
@@ -5490,7 +5560,8 @@ fn workflow_manual_conversion_proofs_are_untrusted_and_cannot_upload_or_delete()
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("conversion recipe"));
+        .stderr(predicate::str::contains("state is conversion_verified"))
+        .stderr(predicate::str::contains("upload proof required"));
 }
 
 #[cfg(all(unix, target_os = "macos"))]
@@ -6156,6 +6227,7 @@ fn workflow_heic_verified_requires_conversion_performance_without_mutating_manif
         ])
         .assert()
         .success();
+    persist_current_conversion_recipe_claims_for_test(&manifest_path, &["conversion"]);
     let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
 
     binary()
@@ -7043,6 +7115,10 @@ fn workflow_mark_delete_eligible_requires_source_age_without_mutating_manifest()
         .assert()
         .success();
     record_conversion_performance_cli(manifest_arg);
+    persist_current_conversion_recipe_claims_for_test(
+        &manifest_path,
+        &["conversion", "conversion_performance"],
+    );
     binary()
         .args([
             "workflow",
@@ -7064,6 +7140,7 @@ fn workflow_mark_delete_eligible_requires_source_age_without_mutating_manifest()
         ])
         .assert()
         .success();
+    persist_current_conversion_recipe_fixture(&manifest_path);
     record_original_asset_cli(manifest_arg, "42", "raw-sha256");
     binary()
         .args([
@@ -7154,6 +7231,10 @@ fn workflow_mark_delete_eligible_rejects_too_new_source_age_without_mutating_man
         .assert()
         .success();
     record_conversion_performance_cli(manifest_arg);
+    persist_current_conversion_recipe_claims_for_test(
+        &manifest_path,
+        &["conversion", "conversion_performance"],
+    );
     binary()
         .args([
             "workflow",
@@ -7175,6 +7256,7 @@ fn workflow_mark_delete_eligible_rejects_too_new_source_age_without_mutating_man
         ])
         .assert()
         .success();
+    persist_current_conversion_recipe_fixture(&manifest_path);
     let manifest = Manifest::load(&manifest_path).expect("manifest should load");
     let nas = manifest.get("asset-1").expect("asset should exist").proofs["nas"].clone();
     record_original_asset_cli(
@@ -7499,6 +7581,7 @@ fn workflow_delete_plan_rejects_malformed_nas_relative_path_without_mutating_man
     manifest
         .save_atomic(&manifest_path)
         .expect("manifest should save");
+    persist_current_conversion_recipe_fixture(&manifest_path);
     let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
 
     binary()
@@ -7534,6 +7617,7 @@ fn workflow_delete_plan_rejects_forged_source_age_minimum_without_mutating_manif
     manifest
         .save_atomic(&manifest_path)
         .expect("manifest should save");
+    persist_current_conversion_recipe_fixture(&manifest_path);
     let before = fs::read_to_string(&manifest_path).expect("manifest should be readable");
 
     binary()

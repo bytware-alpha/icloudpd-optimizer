@@ -696,6 +696,7 @@ fn record_heic_verification_with_recipe<'a>(
         proof.size_bytes,
     )?;
     validate_heic_verification_flags_legacy(&proof)?;
+    require_valid_conversion_performance(manifest, asset_id)?;
     if trusted {
         transition_with_trusted_proof(
             manifest,
@@ -2902,6 +2903,19 @@ mod provenance_tests {
             manifest.get("asset").unwrap().proofs[CONVERSION_PROOF]["conversion_recipe_id"],
             ""
         );
+    }
+
+    #[test]
+    fn current_heic_recorder_requires_conversion_performance_without_mutation() {
+        let mut manifest = nas_verified_manifest();
+        record_current_conversion_result(&mut manifest, "asset", conversion_input()).unwrap();
+        let before = manifest.clone();
+
+        let error = record_current_heic_verification(&mut manifest, "asset", heic_input())
+            .expect_err("current HEIC verification must require conversion performance");
+
+        assert!(matches!(error, WorkflowError::MissingProof { .. }));
+        assert_eq!(manifest, before);
     }
 
     #[test]
