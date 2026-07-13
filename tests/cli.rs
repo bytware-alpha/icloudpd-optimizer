@@ -5468,10 +5468,7 @@ fn workflow_manual_conversion_proofs_are_untrusted_and_cannot_upload_or_delete()
         .assert()
         .success();
     record_conversion_performance_cli(manifest_arg);
-    persist_current_conversion_recipe_claims_for_test(
-        &manifest_path,
-        &["conversion", "conversion_performance"],
-    );
+    let before_heic = fs::read_to_string(&manifest_path).expect("manifest should be readable");
     binary()
         .args([
             "workflow",
@@ -5492,11 +5489,16 @@ fn workflow_manual_conversion_proofs_are_untrusted_and_cannot_upload_or_delete()
             "--visual-match-ok",
         ])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("conversion recipe"));
+    assert_eq!(
+        fs::read_to_string(&manifest_path).expect("manifest should remain readable"),
+        before_heic
+    );
 
     let manifest = Manifest::load(&manifest_path).expect("manifest should load");
     let record = manifest.get("asset-1").expect("asset should exist");
-    assert_eq!(record.state, State::ConversionVerified);
+    assert_eq!(record.state, State::Converted);
     assert_eq!(record.proofs["conversion"]["heic_sha256"], "heic-sha256");
     assert_eq!(
         record.proofs["conversion_performance"]["conversion_tool"],
@@ -5525,14 +5527,8 @@ fn workflow_manual_conversion_proofs_are_untrusted_and_cannot_upload_or_delete()
             .expect("measured_at should be filled")
             > 0
     );
-    assert_eq!(record.proofs["heic"]["heic_path"], "/staging/IMG_0001.heic");
+    assert!(!record.proofs.contains_key("heic"));
     for proof_key in ["conversion", "conversion_performance"] {
-        assert_eq!(
-            record.proofs[proof_key]["conversion_recipe_id"],
-            "embedded-preview-normalized-v1"
-        );
-    }
-    for proof_key in ["heic"] {
         assert_eq!(record.proofs[proof_key]["conversion_recipe_id"], "");
     }
     binary()
@@ -5548,7 +5544,8 @@ fn workflow_manual_conversion_proofs_are_untrusted_and_cannot_upload_or_delete()
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("conversion recipe"));
+        .stderr(predicate::str::contains("state is converted"))
+        .stderr(predicate::str::contains("conversion verification required"));
     binary()
         .args([
             "workflow",
@@ -5560,7 +5557,7 @@ fn workflow_manual_conversion_proofs_are_untrusted_and_cannot_upload_or_delete()
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("state is conversion_verified"))
+        .stderr(predicate::str::contains("state is converted"))
         .stderr(predicate::str::contains("upload proof required"));
 }
 
