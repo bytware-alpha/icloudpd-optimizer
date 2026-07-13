@@ -11829,6 +11829,37 @@ esac
                 .is_err()
             );
         }
+
+        let mut record = upload_verified_delete_ready_record("asset", tempdir.path());
+        record.state = State::ConversionVerified;
+        record.proofs.remove("upload");
+        record.proofs.remove("icloudpd_local_mirror");
+        let mut manifest = Manifest::new();
+        manifest.upsert_trusted(record);
+        let before = manifest.clone();
+        let summary = MonitorScanSummary::default();
+        let store = AssetStateStore::open_writer(
+            tempdir.path().join("manifest.json"),
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        store.persist_manifest_records_trusted(&manifest).unwrap();
+        let mut mismatch = response.clone();
+        mismatch["asset_id"] = json!("other");
+        assert!(
+            parse_upload_proof_child_response(
+                &serde_json::to_vec(&mismatch).unwrap(),
+                "asset",
+                &UploadVerifiedHeic::from(&heic),
+                &destination,
+            )
+            .is_err()
+        );
+        assert_eq!(manifest, before);
+        assert_eq!(store.load().unwrap(), before);
+        assert!(!manifest.get("asset").unwrap().proofs.contains_key("upload"));
+        assert_eq!(summary.uploads_completed, 0);
     }
 
     #[test]
