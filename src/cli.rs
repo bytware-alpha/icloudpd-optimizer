@@ -5188,7 +5188,7 @@ mod original_assets_audit_tests {
     use std::collections::BTreeSet;
     use std::io::{self, Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -5430,11 +5430,10 @@ mod original_assets_audit_tests {
             .expect("listener should have a local address");
         let (ready_tx, ready_rx) = mpsc::channel();
         let (complete_tx, complete_rx) = mpsc::channel();
-        let mut starts = Vec::with_capacity(CLIENT_COUNT);
+        let start = Arc::new(Barrier::new(CLIENT_COUNT + 1));
         let mut clients = Vec::with_capacity(CLIENT_COUNT);
         for client_index in 0..CLIENT_COUNT {
-            let (start_tx, start_rx) = mpsc::sync_channel(0);
-            starts.push(start_tx);
+            let start = Arc::clone(&start);
             let ready_tx = ready_tx.clone();
             let complete_tx = complete_tx.clone();
             clients.push(thread::spawn(move || {
@@ -5443,9 +5442,7 @@ mod original_assets_audit_tests {
                     stream.set_read_timeout(Some(RECORDING_SERVER_TIMEOUT))?;
                     stream.set_write_timeout(Some(RECORDING_SERVER_TIMEOUT))?;
                     ready_tx.send(client_index).expect("test should receive client readiness");
-                    start_rx
-                        .recv_timeout(RECORDING_SERVER_TIMEOUT)
-                        .expect("client should receive start signal");
+                    start.wait();
                     let request = format!(
                         "POST /parallel/{client_index} HTTP/1.1\r\nHost: recording.test\r\nContent-Length: 0\r\n\r\n"
                     );
@@ -5492,11 +5489,7 @@ mod original_assets_audit_tests {
             CLIENT_COUNT,
             "clients should be distinct"
         );
-        for start in starts {
-            start
-                .send(())
-                .expect("connected client should receive the start signal");
-        }
+        start.wait();
 
         let expected_requests = (0..CLIENT_COUNT)
             .map(|client_index| format!("POST /parallel/{client_index} HTTP/1.1"))
