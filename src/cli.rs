@@ -1805,7 +1805,7 @@ fn monitor_original_assets_reconcile<W: Write>(
     monitor_original_assets_reconcile_with_transport(args, writer, transport)
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct UploadVerifiedReverifyReport {
     target_set_sha256: String,
     target_count: u64,
@@ -2369,6 +2369,99 @@ mod upload_verified_reverify_tests {
         assert!(output.is_empty());
         assert!(!lock_path.exists());
         assert_eq!(persisted_bytes(&config), before);
+    }
+
+    #[test]
+    fn command_executor_serializes_mixed_reverify_report_for_dry_run_and_apply() {
+        let current = record("current", "100.000000000Z");
+        let legacy = record("legacy", "100.000000000Z");
+        let mut upgraded = legacy.clone();
+        upgraded.updated_at = "300.000000000Z".to_string();
+        let (_tempdir, config, expected) = persisted_fixture(vec![current.clone(), legacy]);
+        let before_dry_run = persisted_bytes(&config);
+        let lock_path = crate::monitor::monitor_run_lock_path(&config);
+        let ids = BTreeSet::from(["legacy".to_string(), "current".to_string()]);
+        let dry_run_store =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("dry store");
+        let dry_run_manifest = dry_run_store.load().expect("dry manifest");
+        let mut dry_run_reverifier = FakeReverifier {
+            records: BTreeMap::from([
+                (current.asset_id.clone(), current.clone()),
+                (upgraded.asset_id.clone(), upgraded.clone()),
+            ]),
+            calls: Vec::new(),
+            fail_on: None,
+        };
+        let mut dry_run_output = Vec::new();
+        monitor_upload_verified_reverify_with_reverifier(
+            UploadVerifiedReverifyExecutorInput {
+                config: &config,
+                state_store: &dry_run_store,
+                manifest: &dry_run_manifest,
+                expected: &expected,
+                ids: &ids,
+                apply: false,
+                timeout_seconds: 1,
+                target_set_sha256: "x".repeat(64),
+                started: Instant::now(),
+            },
+            &mut dry_run_reverifier,
+            &mut dry_run_output,
+        )
+        .expect("dry run");
+        let dry_run_report: UploadVerifiedReverifyReport =
+            serde_json::from_slice(&dry_run_output).expect("serialized dry-run report");
+        assert_eq!(dry_run_report.target_count, 2);
+        assert_eq!(dry_run_report.verified_count, 2);
+        assert_eq!(dry_run_report.would_change_count, 1);
+        assert_eq!(dry_run_report.unchanged_count, 1);
+        assert_eq!(dry_run_report.changed_count, 0);
+        assert!(!dry_run_report.applied);
+        assert!(!lock_path.exists());
+        assert_eq!(persisted_bytes(&config), before_dry_run);
+
+        let apply_store =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("apply store");
+        let apply_manifest = apply_store.load().expect("apply manifest");
+        let mut apply_reverifier = FakeReverifier {
+            records: BTreeMap::from([
+                (current.asset_id.clone(), current.clone()),
+                (upgraded.asset_id.clone(), upgraded.clone()),
+            ]),
+            calls: Vec::new(),
+            fail_on: None,
+        };
+        let mut apply_output = Vec::new();
+        monitor_upload_verified_reverify_with_reverifier(
+            UploadVerifiedReverifyExecutorInput {
+                config: &config,
+                state_store: &apply_store,
+                manifest: &apply_manifest,
+                expected: &expected,
+                ids: &ids,
+                apply: true,
+                timeout_seconds: 1,
+                target_set_sha256: "x".repeat(64),
+                started: Instant::now(),
+            },
+            &mut apply_reverifier,
+            &mut apply_output,
+        )
+        .expect("apply");
+        let apply_report: UploadVerifiedReverifyReport =
+            serde_json::from_slice(&apply_output).expect("serialized apply report");
+        assert_eq!(apply_report.target_count, 2);
+        assert_eq!(apply_report.verified_count, 2);
+        assert_eq!(apply_report.would_change_count, 1);
+        assert_eq!(apply_report.unchanged_count, 1);
+        assert_eq!(apply_report.changed_count, 1);
+        assert!(apply_report.applied);
+        let persisted = AssetStateStore::open_read_only(&config.manifest_path)
+            .expect("persisted state")
+            .load()
+            .expect("persisted manifest");
+        assert_eq!(persisted.get("current").expect("current"), &current);
+        assert_eq!(persisted.get("legacy").expect("legacy"), &upgraded);
     }
 
     #[test]
