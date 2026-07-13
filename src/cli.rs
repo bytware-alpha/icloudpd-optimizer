@@ -1862,68 +1862,13 @@ fn monitor_upload_verified_reverify<W: Write>(
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     let session_path = config.delete_session_path.as_deref().ok_or_else(|| CliError::OriginalAssetsReconcileGate { message: "upload-verified-reverify requires delete_session_path for read-only exact remote verification".to_string() })?;
-    let session = load_cloudkit_delete_session(session_path)?;
-    let mut transport = ReqwestCloudKitReadTransport::new()?;
+    let mut reverifier = ProductionUploadVerifiedAssetReverifier::new(
+        load_cloudkit_delete_session(session_path)?,
+        ReqwestCloudKitReadTransport::new()?,
+    );
     let mut updated = Vec::with_capacity(ids.len());
     for id in &ids {
-        let record = manifest
-            .get(id)
-            .map_err(|error| CliError::Workflow(WorkflowError::Manifest(error)))?;
-        let upload: UploadProof =
-            serde_json::from_value(record.proofs.get("upload").cloned().ok_or_else(|| {
-                CliError::OriginalAssetsReconcileGate {
-                    message: "upload-verified-reverify requires upload proof".to_string(),
-                }
-            })?)?;
-        let mirror: IcloudpdLocalMirrorProof = serde_json::from_value(
-            record
-                .proofs
-                .get("icloudpd_local_mirror")
-                .cloned()
-                .ok_or_else(|| CliError::OriginalAssetsReconcileGate {
-                    message: "upload-verified-reverify requires local mirror proof".to_string(),
-                })?,
-        )?;
-        let final_path = upload.uploaded_heic_path.as_ref().ok_or_else(|| {
-            CliError::OriginalAssetsReconcileGate {
-                message: "upload-verified-reverify requires uploaded HEIC path".to_string(),
-            }
-        })?;
-        let mut reference_path = final_path.clone();
-        reference_path.set_extension("oriented-preview.jpg");
-        let witnesses_before = [
-            no_follow_file_witness(&reference_path)?,
-            no_follow_file_witness(final_path)?,
-            no_follow_file_witness(&mirror.icloudpd_download_path)?,
-        ];
-        if witnesses_before[1].sha256 != upload.uploaded_heic_sha256
-            || witnesses_before[1].size_bytes != mirror.size_bytes
-            || witnesses_before[2].sha256 != upload.uploaded_heic_sha256
-            || witnesses_before[2].size_bytes != mirror.size_bytes
-        {
-            return Err(CliError::OriginalAssetsReconcileGate { message: "upload-verified-reverify local final or mirror bytes did not match upload proof".to_string() });
-        }
-        let heic =
-            reverify_upload_verified_heic(&manifest, id, config.heic_verify_timeout_seconds)?;
-        let witnesses_after = [
-            no_follow_file_witness(&reference_path)?,
-            no_follow_file_witness(final_path)?,
-            no_follow_file_witness(&mirror.icloudpd_download_path)?,
-        ];
-        if witnesses_before != witnesses_after {
-            return Err(CliError::OriginalAssetsReconcileGate {
-                message: "upload-verified-reverify detected a local file swap during verification"
-                    .to_string(),
-            });
-        }
-        let updated_record = reverify_upload_verified_record(&manifest, id, heic)?;
-        let staged = Manifest::new();
-        let mut staged = staged;
-        staged.upsert_trusted(updated_record.clone());
-        let request = uploaded_heic_delete_request(&staged, id)?;
-        CloudKitUploadedHeicReadClient::new(&mut transport)
-            .resolve_uploaded_heic_asset(&session, &request)?;
-        updated.push(updated_record);
+        updated.push(reverifier.reverify(&manifest, id, config.heic_verify_timeout_seconds)?);
     }
     let updated = reverify_changed_records(&expected, updated);
     let would_change_count = updated.len() as u64;
@@ -1947,6 +1892,93 @@ fn monitor_upload_verified_reverify<W: Write>(
         report.verified_count, report.changed_count, report.applied, report.elapsed_millis
     );
     Ok(())
+}
+
+trait UploadVerifiedAssetReverifier {
+    fn reverify(
+        &mut self,
+        manifest: &Manifest,
+        asset_id: &str,
+        timeout_seconds: u64,
+    ) -> Result<AssetRecord, CliError>;
+}
+
+struct ProductionUploadVerifiedAssetReverifier {
+    session: crate::upload::CloudKitDeleteSession,
+    transport: ReqwestCloudKitReadTransport,
+}
+
+impl ProductionUploadVerifiedAssetReverifier {
+    fn new(
+        session: crate::upload::CloudKitDeleteSession,
+        transport: ReqwestCloudKitReadTransport,
+    ) -> Self {
+        Self { session, transport }
+    }
+}
+
+impl UploadVerifiedAssetReverifier for ProductionUploadVerifiedAssetReverifier {
+    fn reverify(
+        &mut self,
+        manifest: &Manifest,
+        asset_id: &str,
+        timeout_seconds: u64,
+    ) -> Result<AssetRecord, CliError> {
+        let record = manifest.get(asset_id).map_err(WorkflowError::Manifest)?;
+        let upload: UploadProof =
+            serde_json::from_value(record.proofs.get("upload").cloned().ok_or_else(|| {
+                CliError::OriginalAssetsReconcileGate {
+                    message: "upload-verified-reverify requires upload proof".to_string(),
+                }
+            })?)?;
+        let mirror: IcloudpdLocalMirrorProof = serde_json::from_value(
+            record
+                .proofs
+                .get("icloudpd_local_mirror")
+                .cloned()
+                .ok_or_else(|| CliError::OriginalAssetsReconcileGate {
+                    message: "upload-verified-reverify requires local mirror proof".to_string(),
+                })?,
+        )?;
+        let final_path = upload.uploaded_heic_path.as_ref().ok_or_else(|| {
+            CliError::OriginalAssetsReconcileGate {
+                message: "upload-verified-reverify requires uploaded HEIC path".to_string(),
+            }
+        })?;
+        let mut reference_path = final_path.clone();
+        reference_path.set_extension("oriented-preview.jpg");
+        let before = [
+            no_follow_file_witness(&reference_path)?,
+            no_follow_file_witness(final_path)?,
+            no_follow_file_witness(&mirror.icloudpd_download_path)?,
+        ];
+        if before[1].sha256 != upload.uploaded_heic_sha256
+            || before[1].size_bytes != mirror.size_bytes
+            || before[2].sha256 != upload.uploaded_heic_sha256
+            || before[2].size_bytes != mirror.size_bytes
+        {
+            return Err(CliError::OriginalAssetsReconcileGate { message: "upload-verified-reverify local final or mirror bytes did not match upload proof".to_string() });
+        }
+        let heic = reverify_upload_verified_heic(manifest, asset_id, timeout_seconds)?;
+        let after = [
+            no_follow_file_witness(&reference_path)?,
+            no_follow_file_witness(final_path)?,
+            no_follow_file_witness(&mirror.icloudpd_download_path)?,
+        ];
+        if before != after {
+            return Err(CliError::OriginalAssetsReconcileGate {
+                message: "upload-verified-reverify detected a local file swap during verification"
+                    .to_string(),
+            });
+        }
+        let updated = reverify_upload_verified_record(manifest, asset_id, heic)?;
+        let mut staged = Manifest::new();
+        staged.upsert_trusted(updated.clone());
+        let request = uploaded_heic_delete_request(&staged, asset_id)?;
+        CloudKitUploadedHeicReadClient::new(&mut self.transport)
+            .resolve_uploaded_heic_asset(&self.session, &request)?;
+        Ok(updated)
+    }
 }
 
 fn reverify_needs_writer(apply: bool, changed_records: usize) -> bool {
