@@ -15546,7 +15546,9 @@ esac
         newer_unrelated
             .proofs
             .insert("unrelated_writer".to_string(), json!(true));
-        state_store.persist_record(&newer_unrelated).unwrap();
+        state_store
+            .persist_record_trusted(&newer_unrelated)
+            .unwrap();
         let mut summary = MonitorScanSummary {
             started_unix_seconds: 1,
             ..MonitorScanSummary::default()

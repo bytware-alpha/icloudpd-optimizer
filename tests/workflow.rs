@@ -187,7 +187,7 @@ fn conversion_and_heic_recipe_gate_matrix_blocks_upload_and_delete_admission() {
         assert!(build_delete_plan(&upload_verified, "asset-1").is_err());
     }
 
-    let mut current = trusted_current_manifest(upload_verified_manifest());
+    let (_tempdir, mut current, _raw_path) = real_upload_verified_manifest();
     mark_delete_eligible(&mut current, "asset-1").expect("current recipe should be eligible");
     approve_delete(&mut current, "asset-1", "operator")
         .expect("current recipe should be approvable");
@@ -399,6 +399,7 @@ fn real_upload_verified_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {
         .expect("heic verification should record");
     record_source_age_proof(&mut manifest, "asset-1", old_source_age_proof())
         .expect("source age proof should record");
+    manifest = trusted_current_manifest(manifest);
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
     record_icloudpd_local_mirror_proof(&mut manifest, "asset-1", local_mirror_proof())
