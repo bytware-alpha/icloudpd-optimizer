@@ -10846,7 +10846,128 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn converted_record_for_invalid_orientation(asset_id: &str, output: &Path) -> AssetRecord {
+    fn successful_verifier_tools(blank_preview: bool) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tools = tempfile::tempdir().expect("tool tempdir should be created");
+        let preview = tools.path().join("preview.png");
+        write_rgb_preview_png(
+            &preview,
+            &RgbPreview {
+                width: 2,
+                height: 1,
+                pixels: if blank_preview {
+                    vec![255, 255, 255, 255, 255, 255]
+                } else {
+                    vec![0, 0, 0, 255, 255, 255]
+                },
+            },
+        );
+        for (name, body) in [
+            ("heif-info", "#!/bin/sh\nexit 0\n".to_string()),
+            (
+                "exiftool",
+                "#!/bin/sh\necho '[{\"IFD0:Orientation\":1,\"QuickTime:Rotation\":0,\"File:ImageWidth\":4,\"File:ImageHeight\":3}]'\n"
+                    .to_string(),
+            ),
+            (
+                "sips",
+                format!(
+                    "#!/bin/sh\nout=\"\"\nprevious=\"\"\nfor arg in \"$@\"; do\n  if [ \"$previous\" = \"--out\" ]; then\n    out=\"$arg\"\n    break\n  fi\n  previous=\"$arg\"\ndone\n[ -n \"$out\" ] || exit 41\n/bin/cp '{}' \"$out\"\n",
+                    preview.display()
+                ),
+            ),
+        ] {
+            let path = tools.path().join(name);
+            fs::write(&path, body).expect("fake verifier tool should be written");
+            let mut permissions = fs::metadata(&path)
+                .expect("fake verifier tool metadata should be readable")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions)
+                .expect("fake verifier tool should be executable");
+        }
+        tools
+    }
+
+    #[cfg(unix)]
+    fn run_isolated_heic_event_test(
+        test_name: &str,
+        child_env: &str,
+        tools: &tempfile::TempDir,
+    ) -> Value {
+        let output = Command::new(env::current_exe().expect("test binary path should resolve"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env(child_env, "1")
+            .env("PATH", tools.path())
+            .output()
+            .expect("isolated verifier test should run");
+        assert!(
+            output.status.success(),
+            "isolated verifier test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["event"] == "heic_verify_finished")
+            .and_then(|event| event.get("fields").cloned())
+            .expect("isolated verifier must emit heic_verify_finished fields")
+    }
+
+    #[cfg(unix)]
+    fn assert_emitted_metadata_probe_timing(fields: &Value) {
+        assert!(
+            fields["metadata_probe_wall_time_millis"]
+                .as_u64()
+                .is_some_and(|millis| millis >= 1),
+            "emitted event must include positive metadata probe timing: {fields}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn converted_record_for_verifier(asset_id: &str, output: &Path) -> AssetRecord {
+        let mut record = converted_record_for_verifier_base(asset_id, output);
+        record.proofs.insert(
+            "nas".to_string(),
+            json!({
+                "canonical_path": "/nas/asset.dng",
+                "relative_path": "asset.dng",
+                "size_bytes": 100u64,
+                "modified_unix_seconds": 1_700_000_000u64,
+                "age_seconds": 2_592_000u64,
+                "sha256": "raw-sha256",
+            }),
+        );
+        record.proofs.insert(
+            "conversion".to_string(),
+            json!({
+                "heic_path": output,
+                "heic_sha256": "a".repeat(64),
+                "size_bytes": 1u64,
+                "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
+            }),
+        );
+        record.proofs.insert(
+            "conversion_performance".to_string(),
+            json!({
+                "schema_version": 1,
+                "measured_at_unix_seconds": 1_800_000_001u64,
+                "measurement_method": "monotonic_wall_clock",
+                "conversion_tool": "test-tool",
+                "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
+                "heic_quality": 90,
+                "raw_size_bytes": 100u64,
+                "heic_size_bytes": 1u64,
+                "convert_wall_time_millis": 10u64,
+                "total_wall_time_millis": 11u64,
+            }),
+        );
+        record
+    }
+
+    #[cfg(unix)]
+    fn converted_record_for_verifier_base(asset_id: &str, output: &Path) -> AssetRecord {
         let mut record = lifecycle_record(asset_id, State::Converted);
         record.proofs.insert(
             "conversion".to_string(),
@@ -10894,7 +11015,7 @@ mod tests {
             temporary.path(),
         );
         let mut manifest = Manifest::new();
-        manifest.upsert(converted_record_for_invalid_orientation("bad", &output));
+        manifest.upsert(converted_record_for_verifier_base("bad", &output));
         let mut summary = MonitorScanSummary {
             started_unix_seconds: 1,
             ..MonitorScanSummary::default()
@@ -10974,7 +11095,7 @@ mod tests {
             temporary.path(),
         );
         let mut initial = Manifest::new();
-        initial.upsert(converted_record_for_invalid_orientation("bad", &output));
+        initial.upsert(converted_record_for_verifier_base("bad", &output));
         let manifest = Arc::new(Mutex::new(initial));
         let summary = Arc::new(Mutex::new(MonitorScanSummary {
             started_unix_seconds: 1,
@@ -21830,90 +21951,205 @@ esac
         assert_eq!(fields["direct_visual_mae_ppm"], json!(24_000));
     }
 
-    fn test_visual_metrics() -> VisualMetrics {
-        VisualMetrics {
-            candidate_stdev: 0.25,
-            reference_error: Some(VisualErrorMetrics {
-                rmse: 0.0024,
-                mae: 0.0012,
-            }),
-            direct_reference_error: None,
-            match_basis: VisualMatchBasis::CodecNormalized,
-        }
-    }
-
+    #[cfg(unix)]
     #[test]
     fn rolling_heic_success_event_includes_metadata_probe_timing() {
-        let fields = heic_verification_finished_event_fields(
-            "asset",
-            true,
-            None,
-            Some("rolling_asset_queue"),
-            Some(test_visual_metrics()),
-            Some(1),
-        );
+        const CHILD_ENV: &str = "ICLOUDPD_OPTIMIZER_ROLLING_HEIC_SUCCESS_EVENT_TEST";
+        if env::var_os(CHILD_ENV).is_none() {
+            let tools = successful_verifier_tools(false);
+            let fields = run_isolated_heic_event_test(
+                "monitor::tests::rolling_heic_success_event_includes_metadata_probe_timing",
+                CHILD_ENV,
+                &tools,
+            );
+            assert_eq!(fields["verified"], json!(true), "emitted fields: {fields}");
+            assert_eq!(fields["mode"], json!("rolling_asset_queue"));
+            assert_emitted_metadata_probe_timing(&fields);
+            return;
+        }
 
-        assert_eq!(fields["verified"], json!(true));
-        assert_eq!(fields["mode"], json!("rolling_asset_queue"));
-        assert_eq!(fields["metadata_probe_wall_time_millis"], json!(1));
-        assert_eq!(fields["visual_match_basis"], json!("codec_normalized"));
+        let temporary = tempfile::tempdir().expect("temporary directory should exist");
+        let output = temporary.path().join("valid.heic");
+        fs::write(&output, b"heic").expect("output fixture should exist");
+        fs::write(oriented_preview_path(&output), b"preview")
+            .expect("oriented preview fixture should exist");
+        let state_store = AssetStateStore::open_writer(
+            temporary.path().join("state.json"),
+            "event-test",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+        let config = MonitorConfig::new(
+            temporary.path(),
+            temporary.path().join("state.json"),
+            temporary.path(),
+        );
+        let mut initial = Manifest::new();
+        initial.upsert(converted_record_for_verifier("asset", &output));
+        run_rolling_asset_verify(
+            &config,
+            &state_store,
+            "asset",
+            &Arc::new(Mutex::new(initial)),
+            &Arc::new(Mutex::new(MonitorScanSummary {
+                started_unix_seconds: 1,
+                ..MonitorScanSummary::default()
+            })),
+        )
+        .expect("rolling verifier should complete");
     }
 
+    #[cfg(unix)]
     #[test]
     fn rolling_heic_proof_record_failure_event_includes_metadata_probe_timing() {
-        let fields = heic_verification_finished_event_fields(
-            "asset",
-            false,
-            Some("HEIC verification failed: visual_content_ok".to_string()),
-            Some("rolling_asset_queue"),
-            Some(test_visual_metrics()),
-            Some(7),
-        );
+        const CHILD_ENV: &str = "ICLOUDPD_OPTIMIZER_ROLLING_HEIC_PROOF_FAILURE_EVENT_TEST";
+        if env::var_os(CHILD_ENV).is_none() {
+            let tools = successful_verifier_tools(true);
+            let fields = run_isolated_heic_event_test(
+                "monitor::tests::rolling_heic_proof_record_failure_event_includes_metadata_probe_timing",
+                CHILD_ENV,
+                &tools,
+            );
+            assert_eq!(fields["verified"], json!(false));
+            assert_eq!(fields["mode"], json!("rolling_asset_queue"));
+            assert!(
+                fields["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("visual_content_ok"))
+            );
+            assert_emitted_metadata_probe_timing(&fields);
+            return;
+        }
 
-        assert_eq!(fields["verified"], json!(false));
-        assert_eq!(
-            fields["error"],
-            json!("HEIC verification failed: visual_content_ok")
+        let temporary = tempfile::tempdir().expect("temporary directory should exist");
+        let output = temporary.path().join("blank.heic");
+        fs::write(&output, b"heic").expect("output fixture should exist");
+        fs::write(oriented_preview_path(&output), b"preview")
+            .expect("oriented preview fixture should exist");
+        let state_store = AssetStateStore::open_writer(
+            temporary.path().join("state.json"),
+            "event-test",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+        let config = MonitorConfig::new(
+            temporary.path(),
+            temporary.path().join("state.json"),
+            temporary.path(),
         );
-        assert_eq!(fields["metadata_probe_wall_time_millis"], json!(7));
+        let mut initial = Manifest::new();
+        initial.upsert(converted_record_for_verifier("asset", &output));
+        let outcome = run_rolling_asset_verify(
+            &config,
+            &state_store,
+            "asset",
+            &Arc::new(Mutex::new(initial)),
+            &Arc::new(Mutex::new(MonitorScanSummary {
+                started_unix_seconds: 1,
+                ..MonitorScanSummary::default()
+            })),
+        )
+        .expect("rolling verifier should record the proof failure");
+        assert!(outcome.failed);
     }
 
+    #[cfg(unix)]
     #[test]
     fn phased_heic_success_event_includes_metadata_probe_timing() {
-        let fields = heic_verification_finished_event_fields(
-            "asset",
-            true,
-            None,
-            None,
-            Some(test_visual_metrics()),
-            Some(11),
-        );
+        const CHILD_ENV: &str = "ICLOUDPD_OPTIMIZER_PHASED_HEIC_SUCCESS_EVENT_TEST";
+        if env::var_os(CHILD_ENV).is_none() {
+            let tools = successful_verifier_tools(false);
+            let fields = run_isolated_heic_event_test(
+                "monitor::tests::phased_heic_success_event_includes_metadata_probe_timing",
+                CHILD_ENV,
+                &tools,
+            );
+            assert_eq!(fields["verified"], json!(true));
+            assert!(fields.get("mode").is_none());
+            assert_emitted_metadata_probe_timing(&fields);
+            return;
+        }
 
-        assert_eq!(fields["verified"], json!(true));
-        assert!(fields.get("mode").is_none());
-        assert_eq!(fields["metadata_probe_wall_time_millis"], json!(11));
+        let temporary = tempfile::tempdir().expect("temporary directory should exist");
+        let output = temporary.path().join("valid.heic");
+        fs::write(&output, b"heic").expect("output fixture should exist");
+        fs::write(oriented_preview_path(&output), b"preview")
+            .expect("oriented preview fixture should exist");
+        let state_store = AssetStateStore::open_writer(
+            temporary.path().join("state.json"),
+            "event-test",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+        let config = MonitorConfig::new(
+            temporary.path(),
+            temporary.path().join("state.json"),
+            temporary.path(),
+        );
+        let mut manifest = Manifest::new();
+        manifest.upsert(converted_record_for_verifier("asset", &output));
+        verify_converted_heics(
+            &config,
+            &state_store,
+            &mut manifest,
+            &mut MonitorScanSummary {
+                started_unix_seconds: 1,
+                ..MonitorScanSummary::default()
+            },
+            &["asset".to_string()],
+        )
+        .expect("phased verifier should complete");
     }
 
+    #[cfg(unix)]
     #[test]
     fn phased_typed_metadata_error_event_includes_real_probe_timing() {
-        let error = timed_metadata_probe_error(
-            metadata_verification_error(HeicMetadataFailure::ReferenceOrientationInvalid),
-            Instant::now(),
-        );
-        let timing = metadata_probe_wall_time_millis(&error)
-            .expect("typed metadata errors after probe start must retain timing");
-        let fields = heic_verification_finished_event_fields(
-            "asset",
-            false,
-            Some(error.to_string()),
-            None,
-            None,
-            metadata_probe_wall_time_millis(&error),
-        );
+        const CHILD_ENV: &str = "ICLOUDPD_OPTIMIZER_PHASED_TYPED_METADATA_EVENT_TEST";
+        if env::var_os(CHILD_ENV).is_none() {
+            let tools = invalid_orientation_verifier_tools();
+            let fields = run_isolated_heic_event_test(
+                "monitor::tests::phased_typed_metadata_error_event_includes_real_probe_timing",
+                CHILD_ENV,
+                &tools,
+            );
+            assert_eq!(fields["verified"], json!(false));
+            assert!(fields.get("mode").is_none());
+            assert_emitted_metadata_probe_timing(&fields);
+            return;
+        }
 
-        assert!(timing >= 1);
-        assert_eq!(fields["metadata_probe_wall_time_millis"], json!(timing));
-        assert!(fields.get("visual_match_basis").is_none());
+        let temporary = tempfile::tempdir().expect("temporary directory should exist");
+        let output = temporary.path().join("invalid.heic");
+        fs::write(&output, b"heic").expect("output fixture should exist");
+        let state_store = AssetStateStore::open_writer(
+            temporary.path().join("state.json"),
+            "event-test",
+            Duration::from_secs(60),
+        )
+        .expect("state store should open");
+        let config = MonitorConfig::new(
+            temporary.path(),
+            temporary.path().join("state.json"),
+            temporary.path(),
+        );
+        let mut manifest = Manifest::new();
+        manifest.upsert(converted_record_for_verifier_base("asset", &output));
+        let mut summary = MonitorScanSummary {
+            started_unix_seconds: 1,
+            ..MonitorScanSummary::default()
+        };
+        verify_converted_heics(
+            &config,
+            &state_store,
+            &mut manifest,
+            &mut summary,
+            &["asset".to_string()],
+        )
+        .expect("typed metadata failure should be recorded");
+        assert_eq!(
+            last_failure_kind(manifest.get("asset").unwrap()),
+            Some(FailureKind::HeicReferenceOrientationInvalid)
+        );
     }
 
     #[test]
