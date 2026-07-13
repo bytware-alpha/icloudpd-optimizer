@@ -100,7 +100,7 @@ fn heic_proof() -> HeicVerificationInput {
 #[test]
 fn current_conversion_recipe_is_required_before_upload() {
     for recipe in [None, Some("embedded-preview-legacy-v0")] {
-        let mut manifest = trusted_current_manifest(conversion_verified_manifest());
+        let mut manifest = conversion_verified_manifest();
         let mut record = manifest.get("asset-1").expect("asset should exist").clone();
         let performance = record
             .proofs
@@ -115,7 +115,7 @@ fn current_conversion_recipe_is_required_before_upload() {
                     .remove("conversion_recipe_id");
             }
         }
-        manifest = replace_trusted_record(record);
+        manifest = replace_trusted_record(manifest, record);
 
         let error = upload_ready_heic_proof(&manifest, "asset-1")
             .expect_err("missing or old recipe must not be upload-ready");
@@ -137,7 +137,7 @@ fn conversion_and_heic_recipe_gate_matrix_blocks_upload_and_delete_admission() {
         ("heic", None),
         ("heic", Some("embedded-preview-legacy-v0")),
     ] {
-        let mut conversion_verified = trusted_current_manifest(conversion_verified_manifest());
+        let mut conversion_verified = conversion_verified_manifest();
         let mut record = conversion_verified
             .get("asset-1")
             .expect("asset should exist")
@@ -155,13 +155,13 @@ fn conversion_and_heic_recipe_gate_matrix_blocks_upload_and_delete_admission() {
                     .remove("conversion_recipe_id");
             }
         }
-        conversion_verified = replace_trusted_record(record);
+        conversion_verified = replace_trusted_record(conversion_verified, record);
         assert!(matches!(
             upload_ready_heic_proof(&conversion_verified, "asset-1"),
             Err(WorkflowError::ConversionRecipeOutdated { .. })
         ));
 
-        let mut upload_verified = trusted_current_manifest(upload_verified_manifest());
+        let mut upload_verified = upload_verified_manifest();
         let mut record = upload_verified
             .get("asset-1")
             .expect("asset should exist")
@@ -179,7 +179,7 @@ fn conversion_and_heic_recipe_gate_matrix_blocks_upload_and_delete_admission() {
                     .remove("conversion_recipe_id");
             }
         }
-        upload_verified = replace_trusted_record(record);
+        upload_verified = replace_trusted_record(upload_verified, record);
         assert!(matches!(
             mark_delete_eligible(&mut upload_verified, "asset-1"),
             Err(WorkflowError::ConversionRecipeOutdated { .. })
@@ -331,7 +331,7 @@ fn conversion_verified_manifest() -> Manifest {
     let mut manifest = conversion_performance_manifest();
     record_heic_verification(&mut manifest, "asset-1", heic_proof())
         .expect("heic verification should record");
-    manifest
+    promote_current_recipe_fixture(manifest)
 }
 
 fn source_age_verified_manifest() -> Manifest {
@@ -342,40 +342,52 @@ fn source_age_verified_manifest() -> Manifest {
 }
 
 fn upload_verified_manifest() -> Manifest {
-    let mut manifest = trusted_current_manifest(source_age_verified_manifest());
+    let mut manifest = source_age_verified_manifest();
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
     record_icloudpd_local_mirror_proof(&mut manifest, "asset-1", local_mirror_proof())
         .expect("local mirror proof should record");
     record_original_asset_proof(&mut manifest, "asset-1", original_asset_proof())
         .expect("original asset proof should record");
-    manifest
+    reload_fixture_manifest(manifest)
 }
 
-fn trusted_current_manifest(manifest: Manifest) -> Manifest {
-    let mut record = manifest
-        .get("asset-1")
-        .expect("fixture should contain asset")
-        .clone();
-    for proof_name in ["conversion", "conversion_performance", "heic"] {
-        record
-            .proofs
-            .get_mut(proof_name)
-            .expect("proof should exist")["conversion_recipe_id"] =
-            json!("embedded-preview-normalized-v1");
-    }
-    replace_trusted_record(record)
-}
-
-fn replace_trusted_record(record: AssetRecord) -> Manifest {
+fn reload_fixture_records(records: impl IntoIterator<Item = AssetRecord>) -> Manifest {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let path = tempdir.path().join("manifest.json");
     fs::write(
         &path,
-        serde_json::to_vec(&json!({"records": [record]})).expect("fixture should serialize"),
+        serde_json::to_vec(&json!({"records": records.into_iter().collect::<Vec<_>>() }))
+            .expect("fixture should serialize"),
     )
     .expect("fixture should persist");
     Manifest::load(path).expect("trusted fixture should load")
+}
+
+fn reload_fixture_manifest(manifest: Manifest) -> Manifest {
+    reload_fixture_records(manifest.records().values().cloned())
+}
+
+fn promote_current_recipe_fixture(manifest: Manifest) -> Manifest {
+    let mut records: Vec<_> = manifest.records().values().cloned().collect();
+    for record in &mut records {
+        for proof_name in ["conversion", "conversion_performance", "heic"] {
+            if let Some(proof) = record.proofs.get_mut(proof_name) {
+                proof["conversion_recipe_id"] = json!("embedded-preview-normalized-v1");
+            }
+        }
+    }
+    reload_fixture_records(records)
+}
+
+fn replace_trusted_record(manifest: Manifest, record: AssetRecord) -> Manifest {
+    let mut records: Vec<_> = manifest.records().values().cloned().collect();
+    let index = records
+        .iter()
+        .position(|candidate| candidate.asset_id == record.asset_id)
+        .expect("fixture should contain replacement asset");
+    records[index] = record;
+    reload_fixture_records(records)
 }
 
 fn real_upload_verified_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {
@@ -393,13 +405,15 @@ fn real_upload_verified_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {
     record_nas_proof(&mut manifest, "asset-1", proof).expect("nas proof should record");
     record_conversion_result(&mut manifest, "asset-1", conversion_proof())
         .expect("conversion should record");
+    manifest = promote_current_recipe_fixture(manifest);
     record_conversion_performance(&mut manifest, "asset-1", conversion_performance_input())
         .expect("conversion performance should record");
+    manifest = promote_current_recipe_fixture(manifest);
     record_heic_verification(&mut manifest, "asset-1", heic_proof())
         .expect("heic verification should record");
+    manifest = promote_current_recipe_fixture(manifest);
     record_source_age_proof(&mut manifest, "asset-1", old_source_age_proof())
         .expect("source age proof should record");
-    manifest = trusted_current_manifest(manifest);
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
     record_icloudpd_local_mirror_proof(&mut manifest, "asset-1", local_mirror_proof())
@@ -424,7 +438,7 @@ fn real_upload_verified_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {
 
 fn two_asset_upload_verified_manifest() -> Manifest {
     let mut manifest = Manifest::new();
-    for (asset_id, filename, raw_bytes, raw_sha256, heic_path, heic_sha256, heic_size) in [
+    for (asset_id, filename, raw_bytes, raw_sha256, _heic_path, _heic_sha256, _heic_size) in [
         (
             "asset-1",
             "IMG_0001.dng",
@@ -460,6 +474,27 @@ fn two_asset_upload_verified_manifest() -> Manifest {
             },
         )
         .expect("nas proof should record");
+    }
+    for (asset_id, _filename, _raw_bytes, _raw_sha256, heic_path, heic_sha256, heic_size) in [
+        (
+            "asset-1",
+            "IMG_0001.dng",
+            RAW_BYTES_ASSET_1,
+            "raw-sha256-1",
+            "/staging/IMG_0001.heic",
+            "heic-sha256-1",
+            10,
+        ),
+        (
+            "asset-2",
+            "IMG_0002.dng",
+            RAW_BYTES_ASSET_2,
+            "raw-sha256-2",
+            "/staging/IMG_0002.heic",
+            "heic-sha256-2",
+            11,
+        ),
+    ] {
         record_conversion_result(
             &mut manifest,
             asset_id,
@@ -471,8 +506,52 @@ fn two_asset_upload_verified_manifest() -> Manifest {
             },
         )
         .expect("conversion should record");
+    }
+    manifest = promote_current_recipe_fixture(manifest);
+    for (asset_id, _filename, _raw_bytes, _raw_sha256, _heic_path, _heic_sha256, _heic_size) in [
+        (
+            "asset-1",
+            "IMG_0001.dng",
+            RAW_BYTES_ASSET_1,
+            "raw-sha256-1",
+            "/staging/IMG_0001.heic",
+            "heic-sha256-1",
+            10,
+        ),
+        (
+            "asset-2",
+            "IMG_0002.dng",
+            RAW_BYTES_ASSET_2,
+            "raw-sha256-2",
+            "/staging/IMG_0002.heic",
+            "heic-sha256-2",
+            11,
+        ),
+    ] {
         record_conversion_performance(&mut manifest, asset_id, conversion_performance_input())
             .expect("conversion performance should record");
+    }
+    manifest = promote_current_recipe_fixture(manifest);
+    for (asset_id, _filename, _raw_bytes, _raw_sha256, heic_path, heic_sha256, heic_size) in [
+        (
+            "asset-1",
+            "IMG_0001.dng",
+            RAW_BYTES_ASSET_1,
+            "raw-sha256-1",
+            "/staging/IMG_0001.heic",
+            "heic-sha256-1",
+            10,
+        ),
+        (
+            "asset-2",
+            "IMG_0002.dng",
+            RAW_BYTES_ASSET_2,
+            "raw-sha256-2",
+            "/staging/IMG_0002.heic",
+            "heic-sha256-2",
+            11,
+        ),
+    ] {
         record_heic_verification(
             &mut manifest,
             asset_id,
@@ -489,6 +568,28 @@ fn two_asset_upload_verified_manifest() -> Manifest {
             },
         )
         .expect("heic verification should record");
+    }
+    manifest = promote_current_recipe_fixture(manifest);
+    for (asset_id, _filename, _raw_bytes, _raw_sha256, heic_path, heic_sha256, heic_size) in [
+        (
+            "asset-1",
+            "IMG_0001.dng",
+            RAW_BYTES_ASSET_1,
+            "raw-sha256-1",
+            "/staging/IMG_0001.heic",
+            "heic-sha256-1",
+            10,
+        ),
+        (
+            "asset-2",
+            "IMG_0002.dng",
+            RAW_BYTES_ASSET_2,
+            "raw-sha256-2",
+            "/staging/IMG_0002.heic",
+            "heic-sha256-2",
+            11,
+        ),
+    ] {
         record_source_age_proof(&mut manifest, asset_id, old_source_age_proof())
             .expect("source age proof should record");
         record_upload_proof(
@@ -708,7 +809,7 @@ fn forged_delete_approved_manifest(
     let (tempdir, mut manifest, _) = real_delete_approved_manifest();
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     mutate(&mut record);
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     (tempdir, manifest)
 }
 
@@ -726,7 +827,7 @@ fn converted_manifest() -> Manifest {
     record_nas_proof(&mut manifest, "asset-1", nas_proof()).expect("nas proof should record");
     record_conversion_result(&mut manifest, "asset-1", conversion_proof())
         .expect("conversion should record");
-    manifest
+    promote_current_recipe_fixture(manifest)
 }
 
 #[test]
@@ -858,8 +959,10 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
         },
     )
     .expect("exact adjusted conversion binding should record");
+    manifest = promote_current_recipe_fixture(manifest);
     record_conversion_performance(&mut manifest, "asset-1", conversion_performance_input())
         .expect("conversion performance should record");
+    manifest = promote_current_recipe_fixture(manifest);
     record_heic_verification(
         &mut manifest,
         "asset-1",
@@ -876,6 +979,7 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
         },
     )
     .expect("HEIC verification should record");
+    manifest = promote_current_recipe_fixture(manifest);
     record_source_age_proof(&mut manifest, "asset-1", old_source_age_proof())
         .expect("source age should record");
     record_upload_proof(
@@ -934,7 +1038,7 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
     let mut approval_tampered = approval_original.clone();
     proof_mut(&mut approval_tampered, "delete_approval")["adjusted_source_proof_digest"] =
         json!("e".repeat(64));
-    manifest.upsert(approval_tampered);
+    manifest = replace_trusted_record(manifest, approval_tampered);
     assert!(
         build_delete_plan(&manifest, "asset-1").is_err(),
         "approval lineage tampering must block delete planning"
@@ -945,11 +1049,11 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
         error,
         WorkflowError::PrevalidatedDeleteStale { field, .. } if field == "delete_approval"
     ));
-    manifest.upsert(approval_original);
+    manifest = replace_trusted_record(manifest, approval_original);
 
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     proof_mut(&mut record, "adjusted_source")["downloadedSha256"] = json!("f".repeat(64));
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     assert!(
         build_delete_plan(&manifest, "asset-1").is_err(),
         "adjusted source tampering must block delete planning"
@@ -1046,7 +1150,7 @@ fn conversion_performance_manifest() -> Manifest {
     let mut manifest = converted_manifest();
     record_conversion_performance(&mut manifest, "asset-1", conversion_performance_input())
         .expect("conversion performance should record");
-    manifest
+    promote_current_recipe_fixture(manifest)
 }
 
 #[test]
@@ -1311,7 +1415,7 @@ fn delete_eligibility_requires_original_asset_identity_without_mutation() {
     let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     record.proofs.remove("original_asset");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = mark_delete_eligible(&mut manifest, "asset-1")
@@ -1337,7 +1441,7 @@ fn delete_approval_revalidates_original_asset_identity() {
     mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     proof_mut(&mut record, "original_asset")["matched_raw_sha256"] = json!("forged-raw-sha256");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = approve_delete(&mut manifest, "asset-1", "operator")
@@ -1458,7 +1562,7 @@ fn prevalidated_delete_rejects_changed_proof_snapshot_without_mutation() {
         .expect("approved delete should prevalidate");
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     proof_mut(&mut record, "upload")["uploaded_heic_asset_id"] = json!("changed-upload");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.clone();
 
     let error = record_prevalidated_delete_execution(&mut manifest, prevalidated, delete_outcome())
@@ -1501,7 +1605,7 @@ fn delete_reconciliation_rejects_stale_proof_snapshot_without_mutation() {
         .expect("approved delete should build reconciliation token");
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     proof_mut(&mut record, "upload")["uploaded_heic_asset_id"] = json!("changed-upload");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.clone();
 
     let error = record_reconciled_delete_execution(&mut manifest, reconciliation, delete_outcome())
@@ -1588,7 +1692,7 @@ fn prevalidated_delete_rejects_changed_raw_path_without_mutation() {
         .expect("approved delete should prevalidate");
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     record.raw_path = PathBuf::from("/other/IMG_0001.dng");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.clone();
 
     let error = record_prevalidated_delete_execution(&mut manifest, prevalidated, delete_outcome())
@@ -1810,7 +1914,7 @@ fn delete_execution_fails_closed_without_original_identity_or_with_forged_facts(
     let (_tempdir, mut manifest, _) = real_delete_approved_manifest();
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     record.proofs.remove("original_asset");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = record_delete_execution(&mut manifest, "asset-1", delete_outcome())
@@ -1832,7 +1936,7 @@ fn delete_execution_fails_closed_without_original_identity_or_with_forged_facts(
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     proof_mut(&mut record, "delete_eligibility")["uploaded_heic_asset_id"] =
         json!("forged-heic-asset");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = record_delete_execution(&mut manifest, "asset-1", delete_outcome())
@@ -2357,7 +2461,7 @@ fn uploaded_heic_delete_request_rejects_original_asset_target() {
     let mut manifest = upload_verified_manifest();
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     proof_mut(&mut record, "upload")["uploaded_heic_asset_id"] = json!("original-record-1");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
 
     let error = uploaded_heic_delete_request(&manifest, "asset-1")
         .expect_err("uploaded HEIC delete must not target original RAW asset");
@@ -2520,10 +2624,7 @@ fn conversion_performance_records_derived_sizes_and_metrics() {
     assert_eq!(proof["measurement_method"], "monotonic_wall_clock");
     assert_eq!(proof["conversion_tool"], "magick");
     assert_eq!(proof["conversion_tool_version"], "7.1.1-41");
-    assert_eq!(
-        proof["conversion_recipe_id"],
-        "embedded-preview-normalized-v1"
-    );
+    assert_eq!(proof["conversion_recipe_id"], "");
     assert_eq!(proof["heic_quality"], 90);
     assert_eq!(proof["raw_size_bytes"], 42);
     assert_eq!(proof["heic_size_bytes"], 24);
@@ -2758,7 +2859,7 @@ fn upload_ready_revalidates_visual_proofs() {
     let mut manifest = conversion_verified_manifest();
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     proof_mut(&mut record, "heic")["visual_match_ok"] = json!(false);
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
 
     let error = upload_ready_heic_proof(&manifest, "asset-1")
         .expect_err("forged visual proof must not be upload-ready");
@@ -2777,7 +2878,7 @@ fn upload_ready_rejects_legacy_raw_sensor_render_conversion_tool() {
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     proof_mut(&mut record, "conversion_performance")["conversion_tool"] =
         json!("dcraw_emu+magick+heif-enc");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
 
     let error = upload_ready_heic_proof(&manifest, "asset-1")
         .expect_err("legacy raw sensor render must not be upload-ready");
@@ -2797,7 +2898,7 @@ fn upload_ready_requires_conversion_performance_proof() {
     let mut manifest = conversion_verified_manifest();
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     record.proofs.remove("conversion_performance");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
 
     let error = upload_ready_heic_proof(&manifest, "asset-1")
         .expect_err("legacy conversion verification without performance must not be upload-ready");
@@ -2816,7 +2917,7 @@ fn upload_proof_requires_conversion_performance_without_mutation() {
     let mut manifest = conversion_verified_manifest();
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     record.proofs.remove("conversion_performance");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = record_upload_proof(&mut manifest, "asset-1", upload_proof())
@@ -3025,7 +3126,7 @@ fn delete_eligibility_requires_conversion_performance_without_mutation() {
     let mut manifest = upload_verified_manifest();
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     record.proofs.remove("conversion_performance");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = mark_delete_eligible(&mut manifest, "asset-1")
@@ -3050,7 +3151,7 @@ fn delete_eligibility_requires_icloudpd_local_mirror_without_mutation() {
     let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     record.proofs.remove("icloudpd_local_mirror");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = mark_delete_eligible(&mut manifest, "asset-1")
@@ -3112,7 +3213,7 @@ fn icloudpd_local_mirror_proof_repairs_existing_delete_states() {
         eligibility.remove("icloudpd_download_path");
         eligibility.remove("mirrored_heic_sha256");
         eligibility.remove("mirrored_size_bytes");
-        manifest.upsert(record);
+        manifest = replace_trusted_record(manifest, record);
 
         record_icloudpd_local_mirror_proof(&mut manifest, "asset-1", local_mirror_proof())
             .expect("recording mirror proof should repair legacy delete state");
@@ -3142,7 +3243,7 @@ fn delete_eligibility_revalidates_conversion_performance_without_mutation() {
     let mut manifest = upload_verified_manifest();
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     proof_mut(&mut record, "conversion_performance")["raw_size_bytes"] = json!(41);
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = mark_delete_eligible(&mut manifest, "asset-1")
@@ -3175,7 +3276,7 @@ fn delete_eligibility_revalidates_heic_identity_without_mutation() {
         let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
         let mut record = manifest.get("asset-1").expect("asset should exist").clone();
         proof_mut(&mut record, "heic")[field] = value;
-        manifest.upsert(record);
+        manifest = replace_trusted_record(manifest, record);
         let before = manifest.get("asset-1").expect("asset should exist").clone();
 
         let error = mark_delete_eligible(&mut manifest, "asset-1")
@@ -3208,7 +3309,7 @@ fn delete_eligibility_revalidates_upload_binding_without_mutation() {
         let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
         let mut record = manifest.get("asset-1").expect("asset should exist").clone();
         proof_mut(&mut record, "upload")[field] = value;
-        manifest.upsert(record);
+        manifest = replace_trusted_record(manifest, record);
         let before = manifest.get("asset-1").expect("asset should exist").clone();
 
         let error = mark_delete_eligible(&mut manifest, "asset-1")
@@ -3236,7 +3337,7 @@ fn delete_eligibility_revalidates_nas_size_without_mutation() {
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     proof_mut(&mut record, "nas")["size_bytes"] = json!(43);
     proof_mut(&mut record, "conversion_performance")["raw_size_bytes"] = json!(43);
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = mark_delete_eligible(&mut manifest, "asset-1")
@@ -3288,7 +3389,7 @@ fn delete_eligibility_revalidates_source_age_without_mutation() {
         let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
         let mut record = manifest.get("asset-1").expect("asset should exist").clone();
         proof_mut(&mut record, "source_age")[field] = value;
-        manifest.upsert(record);
+        manifest = replace_trusted_record(manifest, record);
         let before = manifest.get("asset-1").expect("asset should exist").clone();
 
         let error = mark_delete_eligible(&mut manifest, "asset-1")
@@ -3327,7 +3428,7 @@ fn delete_approval_requires_conversion_performance_without_mutation() {
     mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     record.proofs.remove("conversion_performance");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = approve_delete(&mut manifest, "asset-1", "operator")
@@ -3353,7 +3454,7 @@ fn delete_approval_revalidates_conversion_performance_without_mutation() {
     mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     proof_mut(&mut record, "conversion_performance")["heic_size_bytes"] = json!(25);
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = approve_delete(&mut manifest, "asset-1", "operator")
@@ -3386,7 +3487,7 @@ fn delete_approval_revalidates_heic_identity_without_mutation() {
         mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
         let mut record = manifest.get("asset-1").expect("asset should exist").clone();
         proof_mut(&mut record, "heic")[field] = value;
-        manifest.upsert(record);
+        manifest = replace_trusted_record(manifest, record);
         let before = manifest.get("asset-1").expect("asset should exist").clone();
 
         let error = approve_delete(&mut manifest, "asset-1", "operator")
@@ -3429,7 +3530,7 @@ fn delete_approval_revalidates_upload_binding_without_mutation() {
         mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
         let mut record = manifest.get("asset-1").expect("asset should exist").clone();
         proof_mut(&mut record, "upload")[field] = value;
-        manifest.upsert(record);
+        manifest = replace_trusted_record(manifest, record);
         let before = manifest.get("asset-1").expect("asset should exist").clone();
 
         let error = approve_delete(&mut manifest, "asset-1", "operator")
@@ -3465,7 +3566,7 @@ fn delete_approval_revalidates_icloudpd_local_mirror_without_mutation() {
         mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
         let mut record = manifest.get("asset-1").expect("asset should exist").clone();
         proof_mut(&mut record, "icloudpd_local_mirror")[field] = value;
-        manifest.upsert(record);
+        manifest = replace_trusted_record(manifest, record);
         let before = manifest.get("asset-1").expect("asset should exist").clone();
 
         let error = approve_delete(&mut manifest, "asset-1", "operator")
@@ -3532,7 +3633,7 @@ fn delete_approval_revalidates_source_age_without_mutation() {
         mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
         let mut record = manifest.get("asset-1").expect("asset should exist").clone();
         proof_mut(&mut record, "source_age")[field] = value;
-        manifest.upsert(record);
+        manifest = replace_trusted_record(manifest, record);
         let before = manifest.get("asset-1").expect("asset should exist").clone();
 
         let error = approve_delete(&mut manifest, "asset-1", "operator")
@@ -3572,7 +3673,7 @@ fn delete_approval_revalidates_delete_eligibility_without_mutation() {
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     proof_mut(&mut record, "delete_eligibility")["uploaded_heic_sha256"] =
         json!("stale-heic-sha256");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = approve_delete(&mut manifest, "asset-1", "operator")
@@ -3679,7 +3780,7 @@ fn source_age_proof_can_be_recorded_after_upload_before_delete_eligibility() {
     let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
     let mut record = manifest.get("asset-1").expect("asset should exist").clone();
     record.proofs.remove("source_age");
-    manifest.upsert(record);
+    manifest = replace_trusted_record(manifest, record);
 
     record_source_age_proof(&mut manifest, "asset-1", old_source_age_proof())
         .expect("source age proof should remain valid before delete eligibility");
