@@ -608,6 +608,18 @@ pub trait CloudKitDeleteTransport {
 }
 
 pub trait CloudKitOriginalAssetReadTransport {
+    /// Read-only lookup. This trait deliberately omits records/modify and all
+    /// upload/delete operations, so callers using it cannot perform mutation.
+    fn post_records_lookup(
+        &mut self,
+        _session: &CloudKitDeleteSession,
+        _payload: Value,
+    ) -> Result<Value, UploadError> {
+        Err(UploadError::InvalidCloudKitOriginalAssetResponse(
+            "read-only transport does not implement records/lookup",
+        ))
+    }
+
     fn post_records_query(
         &mut self,
         session: &CloudKitDeleteSession,
@@ -641,6 +653,14 @@ impl<T: CloudKitDeleteTransport + ?Sized> CloudKitDeleteTransport for &mut T {
 }
 
 impl<T: CloudKitOriginalAssetReadTransport + ?Sized> CloudKitOriginalAssetReadTransport for &mut T {
+    fn post_records_lookup(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        (**self).post_records_lookup(session, payload)
+    }
+
     fn post_records_query(
         &mut self,
         session: &CloudKitDeleteSession,
@@ -931,7 +951,7 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
     }
 }
 
-impl<T: CloudKitDeleteTransport + CloudKitOriginalAssetReadTransport> CloudKitDeleteClient<T> {
+impl<T: CloudKitOriginalAssetReadTransport> CloudKitDeleteClient<T> {
     pub fn resolve_uploaded_heic_asset(
         &mut self,
         session: &CloudKitDeleteSession,
@@ -1966,6 +1986,21 @@ impl ReqwestCloudKitReadTransport {
 }
 
 impl CloudKitOriginalAssetReadTransport for ReqwestCloudKitReadTransport {
+    fn post_records_lookup(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        let url = self.records_lookup_url(session, payload_database_scope(&payload, session))?;
+        self.transport.post_records_json(
+            session,
+            url,
+            payload,
+            "records_lookup",
+            read_json_response,
+        )
+    }
+
     fn post_records_query(
         &mut self,
         session: &CloudKitDeleteSession,

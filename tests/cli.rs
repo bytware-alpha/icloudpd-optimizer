@@ -2743,6 +2743,24 @@ fn monitor_original_assets_reconcile_requires_explicit_reconciliation_gates() {
 }
 
 #[test]
+fn monitor_upload_verified_reverify_requires_explicit_target_gates() {
+    Command::cargo_bin("icloudpd-optimizer")
+        .expect("binary")
+        .args(["monitor", "upload-verified-reverify", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--config <PATH>"))
+        .stdout(predicate::str::contains("--asset-id <ASSET_ID>"))
+        .stdout(predicate::str::contains(
+            "--expected-target-count <EXPECTED_TARGET_COUNT>",
+        ))
+        .stdout(predicate::str::contains(
+            "--expected-target-set-sha256 <HEX>",
+        ))
+        .stdout(predicate::str::contains("--apply"));
+}
+
+#[test]
 fn monitor_failed_assets_quarantine_requires_explicit_safety_arguments() {
     binary()
         .args(["monitor", "failed-assets-quarantine", "--help"])

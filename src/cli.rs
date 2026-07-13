@@ -5,7 +5,7 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::ErrorKind;
 use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::thread;
@@ -34,8 +34,8 @@ use crate::metrics::VerifiedMetrics;
 use crate::monitor::{
     LegacyEmbeddedPreviewMigrationClassification, MonitorConfig, MonitorError, MonitorScanSummary,
     MonitorStats, acquire_monitor_run_guard, classify_legacy_embedded_preview_migration,
-    launchd_plist, log_monitor_failure_event, render_tui, run_monitor_once,
-    run_scan_root_preflight_probe, write_launchd_plist,
+    launchd_plist, log_monitor_failure_event, render_tui, reverify_upload_verified_heic,
+    run_monitor_once, run_scan_root_preflight_probe, write_launchd_plist,
 };
 use crate::proof::NasRawProof;
 use crate::reconciliation::{OriginalAssetResolutionBatch, OriginalAssetResolutionError};
@@ -57,15 +57,15 @@ use crate::upload::{
 };
 use crate::workflow::{
     ConversionPerformanceInput, ConversionResultInput, ConversionSourceBinding,
-    HeicVerificationInput, IcloudpdLocalMirrorProofDisposition, OriginalAssetProof, SourceAgeProof,
-    UploadProof, WorkflowError, approve_delete, approved_original_delete_request,
-    build_delete_plan, icloudpd_local_mirror_proof_disposition, icloudpd_local_mirror_ready_proofs,
-    mark_delete_eligible, prove_and_record_nas, record_conversion_performance,
-    record_conversion_result, record_delete_execution, record_heic_verification,
-    record_icloudpd_local_mirror_proof, record_original_asset_batch_proofs,
-    record_original_asset_proof, record_source_age_proof, record_stage_failure,
-    record_upload_proof, record_uploaded_heic_delete, upload_ready_heic_proof,
-    uploaded_heic_delete_request,
+    HeicVerificationInput, IcloudpdLocalMirrorProof, IcloudpdLocalMirrorProofDisposition,
+    OriginalAssetProof, SourceAgeProof, UploadProof, WorkflowError, approve_delete,
+    approved_original_delete_request, build_delete_plan, icloudpd_local_mirror_proof_disposition,
+    icloudpd_local_mirror_ready_proofs, mark_delete_eligible, prove_and_record_nas,
+    record_conversion_performance, record_conversion_result, record_delete_execution,
+    record_heic_verification, record_icloudpd_local_mirror_proof,
+    record_original_asset_batch_proofs, record_original_asset_proof, record_source_age_proof,
+    record_stage_failure, record_upload_proof, record_uploaded_heic_delete,
+    reverify_upload_verified_record, upload_ready_heic_proof, uploaded_heic_delete_request,
 };
 
 const DAY_SECONDS: u64 = 24 * 60 * 60;
@@ -224,6 +224,11 @@ enum MonitorCommand {
         about = "Query and optionally atomically reconcile one CloudKit original-assets destination"
     )]
     OriginalAssetsReconcile(MonitorOriginalAssetsReconcileArgs),
+    #[command(
+        name = "upload-verified-reverify",
+        about = "Read-only reverify explicit UploadVerified assets and atomically refresh current proof recipes"
+    )]
+    UploadVerifiedReverify(MonitorUploadVerifiedReverifyArgs),
     #[command(
         name = "failed-assets-quarantine",
         about = "Atomically quarantine audited failed assets with historical remote side effects"
@@ -407,6 +412,20 @@ struct MonitorOriginalAssetsReconcileArgs {
     expected_ambiguous_count: u64,
     #[arg(long)]
     expected_incomplete_transient_count: u64,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    apply: bool,
+}
+
+#[derive(Debug, Args)]
+struct MonitorUploadVerifiedReverifyArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long, required = true)]
+    asset_id: Vec<String>,
+    #[arg(long)]
+    expected_target_count: u64,
+    #[arg(long, value_name = "HEX")]
+    expected_target_set_sha256: String,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     apply: bool,
 }
@@ -1178,6 +1197,9 @@ fn run_monitor<W: Write>(args: MonitorArgs, writer: &mut W) -> Result<(), CliErr
         MonitorCommand::OriginalAssetsReconcile(args) => {
             monitor_original_assets_reconcile(args, writer)
         }
+        MonitorCommand::UploadVerifiedReverify(args) => {
+            monitor_upload_verified_reverify(args, writer)
+        }
         MonitorCommand::FailedAssetsQuarantine(args) => {
             monitor_failed_assets_quarantine(args, writer)
         }
@@ -1781,6 +1803,226 @@ fn monitor_original_assets_reconcile<W: Write>(
     let transport =
         ReqwestCloudKitReadTransport::new().map_err(original_assets_reconcile_cloudkit_failure)?;
     monitor_original_assets_reconcile_with_transport(args, writer, transport)
+}
+
+#[derive(Serialize)]
+struct UploadVerifiedReverifyReport {
+    target_set_sha256: String,
+    target_count: u64,
+    verified_count: u64,
+    changed_count: u64,
+    applied: bool,
+    elapsed_millis: u128,
+}
+
+fn monitor_upload_verified_reverify<W: Write>(
+    args: MonitorUploadVerifiedReverifyArgs,
+    writer: &mut W,
+) -> Result<(), CliError> {
+    let started = Instant::now();
+    if args.asset_id.is_empty() || args.expected_target_count == 0 {
+        return Err(CliError::OriginalAssetsReconcileGate {
+            message: "upload-verified-reverify requires a positive explicit target count"
+                .to_string(),
+        });
+    }
+    let ids = args.asset_id.iter().cloned().collect::<BTreeSet<_>>();
+    if ids.len() != args.asset_id.len() || ids.iter().any(|id| id.trim().is_empty()) {
+        return Err(CliError::OriginalAssetsReconcileGate {
+            message: "upload-verified-reverify asset IDs must be non-empty and unique".to_string(),
+        });
+    }
+    if args.expected_target_count != ids.len() as u64
+        || !is_sha256_fingerprint(&args.expected_target_set_sha256)
+    {
+        return Err(CliError::OriginalAssetsReconcileGate {
+            message: "upload-verified-reverify target gates are invalid".to_string(),
+        });
+    }
+    let target_set_sha256 = upload_verified_reverify_target_set_sha256(&ids);
+    if target_set_sha256 != args.expected_target_set_sha256 {
+        return Err(CliError::OriginalAssetsReconcileGate {
+            message: "upload-verified-reverify target set did not match expected SHA-256"
+                .to_string(),
+        });
+    }
+    let config = MonitorConfig::load(&args.config)?;
+    config.validate()?;
+    let mut guard = args
+        .apply
+        .then(|| acquire_monitor_run_guard(&config))
+        .transpose()?;
+    let state_store = match guard.as_mut() {
+        Some(guard) => guard.state_store(&config.manifest_path)?.clone(),
+        None => AssetStateStore::open_immutable_read_only(&config.manifest_path)?,
+    };
+    let manifest = state_store.load()?;
+    let expected = ids
+        .iter()
+        .map(|id| {
+            manifest
+                .get(id)
+                .map(|record| (id.clone(), record.clone()))
+                .map_err(|error| CliError::Workflow(WorkflowError::Manifest(error)))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let session_path = config.delete_session_path.as_deref().ok_or_else(|| CliError::OriginalAssetsReconcileGate { message: "upload-verified-reverify requires delete_session_path for read-only exact remote verification".to_string() })?;
+    let session = load_cloudkit_delete_session(session_path)?;
+    let mut transport = ReqwestCloudKitReadTransport::new()?;
+    let mut updated = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let record = manifest
+            .get(id)
+            .map_err(|error| CliError::Workflow(WorkflowError::Manifest(error)))?;
+        let upload: UploadProof =
+            serde_json::from_value(record.proofs.get("upload").cloned().ok_or_else(|| {
+                CliError::OriginalAssetsReconcileGate {
+                    message: "upload-verified-reverify requires upload proof".to_string(),
+                }
+            })?)?;
+        let mirror: IcloudpdLocalMirrorProof = serde_json::from_value(
+            record
+                .proofs
+                .get("icloudpd_local_mirror")
+                .cloned()
+                .ok_or_else(|| CliError::OriginalAssetsReconcileGate {
+                    message: "upload-verified-reverify requires local mirror proof".to_string(),
+                })?,
+        )?;
+        let final_path = upload.uploaded_heic_path.as_ref().ok_or_else(|| {
+            CliError::OriginalAssetsReconcileGate {
+                message: "upload-verified-reverify requires uploaded HEIC path".to_string(),
+            }
+        })?;
+        let mut reference_path = final_path.clone();
+        reference_path.set_extension("oriented-preview.jpg");
+        let witnesses_before = [
+            no_follow_file_witness(&reference_path)?,
+            no_follow_file_witness(final_path)?,
+            no_follow_file_witness(&mirror.icloudpd_download_path)?,
+        ];
+        if witnesses_before[1].sha256 != upload.uploaded_heic_sha256
+            || witnesses_before[1].size_bytes != mirror.size_bytes
+            || witnesses_before[2].sha256 != upload.uploaded_heic_sha256
+            || witnesses_before[2].size_bytes != mirror.size_bytes
+        {
+            return Err(CliError::OriginalAssetsReconcileGate { message: "upload-verified-reverify local final or mirror bytes did not match upload proof".to_string() });
+        }
+        let heic =
+            reverify_upload_verified_heic(&manifest, id, config.heic_verify_timeout_seconds)?;
+        let witnesses_after = [
+            no_follow_file_witness(&reference_path)?,
+            no_follow_file_witness(final_path)?,
+            no_follow_file_witness(&mirror.icloudpd_download_path)?,
+        ];
+        if witnesses_before != witnesses_after {
+            return Err(CliError::OriginalAssetsReconcileGate {
+                message: "upload-verified-reverify detected a local file swap during verification"
+                    .to_string(),
+            });
+        }
+        let updated_record = reverify_upload_verified_record(&manifest, id, heic)?;
+        let staged = Manifest::new();
+        let mut staged = staged;
+        staged.upsert_trusted(updated_record.clone());
+        let request = uploaded_heic_delete_request(&staged, id)?;
+        CloudKitDeleteClient::new(&mut transport)
+            .resolve_uploaded_heic_asset(&session, &request)?;
+        updated.push(updated_record);
+    }
+    if !args.apply {
+        state_store.revalidate_immutable_read_snapshot()?;
+    }
+    let changed_count = if args.apply {
+        state_store.persist_records_exact_cas_atomic_trusted(
+            updated
+                .iter()
+                .map(|updated| AssetRecordExactCasUpdate {
+                    expected: expected.get(&updated.asset_id).expect("target snapshot"),
+                    updated,
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        state_store.export_json()?;
+        updated.len() as u64
+    } else {
+        0
+    };
+    let report = UploadVerifiedReverifyReport {
+        target_set_sha256,
+        target_count: ids.len() as u64,
+        verified_count: ids.len() as u64,
+        changed_count,
+        applied: args.apply,
+        elapsed_millis: started.elapsed().as_millis(),
+    };
+    serde_json::to_writer_pretty(&mut *writer, &report)?;
+    writeln!(writer)?;
+    eprintln!(
+        "upload-verified-reverify: verified={} changed={} applied={} elapsed_ms={}",
+        report.verified_count, report.changed_count, report.applied, report.elapsed_millis
+    );
+    Ok(())
+}
+
+#[derive(Eq, PartialEq)]
+struct NoFollowFileWitness {
+    device: u64,
+    inode: u64,
+    size_bytes: u64,
+    sha256: String,
+}
+
+fn no_follow_file_witness(path: &Path) -> Result<NoFollowFileWitness, CliError> {
+    let metadata = fs::symlink_metadata(path).map_err(CliError::Output)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CliError::OriginalAssetsReconcileGate {
+            message: "upload-verified-reverify requires regular non-symlink local evidence files"
+                .to_string(),
+        });
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path).map_err(CliError::Output)?;
+    let opened = file.metadata().map_err(CliError::Output)?;
+    if !opened.is_file() || opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+        return Err(CliError::OriginalAssetsReconcileGate {
+            message: "upload-verified-reverify detected unsafe local evidence identity".to_string(),
+        });
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(CliError::Output)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let after = file.metadata().map_err(CliError::Output)?;
+    if after.dev() != opened.dev() || after.ino() != opened.ino() || after.len() != opened.len() {
+        return Err(CliError::OriginalAssetsReconcileGate {
+            message: "upload-verified-reverify detected a local evidence swap".to_string(),
+        });
+    }
+    Ok(NoFollowFileWitness {
+        device: opened.dev(),
+        inode: opened.ino(),
+        size_bytes: opened.len(),
+        sha256: format!("{:x}", hasher.finalize()),
+    })
+}
+
+fn upload_verified_reverify_target_set_sha256(ids: &BTreeSet<String>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"upload-verified-reverify-target-set-v1\\0");
+    for id in ids {
+        hasher.update((id.len() as u64).to_be_bytes());
+        hasher.update(id.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -6390,7 +6632,11 @@ mod original_assets_audit_tests {
 
             for error in [
                 read_transport.post_records_query(&session, payload.clone()),
-                delete_transport.post_records_lookup(&session, payload.clone()),
+                crate::upload::CloudKitDeleteTransport::post_records_lookup(
+                    &mut delete_transport,
+                    &session,
+                    payload.clone(),
+                ),
                 delete_transport.post_records_modify(&session, payload.clone()),
             ] {
                 assert!(matches!(error, Err(UploadError::InvalidSession(_))));

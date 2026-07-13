@@ -9579,6 +9579,14 @@ fn verify_converted_heic(
     })
 }
 
+pub(crate) fn reverify_upload_verified_heic(
+    manifest: &Manifest,
+    asset_id: &str,
+    timeout_seconds: u64,
+) -> Result<HeicVerificationInput, MonitorError> {
+    Ok(verify_converted_heic(manifest, asset_id, timeout_seconds)?.proof)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MediaMetadata {
     orientations: Vec<u64>,

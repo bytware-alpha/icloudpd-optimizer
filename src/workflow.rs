@@ -780,6 +780,90 @@ pub fn uploaded_heic_delete_request(
     })
 }
 
+/// Builds a replacement record with only the current conversion recipe claims
+/// and HEIC verification measurements refreshed.  The caller is responsible
+/// for proving the files and remote resource before persisting this record.
+pub fn reverify_upload_verified_record(
+    manifest: &Manifest,
+    asset_id: &str,
+    heic_input: HeicVerificationInput,
+) -> Result<AssetRecord, WorkflowError> {
+    if manifest.get(asset_id)?.state != State::UploadVerified {
+        return Err(WorkflowError::UploadUnavailable {
+            asset_id: asset_id.to_string(),
+            state: manifest.get(asset_id)?.state,
+        });
+    }
+
+    let conversion = stored_proof::<ConversionResultProof>(manifest, asset_id, CONVERSION_PROOF)?;
+    require_matching_path(
+        CONVERSION_PROOF,
+        "heic_path",
+        &conversion.heic_path,
+        &heic_input.heic_path,
+    )?;
+    require_matching_str(
+        CONVERSION_PROOF,
+        "heic_sha256",
+        &conversion.heic_sha256,
+        &heic_input.heic_sha256,
+    )?;
+    require_matching_u64(
+        CONVERSION_PROOF,
+        "size_bytes",
+        conversion.size_bytes,
+        heic_input.size_bytes,
+    )?;
+    validate_heic_verification_flags_legacy(&HeicVerificationProof {
+        heic_path: heic_input.heic_path.clone(),
+        heic_sha256: heic_input.heic_sha256.clone(),
+        size_bytes: heic_input.size_bytes,
+        conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
+        heif_info_ok: heic_input.heif_info_ok,
+        metadata_copied: heic_input.metadata_copied,
+        visual_content_ok: heic_input.visual_content_ok,
+        visual_match_ok: heic_input.visual_match_ok,
+        visual_rmse_ppm: heic_input.visual_rmse_ppm,
+        visual_mae_ppm: heic_input.visual_mae_ppm,
+    })?;
+
+    let mut candidate = manifest.snapshot_record(asset_id)?;
+    for proof_key in [CONVERSION_PROOF, CONVERSION_PERFORMANCE_PROOF] {
+        let mut proof = candidate
+            .get(asset_id)?
+            .proofs
+            .get(proof_key)
+            .cloned()
+            .ok_or_else(|| WorkflowError::MissingProof {
+                asset_id: asset_id.to_string(),
+                proof_key: proof_key.to_string(),
+            })?;
+        proof["conversion_recipe_id"] =
+            Value::String(EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string());
+        candidate.record_trusted_proof(asset_id, proof_key, proof)?;
+    }
+    candidate.record_trusted_proof(
+        asset_id,
+        HEIC_PROOF,
+        serde_json::to_value(HeicVerificationProof {
+            heic_path: heic_input.heic_path,
+            heic_sha256: heic_input.heic_sha256,
+            size_bytes: heic_input.size_bytes,
+            conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
+            heif_info_ok: heic_input.heif_info_ok,
+            metadata_copied: heic_input.metadata_copied,
+            visual_content_ok: heic_input.visual_content_ok,
+            visual_match_ok: heic_input.visual_match_ok,
+            visual_rmse_ppm: heic_input.visual_rmse_ppm,
+            visual_mae_ppm: heic_input.visual_mae_ppm,
+        })?,
+    )?;
+    // This validates the complete NAS/original/conversion/performance/HEIC/
+    // upload/mirror lineage, including distinct original/replacement identity.
+    validate_pre_delete_facts(&candidate, asset_id)?;
+    Ok(candidate.get(asset_id)?.clone())
+}
+
 pub fn record_uploaded_heic_delete<'a>(
     manifest: &'a mut Manifest,
     asset_id: &str,
