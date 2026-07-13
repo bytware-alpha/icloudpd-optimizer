@@ -2197,7 +2197,7 @@ fn persist_failed_assets_quarantine_updates(
         ));
     }
     state_store
-        .persist_records_exact_cas_atomic(
+        .persist_records_exact_cas_atomic_trusted(
             changed_records
                 .iter()
                 .map(|updated| {
@@ -2502,7 +2502,7 @@ fn persist_legacy_failures_classify_updates(
         ));
     }
     state_store
-        .persist_records_exact_cas_atomic(
+        .persist_records_exact_cas_atomic_trusted(
             changed_records
                 .iter()
                 .map(|updated| {
@@ -2666,7 +2666,7 @@ fn monitor_original_assets_reconcile_with_transport<
         let changed_count = changed_records.len() as u64;
         validate_original_assets_reconcile_update_set(&expected_records, &changed_records)?;
         let elapsed = state_store
-            .persist_records_exact_cas_atomic(
+            .persist_records_exact_cas_atomic_trusted(
                 changed_records
                     .iter()
                     .map(|updated| {
@@ -4765,7 +4765,7 @@ fn save_manifest(manifest: &Manifest, path: &Path) -> Result<(), CliError> {
             Uuid::new_v4().to_string(),
             Duration::from_secs(60),
         )?;
-        store.persist_manifest_records(manifest)?;
+        store.persist_manifest_records_trusted(manifest)?;
         store.export_json()?;
         return Ok(());
     }

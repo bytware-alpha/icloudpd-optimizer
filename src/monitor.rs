@@ -3205,7 +3205,7 @@ fn persist_rolling_adjusted_source_exact_cas(
     updated: &AssetRecord,
 ) -> Result<Option<Duration>, MonitorError> {
     match state_store
-        .persist_records_exact_cas_atomic([AssetRecordExactCasUpdate { expected, updated }])
+        .persist_records_exact_cas_atomic_trusted([AssetRecordExactCasUpdate { expected, updated }])
     {
         Ok(elapsed) => {
             lock_shared(manifest, "rolling lifecycle manifest")?.upsert_trusted(updated.clone());
@@ -4084,7 +4084,7 @@ fn persist_asset_record(
     scan_started_unix_seconds: u64,
     proof_stage: &'static str,
 ) -> Result<(), MonitorError> {
-    let elapsed = match state_store.persist_record(manifest.get(asset_id)?) {
+    let elapsed = match state_store.persist_record_trusted(manifest.get(asset_id)?) {
         Ok(elapsed) => elapsed,
         Err(error) => {
             manifest.upsert_trusted(previous);
@@ -4108,7 +4108,7 @@ fn checkpoint_manifest_state(
     state_store: &AssetStateStore,
     manifest: &Manifest,
 ) -> Result<(), MonitorError> {
-    state_store.persist_manifest_records(manifest)?;
+    state_store.persist_manifest_records_trusted(manifest)?;
     state_store.export_json()?;
     Ok(())
 }
@@ -5941,7 +5941,7 @@ fn stage_and_commit_reconciled_deletes(
                 .saturating_sub(confirmed_item.item.heic_bytes),
         );
     }
-    let elapsed = state_store.persist_records_atomic(changed_records.iter())?;
+    let elapsed = state_store.persist_records_atomic_trusted(changed_records.iter())?;
     totals.atomic_batch_commit_wall_time_micros = elapsed.as_micros() as u64;
     for record in changed_records {
         manifest.upsert_trusted(record);
@@ -5975,7 +5975,8 @@ fn process_delete_preparation_window(
     let atomic_commit_micros = if preparation.changed_records.is_empty() {
         0
     } else {
-        let elapsed = state_store.persist_records_atomic(preparation.changed_records.iter())?;
+        let elapsed =
+            state_store.persist_records_atomic_trusted(preparation.changed_records.iter())?;
         for record in &preparation.changed_records {
             manifest.upsert_trusted(record.clone());
         }
@@ -6340,7 +6341,7 @@ fn stage_and_commit_confirmed_deletes(
         );
     }
 
-    let elapsed = state_store.persist_records_atomic(changed_records.iter())?;
+    let elapsed = state_store.persist_records_atomic_trusted(changed_records.iter())?;
     totals.atomic_batch_commit_wall_time_micros = elapsed.as_micros() as u64;
     for record in changed_records {
         manifest.upsert_trusted(record);

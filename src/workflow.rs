@@ -2835,6 +2835,7 @@ fn require_positive_u64(
 #[cfg(test)]
 mod provenance_tests {
     use super::*;
+    use crate::state_store::AssetStateStore;
 
     fn nas_proof() -> NasRawProof {
         NasRawProof {
@@ -2904,14 +2905,18 @@ mod provenance_tests {
     }
 
     #[test]
-    fn production_current_recorders_roundtrip_through_manifest_storage() {
+    fn production_current_recorders_roundtrip_through_trusted_state_storage() {
         let mut manifest = nas_verified_manifest();
         record_current_conversion_result(&mut manifest, "asset", conversion_input()).unwrap();
         record_current_conversion_performance(&mut manifest, "asset", performance_input()).unwrap();
         record_current_heic_verification(&mut manifest, "asset", heic_input()).unwrap();
-        let path = tempfile::tempdir().unwrap().path().join("manifest.json");
-        manifest.save_atomic(&path).unwrap();
-        let loaded = Manifest::load(&path).unwrap();
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&path, "workflow-test", Duration::from_secs(30)).unwrap();
+        store.load_or_import().unwrap();
+        store.persist_manifest_records_trusted(&manifest).unwrap();
+        let loaded = store.load().unwrap();
 
         assert!(upload_ready_heic_proof(&loaded, "asset").is_ok());
         assert_eq!(

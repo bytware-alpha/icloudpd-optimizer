@@ -557,7 +557,7 @@ impl Manifest {
     }
 }
 
-fn sanitize_untrusted_recipe_claims(record: &mut AssetRecord) {
+pub(crate) fn sanitize_untrusted_recipe_claims(record: &mut AssetRecord) {
     for proof_name in ["conversion", "conversion_performance", "heic"] {
         if let Some(proof) = record.proofs.get_mut(proof_name) {
             sanitize_untrusted_recipe_claim(proof_name, proof);

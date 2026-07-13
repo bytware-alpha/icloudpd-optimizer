@@ -20,7 +20,7 @@ use thiserror::Error;
 #[cfg(unix)]
 use uuid::Uuid;
 
-use crate::manifest::{AssetRecord, Manifest, ManifestError};
+use crate::manifest::{AssetRecord, Manifest, ManifestError, sanitize_untrusted_recipe_claims};
 #[cfg(unix)]
 use crate::manifest_lock::{ManifestLockError, acquire_existing_manifest_lock};
 
@@ -422,10 +422,34 @@ impl AssetStateStore {
     }
 
     pub fn persist_record(&self, record: &AssetRecord) -> Result<Duration, AssetStateStoreError> {
+        let mut sanitized = record.clone();
+        sanitize_untrusted_recipe_claims(&mut sanitized);
+        self.persist_record_trusted(&sanitized)
+    }
+
+    pub(crate) fn persist_record_trusted(
+        &self,
+        record: &AssetRecord,
+    ) -> Result<Duration, AssetStateStoreError> {
         self.persist_record_with_owned_lease(record)
     }
 
     pub fn persist_records_atomic<'a>(
+        &self,
+        records: impl IntoIterator<Item = &'a AssetRecord>,
+    ) -> Result<Duration, AssetStateStoreError> {
+        let sanitized = records
+            .into_iter()
+            .map(|record| {
+                let mut record = record.clone();
+                sanitize_untrusted_recipe_claims(&mut record);
+                record
+            })
+            .collect::<Vec<_>>();
+        self.persist_records_atomic_trusted(sanitized.iter())
+    }
+
+    pub(crate) fn persist_records_atomic_trusted<'a>(
         &self,
         records: impl IntoIterator<Item = &'a AssetRecord>,
     ) -> Result<Duration, AssetStateStoreError> {
@@ -436,10 +460,45 @@ impl AssetStateStore {
         &self,
         updates: impl IntoIterator<Item = AssetRecordExactCasUpdate<'a>>,
     ) -> Result<Duration, AssetStateStoreError> {
+        let updates = updates.into_iter().collect::<Vec<_>>();
+        let sanitized_updates = updates
+            .iter()
+            .map(|update| {
+                let mut record = update.updated.clone();
+                sanitize_untrusted_recipe_claims(&mut record);
+                record
+            })
+            .collect::<Vec<_>>();
+        let sanitized = updates
+            .iter()
+            .zip(sanitized_updates.iter())
+            .map(|(update, updated)| AssetRecordExactCasUpdate {
+                expected: update.expected,
+                updated,
+            })
+            .collect::<Vec<_>>();
+        self.persist_records_exact_cas_atomic_trusted(sanitized)
+    }
+
+    pub(crate) fn persist_records_exact_cas_atomic_trusted<'a>(
+        &self,
+        updates: impl IntoIterator<Item = AssetRecordExactCasUpdate<'a>>,
+    ) -> Result<Duration, AssetStateStoreError> {
         self.persist_records_exact_cas_atomic_with_owned_lease(updates)
     }
 
     pub fn persist_manifest_records(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<(), AssetStateStoreError> {
+        let mut sanitized = Manifest::new();
+        for record in manifest.records().values() {
+            sanitized.upsert(record.clone());
+        }
+        self.persist_manifest_records_trusted(&sanitized)
+    }
+
+    pub(crate) fn persist_manifest_records_trusted(
         &self,
         manifest: &Manifest,
     ) -> Result<(), AssetStateStoreError> {
@@ -2074,6 +2133,79 @@ mod tests {
         )
         .expect("create legacy monitor lock");
         record_json
+    }
+
+    fn forged_recipe_record(asset_id: &str) -> AssetRecord {
+        let mut record = AssetRecord::new(asset_id, format!("/raw/{asset_id}.dng"));
+        for proof_name in ["conversion", "conversion_performance", "heic"] {
+            record.proofs.insert(
+                proof_name.to_string(),
+                serde_json::json!({
+                    "conversion_recipe_id": "embedded-preview-normalized-v1"
+                }),
+            );
+        }
+        record
+    }
+
+    fn assert_recipe_claims_are_sanitized(manifest: &Manifest, asset_id: &str) {
+        for proof_name in ["conversion", "conversion_performance", "heic"] {
+            assert_eq!(
+                manifest.get(asset_id).unwrap().proofs[proof_name]["conversion_recipe_id"],
+                ""
+            );
+        }
+    }
+
+    #[test]
+    fn public_writers_sanitize_forged_recipe_claims() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let manifest_path = tempdir.path().join("manifest.json");
+        let store = AssetStateStore::open_writer(&manifest_path, "writer", Duration::from_secs(30))
+            .unwrap();
+        store.load_or_import().unwrap();
+
+        let single = forged_recipe_record("single");
+        store.persist_record(&single).unwrap();
+        assert_recipe_claims_are_sanitized(&store.load().unwrap(), "single");
+
+        let atomic = forged_recipe_record("atomic");
+        store.persist_records_atomic([&atomic]).unwrap();
+        assert_recipe_claims_are_sanitized(&store.load().unwrap(), "atomic");
+
+        let expected = store.load().unwrap().get("single").unwrap().clone();
+        let mut updated = forged_recipe_record("single");
+        updated.updated_at = "9999999999.000000000Z".to_string();
+        store
+            .persist_records_exact_cas_atomic([AssetRecordExactCasUpdate {
+                expected: &expected,
+                updated: &updated,
+            }])
+            .unwrap();
+        assert_recipe_claims_are_sanitized(&store.load().unwrap(), "single");
+
+        let mut manifest = Manifest::new();
+        manifest.upsert_trusted(forged_recipe_record("manifest"));
+        store.persist_manifest_records(&manifest).unwrap();
+        assert_recipe_claims_are_sanitized(&store.load().unwrap(), "manifest");
+    }
+
+    #[test]
+    fn trusted_writer_preserves_current_recipe_claims_for_reloaded_state() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let manifest_path = tempdir.path().join("manifest.json");
+        let store = AssetStateStore::open_writer(&manifest_path, "writer", Duration::from_secs(30))
+            .unwrap();
+        store.load_or_import().unwrap();
+
+        let trusted = forged_recipe_record("trusted");
+        store.persist_record_trusted(&trusted).unwrap();
+        for proof_name in ["conversion", "conversion_performance", "heic"] {
+            assert_eq!(
+                store.load().unwrap().get("trusted").unwrap().proofs[proof_name]["conversion_recipe_id"],
+                "embedded-preview-normalized-v1"
+            );
+        }
     }
 
     #[test]

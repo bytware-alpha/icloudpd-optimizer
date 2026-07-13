@@ -342,7 +342,7 @@ fn source_age_verified_manifest() -> Manifest {
 }
 
 fn upload_verified_manifest() -> Manifest {
-    let mut manifest = source_age_verified_manifest();
+    let mut manifest = trusted_current_manifest(source_age_verified_manifest());
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
     record_icloudpd_local_mirror_proof(&mut manifest, "asset-1", local_mirror_proof())
