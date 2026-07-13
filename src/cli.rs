@@ -1850,14 +1850,7 @@ fn monitor_upload_verified_reverify<W: Write>(
     }
     let config = MonitorConfig::load(&args.config)?;
     config.validate()?;
-    let mut guard = args
-        .apply
-        .then(|| acquire_monitor_run_guard(&config))
-        .transpose()?;
-    let state_store = match guard.as_mut() {
-        Some(guard) => guard.state_store(&config.manifest_path)?.clone(),
-        None => AssetStateStore::open_immutable_read_only(&config.manifest_path)?,
-    };
+    let state_store = AssetStateStore::open_immutable_read_only(&config.manifest_path)?;
     let manifest = state_store.load()?;
     let expected = ids
         .iter()
@@ -1937,8 +1930,12 @@ fn monitor_upload_verified_reverify<W: Write>(
     }
     let updated = reverify_changed_records(&expected, updated);
     let would_change_count = updated.len() as u64;
-    let changed_count = if args.apply && !updated.is_empty() {
-        state_store.persist_records_exact_cas_atomic_trusted(
+    let changed_count = if reverify_needs_writer(args.apply, updated.len()) {
+        let mut guard = acquire_monitor_run_guard(&config)?;
+        let writer_store = guard.state_store(&config.manifest_path)?.clone();
+        let current = writer_store.load()?;
+        reverify_exact_snapshot_still_current(&current, &expected)?;
+        writer_store.persist_records_exact_cas_atomic_trusted(
             updated
                 .iter()
                 .map(|updated| AssetRecordExactCasUpdate {
@@ -1947,7 +1944,7 @@ fn monitor_upload_verified_reverify<W: Write>(
                 })
                 .collect::<Vec<_>>(),
         )?;
-        state_store.export_json()?;
+        writer_store.export_json()?;
         would_change_count
     } else {
         0
@@ -1968,6 +1965,27 @@ fn monitor_upload_verified_reverify<W: Write>(
         "upload-verified-reverify: verified={} changed={} applied={} elapsed_ms={}",
         report.verified_count, report.changed_count, report.applied, report.elapsed_millis
     );
+    Ok(())
+}
+
+fn reverify_needs_writer(apply: bool, changed_records: usize) -> bool {
+    apply && changed_records != 0
+}
+
+fn reverify_exact_snapshot_still_current(
+    current: &Manifest,
+    expected: &BTreeMap<String, AssetRecord>,
+) -> Result<(), CliError> {
+    for (asset_id, expected_record) in expected {
+        let current_record = current.get(asset_id).map_err(WorkflowError::Manifest)?;
+        if current_record != expected_record {
+            return Err(CliError::OriginalAssetsReconcileGate {
+                message:
+                    "upload-verified-reverify selected record changed during read-only verification"
+                        .to_string(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -2074,6 +2092,13 @@ mod upload_verified_reverify_tests {
         let current = record("current", "unchanged");
         let expected = BTreeMap::from([(current.asset_id.clone(), current.clone())]);
         assert!(reverify_changed_records(&expected, vec![current]).is_empty());
+    }
+
+    #[test]
+    fn reverify_writer_is_not_needed_for_all_current_apply_or_dry_run() {
+        assert!(!reverify_needs_writer(true, 0));
+        assert!(!reverify_needs_writer(false, 1));
+        assert!(reverify_needs_writer(true, 1));
     }
 }
 
