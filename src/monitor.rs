@@ -27,6 +27,7 @@ use crate::adjusted_source::{
 };
 use crate::cli::{
     UPLOAD_PROOF_CHILD_PROTOCOL_VERSION, UploadProofChildInput, UploadProofChildResponse,
+    upload_proof_child_record_sha256,
 };
 use crate::conversion_execution::{
     ConversionExecutionError, ConversionExecutionRequest, execute_measured_conversion,
@@ -3649,8 +3650,9 @@ fn run_rolling_asset_upload(
         asset_id,
         manifest,
         summary,
-        |asset_id, record, session_path, timeout_seconds| {
+        |manifest_path, asset_id, record, session_path, timeout_seconds| {
             run_upload_proof_direct_child_response_with_timeout(
+                manifest_path,
                 asset_id,
                 record,
                 session_path,
@@ -3669,7 +3671,7 @@ fn run_rolling_asset_upload_with_child<F>(
     child_runner: F,
 ) -> Result<RollingAssetStepOutcome, MonitorError>
 where
-    F: FnOnce(&str, &AssetRecord, &Path, u64) -> Result<Vec<u8>, MonitorError>,
+    F: FnOnce(&Path, &str, &AssetRecord, &Path, u64) -> Result<Vec<u8>, MonitorError>,
 {
     let session_path = required_path(&config.upload_session_path, "upload_session_path")?;
     let (heic, destination, record) = {
@@ -3725,6 +3727,7 @@ where
     );
 
     match child_runner(
+        &config.manifest_path,
         asset_id,
         &record,
         session_path,
@@ -5058,6 +5061,7 @@ fn run_upload_proof_child_with_timeout(
 }
 
 fn run_upload_proof_direct_child_response_with_timeout(
+    manifest_path: &Path,
     asset_id: &str,
     record: &AssetRecord,
     session_path: &Path,
@@ -5069,6 +5073,7 @@ fn run_upload_proof_direct_child_response_with_timeout(
     })?;
     run_upload_proof_direct_child_response_executable_with_timeout(
         &executable,
+        manifest_path,
         asset_id,
         record,
         session_path,
@@ -5078,6 +5083,7 @@ fn run_upload_proof_direct_child_response_with_timeout(
 
 fn run_upload_proof_direct_child_response_executable_with_timeout(
     executable: &Path,
+    manifest_path: &Path,
     asset_id: &str,
     record: &AssetRecord,
     session_path: &Path,
@@ -5088,7 +5094,15 @@ fn run_upload_proof_direct_child_response_executable_with_timeout(
     let input = serde_json::to_vec(&UploadProofChildInput {
         version: UPLOAD_PROOF_CHILD_PROTOCOL_VERSION,
         asset_id: asset_id.to_string(),
-        record: record.clone(),
+        trusted_state_manifest_path: manifest_path.to_path_buf(),
+        expected_state: record.state,
+        expected_record_updated_at: record.updated_at.clone(),
+        expected_record_sha256: upload_proof_child_record_sha256(record).map_err(|source| {
+            MonitorError::CommandFailed {
+                program: "icloudpd-optimizer",
+                message: format!("failed to encode upload child record witness: {source}"),
+            }
+        })?,
         session_path: session_path.to_path_buf(),
     })
     .map_err(|source| MonitorError::CommandFailed {
@@ -12319,6 +12333,7 @@ esac
 
         let response = run_upload_proof_direct_child_response_executable_with_timeout(
             &helper_path,
+            &tempdir.path().join("manifest.json"),
             "raw-test",
             &lifecycle_record("raw-test", State::ConversionVerified),
             &session_path,
@@ -12341,6 +12356,13 @@ esac
                 .expect("child input should be JSON");
         assert_eq!(input.version, UPLOAD_PROOF_CHILD_PROTOCOL_VERSION);
         assert_eq!(input.asset_id, "raw-test");
+        assert_eq!(
+            input.trusted_state_manifest_path,
+            tempdir.path().join("manifest.json")
+        );
+        assert_eq!(input.expected_state, State::ConversionVerified);
+        assert!(!input.expected_record_updated_at.is_empty());
+        assert_eq!(input.expected_record_sha256.len(), 64);
     }
 
     #[test]
@@ -12401,7 +12423,7 @@ esac
             "asset",
             &manifest,
             &summary,
-            |_asset_id, _record, _session_path, _timeout_seconds| {
+            |_manifest_path, _asset_id, _record, _session_path, _timeout_seconds| {
                 Ok(serde_json::to_vec(&mismatch).unwrap())
             },
         )

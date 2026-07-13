@@ -73,13 +73,17 @@ const FAILED_ASSETS_QUARANTINE_TARGET_SET_FINGERPRINT_VERSION: &[u8] =
     b"failed-assets-quarantine-target-set-v2";
 const LEGACY_FAILURES_CLASSIFY_TARGET_SET_FINGERPRINT_VERSION: &[u8] =
     b"legacy-failures-classify-target-set-v1";
-pub(crate) const UPLOAD_PROOF_CHILD_PROTOCOL_VERSION: u8 = 2;
+pub(crate) const UPLOAD_PROOF_CHILD_PROTOCOL_VERSION: u8 = 3;
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct UploadProofChildInput {
     pub version: u8,
     pub asset_id: String,
-    pub record: AssetRecord,
+    pub trusted_state_manifest_path: PathBuf,
+    pub expected_state: State,
+    pub expected_record_updated_at: String,
+    pub expected_record_sha256: String,
     pub session_path: PathBuf,
 }
 
@@ -1013,13 +1017,21 @@ fn run_upload_proof_child_protocol<R: Read, W: Write>(
     writer: &mut W,
 ) -> Result<(), CliError> {
     let input: UploadProofChildInput = serde_json::from_reader(reader)?;
-    if input.version != UPLOAD_PROOF_CHILD_PROTOCOL_VERSION
-        || input.record.asset_id != input.asset_id
+    if input.version != UPLOAD_PROOF_CHILD_PROTOCOL_VERSION {
+        return Err(CliError::InvalidPrivateChildProtocol);
+    }
+    let state_store = AssetStateStore::open_read_only(&input.trusted_state_manifest_path)?;
+    let manifest = state_store.load()?;
+    let record = manifest
+        .get(&input.asset_id)
+        .map_err(WorkflowError::Manifest)?;
+    if record.asset_id != input.asset_id
+        || record.state != input.expected_state
+        || record.updated_at != input.expected_record_updated_at
+        || upload_proof_child_record_sha256(record)? != input.expected_record_sha256
     {
         return Err(CliError::InvalidPrivateChildProtocol);
     }
-    let mut manifest = Manifest::new();
-    manifest.upsert_trusted(input.record);
     let heic = upload_ready_heic_proof(&manifest, &input.asset_id)?;
     verify_local_heic(&heic)?;
     load_upload_session(&input.session_path)?;
@@ -1039,6 +1051,11 @@ fn run_upload_proof_child_protocol<R: Read, W: Write>(
     )?;
     writeln!(writer)?;
     Ok(())
+}
+
+pub(crate) fn upload_proof_child_record_sha256(record: &AssetRecord) -> Result<String, CliError> {
+    let bytes = serde_json::to_vec(record)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn run_with_writer<W: Write>(cli: Cli, writer: &mut W) -> Result<(), CliError> {
@@ -3862,6 +3879,180 @@ fn queue_raw_size_bytes(record: &AssetRecord) -> u64 {
         .and_then(|proof| proof.get("size_bytes"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod upload_proof_child_protocol_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn child_input(
+        manifest_path: &Path,
+        record: &AssetRecord,
+        session_path: &Path,
+    ) -> UploadProofChildInput {
+        UploadProofChildInput {
+            version: UPLOAD_PROOF_CHILD_PROTOCOL_VERSION,
+            asset_id: record.asset_id.clone(),
+            trusted_state_manifest_path: manifest_path.to_path_buf(),
+            expected_state: record.state,
+            expected_record_updated_at: record.updated_at.clone(),
+            expected_record_sha256: upload_proof_child_record_sha256(record).unwrap(),
+            session_path: session_path.to_path_buf(),
+        }
+    }
+
+    fn run_child(input: &UploadProofChildInput) -> Result<(), CliError> {
+        let request = serde_json::to_vec(input).unwrap();
+        let mut request = request.as_slice();
+        let mut output = Vec::new();
+        run_upload_proof_child_protocol(&mut request, &mut output)
+    }
+
+    fn conversion_verified_record(tempdir: &tempfile::TempDir) -> (AssetRecord, PathBuf) {
+        let raw_path = tempdir.path().join("asset.DNG");
+        let heic_path = tempdir.path().join("asset.HEIC");
+        let raw_bytes = b"raw bytes that are larger than the HEIC";
+        let heic_bytes = b"verified heic";
+        fs::write(&raw_path, raw_bytes).unwrap();
+        fs::write(&heic_path, heic_bytes).unwrap();
+        let raw_sha256 = format!("{:x}", Sha256::digest(raw_bytes));
+        let heic_sha256 = format!("{:x}", Sha256::digest(heic_bytes));
+        let mut record = AssetRecord::new("asset", &raw_path);
+        record.state = State::ConversionVerified;
+        record.proofs.insert("nas".to_string(), serde_json::json!({
+            "canonical_path": raw_path, "relative_path": "asset.DNG", "size_bytes": raw_bytes.len(),
+            "modified_unix_seconds": 1_700_000_000u64, "age_seconds": 2_592_000u64, "sha256": raw_sha256,
+        }));
+        for proof_name in ["conversion", "heic"] {
+            record.proofs.insert(proof_name.to_string(), serde_json::json!({
+                "heic_path": heic_path, "heic_sha256": heic_sha256, "size_bytes": heic_bytes.len(),
+                "conversion_recipe_id": crate::workflow::EMBEDDED_PREVIEW_CONVERSION_RECIPE,
+                "heif_info_ok": true, "metadata_copied": true, "visual_content_ok": true, "visual_match_ok": true,
+            }));
+        }
+        record.proofs.insert("conversion_performance".to_string(), serde_json::json!({
+            "schema_version": 1, "measured_at_unix_seconds": 1_800_000_001u64,
+            "measurement_method": "monotonic_wall_clock", "conversion_tool": "test-tool",
+            "conversion_recipe_id": crate::workflow::EMBEDDED_PREVIEW_CONVERSION_RECIPE,
+            "heic_quality": 90, "raw_size_bytes": raw_bytes.len(), "heic_size_bytes": heic_bytes.len(),
+            "convert_wall_time_millis": 10, "total_wall_time_millis": 11,
+        }));
+        (record, heic_path)
+    }
+
+    #[test]
+    fn private_upload_child_request_rejects_legacy_record_payload() {
+        let legacy = serde_json::json!({
+            "version": UPLOAD_PROOF_CHILD_PROTOCOL_VERSION,
+            "asset_id": "asset",
+            "record": AssetRecord::new("asset", "/raw/asset.dng"),
+            "session_path": "/missing/session.json",
+        });
+
+        assert!(serde_json::from_value::<UploadProofChildInput>(legacy).is_err());
+    }
+
+    #[test]
+    fn private_upload_child_is_absent_from_clap_help_and_parser() {
+        let root_help = Cli::command().render_help().to_string();
+        assert!(!root_help.contains("__upload-proof-child"));
+
+        let workflow_help = Cli::try_parse_from(["icloudpd-optimizer", "workflow", "--help"])
+            .expect_err("workflow help should stop parsing");
+        assert!(!workflow_help.to_string().contains("__upload-proof-child"));
+
+        assert!(Cli::try_parse_from(["icloudpd-optimizer", "__upload-proof-child"]).is_err());
+    }
+
+    #[test]
+    fn private_upload_child_rejects_state_or_digest_witness_mismatch_before_session() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let manifest_path = tempdir.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&manifest_path, "test-writer", Duration::from_secs(30))
+                .unwrap();
+        let mut record = AssetRecord::new("asset", tempdir.path().join("asset.DNG"));
+        record.state = State::ConversionVerified;
+        store.persist_record_trusted(&record).unwrap();
+        let persisted = store.load().unwrap().get("asset").unwrap().clone();
+
+        let mut wrong_state = child_input(
+            &manifest_path,
+            &persisted,
+            &tempdir.path().join("missing-session.json"),
+        );
+        wrong_state.expected_state = State::NasVerified;
+        assert!(matches!(
+            run_child(&wrong_state),
+            Err(CliError::InvalidPrivateChildProtocol)
+        ));
+
+        let mut wrong_digest = child_input(
+            &manifest_path,
+            &persisted,
+            &tempdir.path().join("missing-session.json"),
+        );
+        wrong_digest.expected_record_sha256 = "0".repeat(64);
+        assert!(matches!(
+            run_child(&wrong_digest),
+            Err(CliError::InvalidPrivateChildProtocol)
+        ));
+    }
+
+    #[test]
+    fn private_upload_child_rejects_public_writer_sanitized_forged_recipe_before_session() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let manifest_path = tempdir.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&manifest_path, "test-writer", Duration::from_secs(30))
+                .unwrap();
+        let mut forged = AssetRecord::new("asset", tempdir.path().join("asset.DNG"));
+        forged.state = State::ConversionVerified;
+        for proof_name in ["conversion", "conversion_performance", "heic"] {
+            forged.proofs.insert(
+                proof_name.to_string(),
+                serde_json::json!({
+                    "conversion_recipe_id": crate::workflow::EMBEDDED_PREVIEW_CONVERSION_RECIPE,
+                }),
+            );
+        }
+        store.persist_record(&forged).unwrap();
+        let persisted = store.load().unwrap().get("asset").unwrap().clone();
+        assert_eq!(persisted.proofs["heic"]["conversion_recipe_id"], "");
+
+        let error = run_child(&child_input(
+            &manifest_path,
+            &persisted,
+            &tempdir.path().join("missing-session.json"),
+        ))
+        .unwrap_err();
+        assert!(!error.to_string().contains("missing-session"));
+    }
+
+    #[test]
+    fn private_upload_child_rechecks_local_heic_before_loading_session() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let manifest_path = tempdir.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&manifest_path, "test-writer", Duration::from_secs(30))
+                .unwrap();
+        let (record, heic_path) = conversion_verified_record(&tempdir);
+        store.persist_record_trusted(&record).unwrap();
+        let persisted = store.load().unwrap().get("asset").unwrap().clone();
+        fs::write(&heic_path, b"changed HEIC bytes").unwrap();
+
+        let error = run_child(&child_input(
+            &manifest_path,
+            &persisted,
+            &tempdir.path().join("missing-session.json"),
+        ))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("HEIC size mismatch")
+                || error.to_string().contains("HEIC SHA-256 mismatch")
+        );
+    }
 }
 
 #[cfg(test)]
