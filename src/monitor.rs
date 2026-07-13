@@ -11176,6 +11176,134 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exact_legacy_metadata_failures_remain_untyped_on_disk_but_admit_their_retry_policy() {
+        let cases = [
+            (
+                "reference-orientation",
+                "HEIC metadata verification failed: ReferenceOrientationInvalid",
+                FailureKind::HeicReferenceOrientationInvalid,
+                "retryable_heic_reference_orientation_invalid",
+            ),
+            (
+                "final-rotation",
+                "HEIC metadata verification failed: FinalOrientationRotationInvalid",
+                FailureKind::HeicFinalOrientationRotationInvalid,
+                "retryable_heic_final_orientation_rotation_invalid",
+            ),
+            (
+                "dimensions",
+                "HEIC metadata verification failed: DimensionMismatch",
+                FailureKind::HeicDimensionMismatch,
+                "retryable_heic_dimension_mismatch",
+            ),
+        ];
+        let mut manifest = Manifest::new();
+        for (asset_id, message, _, _) in cases {
+            manifest.upsert(policy_failed_record(
+                asset_id,
+                "heic_verify",
+                message,
+                None,
+                "100.000000000Z",
+            ));
+        }
+
+        for (asset_id, _, expected_kind, expected_bucket) in cases {
+            let record = manifest.get(asset_id).expect("legacy record should exist");
+            assert_eq!(
+                record.failures.last().and_then(|failure| failure.kind),
+                None
+            );
+            assert_eq!(last_failure_kind(record), Some(expected_kind));
+            let policy = failed_retry_policy(expected_kind).expect("metadata failure is retryable");
+            assert_eq!(policy.bucket, expected_bucket);
+            assert_eq!(policy.retry_state, State::Converted);
+            assert_eq!(policy.max_attempts, 1);
+        }
+
+        let admission = admit_failed_retryable_assets(&mut manifest, 3, 3, 300, 3_000_000)
+            .expect("exact legacy metadata failures should admit");
+        assert_eq!(admission.unknown, 0);
+        for (asset_id, _, _, expected_bucket) in cases {
+            assert_eq!(admission.admitted_by_category[expected_bucket], 1);
+            assert_eq!(manifest.get(asset_id).unwrap().state, State::Converted);
+        }
+    }
+
+    #[test]
+    fn near_match_legacy_metadata_failures_remain_unknown_and_unadmitted() {
+        let cases = [
+            (
+                "message-suffix",
+                "heic_verify",
+                "HEIC metadata verification failed: ReferenceOrientationInvalid (retry)",
+            ),
+            (
+                "message-prefix",
+                "heic_verify",
+                "legacy HEIC metadata verification failed: FinalOrientationRotationInvalid",
+            ),
+            (
+                "exit-status",
+                "conversion",
+                "metadata command failed: exiftool exited with exit status: 2",
+            ),
+            (
+                "punctuation",
+                "heic_verify",
+                "HEIC metadata verification failed: DimensionMismatch!",
+            ),
+            (
+                "category-lookalike",
+                "heic_verify",
+                "HEIC metadata verification failed: ReferenceOrientationInvalidLegacy",
+            ),
+        ];
+        let mut manifest = Manifest::new();
+        for (asset_id, stage, message) in cases {
+            manifest.upsert(policy_failed_record(
+                asset_id,
+                stage,
+                message,
+                None,
+                "100.000000000Z",
+            ));
+        }
+
+        for (asset_id, _, _) in cases {
+            let record = manifest
+                .get(asset_id)
+                .expect("near-match record should exist");
+            assert_eq!(
+                record.failures.last().and_then(|failure| failure.kind),
+                None
+            );
+            assert_eq!(last_failure_kind(record), None);
+            assert_eq!(
+                classify_legacy_embedded_preview_migration(record),
+                LegacyEmbeddedPreviewMigrationClassification::ClassifierMismatch
+            );
+        }
+        assert_eq!(
+            failed_retry_queue_counts_at(&manifest, 3_000_000)["failed_unknown"],
+            5
+        );
+
+        let admission = admit_failed_retryable_assets(&mut manifest, 5, 5, 300, 3_000_000)
+            .expect("near-match legacy failures should remain manual");
+        assert_eq!(admission.unknown, 5);
+        assert!(admission.admitted_by_category.is_empty());
+        for (asset_id, _, _) in cases {
+            let record = manifest
+                .get(asset_id)
+                .expect("near-match record should remain");
+            assert_eq!(record.state, State::Failed);
+            assert!(!record.proofs.contains_key(FAILURE_RETRY_PROOF));
+            assert!(!record.proofs.contains_key(FAILURE_RETRY_V3_PROOF));
+        }
+    }
+
     #[cfg(unix)]
     fn invalid_orientation_verifier_tools() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
