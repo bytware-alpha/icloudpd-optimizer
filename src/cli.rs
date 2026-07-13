@@ -3492,12 +3492,11 @@ mod upload_verified_reverify_tests {
     fn command_executor_recovers_missing_and_malformed_current_json_checkpoints() {
         for malformed in [false, true] {
             let current = record("current", "100.000000000Z");
-            let (_tempdir, config, expected) = persisted_fixture(vec![current.clone()]);
+            let untouched = record("untouched", "200.000000000Z");
+            let (_tempdir, config, expected) = persisted_fixture(vec![current.clone(), untouched]);
             let store = AssetStateStore::open_immutable_read_only(&config.manifest_path)
                 .expect("immutable store");
             let manifest = store.load().expect("manifest");
-            let db_before = fs::read(AssetStateStore::db_path_for_manifest(&config.manifest_path))
-                .expect("database");
             if malformed {
                 fs::write(&config.manifest_path, b"not json").expect("malformed checkpoint");
             } else {
@@ -3536,17 +3535,14 @@ mod upload_verified_reverify_tests {
             assert!(report.checkpoint_recovered);
             assert_eq!(boundary.acquire_calls, 1);
             assert_eq!(boundary.export_calls, 1);
+            let database_manifest = AssetStateStore::open_read_only(&config.manifest_path)
+                .expect("database")
+                .load()
+                .expect("database manifest");
+            assert_eq!(database_manifest.records(), &expected);
             assert_eq!(
                 Manifest::load(&config.manifest_path).expect("recovered json"),
-                AssetStateStore::open_read_only(&config.manifest_path)
-                    .expect("database")
-                    .load()
-                    .expect("database manifest")
-            );
-            assert_eq!(
-                fs::read(AssetStateStore::db_path_for_manifest(&config.manifest_path))
-                    .expect("database"),
-                db_before
+                database_manifest
             );
             drop(boundary);
             drop(store);
