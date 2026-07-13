@@ -395,13 +395,13 @@ struct TestMacosFchflagsState {
 
 #[cfg(all(test, target_os = "macos"))]
 thread_local! {
-    static TEST_MACOS_FCHFLAGS_STATE: RefCell<TestMacosFchflagsState> = RefCell::new(TestMacosFchflagsState {
+    static TEST_MACOS_FCHFLAGS_STATE: RefCell<TestMacosFchflagsState> = const { RefCell::new(TestMacosFchflagsState {
         failures: VecDeque::new(),
         calls: Vec::new(),
         metadata_failures: VecDeque::new(),
         metadata_calls: Vec::new(),
         source_pause: None,
-    });
+    }) };
 }
 
 #[cfg(all(test, target_os = "macos"))]
