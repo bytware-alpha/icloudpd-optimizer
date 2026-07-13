@@ -1,7 +1,9 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::marker::PhantomData;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -55,6 +57,7 @@ pub struct VerifiedUploadSource {
     last_modified_millis: u64,
     identity: UploadFileIdentity,
     file: File,
+    _sequential_only: PhantomData<Cell<()>>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -144,13 +147,19 @@ impl VerifiedUploadSource {
             last_modified_millis,
             identity: upload_file_identity(&metadata),
             file,
+            _sequential_only: PhantomData,
         })
     }
 
     fn upload_file(&self) -> Result<File, UploadError> {
-        let file = self
+        let mut file = self
             .file
             .try_clone()
+            .map_err(|source| UploadError::ReadHeic {
+                path: self.path.clone(),
+                source,
+            })?;
+        file.seek(SeekFrom::Start(0))
             .map_err(|source| UploadError::ReadHeic {
                 path: self.path.clone(),
                 source,
@@ -5134,6 +5143,102 @@ mod tests {
         assert_eq!(streamed, bytes);
         assert_eq!(size_bytes, bytes.len() as u64);
         assert_eq!(sha256, format!("{:x}", Sha256::digest(&bytes)));
+    }
+
+    #[derive(Default)]
+    struct RecordingUploadTransport {
+        uploaded_bodies: Vec<Vec<u8>>,
+    }
+
+    impl PhotosUploadTransport for RecordingUploadTransport {
+        fn post_service_json(
+            &mut self,
+            _session: &UploadSession,
+            endpoint: PhotosUploadEndpoint,
+            _payload: Value,
+        ) -> Result<Value, UploadError> {
+            Ok(match endpoint {
+                PhotosUploadEndpoint::CreateUploadUrl => json!({
+                    "uploadUrls": {"upload": "https://uploads.icloud.com/signed"}
+                }),
+                PhotosUploadEndpoint::PutAsset => {
+                    json!([{
+                        "uploadJobId": "job",
+                        "cplMaster": "master",
+                        "cplAsset": "asset"
+                    }])
+                }
+                PhotosUploadEndpoint::UploadStatus => json!({"job": {"status": "COMPLETED"}}),
+            })
+        }
+
+        fn post_signed_upload(
+            &mut self,
+            _session: &UploadSession,
+            _upload_url: &Url,
+            mut heic_file: File,
+            heic_size: u64,
+        ) -> Result<(SingleFileUploadRequest, String, u64), UploadError> {
+            let mut body = Vec::new();
+            heic_file
+                .read_to_end(&mut body)
+                .expect("recording transport should read upload body");
+            assert_eq!(body.len() as u64, heic_size);
+            let checksum = format!("{:x}", Sha256::digest(&body));
+            self.uploaded_bodies.push(body);
+            Ok((
+                SingleFileUploadRequest {
+                    file_checksum: checksum.clone(),
+                    size_bytes: heic_size,
+                    wrapping_key: None,
+                    reference_checksum: "reference".to_owned(),
+                    receipt: "receipt".to_owned(),
+                },
+                checksum,
+                heic_size,
+            ))
+        }
+    }
+
+    #[test]
+    fn verified_upload_source_rewinds_each_sequential_upload() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let heic_path = tempdir.path().join("IMG_0001.heic");
+        let bytes: Vec<u8> = (0..(HASH_BUFFER_BYTES + 137))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        std::fs::write(&heic_path, &bytes).expect("HEIC bytes should be written");
+        let source = VerifiedUploadSource::open_candidate(&heic_path).expect("source should open");
+        let session = UploadSession {
+            dsid: "123456789".to_owned(),
+            photosupload_url: Url::parse("https://photos.example.com").expect("session URL"),
+            cookies: vec![],
+            local_time_zone_id: "UTC".to_owned(),
+            time_zone_offset_minutes: 0,
+        };
+        let mut client = PhotosUploadClient::new(RecordingUploadTransport::default());
+        let expected_hash = format!("{:x}", Sha256::digest(&bytes));
+
+        let first = client
+            .upload_verified_source_to_library(
+                &session,
+                &source,
+                &CloudKitLibraryDestination::primary_sync(),
+            )
+            .expect("first upload should succeed");
+        let second = client
+            .upload_verified_source_to_library(
+                &session,
+                &source,
+                &CloudKitLibraryDestination::primary_sync(),
+            )
+            .expect("second upload should succeed");
+
+        assert_eq!(first.streamed_heic_sha256, expected_hash);
+        assert_eq!(first.streamed_size_bytes, bytes.len() as u64);
+        assert_eq!(second.streamed_heic_sha256, expected_hash);
+        assert_eq!(second.streamed_size_bytes, bytes.len() as u64);
+        assert_eq!(client.transport.uploaded_bodies, vec![bytes.clone(), bytes]);
     }
 
     fn valid_delete_session() -> CloudKitDeleteSession {
