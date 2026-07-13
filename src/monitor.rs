@@ -3569,27 +3569,26 @@ fn run_rolling_asset_verify(
             };
             match result {
                 Ok(()) => {
-                    let mut fields = json!({
-                        "asset_id": asset_id,
-                        "verified": true,
-                        "mode": "rolling_asset_queue",
-                    });
-                    append_visual_verification_event_fields(&mut fields, visual_metrics);
-                    append_metadata_probe_event_fields(
-                        &mut fields,
-                        metadata_probe_wall_time_millis,
+                    let fields = heic_verification_finished_event_fields(
+                        asset_id,
+                        true,
+                        None,
+                        Some("rolling_asset_queue"),
+                        Some(visual_metrics),
+                        Some(metadata_probe_wall_time_millis),
                     );
                     log_monitor_event("heic_verify_finished", scan_started, fields);
                     Ok(RollingAssetStepOutcome::completed())
                 }
                 Err(message) => {
-                    let mut fields = json!({
-                        "asset_id": asset_id,
-                        "verified": false,
-                        "error": message,
-                        "mode": "rolling_asset_queue",
-                    });
-                    append_visual_verification_event_fields(&mut fields, visual_metrics);
+                    let fields = heic_verification_finished_event_fields(
+                        asset_id,
+                        false,
+                        Some(message),
+                        Some("rolling_asset_queue"),
+                        Some(visual_metrics),
+                        Some(metadata_probe_wall_time_millis),
+                    );
                     log_monitor_event("heic_verify_finished", scan_started, fields);
                     Ok(RollingAssetStepOutcome::failed(false))
                 }
@@ -3617,18 +3616,20 @@ fn run_rolling_asset_verify(
                         "heic_verification",
                     )?;
                 } else {
-                    record_monitor_failure(&mut summary, error);
+                    record_monitor_failure(&mut summary, &error);
                 }
             }
             log_monitor_event(
                 "heic_verify_finished",
                 scan_started,
-                json!({
-                    "asset_id": asset_id,
-                    "verified": false,
-                    "error": message,
-                    "mode": "rolling_asset_queue",
-                }),
+                heic_verification_finished_event_fields(
+                    asset_id,
+                    false,
+                    Some(message),
+                    Some("rolling_asset_queue"),
+                    None,
+                    metadata_probe_wall_time_millis(&error),
+                ),
             );
             Ok(RollingAssetStepOutcome::failed(false))
         }
@@ -4292,17 +4293,19 @@ fn verify_converted_heics(
                         &outcome.asset_id,
                         verification.proof,
                     ) {
-                        Ok(()) => verified_assets.push((outcome.asset_id, visual_metrics)),
+                        Ok(()) => verified_assets.push((
+                            outcome.asset_id,
+                            visual_metrics,
+                            metadata_probe_wall_time_millis,
+                        )),
                         Err(message) => {
-                            let mut fields = json!({
-                                "asset_id": outcome.asset_id,
-                                "verified": false,
-                                "error": message,
-                            });
-                            append_visual_verification_event_fields(&mut fields, visual_metrics);
-                            append_metadata_probe_event_fields(
-                                &mut fields,
-                                metadata_probe_wall_time_millis,
+                            let fields = heic_verification_finished_event_fields(
+                                &outcome.asset_id,
+                                false,
+                                Some(message),
+                                None,
+                                Some(visual_metrics),
+                                Some(metadata_probe_wall_time_millis),
                             );
                             log_monitor_event(
                                 "heic_verify_finished",
@@ -4325,11 +4328,14 @@ fn verify_converted_heics(
                     log_monitor_event(
                         "heic_verify_finished",
                         summary.started_unix_seconds,
-                        json!({
-                            "asset_id": outcome.asset_id,
-                            "verified": false,
-                            "error": message,
-                        }),
+                        heic_verification_finished_event_fields(
+                            &outcome.asset_id,
+                            false,
+                            Some(message),
+                            None,
+                            None,
+                            metadata_probe_wall_time_millis(&error),
+                        ),
                     );
                     should_stop |= matches!(error, MonitorError::CommandTimeout { .. });
                     if monitor_failure_kind(&error).is_none() {
@@ -4340,12 +4346,15 @@ fn verify_converted_heics(
         }
         if manifest_changed || !verified_assets.is_empty() {
             checkpoint_manifest_state(state_store, manifest)?;
-            for (asset_id, visual_metrics) in verified_assets {
-                let mut fields = json!({
-                    "asset_id": asset_id,
-                    "verified": true,
-                });
-                append_visual_verification_event_fields(&mut fields, visual_metrics);
+            for (asset_id, visual_metrics, metadata_probe_wall_time_millis) in verified_assets {
+                let fields = heic_verification_finished_event_fields(
+                    &asset_id,
+                    true,
+                    None,
+                    None,
+                    Some(visual_metrics),
+                    Some(metadata_probe_wall_time_millis),
+                );
                 log_monitor_event("heic_verify_finished", summary.started_unix_seconds, fields);
             }
         }
@@ -4426,12 +4435,15 @@ fn monitor_failure_kind(error: &MonitorError) -> Option<FailureKind> {
     match error {
         MonitorError::HeicMetadataVerification {
             kind: HeicMetadataFailure::ReferenceOrientationInvalid,
+            ..
         } => Some(FailureKind::HeicReferenceOrientationInvalid),
         MonitorError::HeicMetadataVerification {
             kind: HeicMetadataFailure::FinalOrientationRotationInvalid,
+            ..
         } => Some(FailureKind::HeicFinalOrientationRotationInvalid),
         MonitorError::HeicMetadataVerification {
             kind: HeicMetadataFailure::DimensionMismatch,
+            ..
         } => Some(FailureKind::HeicDimensionMismatch),
         _ => None,
     }
@@ -9497,30 +9509,33 @@ fn verify_converted_heic(
         &oriented_preview,
         timeout_seconds,
         HeicMetadataFailure::ReferenceOrientationInvalid,
-    )?;
+    )
+    .map_err(|error| timed_metadata_probe_error(error, metadata_probe_started))?;
     validate_normal_orientation(
         &reference_metadata,
         HeicMetadataFailure::ReferenceOrientationInvalid,
-    )?;
+    )
+    .map_err(|error| timed_metadata_probe_error(error, metadata_probe_started))?;
     let final_metadata = read_media_metadata(
         &conversion.heic_path,
         timeout_seconds,
         HeicMetadataFailure::FinalOrientationRotationInvalid,
-    )?;
+    )
+    .map_err(|error| timed_metadata_probe_error(error, metadata_probe_started))?;
     validate_normal_orientation(
         &final_metadata,
         HeicMetadataFailure::FinalOrientationRotationInvalid,
-    )?;
-    validate_zero_rotation(&final_metadata)?;
+    )
+    .map_err(|error| timed_metadata_probe_error(error, metadata_probe_started))?;
+    validate_zero_rotation(&final_metadata)
+        .map_err(|error| timed_metadata_probe_error(error, metadata_probe_started))?;
     if reference_metadata.dimensions != final_metadata.dimensions {
-        return Err(metadata_verification_error(
-            HeicMetadataFailure::DimensionMismatch,
+        return Err(timed_metadata_probe_error(
+            metadata_verification_error(HeicMetadataFailure::DimensionMismatch),
+            metadata_probe_started,
         ));
     }
-    let metadata_probe_wall_time_millis =
-        u64::try_from(metadata_probe_started.elapsed().as_millis())
-            .unwrap_or(u64::MAX)
-            .max(1);
+    let metadata_probe_wall_time_millis = metadata_probe_elapsed_millis(metadata_probe_started);
     let metadata_copied = true;
     let visual_metrics =
         visual_metrics_for_conversion(&oriented_preview, &conversion.heic_path, timeout_seconds)?;
@@ -9611,7 +9626,43 @@ fn read_media_metadata(
 }
 
 fn metadata_verification_error(kind: HeicMetadataFailure) -> MonitorError {
-    MonitorError::HeicMetadataVerification { kind }
+    MonitorError::HeicMetadataVerification {
+        kind,
+        metadata_probe_wall_time_millis: None,
+    }
+}
+
+fn metadata_probe_elapsed_millis(metadata_probe_started: Instant) -> u64 {
+    u64::try_from(metadata_probe_started.elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
+fn timed_metadata_probe_error(
+    error: MonitorError,
+    metadata_probe_started: Instant,
+) -> MonitorError {
+    match error {
+        MonitorError::HeicMetadataVerification { kind, .. } => {
+            MonitorError::HeicMetadataVerification {
+                kind,
+                metadata_probe_wall_time_millis: Some(metadata_probe_elapsed_millis(
+                    metadata_probe_started,
+                )),
+            }
+        }
+        error => error,
+    }
+}
+
+fn metadata_probe_wall_time_millis(error: &MonitorError) -> Option<u64> {
+    match error {
+        MonitorError::HeicMetadataVerification {
+            metadata_probe_wall_time_millis,
+            ..
+        } => *metadata_probe_wall_time_millis,
+        _ => None,
+    }
 }
 
 fn validate_normal_orientation(
@@ -9848,6 +9899,33 @@ fn append_metadata_probe_event_fields(fields: &mut serde_json::Value, wall_time_
             json!(wall_time_millis),
         );
     }
+}
+
+fn heic_verification_finished_event_fields(
+    asset_id: &str,
+    verified: bool,
+    error: Option<String>,
+    mode: Option<&str>,
+    visual_metrics: Option<VisualMetrics>,
+    metadata_probe_wall_time_millis: Option<u64>,
+) -> serde_json::Value {
+    let mut fields = json!({
+        "asset_id": asset_id,
+        "verified": verified,
+    });
+    if let Some(error) = error {
+        fields["error"] = json!(error);
+    }
+    if let Some(mode) = mode {
+        fields["mode"] = json!(mode);
+    }
+    if let Some(visual_metrics) = visual_metrics {
+        append_visual_verification_event_fields(&mut fields, visual_metrics);
+    }
+    if let Some(metadata_probe_wall_time_millis) = metadata_probe_wall_time_millis {
+        append_metadata_probe_event_fields(&mut fields, metadata_probe_wall_time_millis);
+    }
+    fields
 }
 
 #[derive(Clone, Debug)]
@@ -10561,7 +10639,10 @@ pub enum MonitorError {
         timeout_seconds: u64,
     },
     #[error("HEIC metadata verification failed: {kind:?}")]
-    HeicMetadataVerification { kind: HeicMetadataFailure },
+    HeicMetadataVerification {
+        kind: HeicMetadataFailure,
+        metadata_probe_wall_time_millis: Option<u64>,
+    },
     #[error("failed to decode visual preview {path}: {source}")]
     PreviewDecode {
         path: PathBuf,
@@ -10709,7 +10790,13 @@ mod tests {
             let mut manifest = Manifest::new();
             manifest.upsert(lifecycle_record("asset", State::Converted));
             let mut summary = MonitorScanSummary::default();
-            let error = metadata_verification_error(failure);
+            let error =
+                timed_metadata_probe_error(metadata_verification_error(failure), Instant::now());
+            let expected_message = error.to_string();
+            assert!(
+                metadata_probe_wall_time_millis(&error).is_some(),
+                "timed metadata failures must carry probe duration"
+            );
 
             record_heic_monitor_error_or_failure(&mut manifest, &mut summary, "asset", &error)
                 .expect("typed metadata failures must be durable");
@@ -10719,6 +10806,13 @@ mod tests {
             assert_eq!(
                 record.failures.last().and_then(|failure| failure.kind),
                 None
+            );
+            assert_eq!(
+                record
+                    .failures
+                    .last()
+                    .map(|failure| failure.message.as_str()),
+                Some(expected_message.as_str())
             );
             assert_eq!(last_failure_kind(record), Some(expected_kind));
             let policy = failed_retry_policy(expected_kind).expect("metadata failure is retryable");
@@ -21734,6 +21828,92 @@ esac
         assert_eq!(fields["visual_mae_ppm"], json!(1_200));
         assert_eq!(fields["direct_visual_rmse_ppm"], json!(45_000));
         assert_eq!(fields["direct_visual_mae_ppm"], json!(24_000));
+    }
+
+    fn test_visual_metrics() -> VisualMetrics {
+        VisualMetrics {
+            candidate_stdev: 0.25,
+            reference_error: Some(VisualErrorMetrics {
+                rmse: 0.0024,
+                mae: 0.0012,
+            }),
+            direct_reference_error: None,
+            match_basis: VisualMatchBasis::CodecNormalized,
+        }
+    }
+
+    #[test]
+    fn rolling_heic_success_event_includes_metadata_probe_timing() {
+        let fields = heic_verification_finished_event_fields(
+            "asset",
+            true,
+            None,
+            Some("rolling_asset_queue"),
+            Some(test_visual_metrics()),
+            Some(1),
+        );
+
+        assert_eq!(fields["verified"], json!(true));
+        assert_eq!(fields["mode"], json!("rolling_asset_queue"));
+        assert_eq!(fields["metadata_probe_wall_time_millis"], json!(1));
+        assert_eq!(fields["visual_match_basis"], json!("codec_normalized"));
+    }
+
+    #[test]
+    fn rolling_heic_proof_record_failure_event_includes_metadata_probe_timing() {
+        let fields = heic_verification_finished_event_fields(
+            "asset",
+            false,
+            Some("HEIC verification failed: visual_content_ok".to_string()),
+            Some("rolling_asset_queue"),
+            Some(test_visual_metrics()),
+            Some(7),
+        );
+
+        assert_eq!(fields["verified"], json!(false));
+        assert_eq!(
+            fields["error"],
+            json!("HEIC verification failed: visual_content_ok")
+        );
+        assert_eq!(fields["metadata_probe_wall_time_millis"], json!(7));
+    }
+
+    #[test]
+    fn phased_heic_success_event_includes_metadata_probe_timing() {
+        let fields = heic_verification_finished_event_fields(
+            "asset",
+            true,
+            None,
+            None,
+            Some(test_visual_metrics()),
+            Some(11),
+        );
+
+        assert_eq!(fields["verified"], json!(true));
+        assert!(fields.get("mode").is_none());
+        assert_eq!(fields["metadata_probe_wall_time_millis"], json!(11));
+    }
+
+    #[test]
+    fn phased_typed_metadata_error_event_includes_real_probe_timing() {
+        let error = timed_metadata_probe_error(
+            metadata_verification_error(HeicMetadataFailure::ReferenceOrientationInvalid),
+            Instant::now(),
+        );
+        let timing = metadata_probe_wall_time_millis(&error)
+            .expect("typed metadata errors after probe start must retain timing");
+        let fields = heic_verification_finished_event_fields(
+            "asset",
+            false,
+            Some(error.to_string()),
+            None,
+            None,
+            metadata_probe_wall_time_millis(&error),
+        );
+
+        assert!(timing >= 1);
+        assert_eq!(fields["metadata_probe_wall_time_millis"], json!(timing));
+        assert!(fields.get("visual_match_basis").is_none());
     }
 
     #[test]
