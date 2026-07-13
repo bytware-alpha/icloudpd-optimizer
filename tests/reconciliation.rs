@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use serde_json::json;
+
 use icloudpd_optimizer::manifest::{AssetRecord, FailureRecord, Manifest, State};
 use icloudpd_optimizer::proof::NasRawProof;
 use icloudpd_optimizer::reconciliation::{
@@ -13,9 +15,8 @@ use icloudpd_optimizer::upload::{
     CloudKitOriginalAssetResolveTarget, CloudKitReplacementResourceProof,
 };
 use icloudpd_optimizer::workflow::{
-    ConversionPerformanceProof, ConversionResultProof, ConversionSourceBinding,
-    HeicVerificationProof, OriginalAssetProof, SourceAgeProof, UploadProof, WorkflowError,
-    mark_delete_eligible, record_source_age_proof,
+    OriginalAssetProof, SourceAgeProof, UploadProof, WorkflowError, mark_delete_eligible,
+    record_source_age_proof,
 };
 
 const DAY: u64 = 24 * 60 * 60;
@@ -210,52 +211,35 @@ fn failed_resolver_record_at_strength(asset_id: &str, strength: State) -> AssetR
     let mut record = failed_resolver_record(asset_id);
     record.proofs.insert(
         "conversion".to_string(),
-        serde_json::to_value(ConversionResultProof {
-            heic_path: PathBuf::from("/staging/IMG_0001.heic"),
-            heic_sha256: HEIC_SHA256.to_string(),
-            size_bytes: 24,
-            conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
-            source_binding: ConversionSourceBinding::EmbeddedPreview,
-        })
-        .unwrap(),
+        json!({
+            "heic_path": "/staging/IMG_0001.heic",
+            "heic_sha256": HEIC_SHA256,
+            "size_bytes": 24,
+            "conversion_recipe_id": "embedded-preview-normalized-v1",
+            "source_binding": "embedded_preview",
+        }),
     );
     if matches!(strength, State::ConversionVerified | State::UploadVerified) {
         record.proofs.insert(
             "conversion_performance".to_string(),
-            serde_json::to_value(ConversionPerformanceProof {
-                schema_version: 1,
-                measured_at_unix_seconds: 1_800_000_000,
-                measurement_method: "monotonic_wall_clock".to_string(),
-                conversion_tool: "sips".to_string(),
-                conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
-                conversion_tool_version: Some("1.0".to_string()),
-                heic_quality: 100,
-                raw_size_bytes: 42,
-                heic_size_bytes: 24,
-                convert_wall_time_millis: 10,
-                total_wall_time_millis: 20,
-                user_cpu_time_millis: Some(5),
-                system_cpu_time_millis: Some(2),
-                peak_rss_kib: Some(1_024),
-                conversion_command_timings: Vec::new(),
-            })
-            .unwrap(),
+            json!({
+                "schema_version": 1, "measured_at_unix_seconds": 1_800_000_000,
+                "measurement_method": "monotonic_wall_clock", "conversion_tool": "sips",
+                "conversion_recipe_id": "embedded-preview-normalized-v1",
+                "conversion_tool_version": "1.0", "heic_quality": 100,
+                "raw_size_bytes": 42, "heic_size_bytes": 24,
+                "convert_wall_time_millis": 10, "total_wall_time_millis": 20,
+                "user_cpu_time_millis": 5, "system_cpu_time_millis": 2, "peak_rss_kib": 1024,
+            }),
         );
         record.proofs.insert(
             "heic".to_string(),
-            serde_json::to_value(HeicVerificationProof {
-                heic_path: PathBuf::from("/staging/IMG_0001.heic"),
-                heic_sha256: HEIC_SHA256.to_string(),
-                size_bytes: 24,
-                conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
-                heif_info_ok: true,
-                metadata_copied: true,
-                visual_content_ok: true,
-                visual_match_ok: true,
-                visual_rmse_ppm: Some(0),
-                visual_mae_ppm: Some(0),
-            })
-            .unwrap(),
+            json!({
+                "heic_path": "/staging/IMG_0001.heic", "heic_sha256": HEIC_SHA256,
+                "size_bytes": 24, "conversion_recipe_id": "embedded-preview-normalized-v1",
+                "heif_info_ok": true, "metadata_copied": true, "visual_content_ok": true,
+                "visual_match_ok": true, "visual_rmse_ppm": 0, "visual_mae_ppm": 0,
+            }),
         );
     }
     if strength == State::UploadVerified {

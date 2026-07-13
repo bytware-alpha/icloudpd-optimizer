@@ -23,10 +23,10 @@ use crate::conversion_backend::{TargetPlatform, backend_report_for_target};
 use crate::manifest::{FailureKind, Manifest, ManifestError, State};
 use crate::proof::NasRawProof;
 use crate::workflow::{
-    ConversionCommandTiming, ConversionPerformanceInput, ConversionResultProof,
-    ConversionSourceBinding, EMBEDDED_PREVIEW_CONVERSION_RECIPE, WorkflowError,
-    materialize_adjusted_source_for_conversion, record_conversion_performance,
-    record_conversion_result, stored_adjusted_source_for_conversion,
+    ConversionCommandTiming, ConversionPerformanceInput, ConversionResultInput,
+    ConversionSourceBinding, WorkflowError, materialize_adjusted_source_for_conversion,
+    record_current_conversion_performance, record_current_conversion_result,
+    stored_adjusted_source_for_conversion,
 };
 
 const DEFAULT_CHILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -324,24 +324,22 @@ fn execute_measured_conversion_for_target(
         let resource_usage = convert_outcome.resource_usage.combine(metadata_usage);
 
         let mut updated = manifest.clone();
-        record_conversion_result(
+        record_current_conversion_result(
             &mut updated,
             &request.asset_id,
-            ConversionResultProof {
+            ConversionResultInput {
                 heic_path: request.output_path.clone(),
                 heic_sha256: output.sha256,
                 size_bytes: output.size_bytes,
-                conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
                 source_binding,
             },
         )?;
-        record_conversion_performance(
+        record_current_conversion_performance(
             &mut updated,
             &request.asset_id,
             ConversionPerformanceInput {
                 measured_at_unix_seconds: current_unix_seconds(),
                 conversion_tool: conversion_tool_name(&plan),
-                conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
                 conversion_tool_version: request.conversion_tool_version,
                 heic_quality: request.heic_quality,
                 convert_wall_time_millis,

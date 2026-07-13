@@ -12,17 +12,17 @@ use icloudpd_optimizer::proof::{NasRawProof, ProofError, prove_nas_raw};
 use icloudpd_optimizer::upload::{CloudKitDeleteOutcome, CloudKitUploadedHeicAsset};
 use icloudpd_optimizer::workflow::{
     ConversionCommandTiming, ConversionPerformanceInput, ConversionPerformanceProof,
-    ConversionResultProof, ConversionSourceBinding, HeicVerificationProof,
-    IcloudpdLocalMirrorProof, OriginalAssetProof, SourceAgeProof, UploadProof, WorkflowError,
-    approve_delete, build_delete_plan, discover_raw_asset, mark_delete_eligible,
-    prepare_delete_reconciliation, prevalidate_approved_original_delete, prove_and_record_nas,
-    record_adjusted_source_proof, record_conversion_performance, record_conversion_result,
-    record_delete_execution, record_heic_verification, record_icloudpd_local_mirror_proof,
-    record_nas_proof, record_original_asset_batch_proofs, record_original_asset_proof,
-    record_prevalidated_delete_execution, record_reconciled_delete_execution,
-    record_source_age_proof, record_stage_failure, record_stage_failure_with_kind,
-    record_upload_proof, record_uploaded_heic_delete, upload_ready_heic_proof,
-    uploaded_heic_delete_request,
+    ConversionResultInput, ConversionResultProof, ConversionSourceBinding, HeicVerificationInput,
+    HeicVerificationProof, IcloudpdLocalMirrorProof, OriginalAssetProof, SourceAgeProof,
+    UploadProof, WorkflowError, approve_delete, build_delete_plan, discover_raw_asset,
+    mark_delete_eligible, prepare_delete_reconciliation, prevalidate_approved_original_delete,
+    prove_and_record_nas, record_adjusted_source_proof, record_conversion_performance,
+    record_conversion_result, record_delete_execution, record_heic_verification,
+    record_icloudpd_local_mirror_proof, record_nas_proof, record_original_asset_batch_proofs,
+    record_original_asset_proof, record_prevalidated_delete_execution,
+    record_reconciled_delete_execution, record_source_age_proof, record_stage_failure,
+    record_stage_failure_with_kind, record_upload_proof, record_uploaded_heic_delete,
+    upload_ready_heic_proof, uploaded_heic_delete_request,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -43,12 +43,11 @@ fn nas_proof() -> NasRawProof {
     }
 }
 
-fn conversion_proof() -> ConversionResultProof {
-    ConversionResultProof {
+fn conversion_proof() -> ConversionResultInput {
+    ConversionResultInput {
         heic_path: PathBuf::from("/staging/IMG_0001.heic"),
         heic_sha256: "heic-sha256".to_string(),
         size_bytes: 24,
-        conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
         source_binding: ConversionSourceBinding::EmbeddedPreview,
     }
 }
@@ -57,7 +56,6 @@ fn conversion_performance_input() -> ConversionPerformanceInput {
     ConversionPerformanceInput {
         measured_at_unix_seconds: 1_800_000_100,
         conversion_tool: "magick".to_string(),
-        conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
         conversion_tool_version: Some("7.1.1-41".to_string()),
         heic_quality: 90,
         convert_wall_time_millis: 1_250,
@@ -69,12 +67,11 @@ fn conversion_performance_input() -> ConversionPerformanceInput {
     }
 }
 
-fn heic_proof() -> HeicVerificationProof {
-    HeicVerificationProof {
+fn heic_proof() -> HeicVerificationInput {
+    HeicVerificationInput {
         heic_path: PathBuf::from("/staging/IMG_0001.heic"),
         heic_sha256: "heic-sha256".to_string(),
         size_bytes: 24,
-        conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
         heif_info_ok: true,
         metadata_copied: true,
         visual_content_ok: true,
@@ -101,17 +98,19 @@ fn heic_verification_proof_accepts_legacy_vipsheader_field() {
 }
 
 #[test]
-fn conversion_and_heic_proofs_keep_legacy_recipe_missing_and_write_current_recipe() {
+fn manual_inputs_and_legacy_proofs_cannot_claim_current_recipe() {
     let legacy_conversion: ConversionResultProof = serde_json::from_value(json!({
         "heic_path": "/staging/IMG_0001.heic",
         "heic_sha256": "heic-sha256",
         "size_bytes": 24
     }))
     .expect("legacy conversion proof should deserialize");
-    assert!(legacy_conversion.conversion_recipe_id.is_empty());
+    assert!(serde_json::to_value(&legacy_conversion).expect("legacy conversion should serialize")["conversion_recipe_id"].as_str().expect("recipe should serialize").is_empty());
     assert_eq!(
-        serde_json::to_value(conversion_proof()).expect("current conversion should serialize")["conversion_recipe_id"],
-        "embedded-preview-normalized-v1"
+        serde_json::to_value(conversion_proof())
+            .expect("manual input should serialize")
+            .get("conversion_recipe_id"),
+        None
     );
 
     let legacy_heic: HeicVerificationProof = serde_json::from_value(json!({
@@ -124,10 +123,12 @@ fn conversion_and_heic_proofs_keep_legacy_recipe_missing_and_write_current_recip
         "visual_match_ok": true
     }))
     .expect("legacy HEIC proof should deserialize");
-    assert!(legacy_heic.conversion_recipe_id.is_empty());
+    assert!(serde_json::to_value(&legacy_heic).expect("legacy HEIC should serialize")["conversion_recipe_id"].as_str().expect("recipe should serialize").is_empty());
     assert_eq!(
-        serde_json::to_value(heic_proof()).expect("current HEIC proof should serialize")["conversion_recipe_id"],
-        "embedded-preview-normalized-v1"
+        serde_json::to_value(heic_proof())
+            .expect("manual input should serialize")
+            .get("conversion_recipe_id"),
+        None
     );
 }
 
@@ -470,11 +471,10 @@ fn two_asset_upload_verified_manifest() -> Manifest {
         record_conversion_result(
             &mut manifest,
             asset_id,
-            ConversionResultProof {
+            ConversionResultInput {
                 heic_path: PathBuf::from(heic_path),
                 heic_sha256: heic_sha256.to_string(),
                 size_bytes: heic_size,
-                conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
                 source_binding: ConversionSourceBinding::EmbeddedPreview,
             },
         )
@@ -484,11 +484,10 @@ fn two_asset_upload_verified_manifest() -> Manifest {
         record_heic_verification(
             &mut manifest,
             asset_id,
-            HeicVerificationProof {
+            HeicVerificationInput {
                 heic_path: PathBuf::from(heic_path),
                 heic_sha256: heic_sha256.to_string(),
                 size_bytes: heic_size,
-                conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
                 heif_info_ok: true,
                 metadata_copied: true,
                 visual_content_ok: true,
@@ -802,11 +801,10 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
         WorkflowError::AdjustedSourceProofAlreadyRecorded { .. }
     ));
 
-    let unbound = ConversionResultProof {
+    let unbound = ConversionResultInput {
         heic_path: output_path.clone(),
         heic_sha256: "heic-sha256".to_string(),
         size_bytes: 24,
-        conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
         source_binding: ConversionSourceBinding::EmbeddedPreview,
     };
     let before = manifest.clone();
@@ -843,11 +841,10 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
         let error = record_conversion_result(
             &mut manifest,
             "asset-1",
-            ConversionResultProof {
+            ConversionResultInput {
                 heic_path: output_path.clone(),
                 heic_sha256: "heic-sha256".to_string(),
                 size_bytes: 24,
-                conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
                 source_binding: invalid_binding,
             },
         )
@@ -861,11 +858,10 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
     record_conversion_result(
         &mut manifest,
         "asset-1",
-        ConversionResultProof {
+        ConversionResultInput {
             heic_path: output_path.clone(),
             heic_sha256: "heic-sha256".to_string(),
             size_bytes: 24,
-            conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
             source_binding: binding.clone(),
         },
     )
@@ -875,11 +871,10 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
     record_heic_verification(
         &mut manifest,
         "asset-1",
-        HeicVerificationProof {
+        HeicVerificationInput {
             heic_path: output_path.clone(),
             heic_sha256: "heic-sha256".to_string(),
             size_bytes: 24,
-            conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
             heif_info_ok: true,
             metadata_copied: true,
             visual_content_ok: true,
@@ -1007,11 +1002,10 @@ fn embedded_preview_workflow_rejects_an_unproven_adjusted_conversion_claim() {
     let error = record_conversion_result(
         &mut manifest,
         "asset-1",
-        ConversionResultProof {
+        ConversionResultInput {
             heic_path: PathBuf::from("/staging/IMG_0001.heic"),
             heic_sha256: "heic-sha256".to_string(),
             size_bytes: 24,
-            conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
             source_binding: ConversionSourceBinding::AdjustedSource {
                 adjusted_source_proof_digest: "a".repeat(64),
                 adjusted_jpeg_sha256: "b".repeat(64),
@@ -1090,7 +1084,7 @@ fn conversion_performance_rejects_replacements_without_byte_savings() {
         record_conversion_result(
             &mut manifest,
             "asset-1",
-            ConversionResultProof {
+            ConversionResultInput {
                 size_bytes: heic_size,
                 ..conversion_proof()
             },
@@ -2469,21 +2463,21 @@ fn heic_verification_must_match_conversion_path_hash_and_size_without_mutation()
     let cases = [
         (
             "heic_path",
-            HeicVerificationProof {
+            HeicVerificationInput {
                 heic_path: PathBuf::from("/other/IMG_0001.heic"),
                 ..heic_proof()
             },
         ),
         (
             "heic_sha256",
-            HeicVerificationProof {
+            HeicVerificationInput {
                 heic_sha256: "other-heic-sha256".to_string(),
                 ..heic_proof()
             },
         ),
         (
             "size_bytes",
-            HeicVerificationProof {
+            HeicVerificationInput {
                 size_bytes: 25,
                 ..heic_proof()
             },
@@ -2770,14 +2764,14 @@ fn heic_verification_requires_visual_proofs_without_mutation() {
     let cases = [
         (
             "visual_content_ok",
-            HeicVerificationProof {
+            HeicVerificationInput {
                 visual_content_ok: false,
                 ..heic_proof()
             },
         ),
         (
             "visual_match_ok",
-            HeicVerificationProof {
+            HeicVerificationInput {
                 visual_match_ok: false,
                 ..heic_proof()
             },

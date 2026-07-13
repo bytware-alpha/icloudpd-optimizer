@@ -56,13 +56,13 @@ use crate::upload::{
 #[cfg(test)]
 use crate::workflow::validate_current_icloudpd_local_mirror_proof;
 use crate::workflow::{
-    ConversionResultProof, DeleteReconciliation, EMBEDDED_PREVIEW_CONVERSION_RECIPE,
-    HeicVerificationProof, IcloudpdLocalMirrorProof, IcloudpdLocalMirrorProofDisposition,
-    OriginalAssetProof, PrevalidatedDelete, SourceAgeProof, UploadProof, WorkflowError,
-    approve_delete, icloudpd_local_mirror_proof_disposition, icloudpd_local_mirror_ready_proofs,
+    ConversionResultProof, DeleteReconciliation, HeicVerificationInput, HeicVerificationProof,
+    IcloudpdLocalMirrorProof, IcloudpdLocalMirrorProofDisposition, OriginalAssetProof,
+    PrevalidatedDelete, SourceAgeProof, UploadProof, WorkflowError, approve_delete,
+    icloudpd_local_mirror_proof_disposition, icloudpd_local_mirror_ready_proofs,
     mark_delete_eligible, prepare_delete_reconciliation, prevalidate_approved_original_delete,
     prove_and_record_nas, reconciliation_exact_state_is_consistent, record_adjusted_source_proof,
-    record_heic_verification, record_icloudpd_local_mirror_proof,
+    record_current_heic_verification, record_icloudpd_local_mirror_proof,
     record_prevalidated_delete_execution, record_reconciled_delete_execution,
     record_source_age_proof, record_stage_failure, record_stage_failure_with_kind,
     record_upload_proof, upload_ready_heic_proof, validated_adjusted_source_for_conversion,
@@ -4329,9 +4329,9 @@ fn record_heic_verification_or_failure(
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     asset_id: &str,
-    proof: HeicVerificationProof,
+    proof: HeicVerificationInput,
 ) -> Result<(), String> {
-    match record_heic_verification(manifest, asset_id, proof) {
+    match record_current_heic_verification(manifest, asset_id, proof) {
         Ok(_) => {
             summary.heics_verified = summary.heics_verified.saturating_add(1);
             Ok(())
@@ -9504,11 +9504,10 @@ fn verify_converted_heic(
     let visual_content_ok = heic_has_visual_content(visual_metrics.candidate_stdev);
 
     Ok(VerifiedHeic {
-        proof: HeicVerificationProof {
+        proof: HeicVerificationInput {
             heic_path: conversion.heic_path,
             heic_sha256: conversion.heic_sha256,
             size_bytes: conversion.size_bytes,
-            conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
             heif_info_ok: true,
             metadata_copied,
             visual_content_ok,
@@ -9827,7 +9826,7 @@ fn append_metadata_probe_event_fields(fields: &mut serde_json::Value, wall_time_
 
 #[derive(Clone, Debug)]
 struct VerifiedHeic {
-    proof: HeicVerificationProof,
+    proof: HeicVerificationInput,
     visual_metrics: VisualMetrics,
     metadata_probe_wall_time_millis: u64,
 }
@@ -10571,6 +10570,7 @@ mod tests {
         CloudKitOriginalAssetInventoryFingerprint, CloudKitOriginalAssetResolution,
         CloudKitOriginalAssetResolveDisposition, CloudKitOriginalAssetResolveObservations,
     };
+    use crate::workflow::EMBEDDED_PREVIEW_CONVERSION_RECIPE;
     use filetime::{FileTime, set_file_mtime};
     use serde_json::Value;
     use serde_json::json;
@@ -11715,18 +11715,13 @@ esac
         permissions.set_mode(0o755);
         fs::set_permissions(&helper_path, permissions).expect("helper should be executable");
 
-        let heic = HeicVerificationProof {
-            heic_path: PathBuf::from("/tmp/asset.heic"),
-            heic_sha256: "sha".to_string(),
-            size_bytes: 123,
-            conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
-            heif_info_ok: true,
-            metadata_copied: true,
-            visual_content_ok: true,
-            visual_match_ok: true,
-            visual_rmse_ppm: None,
-            visual_mae_ppm: None,
-        };
+        let heic: HeicVerificationProof = serde_json::from_value(json!({
+            "heic_path": "/tmp/asset.heic", "heic_sha256": "sha", "size_bytes": 123,
+            "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
+            "heif_info_ok": true, "metadata_copied": true, "visual_content_ok": true,
+            "visual_match_ok": true,
+        }))
+        .expect("current HEIC fixture should deserialize");
         let destination = CloudKitLibraryDestination {
             database_scope: crate::upload::CloudKitDatabaseScope::Shared,
             zone_name: "SharedSync-test".to_string(),
@@ -21732,11 +21727,10 @@ esac
         let mut manifest = Manifest::new();
         manifest.upsert(record);
         let mut summary = MonitorScanSummary::default();
-        let proof = HeicVerificationProof {
+        let proof = HeicVerificationInput {
             heic_path: PathBuf::from("/heic/asset.HEIC"),
             heic_sha256: "heic-sha-asset".to_string(),
             size_bytes: 10,
-            conversion_recipe_id: EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
             heif_info_ok: true,
             metadata_copied: true,
             visual_content_ok: false,

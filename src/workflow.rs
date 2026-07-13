@@ -38,7 +38,7 @@ const DELETE_APPROVAL_PROOF: &str = "delete_approval";
 const DELETE_EXECUTION_PROOF: &str = "delete";
 const CONVERSION_PERFORMANCE_SCHEMA_VERSION: u8 = 1;
 const CONVERSION_PERFORMANCE_MEASUREMENT_METHOD: &str = "monotonic_wall_clock";
-pub const EMBEDDED_PREVIEW_CONVERSION_RECIPE: &str = "embedded-preview-normalized-v1";
+pub(crate) const EMBEDDED_PREVIEW_CONVERSION_RECIPE: &str = "embedded-preview-normalized-v1";
 const UNSAFE_LEGACY_RAW_SENSOR_RENDER_TOOL: &str = "dcraw_emu+magick+heif-enc";
 const BASE_DELETE_PLAN_PROOFS: [&str; 10] = [
     NAS_PROOF,
@@ -61,13 +61,20 @@ pub enum IcloudpdLocalMirrorProofDisposition {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ConversionResultInput {
+    pub heic_path: PathBuf,
+    pub heic_sha256: String,
+    pub size_bytes: u64,
+    pub source_binding: ConversionSourceBinding,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConversionResultProof {
     pub heic_path: PathBuf,
     pub heic_sha256: String,
     pub size_bytes: u64,
-    /// Missing values deliberately remain legacy/untrusted; do not default this to current.
     #[serde(default)]
-    pub conversion_recipe_id: String,
+    conversion_recipe_id: String,
     #[serde(default)]
     pub source_binding: ConversionSourceBinding,
 }
@@ -88,7 +95,6 @@ pub enum ConversionSourceBinding {
 pub struct ConversionPerformanceInput {
     pub measured_at_unix_seconds: u64,
     pub conversion_tool: String,
-    pub conversion_recipe_id: String,
     pub conversion_tool_version: Option<String>,
     pub heic_quality: u8,
     pub convert_wall_time_millis: u64,
@@ -112,7 +118,7 @@ pub struct ConversionPerformanceProof {
     pub measurement_method: String,
     pub conversion_tool: String,
     #[serde(default)]
-    pub conversion_recipe_id: String,
+    conversion_recipe_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversion_tool_version: Option<String>,
     pub heic_quality: u8,
@@ -131,12 +137,10 @@ pub struct ConversionPerformanceProof {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct HeicVerificationProof {
+pub struct HeicVerificationInput {
     pub heic_path: PathBuf,
     pub heic_sha256: String,
     pub size_bytes: u64,
-    #[serde(default)]
-    pub conversion_recipe_id: String,
     #[serde(alias = "vipsheader_ok")]
     pub heif_info_ok: bool,
     pub metadata_copied: bool,
@@ -146,6 +150,40 @@ pub struct HeicVerificationProof {
     pub visual_rmse_ppm: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visual_mae_ppm: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HeicVerificationProof {
+    pub heic_path: PathBuf,
+    pub heic_sha256: String,
+    pub size_bytes: u64,
+    #[serde(default)]
+    conversion_recipe_id: String,
+    #[serde(alias = "vipsheader_ok")]
+    pub heif_info_ok: bool,
+    pub metadata_copied: bool,
+    pub visual_content_ok: bool,
+    pub visual_match_ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_rmse_ppm: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_mae_ppm: Option<u32>,
+}
+
+impl From<HeicVerificationProof> for HeicVerificationInput {
+    fn from(proof: HeicVerificationProof) -> Self {
+        Self {
+            heic_path: proof.heic_path,
+            heic_sha256: proof.heic_sha256,
+            size_bytes: proof.size_bytes,
+            heif_info_ok: proof.heif_info_ok,
+            metadata_copied: proof.metadata_copied,
+            visual_content_ok: proof.visual_content_ok,
+            visual_match_ok: proof.visual_match_ok,
+            visual_rmse_ppm: proof.visual_rmse_ppm,
+            visual_mae_ppm: proof.visual_mae_ppm,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -459,8 +497,37 @@ pub fn record_adjusted_source_proof<'a>(
 pub fn record_conversion_result<'a>(
     manifest: &'a mut Manifest,
     asset_id: &str,
-    proof: ConversionResultProof,
+    input: ConversionResultInput,
 ) -> Result<&'a AssetRecord, WorkflowError> {
+    record_conversion_result_with_recipe(manifest, asset_id, input, String::new())
+}
+
+pub(crate) fn record_current_conversion_result<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    input: ConversionResultInput,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    record_conversion_result_with_recipe(
+        manifest,
+        asset_id,
+        input,
+        EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
+    )
+}
+
+fn record_conversion_result_with_recipe<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    input: ConversionResultInput,
+    conversion_recipe_id: String,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    let proof = ConversionResultProof {
+        heic_path: input.heic_path,
+        heic_sha256: input.heic_sha256,
+        size_bytes: input.size_bytes,
+        conversion_recipe_id,
+        source_binding: input.source_binding,
+    };
     require_non_empty_path("heic_path", &proof.heic_path)?;
     require_non_empty("heic_sha256", &proof.heic_sha256)?;
     validate_conversion_source_binding(manifest, asset_id, &proof)?;
@@ -478,6 +545,28 @@ pub fn record_conversion_performance<'a>(
     asset_id: &str,
     input: ConversionPerformanceInput,
 ) -> Result<&'a AssetRecord, WorkflowError> {
+    record_conversion_performance_with_recipe(manifest, asset_id, input, String::new())
+}
+
+pub(crate) fn record_current_conversion_performance<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    input: ConversionPerformanceInput,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    record_conversion_performance_with_recipe(
+        manifest,
+        asset_id,
+        input,
+        EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
+    )
+}
+
+fn record_conversion_performance_with_recipe<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    input: ConversionPerformanceInput,
+    conversion_recipe_id: String,
+) -> Result<&'a AssetRecord, WorkflowError> {
     let state = manifest.get(asset_id)?.state;
     if state != State::Converted {
         return Err(WorkflowError::Manifest(ManifestError::InvalidTransition {
@@ -493,7 +582,7 @@ pub fn record_conversion_performance<'a>(
         measured_at_unix_seconds: input.measured_at_unix_seconds,
         measurement_method: CONVERSION_PERFORMANCE_MEASUREMENT_METHOD.to_string(),
         conversion_tool: input.conversion_tool,
-        conversion_recipe_id: input.conversion_recipe_id,
+        conversion_recipe_id,
         conversion_tool_version: input.conversion_tool_version,
         heic_quality: input.heic_quality,
         raw_size_bytes: nas.size_bytes,
@@ -512,8 +601,42 @@ pub fn record_conversion_performance<'a>(
 pub fn record_heic_verification<'a>(
     manifest: &'a mut Manifest,
     asset_id: &str,
-    proof: HeicVerificationProof,
+    input: HeicVerificationInput,
 ) -> Result<&'a AssetRecord, WorkflowError> {
+    record_heic_verification_with_recipe(manifest, asset_id, input, String::new())
+}
+
+pub(crate) fn record_current_heic_verification<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    input: HeicVerificationInput,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    record_heic_verification_with_recipe(
+        manifest,
+        asset_id,
+        input,
+        EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
+    )
+}
+
+fn record_heic_verification_with_recipe<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    input: HeicVerificationInput,
+    conversion_recipe_id: String,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    let proof = HeicVerificationProof {
+        heic_path: input.heic_path,
+        heic_sha256: input.heic_sha256,
+        size_bytes: input.size_bytes,
+        conversion_recipe_id,
+        heif_info_ok: input.heif_info_ok,
+        metadata_copied: input.metadata_copied,
+        visual_content_ok: input.visual_content_ok,
+        visual_match_ok: input.visual_match_ok,
+        visual_rmse_ppm: input.visual_rmse_ppm,
+        visual_mae_ppm: input.visual_mae_ppm,
+    };
     require_non_empty_path("heic_path", &proof.heic_path)?;
     require_non_empty("heic_sha256", &proof.heic_sha256)?;
     let (_, conversion) = load_conversion_context(manifest, asset_id)?;
@@ -2635,6 +2758,95 @@ fn require_positive_u64(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    fn nas_proof() -> NasRawProof {
+        NasRawProof {
+            canonical_path: PathBuf::from("/nas/IMG_0001.dng"),
+            relative_path: PathBuf::from("IMG_0001.dng"),
+            size_bytes: 42,
+            modified_unix_seconds: 1_700_000_000,
+            age_seconds: 40 * 24 * 60 * 60,
+            sha256: "raw-sha256".to_string(),
+        }
+    }
+
+    fn conversion_input() -> ConversionResultInput {
+        ConversionResultInput {
+            heic_path: PathBuf::from("/staging/IMG_0001.heic"),
+            heic_sha256: "heic-sha256".to_string(),
+            size_bytes: 24,
+            source_binding: ConversionSourceBinding::EmbeddedPreview,
+        }
+    }
+
+    fn performance_input() -> ConversionPerformanceInput {
+        ConversionPerformanceInput {
+            measured_at_unix_seconds: 1_800_000_000,
+            conversion_tool: "sips".to_string(),
+            conversion_tool_version: Some("1.0".to_string()),
+            heic_quality: 90,
+            convert_wall_time_millis: 10,
+            total_wall_time_millis: 20,
+            user_cpu_time_millis: Some(5),
+            system_cpu_time_millis: Some(2),
+            peak_rss_kib: Some(1_024),
+            conversion_command_timings: Vec::new(),
+        }
+    }
+
+    fn heic_input() -> HeicVerificationInput {
+        HeicVerificationInput {
+            heic_path: PathBuf::from("/staging/IMG_0001.heic"),
+            heic_sha256: "heic-sha256".to_string(),
+            size_bytes: 24,
+            heif_info_ok: true,
+            metadata_copied: true,
+            visual_content_ok: true,
+            visual_match_ok: true,
+            visual_rmse_ppm: Some(0),
+            visual_mae_ppm: Some(0),
+        }
+    }
+
+    fn nas_verified_manifest() -> Manifest {
+        let mut manifest = Manifest::new();
+        discover_raw_asset(&mut manifest, "asset", "/nas/IMG_0001.dng").unwrap();
+        record_nas_proof(&mut manifest, "asset", nas_proof()).unwrap();
+        manifest
+    }
+
+    #[test]
+    fn manual_conversion_recorder_stamps_untrusted_recipe() {
+        let mut manifest = nas_verified_manifest();
+        record_conversion_result(&mut manifest, "asset", conversion_input()).unwrap();
+
+        assert_eq!(
+            manifest.get("asset").unwrap().proofs[CONVERSION_PROOF]["conversion_recipe_id"],
+            ""
+        );
+    }
+
+    #[test]
+    fn production_current_recorders_roundtrip_through_manifest_storage() {
+        let mut manifest = nas_verified_manifest();
+        record_current_conversion_result(&mut manifest, "asset", conversion_input()).unwrap();
+        record_current_conversion_performance(&mut manifest, "asset", performance_input()).unwrap();
+        record_current_heic_verification(&mut manifest, "asset", heic_input()).unwrap();
+        let path = tempfile::tempdir().unwrap().path().join("manifest.json");
+        manifest.save_atomic(&path).unwrap();
+        let loaded = Manifest::load(&path).unwrap();
+
+        assert!(upload_ready_heic_proof(&loaded, "asset").is_ok());
+        assert_eq!(
+            loaded.get("asset").unwrap().proofs[HEIC_PROOF]["conversion_recipe_id"],
+            EMBEDDED_PREVIEW_CONVERSION_RECIPE
+        );
+    }
 }
 
 fn require_matching_path(

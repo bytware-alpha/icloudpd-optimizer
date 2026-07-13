@@ -23,18 +23,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn heic_proof(path: PathBuf, bytes: &[u8]) -> HeicVerificationProof {
-    HeicVerificationProof {
-        heic_path: path,
-        heic_sha256: sha256_hex(bytes),
-        size_bytes: bytes.len() as u64,
-        conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
-        heif_info_ok: true,
-        metadata_copied: true,
-        visual_content_ok: true,
-        visual_match_ok: true,
-        visual_rmse_ppm: Some(0),
-        visual_mae_ppm: Some(0),
-    }
+    serde_json::from_value(json!({
+        "heic_path": path,
+        "heic_sha256": sha256_hex(bytes),
+        "size_bytes": bytes.len() as u64,
+        "conversion_recipe_id": "embedded-preview-normalized-v1",
+        "heif_info_ok": true,
+        "metadata_copied": true,
+        "visual_content_ok": true,
+        "visual_match_ok": true,
+        "visual_rmse_ppm": 0,
+        "visual_mae_ppm": 0,
+    }))
+    .expect("current HEIC fixture should deserialize")
 }
 
 fn write_session(path: &Path, body: &str) {

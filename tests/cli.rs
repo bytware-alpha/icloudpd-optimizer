@@ -12,8 +12,8 @@ use icloudpd_optimizer::monitor::{MonitorConfig, admit_adjusted_source_required_
 use icloudpd_optimizer::proof::NasRawProof;
 use icloudpd_optimizer::state_store::AssetStateStore;
 use icloudpd_optimizer::workflow::{
-    ConversionPerformanceInput, ConversionResultProof, ConversionSourceBinding,
-    HeicVerificationProof, SourceAgeProof, discover_raw_asset, record_conversion_performance,
+    ConversionPerformanceInput, ConversionResultInput, ConversionSourceBinding,
+    HeicVerificationInput, SourceAgeProof, discover_raw_asset, record_conversion_performance,
     record_conversion_result, record_heic_verification, record_nas_proof, record_source_age_proof,
 };
 use predicates::prelude::*;
@@ -655,12 +655,11 @@ fn deleted_metrics_record(asset_id: &str, raw_bytes: u64, heic_bytes: u64) -> As
     record
 }
 
-fn conversion_proof() -> ConversionResultProof {
-    ConversionResultProof {
+fn conversion_proof() -> ConversionResultInput {
+    ConversionResultInput {
         heic_path: PathBuf::from("/staging/IMG_0001.heic"),
         heic_sha256: "heic-sha256".to_string(),
         size_bytes: 24,
-        conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
         source_binding: ConversionSourceBinding::EmbeddedPreview,
     }
 }
@@ -669,7 +668,6 @@ fn conversion_performance_input() -> ConversionPerformanceInput {
     ConversionPerformanceInput {
         measured_at_unix_seconds: 1_800_000_100,
         conversion_tool: "magick".to_string(),
-        conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
         conversion_tool_version: Some("7.1.1-41".to_string()),
         heic_quality: 90,
         convert_wall_time_millis: 1_250,
@@ -681,12 +679,11 @@ fn conversion_performance_input() -> ConversionPerformanceInput {
     }
 }
 
-fn heic_proof() -> HeicVerificationProof {
-    HeicVerificationProof {
+fn heic_proof() -> HeicVerificationInput {
+    HeicVerificationInput {
         heic_path: PathBuf::from("/staging/IMG_0001.heic"),
         heic_sha256: "heic-sha256".to_string(),
         size_bytes: 24,
-        conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
         heif_info_ok: true,
         metadata_copied: true,
         visual_content_ok: true,
@@ -904,11 +901,10 @@ fn manifest_with_real_conversion_verified(path: &std::path::Path, heic_path: Pat
     record_conversion_result(
         &mut manifest,
         "asset-1",
-        ConversionResultProof {
+        ConversionResultInput {
             heic_path: heic_path.clone(),
             heic_sha256: sha256_hex(body),
             size_bytes: body.len() as u64,
-            conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
             source_binding: ConversionSourceBinding::EmbeddedPreview,
         },
     )
@@ -918,11 +914,10 @@ fn manifest_with_real_conversion_verified(path: &std::path::Path, heic_path: Pat
     record_heic_verification(
         &mut manifest,
         "asset-1",
-        HeicVerificationProof {
+        HeicVerificationInput {
             heic_path,
             heic_sha256: sha256_hex(body),
             size_bytes: body.len() as u64,
-            conversion_recipe_id: "embedded-preview-normalized-v1".to_string(),
             heif_info_ok: true,
             metadata_copied: true,
             visual_content_ok: true,

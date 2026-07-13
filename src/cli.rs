@@ -55,8 +55,8 @@ use crate::upload::{
     load_upload_session, run_icloud_upload, validate_library_destination, verify_local_heic,
 };
 use crate::workflow::{
-    ConversionPerformanceInput, ConversionResultProof, ConversionSourceBinding,
-    HeicVerificationProof, IcloudpdLocalMirrorProofDisposition, OriginalAssetProof, SourceAgeProof,
+    ConversionPerformanceInput, ConversionResultInput, ConversionSourceBinding,
+    HeicVerificationInput, IcloudpdLocalMirrorProofDisposition, OriginalAssetProof, SourceAgeProof,
     UploadProof, WorkflowError, approve_delete, approved_original_delete_request,
     build_delete_plan, icloudpd_local_mirror_proof_disposition, icloudpd_local_mirror_ready_proofs,
     mark_delete_eligible, prove_and_record_nas, record_conversion_performance,
@@ -4252,11 +4252,10 @@ fn workflow_conversion_result(args: WorkflowConversionResultArgs) -> Result<(), 
     record_conversion_result(
         &mut manifest,
         &args.asset_id,
-        ConversionResultProof {
+        ConversionResultInput {
             heic_path: args.heic_path,
             heic_sha256: args.heic_sha256,
             size_bytes: args.size_bytes,
-            conversion_recipe_id: String::new(),
             source_binding: ConversionSourceBinding::EmbeddedPreview,
         },
     )?;
@@ -4275,7 +4274,6 @@ fn workflow_conversion_performance(
                 .measured_at_unix_seconds
                 .unwrap_or_else(|| system_time_unix_seconds(SystemTime::now())),
             conversion_tool: args.conversion_tool,
-            conversion_recipe_id: String::new(),
             conversion_tool_version: args.conversion_tool_version,
             heic_quality: args.heic_quality,
             convert_wall_time_millis: args.convert_wall_time_millis,
@@ -4294,11 +4292,10 @@ fn workflow_heic_verified(args: WorkflowHeicVerifiedArgs) -> Result<(), CliError
     record_heic_verification(
         &mut manifest,
         &args.asset_id,
-        HeicVerificationProof {
+        HeicVerificationInput {
             heic_path: args.heic_path,
             heic_sha256: args.heic_sha256,
             size_bytes: args.size_bytes,
-            conversion_recipe_id: String::new(),
             heif_info_ok: args.heif_info_ok,
             metadata_copied: args.metadata_copied,
             visual_content_ok: args.visual_content_ok,
