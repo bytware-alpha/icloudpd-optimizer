@@ -1925,30 +1925,16 @@ fn monitor_upload_verified_reverify<W: Write>(
             .resolve_uploaded_heic_asset(&session, &request)?;
         updated.push(updated_record);
     }
-    if !args.apply {
-        state_store.revalidate_immutable_read_snapshot()?;
-    }
     let updated = reverify_changed_records(&expected, updated);
     let would_change_count = updated.len() as u64;
-    let changed_count = if reverify_needs_writer(args.apply, updated.len()) {
-        let mut guard = acquire_monitor_run_guard(&config)?;
-        let writer_store = guard.state_store(&config.manifest_path)?.clone();
-        let current = writer_store.load()?;
-        reverify_exact_snapshot_still_current(&current, &expected)?;
-        writer_store.persist_records_exact_cas_atomic_trusted(
-            updated
-                .iter()
-                .map(|updated| AssetRecordExactCasUpdate {
-                    expected: expected.get(&updated.asset_id).expect("target snapshot"),
-                    updated,
-                })
-                .collect::<Vec<_>>(),
-        )?;
-        writer_store.export_json()?;
-        would_change_count
-    } else {
-        0
-    };
+    let changed_count = apply_verified_reverify_updates(
+        &config,
+        &state_store,
+        &expected,
+        &updated,
+        args.apply,
+        |_| Ok(()),
+    )?;
     let report = UploadVerifiedReverifyReport {
         target_set_sha256,
         target_count: ids.len() as u64,
@@ -1970,6 +1956,39 @@ fn monitor_upload_verified_reverify<W: Write>(
 
 fn reverify_needs_writer(apply: bool, changed_records: usize) -> bool {
     apply && changed_records != 0
+}
+
+fn apply_verified_reverify_updates<F>(
+    config: &MonitorConfig,
+    read_store: &AssetStateStore,
+    expected: &BTreeMap<String, AssetRecord>,
+    updated: &[AssetRecord],
+    apply: bool,
+    before_cas: F,
+) -> Result<u64, CliError>
+where
+    F: FnOnce(&AssetStateStore) -> Result<(), CliError>,
+{
+    if !apply {
+        read_store.revalidate_immutable_read_snapshot()?;
+        return Ok(0);
+    }
+    if !reverify_needs_writer(true, updated.len()) {
+        return Ok(0);
+    }
+    let mut guard = acquire_monitor_run_guard(config)?;
+    let writer_store = guard.state_store(&config.manifest_path)?.clone();
+    before_cas(&writer_store)?;
+    let current = writer_store.load()?;
+    reverify_exact_snapshot_still_current(&current, expected)?;
+    writer_store.persist_records_exact_cas_atomic_trusted(updated.iter().map(|updated| {
+        AssetRecordExactCasUpdate {
+            expected: expected.get(&updated.asset_id).expect("target snapshot"),
+            updated,
+        }
+    }))?;
+    writer_store.export_json()?;
+    Ok(updated.len() as u64)
 }
 
 fn reverify_exact_snapshot_still_current(
@@ -2069,6 +2088,48 @@ mod upload_verified_reverify_tests {
         record
     }
 
+    fn persisted_fixture(
+        records: Vec<AssetRecord>,
+    ) -> (
+        tempfile::TempDir,
+        MonitorConfig,
+        BTreeMap<String, AssetRecord>,
+    ) {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let root = tempdir.path().join("download");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let heic = tempdir.path().join("heic");
+        fs::create_dir_all(&root).expect("root");
+        let mut manifest = Manifest::new();
+        for record in records {
+            manifest.upsert_trusted(record);
+        }
+        manifest.save_atomic(&manifest_path).expect("manifest");
+        let writer =
+            AssetStateStore::open_writer(&manifest_path, "reverify-test", Duration::from_secs(30))
+                .expect("writer");
+        writer.load_or_import().expect("import");
+        drop(writer);
+        let expected = AssetStateStore::open_read_only(&manifest_path)
+            .expect("reader")
+            .load()
+            .expect("load")
+            .records()
+            .clone();
+        (
+            tempdir,
+            MonitorConfig::new(root, manifest_path, heic),
+            expected,
+        )
+    }
+
+    fn persisted_bytes(config: &MonitorConfig) -> (Vec<u8>, Vec<u8>) {
+        (
+            fs::read(&config.manifest_path).expect("json"),
+            fs::read(AssetStateStore::db_path_for_manifest(&config.manifest_path)).expect("db"),
+        )
+    }
+
     #[test]
     fn reverify_changed_records_keeps_current_records_byte_identical_and_selects_only_upgrades() {
         let current = record("current", "unchanged");
@@ -2099,6 +2160,120 @@ mod upload_verified_reverify_tests {
         assert!(!reverify_needs_writer(true, 0));
         assert!(!reverify_needs_writer(false, 1));
         assert!(reverify_needs_writer(true, 1));
+    }
+
+    #[test]
+    fn command_commit_all_current_apply_is_byte_identical_without_writer_or_export() {
+        let current = record("current", "current");
+        let (_tempdir, config, expected) = persisted_fixture(vec![current.clone()]);
+        let reader =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("immutable");
+        let before = persisted_bytes(&config);
+        let changed =
+            apply_verified_reverify_updates(&config, &reader, &expected, &[], true, |_| {
+                panic!("writer must not open")
+            })
+            .expect("all-current apply is a no-op");
+        assert_eq!(changed, 0);
+        assert_eq!(persisted_bytes(&config), before);
+    }
+
+    #[test]
+    fn command_commit_mixed_and_rerun_only_persists_legacy_upgrade() {
+        let current = record("current", "current");
+        let legacy = record("legacy", "legacy");
+        let (_tempdir, config, expected) = persisted_fixture(vec![current.clone(), legacy.clone()]);
+        let reader =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("immutable");
+        let mut upgraded = legacy.clone();
+        upgraded.updated_at = "upgraded".to_string();
+        assert_eq!(
+            apply_verified_reverify_updates(
+                &config,
+                &reader,
+                &expected,
+                &[upgraded.clone()],
+                true,
+                |_| Ok(())
+            )
+            .expect("apply"),
+            1
+        );
+        let after_first = persisted_bytes(&config);
+        let loaded = AssetStateStore::open_read_only(&config.manifest_path)
+            .expect("reader")
+            .load()
+            .expect("load");
+        assert_eq!(loaded.get("current").expect("current"), &current);
+        let next_expected = loaded.records().clone();
+        let rerun =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("immutable");
+        assert_eq!(
+            apply_verified_reverify_updates(
+                &config,
+                &rerun,
+                &next_expected,
+                &[],
+                true,
+                |_| panic!("rerun must not open writer")
+            )
+            .expect("rerun"),
+            0
+        );
+        assert_eq!(persisted_bytes(&config), after_first);
+    }
+
+    #[test]
+    fn command_commit_dry_run_and_drift_failure_leave_state_unchanged() {
+        let legacy = record("legacy", "legacy");
+        let (_tempdir, config, expected) = persisted_fixture(vec![legacy.clone()]);
+        let reader =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("immutable");
+        let mut upgraded = legacy.clone();
+        upgraded.updated_at = "upgraded".to_string();
+        let before = persisted_bytes(&config);
+        assert_eq!(
+            apply_verified_reverify_updates(
+                &config,
+                &reader,
+                &expected,
+                &[upgraded.clone()],
+                false,
+                |_| panic!("dry run must not open writer")
+            )
+            .expect("dry"),
+            0
+        );
+        assert_eq!(persisted_bytes(&config), before);
+        let reader =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("immutable");
+        let error = apply_verified_reverify_updates(
+            &config,
+            &reader,
+            &expected,
+            &[upgraded],
+            true,
+            |store| {
+                let mut drifted = legacy.clone();
+                drifted.updated_at = "drifted".to_string();
+                store.persist_record_trusted(&drifted)?;
+                Ok(())
+            },
+        )
+        .expect_err("drift must fail closed");
+        assert!(
+            matches!(
+                error,
+                CliError::OriginalAssetsReconcileGate { .. } | CliError::StateStore(_)
+            ),
+            "drift path must fail closed: {error}"
+        );
+        assert_eq!(fs::read(&config.manifest_path).expect("json"), before.0);
+        let loaded = AssetStateStore::open_read_only(&config.manifest_path)
+            .expect("reader")
+            .load()
+            .expect("load");
+        assert_eq!(loaded.get("legacy").expect("legacy").updated_at, "legacy");
     }
 }
 
