@@ -2735,11 +2735,11 @@ if [ "$1" != "__stage-raw-copy" ]; then
 fi
 printf 'started\n' > "$STAGE_COPY_LOG"
 printf 'partial-stage' > "$3"
-/bin/sleep 5
+/bin/sleep 20
 "#,
         );
         let _copy_guard = RawStageCopyCommandGuard::install(copy_script.path());
-        let _timeout_guard = CommandTimeoutGuard::install(Duration::from_secs(2));
+        let _timeout_guard = CommandTimeoutGuard::install(Duration::from_secs(5));
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let output_dir = tempdir
             .path()
