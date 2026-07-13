@@ -2304,7 +2304,7 @@ fn apply_verified_reverify_updates<B: ReverifyCommitBoundary>(
     Ok(ReverifyCommitOutcome {
         changed_count: updated.len() as u64,
         checkpoint_stale,
-        checkpoint_recovered: checkpoint_stale && updated.is_empty(),
+        checkpoint_recovered: writer_checkpoint_stale,
     })
 }
 
@@ -3244,6 +3244,65 @@ mod upload_verified_reverify_tests {
         production: ProductionReverifyCommitBoundary<'a>,
     }
 
+    struct CheckpointRaceCommitBoundary<'a> {
+        production: ProductionReverifyCommitBoundary<'a>,
+        export_calls: usize,
+    }
+
+    struct ObservingCommitBoundary<'a> {
+        production: ProductionReverifyCommitBoundary<'a>,
+        acquire_calls: usize,
+        export_calls: usize,
+    }
+
+    impl ReverifyCommitBoundary for ObservingCommitBoundary<'_> {
+        fn read_store(&self) -> &AssetStateStore {
+            self.production.read_store()
+        }
+        fn acquire_writer(&mut self) -> Result<AssetStateStore, CliError> {
+            self.acquire_calls += 1;
+            self.production.acquire_writer()
+        }
+        fn export_json(&mut self, writer_store: &AssetStateStore) -> Result<(), CliError> {
+            self.export_calls += 1;
+            self.production.export_json(writer_store)
+        }
+    }
+
+    impl ReverifyCommitBoundary for CheckpointRaceCommitBoundary<'_> {
+        fn read_store(&self) -> &AssetStateStore {
+            self.production.read_store()
+        }
+        fn acquire_writer(&mut self) -> Result<AssetStateStore, CliError> {
+            let store = self.production.acquire_writer()?;
+            store.export_json()?;
+            Ok(store)
+        }
+        fn export_json(&mut self, writer_store: &AssetStateStore) -> Result<(), CliError> {
+            self.export_calls += 1;
+            self.production.export_json(writer_store)
+        }
+    }
+
+    #[test]
+    fn command_checkpoint_race_skips_export_when_writer_recheck_is_current() {
+        let current = record("current", "100.000000000Z");
+        let (_tempdir, config, expected) = persisted_fixture(vec![current]);
+        let reader =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("reader");
+        fs::remove_file(&config.manifest_path).expect("stale checkpoint");
+        let mut boundary = CheckpointRaceCommitBoundary {
+            production: ProductionReverifyCommitBoundary::new(&config, &reader),
+            export_calls: 0,
+        };
+        let outcome = apply_verified_reverify_updates(&mut boundary, &expected, &[], true)
+            .expect("writer-side checkpoint is current");
+        assert!(outcome.checkpoint_stale);
+        assert!(!outcome.checkpoint_recovered);
+        assert_eq!(outcome.changed_count, 0);
+        assert_eq!(boundary.export_calls, 0);
+    }
+
     impl ReverifyCommitBoundary for FailingExportCommitBoundary<'_> {
         fn read_store(&self) -> &AssetStateStore {
             self.production.read_store()
@@ -3427,6 +3486,183 @@ mod upload_verified_reverify_tests {
                 .expect("database"),
             db_before
         );
+    }
+
+    #[test]
+    fn command_executor_recovers_missing_and_malformed_current_json_checkpoints() {
+        for malformed in [false, true] {
+            let current = record("current", "100.000000000Z");
+            let (_tempdir, config, expected) = persisted_fixture(vec![current.clone()]);
+            let store = AssetStateStore::open_immutable_read_only(&config.manifest_path)
+                .expect("immutable store");
+            let manifest = store.load().expect("manifest");
+            let db_before = fs::read(AssetStateStore::db_path_for_manifest(&config.manifest_path))
+                .expect("database");
+            if malformed {
+                fs::write(&config.manifest_path, b"not json").expect("malformed checkpoint");
+            } else {
+                fs::remove_file(&config.manifest_path).expect("missing checkpoint");
+            }
+            let mut reverifier = FakeReverifier {
+                records: BTreeMap::from([("current".to_string(), current.clone())]),
+                calls: Vec::new(),
+                fail_on: None,
+            };
+            let mut boundary = ObservingCommitBoundary {
+                production: ProductionReverifyCommitBoundary::new(&config, &store),
+                acquire_calls: 0,
+                export_calls: 0,
+            };
+            let mut output = Vec::new();
+            let report = monitor_upload_verified_reverify_with_reverifier_and_commit(
+                UploadVerifiedReverifyExecutorInput {
+                    config: &config,
+                    state_store: &store,
+                    manifest: &manifest,
+                    expected: &expected,
+                    ids: &BTreeSet::from(["current".to_string()]),
+                    apply: true,
+                    timeout_seconds: 1,
+                    target_set_sha256: "x".repeat(64),
+                    started: Instant::now(),
+                },
+                &mut reverifier,
+                &mut boundary,
+                &mut output,
+            )
+            .expect("checkpoint recovery");
+            assert_eq!(report.changed_count, 0);
+            assert_eq!(report.would_change_count, 0);
+            assert!(report.checkpoint_recovered);
+            assert_eq!(boundary.acquire_calls, 1);
+            assert_eq!(boundary.export_calls, 1);
+            assert_eq!(
+                Manifest::load(&config.manifest_path).expect("recovered json"),
+                AssetStateStore::open_read_only(&config.manifest_path)
+                    .expect("database")
+                    .load()
+                    .expect("database manifest")
+            );
+            assert_eq!(
+                fs::read(AssetStateStore::db_path_for_manifest(&config.manifest_path))
+                    .expect("database"),
+                db_before
+            );
+            drop(boundary);
+            drop(store);
+
+            let before_noop = persisted_bytes(&config);
+            let noop_store = AssetStateStore::open_immutable_read_only(&config.manifest_path)
+                .expect("current checkpoint store");
+            let noop_manifest = noop_store.load().expect("current checkpoint manifest");
+            let mut noop_reverifier = FakeReverifier {
+                records: BTreeMap::from([("current".to_string(), current.clone())]),
+                calls: Vec::new(),
+                fail_on: None,
+            };
+            let mut noop_boundary = ObservingCommitBoundary {
+                production: ProductionReverifyCommitBoundary::new(&config, &noop_store),
+                acquire_calls: 0,
+                export_calls: 0,
+            };
+            let mut noop_output = Vec::new();
+            let noop_report = monitor_upload_verified_reverify_with_reverifier_and_commit(
+                UploadVerifiedReverifyExecutorInput {
+                    config: &config,
+                    state_store: &noop_store,
+                    manifest: &noop_manifest,
+                    expected: noop_manifest.records(),
+                    ids: &BTreeSet::from(["current".to_string()]),
+                    apply: true,
+                    timeout_seconds: 1,
+                    target_set_sha256: "x".repeat(64),
+                    started: Instant::now(),
+                },
+                &mut noop_reverifier,
+                &mut noop_boundary,
+                &mut noop_output,
+            )
+            .expect("current checkpoint no-op");
+            assert_eq!(noop_report.changed_count, 0);
+            assert!(!noop_report.checkpoint_stale);
+            assert!(!noop_report.checkpoint_recovered);
+            assert_eq!(noop_boundary.acquire_calls, 0);
+            assert_eq!(noop_boundary.export_calls, 0);
+            assert_eq!(persisted_bytes(&config), before_noop);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_executor_rejects_unsafe_checkpoint_paths_before_writer_or_report() {
+        for kind in ["symlink", "directory", "hardlink"] {
+            let current = record("current", "100.000000000Z");
+            let (_tempdir, config, expected) = persisted_fixture(vec![current.clone()]);
+            let store = AssetStateStore::open_immutable_read_only(&config.manifest_path)
+                .expect("immutable store");
+            let manifest = store.load().expect("manifest");
+            let db_before = fs::read(AssetStateStore::db_path_for_manifest(&config.manifest_path))
+                .expect("database");
+            match kind {
+                "symlink" => {
+                    use std::os::unix::fs::symlink;
+
+                    let target = config
+                        .manifest_path
+                        .with_file_name("checkpoint-target.json");
+                    fs::write(&target, b"{}").expect("target");
+                    fs::remove_file(&config.manifest_path).expect("checkpoint");
+                    symlink(&target, &config.manifest_path).expect("checkpoint symlink");
+                }
+                "directory" => {
+                    fs::remove_file(&config.manifest_path).expect("checkpoint");
+                    fs::create_dir(&config.manifest_path).expect("checkpoint directory");
+                }
+                "hardlink" => {
+                    fs::hard_link(
+                        &config.manifest_path,
+                        config
+                            .manifest_path
+                            .with_file_name("checkpoint-hardlink.json"),
+                    )
+                    .expect("checkpoint hard link");
+                }
+                _ => unreachable!("test table is exhaustive"),
+            }
+            let mut reverifier = FakeReverifier {
+                records: BTreeMap::from([("current".to_string(), current)]),
+                calls: Vec::new(),
+                fail_on: None,
+            };
+            let mut output = Vec::new();
+            let error = monitor_upload_verified_reverify_with_reverifier(
+                UploadVerifiedReverifyExecutorInput {
+                    config: &config,
+                    state_store: &store,
+                    manifest: &manifest,
+                    expected: &expected,
+                    ids: &BTreeSet::from(["current".to_string()]),
+                    apply: true,
+                    timeout_seconds: 1,
+                    target_set_sha256: "x".repeat(64),
+                    started: Instant::now(),
+                },
+                &mut reverifier,
+                &mut output,
+            )
+            .expect_err("unsafe checkpoint must fail closed");
+            assert!(matches!(
+                error,
+                CliError::StateStore(AssetStateStoreError::JsonCheckpointUnsafe { .. })
+            ));
+            assert!(output.is_empty());
+            assert!(!crate::monitor::monitor_run_lock_path(&config).exists());
+            assert_eq!(
+                fs::read(AssetStateStore::db_path_for_manifest(&config.manifest_path))
+                    .expect("database"),
+                db_before
+            );
+        }
     }
 
     #[test]

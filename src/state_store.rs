@@ -2259,7 +2259,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn json_checkpoint_status_rejects_symlink_and_nonregular_paths() {
+    fn json_checkpoint_status_rejects_symlink_nonregular_and_hardlinked_paths() {
         use std::os::unix::fs::symlink;
 
         let (_tempdir, manifest_path, reader) = checkpoint_test_store();
@@ -2273,6 +2273,17 @@ mod tests {
         ));
         fs::remove_file(&manifest_path).expect("remove symlink");
         fs::create_dir(&manifest_path).expect("directory checkpoint");
+        assert!(matches!(
+            reader.json_checkpoint_status(),
+            Err(AssetStateStoreError::JsonCheckpointUnsafe { .. })
+        ));
+        fs::remove_dir(&manifest_path).expect("remove directory checkpoint");
+        fs::write(&manifest_path, b"{}").expect("replacement checkpoint");
+        fs::hard_link(
+            &manifest_path,
+            manifest_path.with_file_name("manifest-checkpoint-hardlink.json"),
+        )
+        .expect("hard link checkpoint");
         assert!(matches!(
             reader.json_checkpoint_status(),
             Err(AssetStateStoreError::JsonCheckpointUnsafe { .. })
