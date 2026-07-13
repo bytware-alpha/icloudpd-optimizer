@@ -5185,8 +5185,10 @@ mod legacy_failures_classify_tests {
 mod original_assets_audit_tests {
     use super::*;
     use crate::upload::CloudKitDeleteTransport;
-    use std::io::{Read, Write};
+    use std::collections::BTreeSet;
+    use std::io::{self, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -5417,6 +5419,8 @@ mod original_assets_audit_tests {
 
     #[test]
     fn recording_server_accepted_stream_is_blocking_under_parallel_test_load() {
+        const CLIENT_COUNT: usize = 16;
+
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         listener
             .set_nonblocking(true)
@@ -5424,22 +5428,96 @@ mod original_assets_audit_tests {
         let address = listener
             .local_addr()
             .expect("listener should have a local address");
-        let client = thread::spawn(move || {
-            let mut stream = TcpStream::connect(address).expect("client should connect");
-            thread::sleep(Duration::from_millis(25));
-            stream.write_all(b"request").expect("client should write");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (complete_tx, complete_rx) = mpsc::channel();
+        let mut starts = Vec::with_capacity(CLIENT_COUNT);
+        let mut clients = Vec::with_capacity(CLIENT_COUNT);
+        for client_index in 0..CLIENT_COUNT {
+            let (start_tx, start_rx) = mpsc::sync_channel(0);
+            starts.push(start_tx);
+            let ready_tx = ready_tx.clone();
+            let complete_tx = complete_tx.clone();
+            clients.push(thread::spawn(move || {
+                let result = (|| -> io::Result<()> {
+                    let mut stream = TcpStream::connect_timeout(&address, RECORDING_SERVER_TIMEOUT)?;
+                    stream.set_read_timeout(Some(RECORDING_SERVER_TIMEOUT))?;
+                    stream.set_write_timeout(Some(RECORDING_SERVER_TIMEOUT))?;
+                    ready_tx.send(client_index).expect("test should receive client readiness");
+                    start_rx
+                        .recv_timeout(RECORDING_SERVER_TIMEOUT)
+                        .expect("client should receive start signal");
+                    let request = format!(
+                        "POST /parallel/{client_index} HTTP/1.1\r\nHost: recording.test\r\nContent-Length: 0\r\n\r\n"
+                    );
+                    stream.write_all(request.as_bytes())?;
+                    let mut response = Vec::new();
+                    stream.read_to_end(&mut response)?;
+                    assert!(
+                        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+                        "client should receive its recording response"
+                    );
+                    Ok(())
+                })();
+                complete_tx
+                    .send((client_index, result))
+                    .expect("test should receive client completion");
+            }));
+        }
+        drop(ready_tx);
+        drop(complete_tx);
+
+        let (server_tx, server_rx) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let mut requests = BTreeSet::new();
+            for _ in 0..CLIENT_COUNT {
+                let mut stream = accept_recording_connection(&listener);
+                requests.insert(read_recording_request(&mut stream));
+                write_recording_response(&mut stream, b"ok");
+            }
+            server_tx
+                .send(requests)
+                .expect("test should receive server requests");
         });
 
-        let mut stream = accept_recording_connection(&listener);
-        stream
-            .set_read_timeout(Some(RECORDING_SERVER_TIMEOUT))
-            .expect("request read timeout should set");
-        let mut request = [0_u8; 7];
-        stream
-            .read_exact(&mut request)
-            .expect("accepted stream should wait for the request");
-        assert_eq!(request, *b"request");
-        client.join().expect("client should complete");
+        let mut ready_clients = BTreeSet::new();
+        for _ in 0..CLIENT_COUNT {
+            ready_clients.insert(
+                ready_rx
+                    .recv_timeout(RECORDING_SERVER_TIMEOUT)
+                    .expect("every client should connect before the test starts requests"),
+            );
+        }
+        assert_eq!(
+            ready_clients.len(),
+            CLIENT_COUNT,
+            "clients should be distinct"
+        );
+        for start in starts {
+            start
+                .send(())
+                .expect("connected client should receive the start signal");
+        }
+
+        let expected_requests = (0..CLIENT_COUNT)
+            .map(|client_index| format!("POST /parallel/{client_index} HTTP/1.1"))
+            .collect::<BTreeSet<_>>();
+        let requests = server_rx
+            .recv_timeout(RECORDING_SERVER_TIMEOUT)
+            .expect("server should accept and read every parallel request");
+        assert_eq!(
+            requests, expected_requests,
+            "requests should not be mixed up"
+        );
+        server.join().expect("server should complete");
+        for _ in 0..CLIENT_COUNT {
+            let (_, result) = complete_rx
+                .recv_timeout(RECORDING_SERVER_TIMEOUT)
+                .expect("every client should complete");
+            result.expect("parallel client should complete without a timeout");
+        }
+        for client in clients {
+            client.join().expect("client should complete");
+        }
     }
 
     fn read_recording_request(stream: &mut TcpStream) -> String {
