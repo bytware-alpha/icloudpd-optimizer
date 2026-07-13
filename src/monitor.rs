@@ -3642,6 +3642,34 @@ fn run_rolling_asset_upload(
     manifest: &Arc<Mutex<Manifest>>,
     summary: &Arc<Mutex<MonitorScanSummary>>,
 ) -> Result<RollingAssetStepOutcome, MonitorError> {
+    run_rolling_asset_upload_with_child(
+        config,
+        state_store,
+        asset_id,
+        manifest,
+        summary,
+        |asset_id, record, session_path, timeout_seconds| {
+            run_upload_proof_direct_child_response_with_timeout(
+                asset_id,
+                record,
+                session_path,
+                timeout_seconds,
+            )
+        },
+    )
+}
+
+fn run_rolling_asset_upload_with_child<F>(
+    config: &MonitorConfig,
+    state_store: &AssetStateStore,
+    asset_id: &str,
+    manifest: &Arc<Mutex<Manifest>>,
+    summary: &Arc<Mutex<MonitorScanSummary>>,
+    child_runner: F,
+) -> Result<RollingAssetStepOutcome, MonitorError>
+where
+    F: FnOnce(&str, &AssetRecord, &Path, u64) -> Result<Vec<u8>, MonitorError>,
+{
     let session_path = required_path(&config.upload_session_path, "upload_session_path")?;
     let (heic, destination, record) = {
         let manifest = lock_shared(manifest, "rolling lifecycle manifest")?;
@@ -3695,14 +3723,15 @@ fn run_rolling_asset_upload(
         }),
     );
 
-    match run_upload_proof_direct_child_with_timeout(
+    match child_runner(
         asset_id,
         &record,
-        &heic,
-        &destination,
         session_path,
         config.upload_timeout_seconds,
-    ) {
+    )
+    .and_then(|response| {
+        parse_upload_proof_child_response(&response, asset_id, &heic, &destination)
+    }) {
         Ok(output) => {
             let timings = output.timings.clone();
             let uploaded = {
@@ -5016,38 +5045,32 @@ fn run_upload_proof_child_with_timeout(
     )
 }
 
-fn run_upload_proof_direct_child_with_timeout(
+fn run_upload_proof_direct_child_response_with_timeout(
     asset_id: &str,
     record: &AssetRecord,
-    heic: &UploadVerifiedHeic,
-    destination: &CloudKitLibraryDestination,
     session_path: &Path,
     timeout_seconds: u64,
-) -> Result<UploadProofChildOutput, MonitorError> {
+) -> Result<Vec<u8>, MonitorError> {
     let executable = env::current_exe().map_err(|source| MonitorError::CommandIo {
         program: "icloudpd-optimizer",
         source,
     })?;
-    run_upload_proof_direct_child_executable_with_timeout(
+    run_upload_proof_direct_child_response_executable_with_timeout(
         &executable,
         asset_id,
         record,
-        heic,
-        destination,
         session_path,
         timeout_seconds,
     )
 }
 
-fn run_upload_proof_direct_child_executable_with_timeout(
+fn run_upload_proof_direct_child_response_executable_with_timeout(
     executable: &Path,
     asset_id: &str,
     record: &AssetRecord,
-    heic: &UploadVerifiedHeic,
-    destination: &CloudKitLibraryDestination,
     session_path: &Path,
     timeout_seconds: u64,
-) -> Result<UploadProofChildOutput, MonitorError> {
+) -> Result<Vec<u8>, MonitorError> {
     let mut command = Command::new(executable);
     command.arg("__upload-proof-child");
     let input = serde_json::to_vec(&UploadProofChildInput {
@@ -5067,7 +5090,7 @@ fn run_upload_proof_direct_child_executable_with_timeout(
             message: command_output_message(&output),
         });
     }
-    parse_upload_proof_child_response(&output.stdout, asset_id, heic, destination)
+    Ok(output.stdout)
 }
 
 fn run_upload_proof_child_executable_with_timeout(
@@ -11738,16 +11761,21 @@ esac
         };
         let session_path = tempdir.path().join("session.json");
 
-        let output = run_upload_proof_direct_child_executable_with_timeout(
+        let response = run_upload_proof_direct_child_response_executable_with_timeout(
             &helper_path,
             "raw-test",
             &lifecycle_record("raw-test", State::ConversionVerified),
-            &UploadVerifiedHeic::from(&heic),
-            &destination,
             &session_path,
             5,
         )
-        .expect("direct child output should parse");
+        .expect("direct child response should return");
+        let output = parse_upload_proof_child_response(
+            &response,
+            "raw-test",
+            &UploadVerifiedHeic::from(&heic),
+            &destination,
+        )
+        .expect("direct child response should parse");
 
         assert_eq!(output.proof.uploaded_heic_asset_id, "asset");
         let args = fs::read_to_string(args_path).expect("args should be captured");
@@ -11760,7 +11788,7 @@ esac
     }
 
     #[test]
-    fn private_upload_child_response_rejects_unbound_raw_outcomes() {
+    fn rolling_upload_rejects_mismatched_child_asset_without_persisting_proof() {
         let tempdir = tempfile::tempdir().unwrap();
         let heic_path = tempdir.path().join("asset.heic");
         let heic_bytes = b"verified heic bytes";
@@ -11773,10 +11801,6 @@ esac
             "visual_match_ok": true,
         }))
         .unwrap();
-        let destination = CloudKitLibraryDestination {
-            database_scope: crate::upload::CloudKitDatabaseScope::Private,
-            zone_name: "PrimarySync".to_string(),
-        };
         let response = json!({
             "version": UPLOAD_PROOF_CHILD_PROTOCOL_VERSION,
             "asset_id": "asset",
@@ -11788,48 +11812,6 @@ esac
                 "timings": UploadTimings::default(),
             }
         });
-        assert!(response.get("proof").is_none());
-        assert!(
-            parse_upload_proof_child_response(
-                &serde_json::to_vec(&response).unwrap(),
-                "asset",
-                &UploadVerifiedHeic::from(&heic),
-                &destination,
-            )
-            .is_ok()
-        );
-
-        for mutation in [
-            ("version", json!(0)),
-            ("asset_id", json!("other")),
-            ("outcome.response.zone_name", json!("other")),
-            ("outcome.streamed_heic_sha256", json!("other")),
-            ("outcome.streamed_size_bytes", json!(0)),
-        ] {
-            let mut mismatched = response.clone();
-            match mutation.0 {
-                "outcome.response.zone_name" => {
-                    mismatched["outcome"]["response"]["zone_name"] = mutation.1
-                }
-                "outcome.streamed_heic_sha256" => {
-                    mismatched["outcome"]["streamed_heic_sha256"] = mutation.1
-                }
-                "outcome.streamed_size_bytes" => {
-                    mismatched["outcome"]["streamed_size_bytes"] = mutation.1
-                }
-                key => mismatched[key] = mutation.1,
-            }
-            assert!(
-                parse_upload_proof_child_response(
-                    &serde_json::to_vec(&mismatched).unwrap(),
-                    "asset",
-                    &UploadVerifiedHeic::from(&heic),
-                    &destination,
-                )
-                .is_err()
-            );
-        }
-
         let mut record = upload_verified_delete_ready_record("asset", tempdir.path());
         record.state = State::ConversionVerified;
         record.proofs.remove("upload");
@@ -11837,29 +11819,50 @@ esac
         let mut manifest = Manifest::new();
         manifest.upsert_trusted(record);
         let before = manifest.clone();
-        let summary = MonitorScanSummary::default();
+        let manifest = Arc::new(Mutex::new(manifest));
+        let summary = Arc::new(Mutex::new(MonitorScanSummary::default()));
         let store = AssetStateStore::open_writer(
             tempdir.path().join("manifest.json"),
             "test-writer",
             Duration::from_secs(60),
         )
         .unwrap();
-        store.persist_manifest_records_trusted(&manifest).unwrap();
+        store
+            .persist_manifest_records_trusted(&manifest.lock().unwrap())
+            .unwrap();
         let mut mismatch = response.clone();
         mismatch["asset_id"] = json!("other");
-        assert!(
-            parse_upload_proof_child_response(
-                &serde_json::to_vec(&mismatch).unwrap(),
-                "asset",
-                &UploadVerifiedHeic::from(&heic),
-                &destination,
-            )
-            .is_err()
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
         );
-        assert_eq!(manifest, before);
+        config.upload_session_path = Some(tempdir.path().join("session.json"));
+
+        let outcome = run_rolling_asset_upload_with_child(
+            &config,
+            &store,
+            "asset",
+            &manifest,
+            &summary,
+            |_asset_id, _record, _session_path, _timeout_seconds| {
+                Ok(serde_json::to_vec(&mismatch).unwrap())
+            },
+        )
+        .expect("mismatched child response should be handled fail-closed");
+
+        assert!(outcome.failed);
+        assert!(!outcome.completed);
+        let manifest = manifest.lock().unwrap();
+        let record = manifest.get("asset").expect("asset should remain tracked");
+        assert_eq!(record.state, State::ConversionVerified);
+        assert!(!record.proofs.contains_key("upload"));
+        assert_eq!(*manifest, before);
+        drop(manifest);
         assert_eq!(store.load().unwrap(), before);
-        assert!(!manifest.get("asset").unwrap().proofs.contains_key("upload"));
+        let summary = summary.lock().unwrap();
         assert_eq!(summary.uploads_completed, 0);
+        assert_eq!(summary.uploads_attempted, 1);
     }
 
     #[test]
