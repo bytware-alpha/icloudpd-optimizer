@@ -1866,32 +1866,64 @@ fn monitor_upload_verified_reverify<W: Write>(
         load_cloudkit_delete_session(session_path)?,
         ReqwestCloudKitReadTransport::new()?,
     );
-    let mut updated = Vec::with_capacity(ids.len());
-    for id in &ids {
-        updated.push(reverifier.reverify(&manifest, id, config.heic_verify_timeout_seconds)?);
-    }
-    let updated = reverify_changed_records(&expected, updated);
-    let would_change_count = updated.len() as u64;
-    let mut commit = ProductionReverifyCommitBoundary::new(&config, &state_store);
-    let changed_count =
-        apply_verified_reverify_updates(&mut commit, &expected, &updated, args.apply)?;
-    let report = UploadVerifiedReverifyReport {
+    let input = UploadVerifiedReverifyExecutorInput {
+        config: &config,
+        state_store: &state_store,
+        manifest: &manifest,
+        expected: &expected,
+        ids: &ids,
+        apply: args.apply,
+        timeout_seconds: config.heic_verify_timeout_seconds,
         target_set_sha256,
-        target_count: ids.len() as u64,
-        verified_count: ids.len() as u64,
-        changed_count,
-        would_change_count,
-        unchanged_count: ids.len() as u64 - would_change_count,
-        applied: args.apply,
-        elapsed_millis: started.elapsed().as_millis(),
+        started,
     };
-    serde_json::to_writer_pretty(&mut *writer, &report)?;
-    writeln!(writer)?;
+    let report = monitor_upload_verified_reverify_with_reverifier(input, &mut reverifier, writer)?;
     eprintln!(
         "upload-verified-reverify: verified={} changed={} applied={} elapsed_ms={}",
         report.verified_count, report.changed_count, report.applied, report.elapsed_millis
     );
     Ok(())
+}
+
+struct UploadVerifiedReverifyExecutorInput<'a> {
+    config: &'a MonitorConfig,
+    state_store: &'a AssetStateStore,
+    manifest: &'a Manifest,
+    expected: &'a BTreeMap<String, AssetRecord>,
+    ids: &'a BTreeSet<String>,
+    apply: bool,
+    timeout_seconds: u64,
+    target_set_sha256: String,
+    started: Instant,
+}
+
+fn monitor_upload_verified_reverify_with_reverifier<W: Write, R: UploadVerifiedAssetReverifier>(
+    input: UploadVerifiedReverifyExecutorInput<'_>,
+    reverifier: &mut R,
+    writer: &mut W,
+) -> Result<UploadVerifiedReverifyReport, CliError> {
+    let mut candidates = Vec::with_capacity(input.ids.len());
+    for id in input.ids {
+        candidates.push(reverifier.reverify(input.manifest, id, input.timeout_seconds)?);
+    }
+    let updated = reverify_changed_records(input.expected, candidates);
+    let would_change_count = updated.len() as u64;
+    let mut commit = ProductionReverifyCommitBoundary::new(input.config, input.state_store);
+    let changed_count =
+        apply_verified_reverify_updates(&mut commit, input.expected, &updated, input.apply)?;
+    let report = UploadVerifiedReverifyReport {
+        target_set_sha256: input.target_set_sha256,
+        target_count: input.ids.len() as u64,
+        verified_count: input.ids.len() as u64,
+        changed_count,
+        would_change_count,
+        unchanged_count: input.ids.len() as u64 - would_change_count,
+        applied: input.apply,
+        elapsed_millis: input.started.elapsed().as_millis(),
+    };
+    serde_json::to_writer_pretty(&mut *writer, &report)?;
+    writeln!(writer)?;
+    Ok(report)
 }
 
 trait UploadVerifiedAssetReverifier {
