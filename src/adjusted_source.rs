@@ -8,8 +8,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::cell::RefCell;
 #[cfg(all(test, target_os = "macos"))]
 use std::collections::VecDeque;
+#[cfg(all(test, target_os = "macos"))]
+use std::sync::mpsc::{Receiver, Sender};
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
+#[cfg(all(test, target_os = "macos"))]
+use std::time::Duration;
 
 use image::ImageDecoder;
 use image::codecs::jpeg::JpegDecoder;
@@ -373,12 +377,20 @@ enum MacosMetadataReadTarget {
 }
 
 #[cfg(all(test, target_os = "macos"))]
+struct TestMacosFchflagsPause {
+    entered: Sender<()>,
+    release: Receiver<()>,
+    timeout: Duration,
+}
+
+#[cfg(all(test, target_os = "macos"))]
 #[derive(Default)]
 struct TestMacosFchflagsState {
     failures: VecDeque<MacosFchflagsTarget>,
     calls: Vec<MacosFchflagsTarget>,
     metadata_failures: VecDeque<MacosMetadataReadTarget>,
     metadata_calls: Vec<MacosMetadataReadTarget>,
+    source_pause: Option<TestMacosFchflagsPause>,
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -388,12 +400,18 @@ thread_local! {
         calls: Vec::new(),
         metadata_failures: VecDeque::new(),
         metadata_calls: Vec::new(),
+        source_pause: None,
     });
 }
 
 #[cfg(all(test, target_os = "macos"))]
 struct TestMacosFchflagsFailureGuard {
     previous: TestMacosFchflagsState,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+struct TestMacosFchflagsPauseGuard {
+    previous: Option<TestMacosFchflagsPause>,
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -432,6 +450,65 @@ impl Drop for TestMacosFchflagsFailureGuard {
         TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
             *state = std::mem::take(&mut self.previous);
         });
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl TestMacosFchflagsPauseGuard {
+    fn install(entered: Sender<()>, release: Receiver<()>, timeout: Duration) -> Self {
+        let previous = TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+            state.source_pause.replace(TestMacosFchflagsPause {
+                entered,
+                release,
+                timeout,
+            })
+        });
+        Self { previous }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for TestMacosFchflagsPauseGuard {
+    fn drop(&mut self) {
+        TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+            state.source_pause = self.previous.take();
+        });
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn assert_test_macos_fchflags_state_is_reset() {
+    TEST_MACOS_FCHFLAGS_STATE.with_borrow(|state| {
+        assert!(state.failures.is_empty());
+        assert!(state.calls.is_empty());
+        assert!(state.metadata_failures.is_empty());
+        assert!(state.metadata_calls.is_empty());
+        assert!(state.source_pause.is_none());
+    });
+}
+
+#[cfg(all(test, target_os = "macos"))]
+struct TestReleaseOnDrop {
+    sender: Option<Sender<()>>,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl TestReleaseOnDrop {
+    fn new(sender: Sender<()>) -> Self {
+        Self {
+            sender: Some(sender),
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for TestReleaseOnDrop {
+    fn drop(&mut self) {
+        let _ = self
+            .sender
+            .take()
+            .expect("release sender must be present")
+            .send(());
     }
 }
 
@@ -1933,15 +2010,27 @@ fn set_macos_file_flags(
     let _ = target;
     #[cfg(test)]
     {
-        let failed = TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+        let (failed, pause) = TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
             state.calls.push(target);
-            if state.failures.front().copied() == Some(target) {
+            let failed = if state.failures.front().copied() == Some(target) {
                 state.failures.pop_front();
                 true
             } else {
                 false
-            }
+            };
+            let pause = if target == MacosFchflagsTarget::Source {
+                state.source_pause.take()
+            } else {
+                None
+            };
+            (failed, pause)
         });
+        if let Some(pause) = pause
+            && (pause.entered.send(()).is_err()
+                || pause.release.recv_timeout(pause.timeout).is_err())
+        {
+            return Err(AdjustedSourceError::Filesystem);
+        }
         if failed {
             return Err(AdjustedSourceError::Filesystem);
         }
@@ -2635,19 +2724,21 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_fchflags_fault_is_thread_local_during_unrelated_adjusted_materialization() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::mpsc;
+        use std::time::Duration;
 
-        let armed = Arc::new(Barrier::new(2));
-        let materialized = Arc::new(Barrier::new(2));
+        const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+        let (entered_source, source_entered) = mpsc::channel();
+        let (release_materializer, materializer_released) = mpsc::channel();
         std::thread::scope(|scope| {
-            let armed_source = Arc::clone(&armed);
-            let materialized_source = Arc::clone(&materialized);
             let source = scope.spawn(move || {
                 let guard = TestMacosFchflagsFailureGuard::install();
                 let mut staging = sealed_macos_staging_for_unseal_test();
                 guard.arm([MacosFchflagsTarget::Source]);
-                armed_source.wait();
-                materialized_source.wait();
+                let _release = TestReleaseOnDrop::new(release_materializer);
+                source_entered
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("unrelated materializer should pause in its Source fchflags wrapper");
 
                 assert!(matches!(
                     staging.cleanup(),
@@ -2663,29 +2754,40 @@ mod tests {
                 );
                 assert_macos_unseal_failure_residual(&staging, true);
                 drop(guard);
+                assert_test_macos_fchflags_state_is_reset();
+                let retry_guard = TestMacosFchflagsFailureGuard::install();
                 staging
                     .cleanup()
                     .expect("thread-local fault residual should clean on retry");
+                drop(retry_guard);
+                assert_test_macos_fchflags_state_is_reset();
             });
 
             let materializer = scope.spawn(move || {
-                armed.wait();
+                let _state_guard = TestMacosFchflagsFailureGuard::install();
+                let _pause_guard = TestMacosFchflagsPauseGuard::install(
+                    entered_source,
+                    materializer_released,
+                    TEST_TIMEOUT,
+                );
                 let source = materialize_unrelated_adjusted_source_for_thread_isolation_test();
                 let staging_path = source.path().to_path_buf();
-                let descriptor = source
-                    .duplicate_file_for_encoder()
-                    .expect("unrelated materialization should expose a validated descriptor");
-                assert!(
-                    descriptor.raw_fd() >= 0,
-                    "materialized adjusted source must expose an open encoder descriptor"
+                let descriptor_observation =
+                    source.duplicate_file_for_encoder().ok().map(|descriptor| {
+                        let observed = descriptor.raw_fd() >= 0;
+                        drop(descriptor);
+                        observed
+                    });
+                assert_eq!(
+                    descriptor_observation,
+                    Some(true),
+                    "unrelated materialization must retain an open encoder descriptor"
                 );
-                drop(descriptor);
                 drop(source);
                 assert!(
                     !staging_path.exists(),
                     "unrelated materialization should clean its sealed staging directory"
                 );
-                materialized.wait();
             });
 
             source.join().expect("armed source thread should complete");
