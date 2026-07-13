@@ -100,7 +100,7 @@ fn heic_proof() -> HeicVerificationInput {
 #[test]
 fn current_conversion_recipe_is_required_before_upload() {
     for recipe in [None, Some("embedded-preview-legacy-v0")] {
-        let mut manifest = conversion_verified_manifest();
+        let mut manifest = trusted_current_manifest(conversion_verified_manifest());
         let mut record = manifest.get("asset-1").expect("asset should exist").clone();
         let performance = record
             .proofs
@@ -115,7 +115,7 @@ fn current_conversion_recipe_is_required_before_upload() {
                     .remove("conversion_recipe_id");
             }
         }
-        manifest.upsert(record);
+        manifest = replace_trusted_record(record);
 
         let error = upload_ready_heic_proof(&manifest, "asset-1")
             .expect_err("missing or old recipe must not be upload-ready");
@@ -137,7 +137,7 @@ fn conversion_and_heic_recipe_gate_matrix_blocks_upload_and_delete_admission() {
         ("heic", None),
         ("heic", Some("embedded-preview-legacy-v0")),
     ] {
-        let mut conversion_verified = conversion_verified_manifest();
+        let mut conversion_verified = trusted_current_manifest(conversion_verified_manifest());
         let mut record = conversion_verified
             .get("asset-1")
             .expect("asset should exist")
@@ -155,13 +155,13 @@ fn conversion_and_heic_recipe_gate_matrix_blocks_upload_and_delete_admission() {
                     .remove("conversion_recipe_id");
             }
         }
-        conversion_verified.upsert(record);
+        conversion_verified = replace_trusted_record(record);
         assert!(matches!(
             upload_ready_heic_proof(&conversion_verified, "asset-1"),
             Err(WorkflowError::ConversionRecipeOutdated { .. })
         ));
 
-        let mut upload_verified = upload_verified_manifest();
+        let mut upload_verified = trusted_current_manifest(upload_verified_manifest());
         let mut record = upload_verified
             .get("asset-1")
             .expect("asset should exist")
@@ -179,7 +179,7 @@ fn conversion_and_heic_recipe_gate_matrix_blocks_upload_and_delete_admission() {
                     .remove("conversion_recipe_id");
             }
         }
-        upload_verified.upsert(record);
+        upload_verified = replace_trusted_record(record);
         assert!(matches!(
             mark_delete_eligible(&mut upload_verified, "asset-1"),
             Err(WorkflowError::ConversionRecipeOutdated { .. })
@@ -187,7 +187,7 @@ fn conversion_and_heic_recipe_gate_matrix_blocks_upload_and_delete_admission() {
         assert!(build_delete_plan(&upload_verified, "asset-1").is_err());
     }
 
-    let mut current = upload_verified_manifest();
+    let mut current = trusted_current_manifest(upload_verified_manifest());
     mark_delete_eligible(&mut current, "asset-1").expect("current recipe should be eligible");
     approve_delete(&mut current, "asset-1", "operator")
         .expect("current recipe should be approvable");
@@ -350,6 +350,32 @@ fn upload_verified_manifest() -> Manifest {
     record_original_asset_proof(&mut manifest, "asset-1", original_asset_proof())
         .expect("original asset proof should record");
     manifest
+}
+
+fn trusted_current_manifest(manifest: Manifest) -> Manifest {
+    let mut record = manifest
+        .get("asset-1")
+        .expect("fixture should contain asset")
+        .clone();
+    for proof_name in ["conversion", "conversion_performance", "heic"] {
+        record
+            .proofs
+            .get_mut(proof_name)
+            .expect("proof should exist")["conversion_recipe_id"] =
+            json!("embedded-preview-normalized-v1");
+    }
+    replace_trusted_record(record)
+}
+
+fn replace_trusted_record(record: AssetRecord) -> Manifest {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let path = tempdir.path().join("manifest.json");
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({"records": [record]})).expect("fixture should serialize"),
+    )
+    .expect("fixture should persist");
+    Manifest::load(path).expect("trusted fixture should load")
 }
 
 fn real_upload_verified_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {

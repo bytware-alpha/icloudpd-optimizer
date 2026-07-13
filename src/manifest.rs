@@ -268,6 +268,18 @@ impl Manifest {
         asset_id: &str,
         new_state: State,
         proof_name: impl Into<String>,
+        mut proof: Value,
+    ) -> Result<&AssetRecord, ManifestError> {
+        let proof_name = proof_name.into();
+        sanitize_untrusted_recipe_claim(&proof_name, &mut proof);
+        self.transition_trusted(asset_id, new_state, proof_name, proof)
+    }
+
+    pub(crate) fn transition_trusted(
+        &mut self,
+        asset_id: &str,
+        new_state: State,
+        proof_name: impl Into<String>,
         proof: Value,
     ) -> Result<&AssetRecord, ManifestError> {
         let current_state = self.get(asset_id)?.state;
@@ -400,8 +412,10 @@ impl Manifest {
         &mut self,
         asset_id: &str,
         proof_name: impl Into<String>,
-        proof: Value,
+        mut proof: Value,
     ) -> Result<&AssetRecord, ManifestError> {
+        let proof_name = proof_name.into();
+        sanitize_untrusted_recipe_claim(&proof_name, &mut proof);
         let current_state = self.get(asset_id)?.state;
         if current_state != State::Failed {
             return Err(ManifestError::InvalidTransition {
@@ -419,7 +433,7 @@ impl Manifest {
                 asset_id: asset_id.to_string(),
             })?;
         record.state = State::NeedsReview;
-        record.proofs.insert(proof_name.into(), proof);
+        record.proofs.insert(proof_name, proof);
         record.updated_at = updated_at;
         Ok(record)
     }
@@ -469,6 +483,17 @@ impl Manifest {
     }
 
     pub(crate) fn record_proof(
+        &mut self,
+        asset_id: &str,
+        proof_name: impl Into<String>,
+        mut proof: Value,
+    ) -> Result<&AssetRecord, ManifestError> {
+        let proof_name = proof_name.into();
+        sanitize_untrusted_recipe_claim(&proof_name, &mut proof);
+        self.record_trusted_proof(asset_id, proof_name, proof)
+    }
+
+    pub(crate) fn record_trusted_proof(
         &mut self,
         asset_id: &str,
         proof_name: impl Into<String>,
@@ -534,12 +559,20 @@ impl Manifest {
 
 fn sanitize_untrusted_recipe_claims(record: &mut AssetRecord) {
     for proof_name in ["conversion", "conversion_performance", "heic"] {
-        if let Some(Value::Object(proof)) = record.proofs.get_mut(proof_name) {
-            proof.insert(
-                "conversion_recipe_id".to_string(),
-                Value::String(String::new()),
-            );
+        if let Some(proof) = record.proofs.get_mut(proof_name) {
+            sanitize_untrusted_recipe_claim(proof_name, proof);
         }
+    }
+}
+
+fn sanitize_untrusted_recipe_claim(proof_name: &str, proof: &mut Value) {
+    if ["conversion", "conversion_performance", "heic"].contains(&proof_name)
+        && let Value::Object(proof) = proof
+    {
+        proof.insert(
+            "conversion_recipe_id".to_string(),
+            Value::String(String::new()),
+        );
     }
 }
 
@@ -782,6 +815,42 @@ mod tests {
             assert_eq!(
                 loaded.get("asset").unwrap().proofs[proof_name]["conversion_recipe_id"],
                 "embedded-preview-normalized-v1"
+            );
+        }
+    }
+
+    #[test]
+    fn public_proof_mutators_strip_forged_current_recipe_claims() {
+        for proof_name in ["conversion", "conversion_performance", "heic"] {
+            let forged = serde_json::json!({
+                "conversion_recipe_id": "embedded-preview-normalized-v1"
+            });
+
+            let mut transitioned = Manifest::new();
+            transitioned.upsert(AssetRecord::new("transitioned", "/raw/transitioned.dng"));
+            transitioned
+                .transition(
+                    "transitioned",
+                    State::NasVerified,
+                    proof_name,
+                    forged.clone(),
+                )
+                .unwrap();
+            assert_eq!(
+                transitioned.get("transitioned").unwrap().proofs[proof_name]["conversion_recipe_id"],
+                ""
+            );
+
+            let mut terminalized = Manifest::new();
+            let mut failed = AssetRecord::new("terminalized", "/raw/terminalized.dng");
+            failed.state = State::Failed;
+            terminalized.upsert(failed);
+            terminalized
+                .terminalize_failed_with_proof("terminalized", proof_name, forged)
+                .unwrap();
+            assert_eq!(
+                terminalized.get("terminalized").unwrap().proofs[proof_name]["conversion_recipe_id"],
+                ""
             );
         }
     }

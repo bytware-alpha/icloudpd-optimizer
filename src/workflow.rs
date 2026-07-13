@@ -516,7 +516,7 @@ pub fn record_conversion_result<'a>(
     asset_id: &str,
     input: ConversionResultInput,
 ) -> Result<&'a AssetRecord, WorkflowError> {
-    record_conversion_result_with_recipe(manifest, asset_id, input, String::new())
+    record_conversion_result_with_recipe(manifest, asset_id, input, String::new(), false)
 }
 
 pub(crate) fn record_current_conversion_result<'a>(
@@ -529,6 +529,7 @@ pub(crate) fn record_current_conversion_result<'a>(
         asset_id,
         input,
         EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
+        true,
     )
 }
 
@@ -537,6 +538,7 @@ fn record_conversion_result_with_recipe<'a>(
     asset_id: &str,
     input: ConversionResultInput,
     conversion_recipe_id: String,
+    trusted: bool,
 ) -> Result<&'a AssetRecord, WorkflowError> {
     let proof = ConversionResultProof {
         heic_path: input.heic_path,
@@ -548,13 +550,23 @@ fn record_conversion_result_with_recipe<'a>(
     require_non_empty_path("heic_path", &proof.heic_path)?;
     require_non_empty("heic_sha256", &proof.heic_sha256)?;
     validate_conversion_source_binding(manifest, asset_id, &proof)?;
-    transition_with_proof(
-        manifest,
-        asset_id,
-        State::Converted,
-        CONVERSION_PROOF,
-        &proof,
-    )
+    if trusted {
+        transition_with_trusted_proof(
+            manifest,
+            asset_id,
+            State::Converted,
+            CONVERSION_PROOF,
+            &proof,
+        )
+    } else {
+        transition_with_proof(
+            manifest,
+            asset_id,
+            State::Converted,
+            CONVERSION_PROOF,
+            &proof,
+        )
+    }
 }
 
 pub fn record_conversion_performance<'a>(
@@ -562,7 +574,7 @@ pub fn record_conversion_performance<'a>(
     asset_id: &str,
     input: ConversionPerformanceInput,
 ) -> Result<&'a AssetRecord, WorkflowError> {
-    record_conversion_performance_with_recipe(manifest, asset_id, input, String::new())
+    record_conversion_performance_with_recipe(manifest, asset_id, input, String::new(), false)
 }
 
 pub(crate) fn record_current_conversion_performance<'a>(
@@ -575,6 +587,7 @@ pub(crate) fn record_current_conversion_performance<'a>(
         asset_id,
         input,
         EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
+        true,
     )
 }
 
@@ -583,6 +596,7 @@ fn record_conversion_performance_with_recipe<'a>(
     asset_id: &str,
     input: ConversionPerformanceInput,
     conversion_recipe_id: String,
+    trusted: bool,
 ) -> Result<&'a AssetRecord, WorkflowError> {
     let state = manifest.get(asset_id)?.state;
     if state != State::Converted {
@@ -612,7 +626,11 @@ fn record_conversion_performance_with_recipe<'a>(
         conversion_command_timings: input.conversion_command_timings,
     };
     validate_conversion_performance_proof(&proof, &nas, &conversion)?;
-    insert_workflow_proof(manifest, asset_id, CONVERSION_PERFORMANCE_PROOF, &proof)
+    if trusted {
+        insert_trusted_workflow_proof(manifest, asset_id, CONVERSION_PERFORMANCE_PROOF, &proof)
+    } else {
+        insert_workflow_proof(manifest, asset_id, CONVERSION_PERFORMANCE_PROOF, &proof)
+    }
 }
 
 pub fn record_heic_verification<'a>(
@@ -620,7 +638,7 @@ pub fn record_heic_verification<'a>(
     asset_id: &str,
     input: HeicVerificationInput,
 ) -> Result<&'a AssetRecord, WorkflowError> {
-    record_heic_verification_with_recipe(manifest, asset_id, input, String::new())
+    record_heic_verification_with_recipe(manifest, asset_id, input, String::new(), false)
 }
 
 pub(crate) fn record_current_heic_verification<'a>(
@@ -633,6 +651,7 @@ pub(crate) fn record_current_heic_verification<'a>(
         asset_id,
         input,
         EMBEDDED_PREVIEW_CONVERSION_RECIPE.to_string(),
+        true,
     )
 }
 
@@ -641,6 +660,7 @@ fn record_heic_verification_with_recipe<'a>(
     asset_id: &str,
     input: HeicVerificationInput,
     conversion_recipe_id: String,
+    trusted: bool,
 ) -> Result<&'a AssetRecord, WorkflowError> {
     let proof = HeicVerificationProof {
         heic_path: input.heic_path,
@@ -676,13 +696,23 @@ fn record_heic_verification_with_recipe<'a>(
         proof.size_bytes,
     )?;
     validate_heic_verification_flags_legacy(&proof)?;
-    transition_with_proof(
-        manifest,
-        asset_id,
-        State::ConversionVerified,
-        HEIC_PROOF,
-        &proof,
-    )
+    if trusted {
+        transition_with_trusted_proof(
+            manifest,
+            asset_id,
+            State::ConversionVerified,
+            HEIC_PROOF,
+            &proof,
+        )
+    } else {
+        transition_with_proof(
+            manifest,
+            asset_id,
+            State::ConversionVerified,
+            HEIC_PROOF,
+            &proof,
+        )
+    }
 }
 
 pub fn record_upload_proof<'a>(
@@ -2686,6 +2716,19 @@ fn transition_with_proof<'a>(
         .map_err(WorkflowError::Manifest)
 }
 
+fn transition_with_trusted_proof<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    state: State,
+    proof_key: &str,
+    proof: &impl Serialize,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    let proof = serde_json::to_value(proof)?;
+    manifest
+        .transition_trusted(asset_id, state, proof_key, proof)
+        .map_err(WorkflowError::Manifest)
+}
+
 fn insert_workflow_proof<'a>(
     manifest: &'a mut Manifest,
     asset_id: &str,
@@ -2695,6 +2738,18 @@ fn insert_workflow_proof<'a>(
     let proof = serde_json::to_value(proof)?;
     manifest
         .record_proof(asset_id, proof_key, proof)
+        .map_err(WorkflowError::Manifest)
+}
+
+fn insert_trusted_workflow_proof<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    proof_key: &str,
+    proof: &impl Serialize,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    let proof = serde_json::to_value(proof)?;
+    manifest
+        .record_trusted_proof(asset_id, proof_key, proof)
         .map_err(WorkflowError::Manifest)
 }
 
