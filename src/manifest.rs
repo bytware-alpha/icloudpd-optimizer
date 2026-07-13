@@ -237,15 +237,11 @@ impl Manifest {
 
     /// Accepts untrusted in-memory records and removes recipe claims before storage.
     pub fn upsert(&mut self, mut record: AssetRecord) {
-        if cfg!(test) {
-            self.records.insert(record.asset_id.clone(), record);
-            return;
-        }
         sanitize_untrusted_recipe_claims(&mut record);
         self.records.insert(record.asset_id.clone(), record);
     }
 
-    pub(crate) fn upsert_loaded(&mut self, record: AssetRecord) {
+    pub(crate) fn upsert_trusted(&mut self, record: AssetRecord) {
         self.records.insert(record.asset_id.clone(), record);
     }
 
@@ -263,7 +259,7 @@ impl Manifest {
 
     pub fn snapshot_record(&self, asset_id: &str) -> Result<Self, ManifestError> {
         let mut snapshot = Self::new();
-        snapshot.upsert(self.get(asset_id)?.clone());
+        snapshot.upsert_trusted(self.get(asset_id)?.clone());
         Ok(snapshot)
     }
 
@@ -530,7 +526,7 @@ impl Manifest {
         let payload: ManifestFile = serde_json::from_reader(file)?;
         let mut manifest = Self::new();
         for record in payload.records {
-            manifest.upsert_loaded(record);
+            manifest.upsert_trusted(record);
         }
         Ok(manifest)
     }
@@ -755,5 +751,38 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn public_upsert_strips_recipe_claims_while_trusted_snapshot_and_load_preserve_them() {
+        let mut record = AssetRecord::new("asset", "/raw/asset.dng");
+        for proof_name in ["conversion", "conversion_performance", "heic"] {
+            record.proofs.insert(
+                proof_name.to_string(),
+                serde_json::json!({"conversion_recipe_id": "embedded-preview-normalized-v1"}),
+            );
+        }
+
+        let mut untrusted = Manifest::new();
+        untrusted.upsert(record.clone());
+        for proof_name in ["conversion", "conversion_performance", "heic"] {
+            assert_eq!(
+                untrusted.get("asset").unwrap().proofs[proof_name]["conversion_recipe_id"],
+                ""
+            );
+        }
+
+        let mut trusted = Manifest::new();
+        trusted.upsert_trusted(record);
+        let snapshot = trusted.snapshot_record("asset").unwrap();
+        let path = tempfile::tempdir().unwrap().path().join("manifest.json");
+        snapshot.save_atomic(&path).unwrap();
+        let loaded = Manifest::load(path).unwrap();
+        for proof_name in ["conversion", "conversion_performance", "heic"] {
+            assert_eq!(
+                loaded.get("asset").unwrap().proofs[proof_name]["conversion_recipe_id"],
+                "embedded-preview-normalized-v1"
+            );
+        }
     }
 }

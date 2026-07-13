@@ -188,7 +188,7 @@ fn execute_measured_conversions_for_target(
 
         for (asset_id, output_path, manifest) in chunk_results {
             let record = manifest.get(&asset_id)?.clone();
-            updated.upsert(record);
+            updated.upsert_trusted(record);
             completed_output_paths.push(output_path);
         }
     }

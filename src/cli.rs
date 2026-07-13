@@ -1021,7 +1021,7 @@ fn run_upload_proof_child_protocol<R: Read, W: Write>(
         return Err(CliError::InvalidPrivateChildProtocol);
     }
     let mut manifest = Manifest::new();
-    manifest.upsert(input.record);
+    manifest.upsert_trusted(input.record);
     let heic = upload_ready_heic_proof(&manifest, &input.asset_id)?;
     verify_local_heic(&heic)?;
     load_upload_session(&input.session_path)?;
@@ -2481,7 +2481,7 @@ fn type_legacy_missing_preview_failures(
                 legacy_failures_classify_gate("a candidate no longer had a final failure")
             })?;
             last_failure.kind = Some(FailureKind::EmbeddedPreviewUnavailable);
-            manifest.upsert(updated.clone());
+            manifest.upsert_trusted(updated.clone());
             Ok(updated)
         })
         .collect()
@@ -3977,8 +3977,8 @@ mod queue_tests {
         config.auto_delete = false;
         config.max_lifecycle_per_scan = 1;
         let mut manifest = Manifest::new();
-        manifest.upsert(upload_verified_record("terminal-mirror", 10));
-        manifest.upsert(upload_verified_record("repair-mirror", 0));
+        manifest.upsert_trusted(upload_verified_record("terminal-mirror", 10));
+        manifest.upsert_trusted(upload_verified_record("repair-mirror", 0));
 
         let runtime_active =
             crate::monitor::active_lifecycle_asset_ids_for_config(&config, &manifest);

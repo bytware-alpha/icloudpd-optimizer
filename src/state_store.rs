@@ -1784,7 +1784,7 @@ fn load_database_manifest_from_statement(
         {
             return Err(AssetStateStoreError::RecordColumnMismatch { asset_id });
         }
-        manifest.upsert(record);
+        manifest.upsert_trusted(record);
     }
     Ok(manifest)
 }

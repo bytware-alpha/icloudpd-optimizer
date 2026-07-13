@@ -1354,7 +1354,7 @@ fn execute_monitor_conversions(
                         .get("conversion")
                         .and_then(|proof| proof.get("size_bytes"))
                         .and_then(serde_json::Value::as_u64);
-                    manifest.upsert(record);
+                    manifest.upsert_trusted(record);
                     summary.conversions_completed = summary.conversions_completed.saturating_add(1);
                     log_monitor_event(
                         "conversion_finished",
@@ -2124,7 +2124,7 @@ fn rolling_lifecycle_worker_stage_sequence(
     config: &MonitorConfig,
 ) -> Vec<RollingAssetStep> {
     let mut manifest = Manifest::new();
-    manifest.upsert(record.clone());
+    manifest.upsert_trusted(record.clone());
     rolling_lifecycle_worker_stage_sequence_for_manifest(&manifest, record, config)
 }
 
@@ -3174,7 +3174,7 @@ fn stage_adjusted_source_resolution_success(
     proof: crate::adjusted_source::CloudKitAdjustedSourceProof,
 ) -> Result<AssetRecord, MonitorError> {
     let mut staged = Manifest::new();
-    staged.upsert(expected.clone());
+    staged.upsert_trusted(expected.clone());
     staged.recover_failed_for_retry(asset_id, State::NasVerified)?;
     record_adjusted_source_proof(&mut staged, asset_id, conversion_output_path, proof)?;
     Ok(staged.get(asset_id)?.clone())
@@ -3186,7 +3186,7 @@ fn stage_adjusted_source_resolution_failure(
     error: &AdjustedSourceError,
 ) -> Result<AssetRecord, MonitorError> {
     let mut staged = Manifest::new();
-    staged.upsert(expected.clone());
+    staged.upsert_trusted(expected.clone());
     record_stage_failure_with_kind(
         &mut staged,
         asset_id,
@@ -3208,7 +3208,7 @@ fn persist_rolling_adjusted_source_exact_cas(
         .persist_records_exact_cas_atomic([AssetRecordExactCasUpdate { expected, updated }])
     {
         Ok(elapsed) => {
-            lock_shared(manifest, "rolling lifecycle manifest")?.upsert(updated.clone());
+            lock_shared(manifest, "rolling lifecycle manifest")?.upsert_trusted(updated.clone());
             Ok(Some(elapsed))
         }
         Err(AssetStateStoreError::ExactCasMismatch { .. }) => {
@@ -3220,7 +3220,7 @@ fn persist_rolling_adjusted_source_exact_cas(
                 &durable_manifest,
                 &durable_record,
             )?;
-            lock_shared(manifest, "rolling lifecycle manifest")?.upsert(durable_record);
+            lock_shared(manifest, "rolling lifecycle manifest")?.upsert_trusted(durable_record);
             Ok(None)
         }
         Err(error) => Err(MonitorError::StateStore(error)),
@@ -3424,7 +3424,7 @@ fn run_rolling_asset_conversion(
                     return Ok(RollingAssetStepOutcome::attempted(false));
                 }
                 let previous = manifest.get(asset_id)?.clone();
-                manifest.upsert(record);
+                manifest.upsert_trusted(record);
                 persist_asset_record(
                     state_store,
                     &mut manifest,
@@ -4087,7 +4087,7 @@ fn persist_asset_record(
     let elapsed = match state_store.persist_record(manifest.get(asset_id)?) {
         Ok(elapsed) => elapsed,
         Err(error) => {
-            manifest.upsert(previous);
+            manifest.upsert_trusted(previous);
             return Err(MonitorError::StateStore(error));
         }
     };
@@ -5918,7 +5918,7 @@ fn stage_and_commit_reconciled_deletes(
     }
     let mut staged = Manifest::new();
     for item in &confirmed {
-        staged.upsert(manifest.get(item.item.reconciliation.asset_id())?.clone());
+        staged.upsert_trusted(manifest.get(item.item.reconciliation.asset_id())?.clone());
     }
 
     let mut changed_records = Vec::with_capacity(confirmed.len());
@@ -5944,7 +5944,7 @@ fn stage_and_commit_reconciled_deletes(
     let elapsed = state_store.persist_records_atomic(changed_records.iter())?;
     totals.atomic_batch_commit_wall_time_micros = elapsed.as_micros() as u64;
     for record in changed_records {
-        manifest.upsert(record);
+        manifest.upsert_trusted(record);
     }
     log_monitor_event(
         "asset_state_batch_committed",
@@ -5977,7 +5977,7 @@ fn process_delete_preparation_window(
     } else {
         let elapsed = state_store.persist_records_atomic(preparation.changed_records.iter())?;
         for record in &preparation.changed_records {
-            manifest.upsert(record.clone());
+            manifest.upsert_trusted(record.clone());
         }
         elapsed.as_micros() as u64
     };
@@ -6310,7 +6310,7 @@ fn stage_and_commit_confirmed_deletes(
 
     let mut staged = Manifest::new();
     for item in &confirmed {
-        staged.upsert(manifest.get(item.prepared.prevalidated.asset_id())?.clone());
+        staged.upsert_trusted(manifest.get(item.prepared.prevalidated.asset_id())?.clone());
     }
     let mut changed_records = Vec::with_capacity(confirmed.len());
     let mut totals = DeleteCommitTotals::default();
@@ -6343,7 +6343,7 @@ fn stage_and_commit_confirmed_deletes(
     let elapsed = state_store.persist_records_atomic(changed_records.iter())?;
     totals.atomic_batch_commit_wall_time_micros = elapsed.as_micros() as u64;
     for record in changed_records {
-        manifest.upsert(record);
+        manifest.upsert_trusted(record);
     }
     log_monitor_event(
         "asset_state_batch_committed",
@@ -11924,7 +11924,7 @@ esac
 
         let mut current = upload_verified_delete_ready_record("current", tempdir.path());
         make_local_mirror_proof_current(&mut current);
-        manifest.upsert(current);
+        manifest.upsert_trusted(current);
         assert!(is_upload_verified_delete_candidate(
             &manifest,
             manifest.get("current").unwrap()
@@ -12907,7 +12907,7 @@ esac
         let mut waiting = upload_verified_delete_ready_record("a-waiting-mirror", tempdir.path());
         make_local_mirror_proof_current(&mut waiting);
         waiting.proofs.remove("icloudpd_local_mirror");
-        manifest.upsert(waiting);
+        manifest.upsert_trusted(waiting);
         let mut ready = lifecycle_record("b-ready-nas", State::NasVerified);
         add_original_asset_proof(&mut ready);
         manifest.upsert(ready);
@@ -14416,7 +14416,7 @@ esac
         fs::create_dir_all(&config.download_root).expect("download root should be created");
 
         let mut manifest = Manifest::new();
-        manifest.upsert(upload_verified_delete_ready_record(
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
             "a-delete-ready",
             &config.download_root,
         ));
@@ -14461,7 +14461,7 @@ esac
         config.rolling_lifecycle = true;
         config.auto_delete = false;
         let mut manifest = Manifest::new();
-        manifest.upsert(upload_verified_delete_ready_record(
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-a",
             &config.download_root,
         ));
@@ -14526,7 +14526,7 @@ esac
             )),
         };
         let mut manifest = Manifest::new();
-        manifest.upsert(record);
+        manifest.upsert_trusted(record);
         let mut summary = MonitorScanSummary {
             started_unix_seconds: 1,
             ..MonitorScanSummary::default()
@@ -14665,7 +14665,7 @@ esac
             }),
         );
         let mut manifest = Manifest::new();
-        manifest.upsert(record);
+        manifest.upsert_trusted(record);
         let mut summary = MonitorScanSummary {
             started_unix_seconds: 1,
             ..MonitorScanSummary::default()
@@ -14782,7 +14782,7 @@ esac
             }),
         );
         let mut manifest = Manifest::new();
-        manifest.upsert(record);
+        manifest.upsert_trusted(record);
         let summary = Arc::new(Mutex::new(MonitorScanSummary {
             started_unix_seconds: 1,
             ..MonitorScanSummary::default()
@@ -14846,7 +14846,7 @@ esac
         make_local_mirror_proof_current(&mut record);
         record.proofs.get_mut("icloudpd_local_mirror").unwrap()["size_bytes"] = json!(0);
         let mut manifest = Manifest::new();
-        manifest.upsert(record);
+        manifest.upsert_trusted(record);
         let mut summary = MonitorScanSummary {
             started_unix_seconds: 1,
             ..MonitorScanSummary::default()
@@ -15135,7 +15135,7 @@ esac
         config.auto_delete = true;
         config.max_lifecycle_per_scan = 10;
         let mut manifest = Manifest::new();
-        manifest.upsert(upload_verified_delete_ready_record(
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-a",
             &config.download_root,
         ));
@@ -15170,7 +15170,7 @@ esac
         config.max_lifecycle_per_scan = 10;
         let mut manifest = Manifest::new();
         for asset_id in ["asset-a", "asset-b"] {
-            manifest.upsert(upload_verified_delete_ready_record(
+            manifest.upsert_trusted(upload_verified_delete_ready_record(
                 asset_id,
                 &config.download_root,
             ));
@@ -15262,7 +15262,7 @@ esac
         let mut manifest = Manifest::new();
         let record = upload_verified_delete_ready_record("asset-a", &config.download_root);
         let raw_path = record.raw_path.clone();
-        manifest.upsert(record);
+        manifest.upsert_trusted(record);
         manifest
             .save_atomic(&config.manifest_path)
             .expect("manifest should save");
@@ -15349,7 +15349,7 @@ esac
         let mut manifest = Manifest::new();
         let record = upload_verified_delete_ready_record("asset-a", &config.download_root);
         let raw_path = record.raw_path.clone();
-        manifest.upsert(record);
+        manifest.upsert_trusted(record);
         let _ = prepare_delete_item("batch-test", &mut manifest, "asset-a")
             .expect("approval should succeed");
         manifest.save_atomic(&config.manifest_path).unwrap();
@@ -15406,7 +15406,7 @@ esac
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.delete_operator = "batch-test".to_string();
         let mut manifest = Manifest::new();
-        manifest.upsert(upload_verified_delete_ready_record(
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-a",
             &config.download_root,
         ));
@@ -15468,7 +15468,7 @@ esac
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.delete_operator = "batch-test".to_string();
         let mut manifest = Manifest::new();
-        manifest.upsert(upload_verified_delete_ready_record(
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-a",
             &config.download_root,
         ));
@@ -15524,11 +15524,11 @@ esac
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.delete_operator = "batch-test".to_string();
         let mut manifest = Manifest::new();
-        manifest.upsert(upload_verified_delete_ready_record(
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-a",
             &config.download_root,
         ));
-        manifest.upsert(upload_verified_delete_ready_record(
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-b",
             &config.download_root,
         ));
@@ -15586,7 +15586,7 @@ esac
         fs::create_dir_all(&download_root).unwrap();
         let mut manifest = Manifest::new();
         for asset_id in ["asset-a", "asset-b"] {
-            manifest.upsert(upload_verified_delete_ready_record(
+            manifest.upsert_trusted(upload_verified_delete_ready_record(
                 asset_id,
                 &download_root,
             ));
@@ -15638,7 +15638,7 @@ esac
         let download_root = tempdir.path().join("download");
         fs::create_dir_all(&download_root).unwrap();
         let mut first_manifest = Manifest::new();
-        first_manifest.upsert(upload_verified_delete_ready_record(
+        first_manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-a",
             &download_root,
         ));
@@ -15683,11 +15683,11 @@ esac
         let download_root = tempdir.path().join("download");
         fs::create_dir_all(&download_root).unwrap();
         let mut manifest = Manifest::new();
-        manifest.upsert(upload_verified_delete_ready_record(
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-a",
             &download_root,
         ));
-        manifest.upsert(upload_verified_delete_ready_record(
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-b",
             &download_root,
         ));
@@ -15775,7 +15775,7 @@ esac
             let mut manifest = Manifest::new();
             let record = upload_verified_delete_ready_record("asset-a", &download_root);
             let raw_path = record.raw_path.clone();
-            manifest.upsert(record);
+            manifest.upsert_trusted(record);
             let (prepared, _) = prepare_delete_item("batch-test", &mut manifest, "asset-a")
                 .expect("delete should prevalidate");
             let prepared = prepared.expect("approved delete should be prepared");
@@ -15829,7 +15829,7 @@ esac
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.delete_operator = "batch-test".to_string();
         let mut manifest = Manifest::new();
-        manifest.upsert(upload_verified_delete_ready_record(
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-a",
             &config.download_root,
         ));
@@ -15911,7 +15911,7 @@ esac
             fs::create_dir_all(&config.download_root).expect("download root should be created");
             config.delete_operator = "batch-test".to_string();
             let mut manifest = Manifest::new();
-            manifest.upsert(upload_verified_delete_ready_record(
+            manifest.upsert_trusted(upload_verified_delete_ready_record(
                 "asset-a",
                 &config.download_root,
             ));
@@ -15980,8 +15980,8 @@ esac
         let mut conflict_record = second.clone();
         conflict_record.state = State::DeleteApproved;
         conflict_record.updated_at = "9999999999.000000000Z".to_string();
-        manifest.upsert(first);
-        manifest.upsert(second);
+        manifest.upsert_trusted(first);
+        manifest.upsert_trusted(second);
         manifest
             .save_atomic(&config.manifest_path)
             .expect("manifest should save");
@@ -16052,7 +16052,7 @@ esac
         let download_root = tempdir.path().join("download");
         fs::create_dir_all(&download_root).expect("download root should be created");
         let mut manifest = Manifest::new();
-        manifest.upsert(upload_verified_delete_ready_record(
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-a",
             &download_root,
         ));
@@ -16063,7 +16063,7 @@ esac
         let mut changed_record = manifest.get("asset-a").expect("asset should exist").clone();
         changed_record.proofs.get_mut("upload").unwrap()["uploaded_heic_asset_id"] =
             json!("changed-upload");
-        manifest.upsert(changed_record);
+        manifest.upsert_trusted(changed_record);
 
         let error = record_prevalidated_delete_execution(
             &mut manifest,
@@ -16091,7 +16091,7 @@ esac
         let download_root = tempdir.path().join("download");
         fs::create_dir_all(&download_root).expect("download root should be created");
         let mut manifest = Manifest::new();
-        manifest.upsert(upload_verified_delete_ready_record(
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-a",
             &download_root,
         ));
@@ -16139,7 +16139,7 @@ esac
             .map(|index| format!("asset-{index}"))
             .collect::<Vec<_>>();
         for asset_id in &active {
-            manifest.upsert(upload_verified_delete_ready_record(
+            manifest.upsert_trusted(upload_verified_delete_ready_record(
                 asset_id,
                 &config.download_root,
             ));
@@ -16181,7 +16181,7 @@ esac
         config.jobs = 2;
         config.delete_operator = "batch-test".to_string();
         let mut manifest = Manifest::new();
-        manifest.upsert(upload_verified_delete_ready_record(
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-ok",
             &config.download_root,
         ));
@@ -16230,7 +16230,7 @@ esac
             .map(|index| format!("asset-{index:03}"))
             .collect::<Vec<_>>();
         for asset_id in &active {
-            manifest.upsert(upload_verified_delete_ready_record(
+            manifest.upsert_trusted(upload_verified_delete_ready_record(
                 asset_id,
                 &config.download_root,
             ));
@@ -16322,8 +16322,8 @@ esac
         let mut shared_record =
             upload_verified_delete_ready_record("asset-b", &config.download_root);
         set_library_destination(&mut shared_record, "shared", "SharedSync-test-zone");
-        manifest.upsert(private_record);
-        manifest.upsert(shared_record);
+        manifest.upsert_trusted(private_record);
+        manifest.upsert_trusted(shared_record);
         manifest
             .save_atomic(&config.manifest_path)
             .expect("manifest should save");
@@ -16399,7 +16399,7 @@ esac
         config.delete_operator = "batch-test".to_string();
         let mut manifest = Manifest::new();
         for asset_id in ["asset-a", "asset-b"] {
-            manifest.upsert(upload_verified_delete_ready_record(
+            manifest.upsert_trusted(upload_verified_delete_ready_record(
                 asset_id,
                 &config.download_root,
             ));
@@ -16466,7 +16466,7 @@ esac
             record
                 .proofs
                 .insert("heic".to_string(), json!({"sha256": "kept"}));
-            manifest.upsert(record);
+            manifest.upsert_trusted(record);
         }
 
         let asset_ids = vec!["asset-a".to_string(), "asset-b".to_string()];
@@ -16862,8 +16862,8 @@ esac
         fs::write(&shared_candidate, b"shared candidate")
             .expect("shared candidate should be written");
         let mut manifest = Manifest::new();
-        manifest.upsert(private_record);
-        manifest.upsert(shared_record);
+        manifest.upsert_trusted(private_record);
+        manifest.upsert_trusted(shared_record);
 
         for (asset_id, expected) in [
             ("private-asset", private_candidate),
@@ -16900,7 +16900,7 @@ esac
         }
         record.proofs.get_mut("upload").unwrap()["uploaded_heic_sha256"] = json!(uploaded_hash);
         let mut manifest = Manifest::new();
-        manifest.upsert(record);
+        manifest.upsert_trusted(record);
         let expected = mirror_root.join(format!("asset-a-{uploaded_hash}.HEIC"));
 
         let rolling = rolling_asset_local_mirror_request(&config, &manifest, "asset-a")
@@ -17446,7 +17446,7 @@ esac
         let mut manifest = Manifest::new();
         let nas = failed_original_asset_resolve_record("nas", "100.000000000Z");
         let nas_proofs = nas.proofs.clone();
-        manifest.upsert(nas);
+        manifest.upsert_trusted(nas);
 
         let mut converted = failed_original_asset_resolve_record("converted", "200.000000000Z");
         converted.proofs.insert(
@@ -17454,7 +17454,7 @@ esac
             json!({"heic_path": "/heic/converted.heic"}),
         );
         let converted_proofs = converted.proofs.clone();
-        manifest.upsert(converted);
+        manifest.upsert_trusted(converted);
 
         let mut verified = failed_original_asset_resolve_record("verified", "300.000000000Z");
         verified.proofs.insert(
@@ -17465,7 +17465,7 @@ esac
             .proofs
             .insert("heic".to_string(), json!({"heif_info_ok": true}));
         let verified_proofs = verified.proofs.clone();
-        manifest.upsert(verified);
+        manifest.upsert_trusted(verified);
 
         let admission =
             recover_original_asset_resolver_retries(&mut manifest, 3, 3, 86_400, 1_000_000)
@@ -20635,7 +20635,7 @@ esac
         let mut uploaded = upload_verified_delete_ready_record("e-uploaded", tempdir.path());
         make_local_mirror_proof_current(&mut uploaded);
         uploaded.proofs.remove("icloudpd_local_mirror");
-        manifest.upsert(uploaded);
+        manifest.upsert_trusted(uploaded);
 
         assert_eq!(
             active_lifecycle_asset_ids(&manifest, 4),
@@ -20753,7 +20753,7 @@ esac
             upload_verified_delete_ready_record("c-uploaded-needs-mirror", tempdir.path());
         make_local_mirror_proof_current(&mut uploaded);
         uploaded.proofs.remove("icloudpd_local_mirror");
-        manifest.upsert(uploaded);
+        manifest.upsert_trusted(uploaded);
         let mut converted = lifecycle_record("d-converted-needs-local-verify", State::Converted);
         converted.proofs.insert(
             "original_asset".to_string(),
@@ -20787,7 +20787,7 @@ esac
             let mut record = upload_verified_delete_ready_record(&asset_id, tempdir.path());
             make_local_mirror_proof_current(&mut record);
             record.proofs.remove("icloudpd_local_mirror");
-            manifest.upsert(record);
+            manifest.upsert_trusted(record);
         }
         for (index, size_bytes) in [10u64, 90, 40, 80, 30].into_iter().enumerate() {
             let asset_id = format!("convert-ready-{index}");
@@ -21015,7 +21015,7 @@ esac
         let mut uploaded = upload_verified_delete_ready_record("uploaded", tempdir.path());
         make_local_mirror_proof_current(&mut uploaded);
         uploaded.proofs.remove("icloudpd_local_mirror");
-        manifest.upsert(uploaded);
+        manifest.upsert_trusted(uploaded);
 
         assert_eq!(pending_lifecycle_count(&manifest), 6);
     }
@@ -21090,7 +21090,7 @@ esac
                 record.proofs.remove("icloudpd_local_mirror");
             }
             let mut manifest = Manifest::new();
-            manifest.upsert(record);
+            manifest.upsert_trusted(record);
 
             assert_eq!(
                 pending_lifecycle_count_for_config(&manifest, &config),
@@ -21220,7 +21220,7 @@ esac
             let mut record = upload_verified_delete_ready_record(asset_id, tempdir.path());
             make_local_mirror_proof_current(&mut record);
             record.state = state;
-            manifest.upsert(record);
+            manifest.upsert_trusted(record);
         }
 
         assert_eq!(pending_lifecycle_count_for_config(&manifest, &config), 3);
