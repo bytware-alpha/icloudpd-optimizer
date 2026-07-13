@@ -10771,6 +10771,347 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_real_tools_execute_production_oriented_preview_conversion_and_verification() {
+        const CHILD_ENV: &str = "ICLOUDPD_OPTIMIZER_REAL_MACOS_ORIENTATION_TEST";
+        const TEST_NAME: &str = "monitor::tests::macos_real_tools_execute_production_oriented_preview_conversion_and_verification";
+
+        if env::var_os(CHILD_ENV).is_none() {
+            let Some(real_tools) = real_macos_orientation_tools() else {
+                eprintln!(
+                    "skipping {TEST_NAME}: required genuine macOS tools are unavailable (sips, exiftool, heif-info, cp)"
+                );
+                return;
+            };
+            let tool_path = tempfile::tempdir().expect("isolated real tool PATH should be created");
+            for (name, path) in real_tools {
+                std::os::unix::fs::symlink(path, tool_path.path().join(name))
+                    .expect("real tool should be exposed on isolated PATH");
+            }
+            let status = Command::new(env::current_exe().expect("test binary path should resolve"))
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .env("PATH", tool_path.path())
+                .status()
+                .expect("isolated real-tool test should run");
+            assert!(status.success(), "isolated real-tool test should pass");
+            return;
+        }
+
+        let temporary = tempfile::tempdir().expect("temporary fixture directory should exist");
+        for (orientation, expected_corners, expected_dimensions) in [
+            (
+                3,
+                [[255, 255, 0], [0, 0, 255], [0, 255, 0], [255, 0, 0]],
+                (64, 48),
+            ),
+            (
+                6,
+                [[0, 0, 255], [255, 0, 0], [255, 255, 0], [0, 255, 0]],
+                (48, 64),
+            ),
+            (
+                8,
+                [[0, 255, 0], [255, 255, 0], [255, 0, 0], [0, 0, 255]],
+                (48, 64),
+            ),
+        ] {
+            let preview = temporary.path().join(format!("preview-{orientation}.jpg"));
+            let raw = temporary.path().join(format!("raw-{orientation}.dng"));
+            let output = temporary.path().join(format!("output-{orientation}.heic"));
+            let rendered = temporary.path().join(format!("rendered-{orientation}.png"));
+            write_asymmetric_four_corner_preview(&preview);
+            write_dng_like_preview_fixture(&raw, &preview, orientation);
+            let fixture_probe = Command::new("exiftool")
+                .args(["-j", "-n", "-PreviewImage", "-JpgFromRaw", "-Orientation#"])
+                .arg(&raw)
+                .output()
+                .expect("ExifTool should probe fixture");
+            assert!(fixture_probe.status.success(), "fixture probe must succeed");
+            let fixture_fields: Vec<Value> =
+                serde_json::from_slice(&fixture_probe.stdout).expect("fixture probe must be JSON");
+            assert!(
+                fixture_fields[0].get("PreviewImage").is_some(),
+                "fixture must expose PreviewImage to the production planner"
+            );
+            assert_eq!(fixture_fields[0]["Orientation"], json!(orientation));
+
+            set_file_mtime(
+                &raw,
+                FileTime::from_system_time(
+                    SystemTime::now() - Duration::from_secs(31 * 24 * 60 * 60),
+                ),
+            )
+            .expect("fixture must satisfy the RAW age gate");
+            let asset_id = format!("real-orientation-{orientation}");
+            let mut manifest = Manifest::new();
+            prove_and_record_nas(
+                &mut manifest,
+                &asset_id,
+                &raw,
+                temporary.path(),
+                30,
+                SystemTime::now(),
+            )
+            .expect("fixture should become NAS verified");
+
+            let mut converted = execute_measured_conversion(
+                &manifest,
+                ConversionExecutionRequest {
+                    asset_id: asset_id.clone(),
+                    output_path: output.clone(),
+                    heic_quality: 100,
+                    conversion_tool_version: Some("macos-real-tools".to_string()),
+                },
+            )
+            .expect("production conversion planner and executor should succeed");
+            let converted_record = converted
+                .get(&asset_id)
+                .expect("converted record should exist");
+            assert_eq!(converted_record.state, State::Converted);
+            assert_eq!(
+                converted_record.proofs["conversion"]["conversion_recipe_id"],
+                json!(EMBEDDED_PREVIEW_CONVERSION_RECIPE)
+            );
+            assert_eq!(
+                converted_record.proofs["conversion_performance"]["conversion_recipe_id"],
+                json!(EMBEDDED_PREVIEW_CONVERSION_RECIPE)
+            );
+            assert_eq!(
+                converted_record.proofs["conversion_performance"]["conversion_tool_version"],
+                json!("macos-real-tools")
+            );
+
+            let final_metadata = read_media_metadata(
+                &output,
+                DEFAULT_HEIC_VERIFY_TIMEOUT_SECONDS,
+                HeicMetadataFailure::FinalOrientationRotationInvalid,
+            )
+            .expect("final HEIC metadata should be readable");
+            assert_eq!(final_metadata.orientations, vec![1]);
+            assert_eq!(final_metadata.rotations, vec![0]);
+            assert_eq!(
+                final_metadata.dimensions,
+                (
+                    u64::from(expected_dimensions.0),
+                    u64::from(expected_dimensions.1)
+                )
+            );
+
+            let verification =
+                verify_converted_heic(&converted, &asset_id, DEFAULT_HEIC_VERIFY_TIMEOUT_SECONDS)
+                    .expect("production HEIC verifier should accept converted output");
+            assert!(verification.proof.heif_info_ok);
+            assert!(verification.proof.metadata_copied);
+            assert!(verification.proof.visual_content_ok);
+            assert!(verification.proof.visual_match_ok);
+            assert!(verification.proof.visual_rmse_ppm.is_some());
+            assert!(verification.proof.visual_mae_ppm.is_some());
+            record_current_heic_verification(&mut converted, &asset_id, verification.proof)
+                .expect("current production verification proof should record");
+            assert_eq!(
+                converted
+                    .get(&asset_id)
+                    .expect("verified record should exist")
+                    .proofs["heic"]["conversion_recipe_id"],
+                json!(EMBEDDED_PREVIEW_CONVERSION_RECIPE)
+            );
+
+            let render_status = Command::new("sips")
+                .args(["-s", "format", "png"])
+                .arg(&output)
+                .args(["--out"])
+                .arg(&rendered)
+                .status()
+                .expect("independent HEIC render should succeed");
+            assert!(
+                render_status.success(),
+                "independent HEIC render should succeed: {render_status}"
+            );
+            let rendered = image::open(&rendered)
+                .expect("rendered HEIC should decode")
+                .to_rgb8();
+            assert_eq!(rendered.dimensions(), expected_dimensions);
+            let probes = [
+                (4, 4),
+                (expected_dimensions.0 - 5, 4),
+                (4, expected_dimensions.1 - 5),
+                (expected_dimensions.0 - 5, expected_dimensions.1 - 5),
+            ];
+            for ((x, y), expected) in probes.into_iter().zip(expected_corners) {
+                let actual = rendered.get_pixel(x, y).0;
+                assert!(
+                    actual
+                        .into_iter()
+                        .zip(expected)
+                        .all(|(actual, expected)| actual.abs_diff(expected) <= 16),
+                    "orientation {orientation}: expected {expected:?}, got {actual:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn real_macos_orientation_tools() -> Option<Vec<(&'static str, PathBuf)>> {
+        [
+            ("sips", &["/usr/bin/sips"][..]),
+            (
+                "exiftool",
+                &["/opt/homebrew/bin/exiftool", "/usr/local/bin/exiftool"][..],
+            ),
+            (
+                "heif-info",
+                &["/opt/homebrew/bin/heif-info", "/usr/local/bin/heif-info"][..],
+            ),
+            ("cp", &["/bin/cp"][..]),
+        ]
+        .into_iter()
+        .map(|(name, candidates)| {
+            candidates
+                .iter()
+                .map(PathBuf::from)
+                .find(|candidate| crate::conversion_execution::is_executable_file(candidate))
+                .map(|path| (name, path))
+        })
+        .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_asymmetric_four_corner_preview(path: &Path) {
+        let mut image = image::RgbImage::new(64, 48);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = match (x < 32, y < 24) {
+                (true, true) => image::Rgb([255, 0, 0]),
+                (false, true) => image::Rgb([0, 255, 0]),
+                (true, false) => image::Rgb([0, 0, 255]),
+                (false, false) => image::Rgb([255, 255, 0]),
+            };
+        }
+        image.save(path).expect("asymmetric JPEG should save");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_dng_like_preview_fixture(raw: &Path, preview: &Path, orientation: u16) {
+        const IFD0_ENTRY_COUNT: u16 = 14;
+        const IFD1_ENTRY_COUNT: u16 = 10;
+        const RAW_PAYLOAD_BYTES: usize = 512 * 1024;
+        let preview_bytes = fs::read(preview).expect("embedded JPEG preview should be readable");
+        let ifd0_offset = 8usize;
+        let ifd0_size = 2 + usize::from(IFD0_ENTRY_COUNT) * 12 + 4;
+        let bits_offset = ifd0_offset + ifd0_size;
+        let dng_version_offset = bits_offset + 6;
+        let sub_ifd_offset = dng_version_offset + 4;
+        let ifd1_size = 2 + usize::from(IFD1_ENTRY_COUNT) * 12 + 4;
+        let raw_byte_offset = sub_ifd_offset + ifd1_size;
+        let preview_offset = raw_byte_offset + RAW_PAYLOAD_BYTES;
+
+        let mut fixture = Vec::with_capacity(preview_offset + preview_bytes.len());
+        fixture.extend_from_slice(b"II");
+        write_le_u16(&mut fixture, 42);
+        write_le_u32(
+            &mut fixture,
+            u32::try_from(ifd0_offset).expect("TIFF offset should fit"),
+        );
+        write_le_u16(&mut fixture, IFD0_ENTRY_COUNT);
+        for (tag, field_type, count, value) in [
+            (254, 4, 1, 1),
+            (256, 4, 1, 64),
+            (257, 4, 1, 48),
+            (
+                258,
+                3,
+                3,
+                u32::try_from(bits_offset).expect("TIFF offset should fit"),
+            ),
+            (259, 3, 1, 7),
+            (262, 3, 1, 6),
+            (
+                273,
+                4,
+                1,
+                u32::try_from(preview_offset).expect("TIFF offset should fit"),
+            ),
+            (274, 3, 1, u32::from(orientation)),
+            (277, 3, 1, 3),
+            (278, 4, 1, 48),
+            (
+                279,
+                4,
+                1,
+                u32::try_from(preview_bytes.len()).expect("preview should fit TIFF length"),
+            ),
+            (284, 3, 1, 1),
+            (
+                330,
+                4,
+                1,
+                u32::try_from(sub_ifd_offset).expect("TIFF offset should fit"),
+            ),
+            (50706, 1, 4, u32::from_le_bytes([1, 4, 0, 0])),
+        ] {
+            write_tiff_ifd_entry(&mut fixture, tag, field_type, count, value);
+        }
+        write_le_u32(&mut fixture, 0);
+        fixture.extend_from_slice(&[8, 0, 8, 0, 8, 0]);
+        fixture.extend_from_slice(&[1, 4, 0, 0]);
+
+        write_le_u16(&mut fixture, IFD1_ENTRY_COUNT);
+        for (tag, field_type, count, value) in [
+            (254, 4, 1, 0),
+            (256, 4, 1, 1),
+            (257, 4, 1, 1),
+            (258, 3, 1, 16),
+            (259, 3, 1, 1),
+            (262, 3, 1, 32803),
+            (
+                273,
+                4,
+                1,
+                u32::try_from(raw_byte_offset).expect("TIFF offset should fit"),
+            ),
+            (277, 3, 1, 1),
+            (278, 4, 1, 1),
+            (
+                279,
+                4,
+                1,
+                u32::try_from(RAW_PAYLOAD_BYTES).expect("RAW payload should fit TIFF length"),
+            ),
+        ] {
+            write_tiff_ifd_entry(&mut fixture, tag, field_type, count, value);
+        }
+        write_le_u32(&mut fixture, 0);
+        fixture.resize(preview_offset, 0);
+        fixture.extend_from_slice(&preview_bytes);
+        assert_eq!(fixture.len(), preview_offset + preview_bytes.len());
+        fs::write(raw, fixture).expect("DNG-like fixture should be written");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_tiff_ifd_entry(
+        output: &mut Vec<u8>,
+        tag: u16,
+        field_type: u16,
+        count: u32,
+        value: u32,
+    ) {
+        write_le_u16(output, tag);
+        write_le_u16(output, field_type);
+        write_le_u32(output, count);
+        write_le_u32(output, value);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_le_u16(output: &mut Vec<u8>, value: u16) {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_le_u32(output: &mut Vec<u8>, value: u32) {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+
     #[test]
     fn typed_metadata_failure_persists_and_uses_one_retry_converted_policy() {
         for (failure, expected_kind) in [
