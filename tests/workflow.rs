@@ -11,18 +11,18 @@ use icloudpd_optimizer::manifest::{AssetRecord, FailureKind, Manifest, ManifestE
 use icloudpd_optimizer::proof::{NasRawProof, ProofError, prove_nas_raw};
 use icloudpd_optimizer::upload::{CloudKitDeleteOutcome, CloudKitUploadedHeicAsset};
 use icloudpd_optimizer::workflow::{
-    ConversionCommandTiming, ConversionPerformanceInput, ConversionPerformanceProof,
-    ConversionResultInput, ConversionResultProof, ConversionSourceBinding, HeicVerificationInput,
-    HeicVerificationProof, IcloudpdLocalMirrorProof, OriginalAssetProof, SourceAgeProof,
-    UploadProof, WorkflowError, approve_delete, build_delete_plan, discover_raw_asset,
-    mark_delete_eligible, prepare_delete_reconciliation, prevalidate_approved_original_delete,
-    prove_and_record_nas, record_adjusted_source_proof, record_conversion_performance,
-    record_conversion_result, record_delete_execution, record_heic_verification,
-    record_icloudpd_local_mirror_proof, record_nas_proof, record_original_asset_batch_proofs,
-    record_original_asset_proof, record_prevalidated_delete_execution,
-    record_reconciled_delete_execution, record_source_age_proof, record_stage_failure,
-    record_stage_failure_with_kind, record_upload_proof, record_uploaded_heic_delete,
-    upload_ready_heic_proof, uploaded_heic_delete_request,
+    ConversionCommandTiming, ConversionPerformanceInput, ConversionResultInput,
+    ConversionSourceBinding, HeicVerificationInput, IcloudpdLocalMirrorProof, OriginalAssetProof,
+    SourceAgeProof, UploadProof, WorkflowError, approve_delete, build_delete_plan,
+    discover_raw_asset, mark_delete_eligible, prepare_delete_reconciliation,
+    prevalidate_approved_original_delete, prove_and_record_nas, record_adjusted_source_proof,
+    record_conversion_performance, record_conversion_result, record_delete_execution,
+    record_heic_verification, record_icloudpd_local_mirror_proof, record_nas_proof,
+    record_original_asset_batch_proofs, record_original_asset_proof,
+    record_prevalidated_delete_execution, record_reconciled_delete_execution,
+    record_source_age_proof, record_stage_failure, record_stage_failure_with_kind,
+    record_upload_proof, record_uploaded_heic_delete, upload_ready_heic_proof,
+    uploaded_heic_delete_request,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -41,6 +41,22 @@ fn nas_proof() -> NasRawProof {
         age_seconds: 40 * DAY,
         sha256: "raw-sha256".to_string(),
     }
+}
+
+#[test]
+fn public_upsert_strips_forged_current_recipe_claims() {
+    let mut manifest = Manifest::new();
+    let mut record = AssetRecord::new("asset-1", "/nas/photos/IMG_0001.dng");
+    record.proofs.insert(
+        "conversion".to_string(),
+        json!({"conversion_recipe_id": "embedded-preview-normalized-v1"}),
+    );
+    manifest.upsert(record);
+
+    assert_eq!(
+        manifest.get("asset-1").expect("asset should exist").proofs["conversion"]["conversion_recipe_id"],
+        ""
+    );
 }
 
 fn conversion_proof() -> ConversionResultInput {
@@ -79,57 +95,6 @@ fn heic_proof() -> HeicVerificationInput {
         visual_rmse_ppm: Some(0),
         visual_mae_ppm: Some(0),
     }
-}
-
-#[test]
-fn heic_verification_proof_accepts_legacy_vipsheader_field() {
-    let proof: HeicVerificationProof = serde_json::from_value(json!({
-        "heic_path": "/staging/IMG_0001.heic",
-        "heic_sha256": "heic-sha256",
-        "size_bytes": 24,
-        "vipsheader_ok": true,
-        "metadata_copied": true,
-        "visual_content_ok": true,
-        "visual_match_ok": true
-    }))
-    .expect("legacy proof field should deserialize");
-
-    assert!(proof.heif_info_ok);
-}
-
-#[test]
-fn manual_inputs_and_legacy_proofs_cannot_claim_current_recipe() {
-    let legacy_conversion: ConversionResultProof = serde_json::from_value(json!({
-        "heic_path": "/staging/IMG_0001.heic",
-        "heic_sha256": "heic-sha256",
-        "size_bytes": 24
-    }))
-    .expect("legacy conversion proof should deserialize");
-    assert!(serde_json::to_value(&legacy_conversion).expect("legacy conversion should serialize")["conversion_recipe_id"].as_str().expect("recipe should serialize").is_empty());
-    assert_eq!(
-        serde_json::to_value(conversion_proof())
-            .expect("manual input should serialize")
-            .get("conversion_recipe_id"),
-        None
-    );
-
-    let legacy_heic: HeicVerificationProof = serde_json::from_value(json!({
-        "heic_path": "/staging/IMG_0001.heic",
-        "heic_sha256": "heic-sha256",
-        "size_bytes": 24,
-        "heif_info_ok": true,
-        "metadata_copied": true,
-        "visual_content_ok": true,
-        "visual_match_ok": true
-    }))
-    .expect("legacy HEIC proof should deserialize");
-    assert!(serde_json::to_value(&legacy_heic).expect("legacy HEIC should serialize")["conversion_recipe_id"].as_str().expect("recipe should serialize").is_empty());
-    assert_eq!(
-        serde_json::to_value(heic_proof())
-            .expect("manual input should serialize")
-            .get("conversion_recipe_id"),
-        None
-    );
 }
 
 #[test]
@@ -961,21 +926,6 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
     assert!(
         build_delete_plan(&manifest, "asset-1").is_err(),
         "adjusted source tampering must block delete planning"
-    );
-}
-
-#[test]
-fn legacy_conversion_proof_deserializes_as_embedded_preview() {
-    let proof: ConversionResultProof = serde_json::from_value(json!({
-        "heic_path": "/staging/IMG_0001.heic",
-        "heic_sha256": "heic-sha256",
-        "size_bytes": 24
-    }))
-    .expect("legacy conversion proof should deserialize");
-
-    assert_eq!(
-        proof.source_binding,
-        ConversionSourceBinding::EmbeddedPreview
     );
 }
 
@@ -2602,28 +2552,6 @@ fn conversion_performance_records_ordered_command_timings() {
             }
         ])
     );
-}
-
-#[test]
-fn conversion_performance_accepts_legacy_proof_without_command_timings() {
-    let proof: ConversionPerformanceProof = serde_json::from_value(json!({
-        "schema_version": 1,
-        "measured_at_unix_seconds": 1_800_000_100,
-        "measurement_method": "monotonic_wall_clock",
-        "conversion_tool": "magick",
-        "conversion_tool_version": "7.1.1-41",
-        "heic_quality": 90,
-        "raw_size_bytes": 42,
-        "heic_size_bytes": 24,
-        "convert_wall_time_millis": 1_250,
-        "total_wall_time_millis": 1_500,
-        "user_cpu_time_millis": 1_100,
-        "system_cpu_time_millis": 90,
-        "peak_rss_kib": 256_000
-    }))
-    .expect("legacy conversion performance proof should deserialize");
-
-    assert_eq!(proof.conversion_command_timings, Vec::new());
 }
 
 #[test]

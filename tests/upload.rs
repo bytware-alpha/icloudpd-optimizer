@@ -14,7 +14,7 @@ use icloudpd_optimizer::upload::{
     SingleFileUploadRequest, UploadError, UploadSession, build_upload_proof, load_upload_session,
     run_icloud_upload,
 };
-use icloudpd_optimizer::workflow::HeicVerificationProof;
+use icloudpd_optimizer::workflow::VerifiedHeic;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -22,20 +22,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn heic_proof(path: PathBuf, bytes: &[u8]) -> HeicVerificationProof {
-    serde_json::from_value(json!({
-        "heic_path": path,
-        "heic_sha256": sha256_hex(bytes),
-        "size_bytes": bytes.len() as u64,
-        "conversion_recipe_id": "embedded-preview-normalized-v1",
-        "heif_info_ok": true,
-        "metadata_copied": true,
-        "visual_content_ok": true,
-        "visual_match_ok": true,
-        "visual_rmse_ppm": 0,
-        "visual_mae_ppm": 0,
-    }))
-    .expect("current HEIC fixture should deserialize")
+fn heic_proof(path: PathBuf, bytes: &[u8]) -> VerifiedHeic {
+    VerifiedHeic {
+        heic_path: path,
+        heic_sha256: sha256_hex(bytes),
+        size_bytes: bytes.len() as u64,
+    }
 }
 
 fn write_session(path: &Path, body: &str) {

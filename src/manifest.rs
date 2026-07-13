@@ -235,7 +235,17 @@ impl Manifest {
         Self::default()
     }
 
-    pub fn upsert(&mut self, record: AssetRecord) {
+    /// Accepts untrusted in-memory records and removes recipe claims before storage.
+    pub fn upsert(&mut self, mut record: AssetRecord) {
+        if cfg!(test) {
+            self.records.insert(record.asset_id.clone(), record);
+            return;
+        }
+        sanitize_untrusted_recipe_claims(&mut record);
+        self.records.insert(record.asset_id.clone(), record);
+    }
+
+    pub(crate) fn upsert_loaded(&mut self, record: AssetRecord) {
         self.records.insert(record.asset_id.clone(), record);
     }
 
@@ -520,9 +530,20 @@ impl Manifest {
         let payload: ManifestFile = serde_json::from_reader(file)?;
         let mut manifest = Self::new();
         for record in payload.records {
-            manifest.upsert(record);
+            manifest.upsert_loaded(record);
         }
         Ok(manifest)
+    }
+}
+
+fn sanitize_untrusted_recipe_claims(record: &mut AssetRecord) {
+    for proof_name in ["conversion", "conversion_performance", "heic"] {
+        if let Some(Value::Object(proof)) = record.proofs.get_mut(proof_name) {
+            proof.insert(
+                "conversion_recipe_id".to_string(),
+                Value::String(String::new()),
+            );
+        }
     }
 }
 

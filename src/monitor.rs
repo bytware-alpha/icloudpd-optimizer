@@ -58,10 +58,11 @@ use crate::workflow::validate_current_icloudpd_local_mirror_proof;
 use crate::workflow::{
     ConversionResultProof, DeleteReconciliation, HeicVerificationInput, HeicVerificationProof,
     IcloudpdLocalMirrorProof, IcloudpdLocalMirrorProofDisposition, OriginalAssetProof,
-    PrevalidatedDelete, SourceAgeProof, UploadProof, WorkflowError, approve_delete,
-    icloudpd_local_mirror_proof_disposition, icloudpd_local_mirror_ready_proofs,
-    mark_delete_eligible, prepare_delete_reconciliation, prevalidate_approved_original_delete,
-    prove_and_record_nas, reconciliation_exact_state_is_consistent, record_adjusted_source_proof,
+    PrevalidatedDelete, SourceAgeProof, UploadProof, VerifiedHeic as UploadVerifiedHeic,
+    WorkflowError, approve_delete, icloudpd_local_mirror_proof_disposition,
+    icloudpd_local_mirror_ready_proofs, mark_delete_eligible, prepare_delete_reconciliation,
+    prevalidate_approved_original_delete, prove_and_record_nas,
+    reconciliation_exact_state_is_consistent, record_adjusted_source_proof,
     record_current_heic_verification, record_icloudpd_local_mirror_proof,
     record_prevalidated_delete_execution, record_reconciled_delete_execution,
     record_source_age_proof, record_stage_failure, record_stage_failure_with_kind,
@@ -5017,7 +5018,7 @@ fn run_upload_proof_child_with_timeout(
 fn run_upload_proof_direct_child_with_timeout(
     asset_id: &str,
     record: &AssetRecord,
-    heic: &HeicVerificationProof,
+    heic: &UploadVerifiedHeic,
     destination: &CloudKitLibraryDestination,
     session_path: &Path,
     timeout_seconds: u64,
@@ -5041,7 +5042,7 @@ fn run_upload_proof_direct_child_executable_with_timeout(
     executable: &Path,
     asset_id: &str,
     record: &AssetRecord,
-    heic: &HeicVerificationProof,
+    heic: &UploadVerifiedHeic,
     destination: &CloudKitLibraryDestination,
     session_path: &Path,
     timeout_seconds: u64,
@@ -5148,7 +5149,7 @@ fn parse_upload_proof_child_output(stdout: &[u8]) -> Result<UploadProofChildOutp
 fn parse_upload_proof_child_response(
     stdout: &[u8],
     asset_id: &str,
-    heic: &HeicVerificationProof,
+    heic: &UploadVerifiedHeic,
     destination: &CloudKitLibraryDestination,
 ) -> Result<UploadProofChildOutput, MonitorError> {
     let response: UploadProofChildResponse =
@@ -11732,7 +11733,7 @@ esac
             &helper_path,
             "raw-test",
             &lifecycle_record("raw-test", State::ConversionVerified),
-            &heic,
+            &UploadVerifiedHeic::from(&heic),
             &destination,
             &session_path,
             5,

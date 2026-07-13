@@ -69,7 +69,7 @@ pub struct ConversionResultInput {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ConversionResultProof {
+pub(crate) struct ConversionResultProof {
     pub heic_path: PathBuf,
     pub heic_sha256: String,
     pub size_bytes: u64,
@@ -112,7 +112,7 @@ pub struct ConversionCommandTiming {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ConversionPerformanceProof {
+pub(crate) struct ConversionPerformanceProof {
     pub schema_version: u8,
     pub measured_at_unix_seconds: u64,
     pub measurement_method: String,
@@ -153,7 +153,7 @@ pub struct HeicVerificationInput {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct HeicVerificationProof {
+pub(crate) struct HeicVerificationProof {
     pub heic_path: PathBuf,
     pub heic_sha256: String,
     pub size_bytes: u64,
@@ -182,6 +182,23 @@ impl From<HeicVerificationProof> for HeicVerificationInput {
             visual_match_ok: proof.visual_match_ok,
             visual_rmse_ppm: proof.visual_rmse_ppm,
             visual_mae_ppm: proof.visual_mae_ppm,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct VerifiedHeic {
+    pub heic_path: PathBuf,
+    pub heic_sha256: String,
+    pub size_bytes: u64,
+}
+
+impl From<&HeicVerificationProof> for VerifiedHeic {
+    fn from(proof: &HeicVerificationProof) -> Self {
+        Self {
+            heic_path: proof.heic_path.clone(),
+            heic_sha256: proof.heic_sha256.clone(),
+            size_bytes: proof.size_bytes,
         }
     }
 }
@@ -885,7 +902,7 @@ fn validate_batch_original_asset_unique_records(
 pub fn upload_ready_heic_proof(
     manifest: &Manifest,
     asset_id: &str,
-) -> Result<HeicVerificationProof, WorkflowError> {
+) -> Result<VerifiedHeic, WorkflowError> {
     let record = manifest.get(asset_id)?;
     if record.state != State::ConversionVerified {
         return Err(WorkflowError::UploadUnavailable {
@@ -896,13 +913,13 @@ pub fn upload_ready_heic_proof(
     require_valid_conversion_performance(manifest, asset_id)?;
     let proof = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
     validate_heic_verification_flags(&proof)?;
-    Ok(proof)
+    Ok(VerifiedHeic::from(&proof))
 }
 
 pub fn icloudpd_local_mirror_ready_proofs(
     manifest: &Manifest,
     asset_id: &str,
-) -> Result<(UploadProof, HeicVerificationProof), WorkflowError> {
+) -> Result<(UploadProof, VerifiedHeic), WorkflowError> {
     let state = manifest.get(asset_id)?.state;
     if !matches!(
         state,
@@ -915,7 +932,7 @@ pub fn icloudpd_local_mirror_ready_proofs(
     }
 
     let (upload, heic, _) = validate_icloudpd_local_mirror_inputs(manifest, asset_id)?;
-    Ok((upload, heic))
+    Ok((upload, VerifiedHeic::from(&heic)))
 }
 
 /// Validates the stored local-mirror proof against the current upload and HEIC

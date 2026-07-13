@@ -19,7 +19,7 @@ use crate::adjusted_source::{
     AdjustedSourceError, CloudKitAdjustedSourceDownload, CloudKitAdjustedSourceTransport,
     MAX_ADJUSTED_SOURCE_ENCODED_BYTES,
 };
-use crate::workflow::{HeicVerificationProof, OriginalAssetProof, UploadProof};
+use crate::workflow::{OriginalAssetProof, UploadProof, VerifiedHeic};
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_UPLOAD_RESPONSE_BYTES: u64 = 1024 * 1024;
@@ -4130,7 +4130,7 @@ fn finalize_hash_progress(
     Ok((format!("{:x}", hasher.finalize()), progress.bytes))
 }
 
-pub fn verify_local_heic(proof: &HeicVerificationProof) -> Result<(), UploadError> {
+pub fn verify_local_heic(proof: &VerifiedHeic) -> Result<(), UploadError> {
     let metadata = std::fs::metadata(&proof.heic_path).map_err(|source| UploadError::ReadHeic {
         path: proof.heic_path.clone(),
         source,
@@ -4156,7 +4156,7 @@ pub fn verify_local_heic(proof: &HeicVerificationProof) -> Result<(), UploadErro
 }
 
 pub fn build_upload_proof(
-    heic: &HeicVerificationProof,
+    heic: &VerifiedHeic,
     upload: &IcloudUploadOutcome,
 ) -> Result<UploadProof, UploadError> {
     if upload.response.asset_id.trim().is_empty() {
