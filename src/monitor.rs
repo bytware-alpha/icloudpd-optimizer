@@ -51,7 +51,8 @@ use crate::upload::{
     CloudKitDeleteSession, CloudKitDeleteTransport, CloudKitLibraryDestination,
     CloudKitOriginalAssetBatchResolveOutcome, CloudKitOriginalAssetBatchResolveRequest,
     CloudKitOriginalAssetResolveTarget, ReqwestCloudKitDeleteTransport,
-    ReqwestCloudKitReadTransport, UploadError, UploadTimings, load_cloudkit_delete_session,
+    ReqwestCloudKitReadTransport, UploadError, UploadTimings, build_upload_proof,
+    load_cloudkit_delete_session,
 };
 #[cfg(test)]
 use crate::workflow::validate_current_icloudpd_local_mirror_proof;
@@ -5159,19 +5160,19 @@ fn parse_upload_proof_child_response(
         })?;
     if response.version != UPLOAD_PROOF_CHILD_PROTOCOL_VERSION
         || response.asset_id != asset_id
-        || response.proof.uploaded_heic_sha256 != heic.heic_sha256
-        || response.proof.uploaded_heic_path.as_ref() != Some(&heic.heic_path)
-        || response.proof.database_scope != destination.database_scope
-        || response.proof.zone_name != destination.zone_name
+        || response.outcome.response.database_scope != destination.database_scope
+        || response.outcome.response.zone_name != destination.zone_name
     {
         return Err(MonitorError::CommandFailed {
             program: "icloudpd-optimizer",
             message: "upload child response did not bind to the requested asset".to_string(),
         });
     }
+    let timings = response.outcome.timings.clone();
+    let proof = build_upload_proof(heic, &response.outcome)?;
     Ok(UploadProofChildOutput {
-        proof: response.proof,
-        timings: Some(response.upload_timings),
+        proof,
+        timings: Some(timings),
     })
 }
 
@@ -11702,12 +11703,19 @@ esac
         let helper_path = tempdir.path().join("fake-direct-upload-proof-child");
         let args_path = tempdir.path().join("args.txt");
         let input_path = tempdir.path().join("input.json");
+        let heic_path = tempdir.path().join("asset.heic");
+        let heic_bytes = b"verified heic bytes";
+        fs::write(&heic_path, heic_bytes).expect("HEIC fixture should be written");
+        let heic_sha256 = format!("{:x}", Sha256::digest(heic_bytes));
         fs::write(
             &helper_path,
             format!(
-                "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done > '{}'\n/bin/cat > '{}'\nprintf '%s\\n' '{{\"version\":1,\"asset_id\":\"raw-test\",\"uploaded_heic_asset_id\":\"asset\",\"uploaded_heic_sha256\":\"sha\",\"database_scope\":\"shared\",\"zone_name\":\"SharedSync-test\",\"uploaded_heic_path\":\"/tmp/asset.heic\",\"upload_timings\":{{\"create_upload_url_wall_time_millis\":1,\"signed_upload_wall_time_millis\":1,\"put_asset_wall_time_millis\":1,\"upload_status_wall_time_millis\":1,\"upload_status_polls\":1,\"total_wall_time_millis\":1}}}}'\n",
+                "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done > '{}'\n/bin/cat > '{}'\nprintf '%s\\n' '{{\"version\":{},\"asset_id\":\"raw-test\",\"outcome\":{{\"response\":{{\"asset_id\":\"asset\",\"filename\":null,\"master_id\":null,\"database_scope\":\"shared\",\"zone_name\":\"SharedSync-test\"}},\"streamed_heic_sha256\":\"{}\",\"streamed_size_bytes\":{},\"timings\":{{\"create_upload_url_wall_time_millis\":1,\"signed_upload_wall_time_millis\":1,\"put_asset_wall_time_millis\":1,\"upload_status_wall_time_millis\":1,\"upload_status_polls\":1,\"total_wall_time_millis\":1}}}}}}'\n",
                 args_path.display(),
                 input_path.display(),
+                UPLOAD_PROOF_CHILD_PROTOCOL_VERSION,
+                heic_sha256,
+                heic_bytes.len(),
             ),
         )
         .expect("helper should be written");
@@ -11718,7 +11726,7 @@ esac
         fs::set_permissions(&helper_path, permissions).expect("helper should be executable");
 
         let heic: HeicVerificationProof = serde_json::from_value(json!({
-            "heic_path": "/tmp/asset.heic", "heic_sha256": "sha", "size_bytes": 123,
+            "heic_path": heic_path, "heic_sha256": heic_sha256, "size_bytes": heic_bytes.len(),
             "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
             "heif_info_ok": true, "metadata_copied": true, "visual_content_ok": true,
             "visual_match_ok": true,
@@ -11749,6 +11757,78 @@ esac
                 .expect("child input should be JSON");
         assert_eq!(input.version, UPLOAD_PROOF_CHILD_PROTOCOL_VERSION);
         assert_eq!(input.asset_id, "raw-test");
+    }
+
+    #[test]
+    fn private_upload_child_response_rejects_unbound_raw_outcomes() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let heic_path = tempdir.path().join("asset.heic");
+        let heic_bytes = b"verified heic bytes";
+        fs::write(&heic_path, heic_bytes).unwrap();
+        let heic_sha256 = format!("{:x}", Sha256::digest(heic_bytes));
+        let heic: HeicVerificationProof = serde_json::from_value(json!({
+            "heic_path": heic_path, "heic_sha256": heic_sha256, "size_bytes": heic_bytes.len(),
+            "conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE,
+            "heif_info_ok": true, "metadata_copied": true, "visual_content_ok": true,
+            "visual_match_ok": true,
+        }))
+        .unwrap();
+        let destination = CloudKitLibraryDestination {
+            database_scope: crate::upload::CloudKitDatabaseScope::Private,
+            zone_name: "PrimarySync".to_string(),
+        };
+        let response = json!({
+            "version": UPLOAD_PROOF_CHILD_PROTOCOL_VERSION,
+            "asset_id": "asset",
+            "outcome": {
+                "response": {"asset_id": "uploaded", "filename": null, "master_id": null,
+                    "database_scope": "private", "zone_name": "PrimarySync"},
+                "streamed_heic_sha256": heic.heic_sha256,
+                "streamed_size_bytes": heic.size_bytes,
+                "timings": UploadTimings::default(),
+            }
+        });
+        assert!(response.get("proof").is_none());
+        assert!(
+            parse_upload_proof_child_response(
+                &serde_json::to_vec(&response).unwrap(),
+                "asset",
+                &UploadVerifiedHeic::from(&heic),
+                &destination,
+            )
+            .is_ok()
+        );
+
+        for mutation in [
+            ("version", json!(0)),
+            ("asset_id", json!("other")),
+            ("outcome.response.zone_name", json!("other")),
+            ("outcome.streamed_heic_sha256", json!("other")),
+            ("outcome.streamed_size_bytes", json!(0)),
+        ] {
+            let mut mismatched = response.clone();
+            match mutation.0 {
+                "outcome.response.zone_name" => {
+                    mismatched["outcome"]["response"]["zone_name"] = mutation.1
+                }
+                "outcome.streamed_heic_sha256" => {
+                    mismatched["outcome"]["streamed_heic_sha256"] = mutation.1
+                }
+                "outcome.streamed_size_bytes" => {
+                    mismatched["outcome"]["streamed_size_bytes"] = mutation.1
+                }
+                key => mismatched[key] = mutation.1,
+            }
+            assert!(
+                parse_upload_proof_child_response(
+                    &serde_json::to_vec(&mismatched).unwrap(),
+                    "asset",
+                    &UploadVerifiedHeic::from(&heic),
+                    &destination,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

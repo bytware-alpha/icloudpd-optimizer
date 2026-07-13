@@ -73,7 +73,7 @@ const FAILED_ASSETS_QUARANTINE_TARGET_SET_FINGERPRINT_VERSION: &[u8] =
     b"failed-assets-quarantine-target-set-v2";
 const LEGACY_FAILURES_CLASSIFY_TARGET_SET_FINGERPRINT_VERSION: &[u8] =
     b"legacy-failures-classify-target-set-v1";
-pub(crate) const UPLOAD_PROOF_CHILD_PROTOCOL_VERSION: u8 = 1;
+pub(crate) const UPLOAD_PROOF_CHILD_PROTOCOL_VERSION: u8 = 2;
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct UploadProofChildInput {
@@ -87,9 +87,7 @@ pub(crate) struct UploadProofChildInput {
 pub(crate) struct UploadProofChildResponse {
     pub version: u8,
     pub asset_id: String,
-    #[serde(flatten)]
-    pub proof: UploadProof,
-    pub upload_timings: crate::upload::UploadTimings,
+    pub outcome: crate::upload::IcloudUploadOutcome,
 }
 
 #[derive(Debug, Parser)]
@@ -1031,14 +1029,12 @@ fn run_upload_proof_child_protocol<R: Read, W: Write>(
         heic_path: heic.heic_path.clone(),
         destination,
     })?;
-    let proof = build_upload_proof(&heic, &response)?;
     serde_json::to_writer(
         &mut *writer,
         &UploadProofChildResponse {
             version: UPLOAD_PROOF_CHILD_PROTOCOL_VERSION,
             asset_id: input.asset_id,
-            proof,
-            upload_timings: response.timings,
+            outcome: response,
         },
     )?;
     writeln!(writer)?;

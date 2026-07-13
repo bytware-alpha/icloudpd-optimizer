@@ -46,7 +46,7 @@ pub struct IcloudUploadRequest {
     pub destination: CloudKitLibraryDestination,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct IcloudUploadResponse {
     pub asset_id: String,
     pub filename: Option<String>,
@@ -55,7 +55,7 @@ pub struct IcloudUploadResponse {
     pub zone_name: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct IcloudUploadOutcome {
     pub response: IcloudUploadResponse,
     pub streamed_heic_sha256: String,
