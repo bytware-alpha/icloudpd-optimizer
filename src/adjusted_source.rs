@@ -9,7 +9,7 @@ use std::cell::RefCell;
 #[cfg(all(test, target_os = "macos"))]
 use std::collections::VecDeque;
 #[cfg(all(test, target_os = "macos"))]
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, SyncSender};
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
 #[cfg(all(test, target_os = "macos"))]
@@ -378,7 +378,7 @@ enum MacosMetadataReadTarget {
 
 #[cfg(all(test, target_os = "macos"))]
 struct TestMacosFchflagsPause {
-    entered: Sender<()>,
+    entered: SyncSender<()>,
     release: Receiver<()>,
     timeout: Duration,
 }
@@ -455,7 +455,7 @@ impl Drop for TestMacosFchflagsFailureGuard {
 
 #[cfg(all(test, target_os = "macos"))]
 impl TestMacosFchflagsPauseGuard {
-    fn install(entered: Sender<()>, release: Receiver<()>, timeout: Duration) -> Self {
+    fn install(entered: SyncSender<()>, release: Receiver<()>, timeout: Duration) -> Self {
         let previous = TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
             state.source_pause.replace(TestMacosFchflagsPause {
                 entered,
@@ -489,12 +489,12 @@ fn assert_test_macos_fchflags_state_is_reset() {
 
 #[cfg(all(test, target_os = "macos"))]
 struct TestReleaseOnDrop {
-    sender: Option<Sender<()>>,
+    sender: Option<SyncSender<()>>,
 }
 
 #[cfg(all(test, target_os = "macos"))]
 impl TestReleaseOnDrop {
-    fn new(sender: Sender<()>) -> Self {
+    fn new(sender: SyncSender<()>) -> Self {
         Self {
             sender: Some(sender),
         }
@@ -504,11 +504,9 @@ impl TestReleaseOnDrop {
 #[cfg(all(test, target_os = "macos"))]
 impl Drop for TestReleaseOnDrop {
     fn drop(&mut self) {
-        let _ = self
-            .sender
-            .take()
-            .expect("release sender must be present")
-            .send(());
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.try_send(());
+        }
     }
 }
 
@@ -2026,7 +2024,7 @@ fn set_macos_file_flags(
             (failed, pause)
         });
         if let Some(pause) = pause
-            && (pause.entered.send(()).is_err()
+            && (pause.entered.try_send(()).is_err()
                 || pause.release.recv_timeout(pause.timeout).is_err())
         {
             return Err(AdjustedSourceError::Filesystem);
@@ -2602,13 +2600,23 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    struct TestMaterializedAdjustedSourceFixture {
+        _directory: tempfile::TempDir,
+        source: MaterializedAdjustedSource,
+    }
+
+    #[cfg(target_os = "macos")]
     fn materialize_unrelated_adjusted_source_for_thread_isolation_test()
-    -> MaterializedAdjustedSource {
+    -> TestMaterializedAdjustedSourceFixture {
         use image::codecs::jpeg::JpegEncoder;
         use image::{DynamicImage, Rgb, RgbImage};
 
         let directory = tempfile::tempdir().expect("materialization test directory");
-        let output_path = directory.path().join("unrelated.heic");
+        let output_path = directory
+            .path()
+            .canonicalize()
+            .expect("materialization test directory should canonicalize")
+            .join("unrelated.heic");
         let adjusted_path = adjusted_source_path_for_output(&output_path);
         let mut image = RgbImage::new(2, 2);
         for (x, y, pixel) in image.enumerate_pixels_mut() {
@@ -2656,8 +2664,17 @@ mod tests {
             verified_at_unix_seconds: 1,
         };
 
-        materialize_adjusted_source_for_conversion(&proof, &proof.asset_id, &original, &output_path)
-            .expect("unrelated adjusted source should materialize")
+        let source = materialize_adjusted_source_for_conversion(
+            &proof,
+            &proof.asset_id,
+            &original,
+            &output_path,
+        )
+        .expect("unrelated adjusted source should materialize");
+        TestMaterializedAdjustedSourceFixture {
+            _directory: directory,
+            source,
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -2728,8 +2745,8 @@ mod tests {
         use std::time::Duration;
 
         const TEST_TIMEOUT: Duration = Duration::from_secs(5);
-        let (entered_source, source_entered) = mpsc::channel();
-        let (release_materializer, materializer_released) = mpsc::channel();
+        let (entered_source, source_entered) = mpsc::sync_channel(1);
+        let (release_materializer, materializer_released) = mpsc::sync_channel(1);
         std::thread::scope(|scope| {
             let source = scope.spawn(move || {
                 let guard = TestMacosFchflagsFailureGuard::install();
@@ -2770,20 +2787,24 @@ mod tests {
                     materializer_released,
                     TEST_TIMEOUT,
                 );
-                let source = materialize_unrelated_adjusted_source_for_thread_isolation_test();
-                let staging_path = source.path().to_path_buf();
+                let fixture = materialize_unrelated_adjusted_source_for_thread_isolation_test();
+                let staging_path = fixture.source.path().to_path_buf();
                 let descriptor_observation =
-                    source.duplicate_file_for_encoder().ok().map(|descriptor| {
-                        let observed = descriptor.raw_fd() >= 0;
-                        drop(descriptor);
-                        observed
-                    });
+                    fixture
+                        .source
+                        .duplicate_file_for_encoder()
+                        .ok()
+                        .map(|descriptor| {
+                            let observed = descriptor.raw_fd() >= 0;
+                            drop(descriptor);
+                            observed
+                        });
                 assert_eq!(
                     descriptor_observation,
                     Some(true),
                     "unrelated materialization must retain an open encoder descriptor"
                 );
-                drop(source);
+                drop(fixture);
                 assert!(
                     !staging_path.exists(),
                     "unrelated materialization should clean its sealed staging directory"
