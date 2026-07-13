@@ -12307,14 +12307,97 @@ esac
 
     #[cfg(unix)]
     #[test]
-    fn child_timeout_covers_undrained_stdin() {
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "/bin/sleep 5"]);
+    fn private_child_stdin_timeout_kills_parent_and_grandchild() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().expect("temporary directory should exist");
+        let helper_path = tempdir.path().join("stuck-private-child");
+        let parent_pid_path = tempdir.path().join("parent.pid");
+        let grandchild_pid_path = tempdir.path().join("grandchild.pid");
+        fs::write(
+            &helper_path,
+            format!(
+                "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' \"$$\" > '{}'\n/bin/sleep 30 &\ngrandchild=$!\nprintf '%s\\n' \"$grandchild\" > '{}'\nwait \"$grandchild\"\n",
+                parent_pid_path.display(),
+                grandchild_pid_path.display(),
+            ),
+        )
+        .expect("helper should be written");
+        let mut permissions = fs::metadata(&helper_path)
+            .expect("helper metadata should load")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&helper_path, permissions).expect("helper should be executable");
+
         let started = Instant::now();
-        let error = run_upload_child_with_stdin_timeout("asset", command, &vec![b'x'; 1 << 20], 1)
-            .expect_err("undrained child stdin must time out");
+        let worker = thread::spawn(move || {
+            run_upload_child_with_stdin_timeout(
+                "asset",
+                Command::new(&helper_path),
+                b"private-child-request",
+                1,
+            )
+        });
+        let pid_deadline = Instant::now() + Duration::from_secs(1);
+        let (parent_pid, grandchild_pid) = loop {
+            if let (Ok(parent), Ok(grandchild)) = (
+                fs::read_to_string(&parent_pid_path),
+                fs::read_to_string(&grandchild_pid_path),
+            ) {
+                break (
+                    parent
+                        .trim()
+                        .parse::<libc::pid_t>()
+                        .expect("parent PID should be numeric"),
+                    grandchild
+                        .trim()
+                        .parse::<libc::pid_t>()
+                        .expect("grandchild PID should be numeric"),
+                );
+            }
+            assert!(
+                Instant::now() < pid_deadline,
+                "private child should record both PIDs before timeout"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        struct ProcessGroupCleanup(libc::pid_t);
+        impl Drop for ProcessGroupCleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(-self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _cleanup = ProcessGroupCleanup(parent_pid);
+        for pid in [parent_pid, grandchild_pid] {
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "private child process {pid} should be alive before timeout"
+            );
+        }
+        let error = worker
+            .join()
+            .expect("private child worker should not panic")
+            .expect_err("private child must time out");
         assert!(started.elapsed() < Duration::from_secs(3));
         assert!(matches!(error, MonitorError::UploadWorkflowTimeout { .. }));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        for pid in [parent_pid, grandchild_pid] {
+            loop {
+                let result = unsafe { libc::kill(pid, 0) };
+                if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed-out private child process {pid} was not reaped"
+                );
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -12355,28 +12438,37 @@ esac
 
     #[cfg(unix)]
     #[test]
-    fn upload_proof_children_can_run_concurrently() {
+    fn direct_upload_proof_children_run_concurrently_with_distinct_protocol_responses() {
         use std::os::unix::fs::PermissionsExt;
 
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let helper_path = tempdir.path().join("fake-upload-proof-child");
+        let helper_path = tempdir.path().join("fake-direct-upload-proof-child");
         let barrier_dir = tempdir.path().join("upload-barrier");
         fs::create_dir(&barrier_dir).expect("barrier directory should be created");
         fs::write(
             &helper_path,
             format!(
                 "#!/bin/sh\n\
-                 /usr/bin/touch '{}/'$6\n\
+                 input=$(/bin/cat)\n\
+                 asset_id=$(printf '%s' \"$input\" | /usr/bin/sed -n 's/.*\\\"asset_id\\\":\\\"\\([^\\\"]*\\)\\\".*/\\1/p')\n\
+                 [ -n \"$asset_id\" ] || exit 96\n\
+                 printf '%s' \"$input\" > '{}/request-'\"$asset_id\"'.json'\n\
+                 /usr/bin/touch '{}/entered-'\"$asset_id\"\n\
                  attempts=0\n\
-                 while [ ! -f '{}/asset-a' ] || [ ! -f '{}/asset-b' ]; do\n\
+                 while [ ! -f '{}/entered-asset-a' ] || [ ! -f '{}/entered-asset-b' ]; do\n\
                    attempts=$((attempts + 1))\n\
                    [ \"$attempts\" -lt 200 ] || exit 97\n\
-                   /bin/sleep 0.05\n\
+                   /bin/sleep 0.01\n\
                  done\n\
-                 printf '%s\\n' '{{\"uploaded_heic_asset_id\":\"asset\",\"uploaded_heic_sha256\":\"sha\",\"database_scope\":\"private\",\"zone_name\":\"PrimarySync\",\"uploaded_heic_path\":\"/tmp/asset.heic\"}}'\n",
+                 /bin/ls '{}/entered-'* | /usr/bin/wc -l | /usr/bin/tr -d ' ' > '{}/overlap-'\"$asset_id\"\n\
+                 printf '{{\"version\":{},\"asset_id\":\"%s\",\"outcome\":{{\"response\":{{\"asset_id\":\"uploaded-%s\",\"filename\":null,\"master_id\":null,\"database_scope\":\"private\",\"zone_name\":\"PrimarySync\"}},\"streamed_heic_sha256\":\"sha\",\"streamed_size_bytes\":1,\"timings\":{{\"create_upload_url_wall_time_millis\":1,\"signed_upload_wall_time_millis\":1,\"put_asset_wall_time_millis\":1,\"upload_status_wall_time_millis\":1,\"upload_status_polls\":1,\"total_wall_time_millis\":1}}}}}}\\n' \"$asset_id\" \"$asset_id\"\n",
                 barrier_dir.display(),
                 barrier_dir.display(),
                 barrier_dir.display(),
+                barrier_dir.display(),
+                barrier_dir.display(),
+                barrier_dir.display(),
+                UPLOAD_PROOF_CHILD_PROTOCOL_VERSION,
             ),
         )
         .expect("helper should be written");
@@ -12391,19 +12483,24 @@ esac
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>();
+        let started = Instant::now();
         let outcomes = run_parallel_asset_job_chunk(&asset_ids, {
             let helper_path = helper_path.clone();
+            let manifest_path = manifest_path.clone();
+            let session_path = session_path.clone();
             move |asset_id| {
-                run_upload_proof_child_executable_with_timeout(
+                run_upload_proof_direct_child_response_executable_with_timeout(
                     &helper_path,
                     &manifest_path,
                     &asset_id,
+                    &lifecycle_record(&asset_id, State::ConversionVerified),
                     &session_path,
-                    15,
+                    5,
                 )
             }
         });
 
+        assert!(started.elapsed() < Duration::from_secs(3));
         assert_eq!(outcomes.len(), 2);
         assert!(
             outcomes.iter().all(|outcome| outcome.result.is_ok()),
@@ -12412,6 +12509,42 @@ esac
                 .iter()
                 .filter_map(|outcome| outcome.result.as_ref().err())
                 .collect::<Vec<_>>()
+        );
+        for asset_id in ["asset-a", "asset-b"] {
+            let input: UploadProofChildInput = serde_json::from_slice(
+                &fs::read(barrier_dir.join(format!("request-{asset_id}.json")))
+                    .expect("direct child request should be captured"),
+            )
+            .expect("direct child request should be protocol JSON");
+            assert_eq!(input.version, UPLOAD_PROOF_CHILD_PROTOCOL_VERSION);
+            assert_eq!(input.asset_id, asset_id);
+            let overlap = fs::read_to_string(barrier_dir.join(format!("overlap-{asset_id}")))
+                .expect("direct child overlap count should be captured");
+            assert!(
+                overlap
+                    .trim()
+                    .parse::<usize>()
+                    .expect("overlap count should be numeric")
+                    >= 2,
+                "direct child {asset_id} did not overlap another private child"
+            );
+        }
+        let responses = outcomes
+            .iter()
+            .map(|outcome| {
+                let response: UploadProofChildResponse = serde_json::from_slice(
+                    outcome.result.as_ref().expect("outcome should succeed"),
+                )
+                .expect("direct child response should be protocol JSON");
+                (response.asset_id, response.outcome.response.asset_id)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            responses,
+            BTreeSet::from([
+                ("asset-a".to_string(), "uploaded-asset-a".to_string()),
+                ("asset-b".to_string(), "uploaded-asset-b".to_string()),
+            ])
         );
     }
 
