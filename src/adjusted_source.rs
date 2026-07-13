@@ -5,6 +5,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(all(test, target_os = "macos"))]
+use std::cell::RefCell;
+#[cfg(all(test, target_os = "macos"))]
 use std::collections::VecDeque;
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
@@ -380,78 +382,56 @@ struct TestMacosFchflagsState {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-static TEST_MACOS_FCHFLAGS_STATE: Mutex<TestMacosFchflagsState> =
-    Mutex::new(TestMacosFchflagsState {
+thread_local! {
+    static TEST_MACOS_FCHFLAGS_STATE: RefCell<TestMacosFchflagsState> = RefCell::new(TestMacosFchflagsState {
         failures: VecDeque::new(),
         calls: Vec::new(),
         metadata_failures: VecDeque::new(),
         metadata_calls: Vec::new(),
     });
-#[cfg(all(test, target_os = "macos"))]
-static TEST_MACOS_FCHFLAGS_LOCK: Mutex<()> = Mutex::new(());
+}
 
 #[cfg(all(test, target_os = "macos"))]
 struct TestMacosFchflagsFailureGuard {
     previous: TestMacosFchflagsState,
-    _lock: MutexGuard<'static, ()>,
 }
 
 #[cfg(all(test, target_os = "macos"))]
 impl TestMacosFchflagsFailureGuard {
     fn install() -> Self {
-        let lock = TEST_MACOS_FCHFLAGS_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut state = TEST_MACOS_FCHFLAGS_STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::mem::take(&mut *state);
-        Self {
-            previous,
-            _lock: lock,
-        }
+        let previous = TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(std::mem::take);
+        Self { previous }
     }
 
     fn arm(&self, failures: impl IntoIterator<Item = MacosFchflagsTarget>) {
-        let mut state = TEST_MACOS_FCHFLAGS_STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.failures = failures.into_iter().collect();
-        state.calls.clear();
+        TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+            state.failures = failures.into_iter().collect();
+            state.calls.clear();
+        });
     }
 
     fn calls(&self) -> Vec<MacosFchflagsTarget> {
-        TEST_MACOS_FCHFLAGS_STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .calls
-            .clone()
+        TEST_MACOS_FCHFLAGS_STATE.with_borrow(|state| state.calls.clone())
     }
 
     fn arm_metadata_reads(&self, failures: impl IntoIterator<Item = MacosMetadataReadTarget>) {
-        let mut state = TEST_MACOS_FCHFLAGS_STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.metadata_failures = failures.into_iter().collect();
-        state.metadata_calls.clear();
+        TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+            state.metadata_failures = failures.into_iter().collect();
+            state.metadata_calls.clear();
+        });
     }
 
     fn metadata_calls(&self) -> Vec<MacosMetadataReadTarget> {
-        TEST_MACOS_FCHFLAGS_STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .metadata_calls
-            .clone()
+        TEST_MACOS_FCHFLAGS_STATE.with_borrow(|state| state.metadata_calls.clone())
     }
 }
 
 #[cfg(all(test, target_os = "macos"))]
 impl Drop for TestMacosFchflagsFailureGuard {
     fn drop(&mut self) {
-        let mut state = TEST_MACOS_FCHFLAGS_STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state = std::mem::take(&mut self.previous);
+        TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+            *state = std::mem::take(&mut self.previous);
+        });
     }
 }
 
@@ -1953,12 +1933,16 @@ fn set_macos_file_flags(
     let _ = target;
     #[cfg(test)]
     {
-        let mut state = TEST_MACOS_FCHFLAGS_STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.calls.push(target);
-        if state.failures.front().copied() == Some(target) {
-            state.failures.pop_front();
+        let failed = TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+            state.calls.push(target);
+            if state.failures.front().copied() == Some(target) {
+                state.failures.pop_front();
+                true
+            } else {
+                false
+            }
+        });
+        if failed {
             return Err(AdjustedSourceError::Filesystem);
         }
     }
@@ -1977,12 +1961,16 @@ fn read_macos_transaction_flags(
     let _ = target;
     #[cfg(test)]
     {
-        let mut state = TEST_MACOS_FCHFLAGS_STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.metadata_calls.push(target);
-        if state.metadata_failures.front().copied() == Some(target) {
-            state.metadata_failures.pop_front();
+        let failed = TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+            state.metadata_calls.push(target);
+            if state.metadata_failures.front().copied() == Some(target) {
+                state.metadata_failures.pop_front();
+                true
+            } else {
+                false
+            }
+        });
+        if failed {
             return Err(AdjustedSourceError::Filesystem);
         }
     }
@@ -2525,6 +2513,65 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn materialize_unrelated_adjusted_source_for_thread_isolation_test()
+    -> MaterializedAdjustedSource {
+        use image::codecs::jpeg::JpegEncoder;
+        use image::{DynamicImage, Rgb, RgbImage};
+
+        let directory = tempfile::tempdir().expect("materialization test directory");
+        let output_path = directory.path().join("unrelated.heic");
+        let adjusted_path = adjusted_source_path_for_output(&output_path);
+        let mut image = RgbImage::new(2, 2);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = Rgb([(x * 80) as u8, (y * 80) as u8, 37]);
+        }
+        let mut bytes = Vec::new();
+        JpegEncoder::new_with_quality(&mut bytes, 100)
+            .encode_image(&DynamicImage::ImageRgb8(image))
+            .expect("test adjusted JPEG should encode");
+        std::fs::write(&adjusted_path, &bytes).expect("test adjusted JPEG should write");
+
+        let original = OriginalAssetProof {
+            record_name: "unrelated-original-record".to_string(),
+            record_change_tag: "unrelated-original-tag".to_string(),
+            record_type: "CPLAsset".to_string(),
+            database_scope: Default::default(),
+            zone_name: "PrimarySync".to_string(),
+            filename: "unrelated.dng".to_string(),
+            size_bytes: 1,
+            matched_raw_sha256: "0".repeat(64),
+        };
+        let proof = CloudKitAdjustedSourceProof {
+            schema_version: ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION.to_string(),
+            source_kind: ADJUSTED_SOURCE_KIND.to_string(),
+            asset_id: "unrelated-asset".to_string(),
+            asset_record_name: original.record_name.clone(),
+            asset_record_change_tag: original.record_change_tag.clone(),
+            asset_record_type: original.record_type.clone(),
+            resource_record_name: original.record_name.clone(),
+            resource_record_change_tag: original.record_change_tag.clone(),
+            resource_record_type: "CPLAsset".to_string(),
+            database_scope: original.database_scope,
+            zone_name: original.zone_name.clone(),
+            master_record_name: None,
+            resource_field: ADJUSTED_RESOURCE_FIELD.to_string(),
+            declared_file_type: "public.jpeg".to_string(),
+            declared_fingerprint: "unrelated-fingerprint".to_string(),
+            declared_size_bytes: bytes.len() as u64,
+            width: 2,
+            height: 2,
+            local_path: adjusted_path,
+            downloaded_size_bytes: bytes.len() as u64,
+            downloaded_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            orientation: 1,
+            verified_at_unix_seconds: 1,
+        };
+
+        materialize_adjusted_source_for_conversion(&proof, &proof.asset_id, &original, &output_path)
+            .expect("unrelated adjusted source should materialize")
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_unseal_directory_clear_failure_leaves_auditable_immutable_residual() {
         let guard = TestMacosFchflagsFailureGuard::install();
@@ -2583,6 +2630,69 @@ mod tests {
         staging
             .cleanup()
             .expect("retry should clean the rolled-back residual");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_fchflags_fault_is_thread_local_during_unrelated_adjusted_materialization() {
+        use std::sync::{Arc, Barrier};
+
+        let armed = Arc::new(Barrier::new(2));
+        let materialized = Arc::new(Barrier::new(2));
+        std::thread::scope(|scope| {
+            let armed_source = Arc::clone(&armed);
+            let materialized_source = Arc::clone(&materialized);
+            let source = scope.spawn(move || {
+                let guard = TestMacosFchflagsFailureGuard::install();
+                let mut staging = sealed_macos_staging_for_unseal_test();
+                guard.arm([MacosFchflagsTarget::Source]);
+                armed_source.wait();
+                materialized_source.wait();
+
+                assert!(matches!(
+                    staging.cleanup(),
+                    Err(AdjustedSourceError::Filesystem)
+                ));
+                assert_eq!(
+                    guard.calls(),
+                    vec![
+                        MacosFchflagsTarget::StagingDirectory,
+                        MacosFchflagsTarget::Source,
+                        MacosFchflagsTarget::StagingDirectory,
+                    ]
+                );
+                assert_macos_unseal_failure_residual(&staging, true);
+                drop(guard);
+                staging
+                    .cleanup()
+                    .expect("thread-local fault residual should clean on retry");
+            });
+
+            let materializer = scope.spawn(move || {
+                armed.wait();
+                let source = materialize_unrelated_adjusted_source_for_thread_isolation_test();
+                let staging_path = source.path().to_path_buf();
+                let descriptor = source
+                    .duplicate_file_for_encoder()
+                    .expect("unrelated materialization should expose a validated descriptor");
+                assert!(
+                    descriptor.raw_fd() >= 0,
+                    "materialized adjusted source must expose an open encoder descriptor"
+                );
+                drop(descriptor);
+                drop(source);
+                assert!(
+                    !staging_path.exists(),
+                    "unrelated materialization should clean its sealed staging directory"
+                );
+                materialized.wait();
+            });
+
+            source.join().expect("armed source thread should complete");
+            materializer
+                .join()
+                .expect("unrelated materializer thread should complete");
+        });
     }
 
     #[cfg(target_os = "macos")]
