@@ -2632,8 +2632,16 @@ mod upload_verified_reverify_tests {
                 "recordName": asset_id,
                 "recordType": "CPLAsset",
                 "recordChangeTag": "change-tag",
+                "zoneID": {"zoneName": "PrimarySync"},
                 "fields": {
-                    "masterRef": {"value": {"recordName": master_id}},
+                    "masterRef": {
+                        "type": "REFERENCE",
+                        "value": {
+                            "recordName": master_id,
+                            "zoneID": {"zoneName": "PrimarySync"},
+                            "action": "DELETE_SELF"
+                        }
+                    },
                     "isDeleted": {"value": 0}
                 }
             }]
@@ -2651,6 +2659,7 @@ mod upload_verified_reverify_tests {
                 "recordName": master_id,
                 "recordType": "CPLMaster",
                 "recordChangeTag": "master-change-tag",
+                "zoneID": {"zoneName": "PrimarySync"},
                 "fields": {
                     "resOriginalRes": {"value": {
                         "size": size_bytes,

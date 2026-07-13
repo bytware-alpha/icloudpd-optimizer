@@ -972,6 +972,7 @@ impl<T: CloudKitDeleteTransport + CloudKitOriginalAssetReadTransport> CloudKitDe
             master_response,
             &asset.master_record_name,
             request.expected_size_bytes,
+            request,
         )?;
         let download = self.transport.download_resource(
             session,
@@ -1091,6 +1092,7 @@ fn resolve_uploaded_heic_asset_with_transport<T: CloudKitUploadedHeicReadTranspo
         master_response,
         &asset.master_record_name,
         request.expected_size_bytes,
+        request,
     )?;
     let download =
         transport.download_resource(session, &download_url, request.expected_size_bytes)?;
@@ -3422,6 +3424,7 @@ fn parse_uploaded_heic_asset_lookup_response(
     let record = &records[0];
     reject_cloudkit_record_error(record, "records/lookup")?;
     require_record_type(record, "CPLAsset")?;
+    validate_uploaded_heic_record_destination(record, request)?;
     let record_name = required_record_string(record, "recordName")?;
     if record_name != request.uploaded_asset_id {
         return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
@@ -3440,16 +3443,7 @@ fn parse_uploaded_heic_asset_lookup_response(
             "uploaded HEIC asset is already deleted",
         ));
     }
-    let master_record_name = field_value(fields, "masterRef")
-        .and_then(master_ref_record_name)
-        .ok_or(UploadError::InvalidCloudKitUploadedHeicResponse(
-            "uploaded HEIC asset missing masterRef",
-        ))?;
-    if master_record_name.trim().is_empty() {
-        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
-            "uploaded HEIC masterRef is empty",
-        ));
-    }
+    let master_record_name = parse_uploaded_heic_master_ref(fields, request)?;
     Ok(UploadedHeicAssetLookup {
         record_name: record_name.to_string(),
         record_change_tag: record_change_tag.to_string(),
@@ -3461,6 +3455,7 @@ fn parse_uploaded_heic_master_lookup_response(
     value: Value,
     expected_master_record_name: &str,
     expected_size_bytes: u64,
+    request: &CloudKitUploadedHeicResolveRequest,
 ) -> Result<Url, UploadError> {
     let records = cloudkit_lookup_records(&value)?;
     if records.len() != 1 {
@@ -3471,6 +3466,7 @@ fn parse_uploaded_heic_master_lookup_response(
     let record = &records[0];
     reject_cloudkit_record_error(record, "records/lookup")?;
     require_record_type(record, "CPLMaster")?;
+    validate_uploaded_heic_record_destination(record, request)?;
     let record_name = required_record_string(record, "recordName")?;
     if record_name != expected_master_record_name {
         return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
@@ -3478,6 +3474,64 @@ fn parse_uploaded_heic_master_lookup_response(
         ));
     }
     master_matching_heic_resource_url(record, expected_size_bytes)
+}
+
+fn validate_uploaded_heic_record_destination(
+    record: &Value,
+    request: &CloudKitUploadedHeicResolveRequest,
+) -> Result<(), UploadError> {
+    validate_uploaded_heic_zone_identity(
+        record.get("zoneID"),
+        request,
+        "uploaded HEIC lookup record zone differs from the requested destination",
+    )
+}
+
+fn parse_uploaded_heic_master_ref(
+    fields: &Map<String, Value>,
+    request: &CloudKitUploadedHeicResolveRequest,
+) -> Result<String, UploadError> {
+    let master_ref = fields
+        .get("masterRef")
+        .and_then(Value::as_object)
+        .filter(|wrapper| wrapper.get("type").and_then(Value::as_str) == Some("REFERENCE"))
+        .and_then(|wrapper| wrapper.get("value"))
+        .and_then(Value::as_object)
+        .ok_or(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "uploaded HEIC masterRef is malformed",
+        ))?;
+    if master_ref.get("action").and_then(Value::as_str) != Some("DELETE_SELF") {
+        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "uploaded HEIC masterRef action is invalid",
+        ));
+    }
+    validate_uploaded_heic_zone_identity(
+        master_ref.get("zoneID"),
+        request,
+        "uploaded HEIC masterRef zone differs from the requested destination",
+    )?;
+    master_ref
+        .get("recordName")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(ToString::to_string)
+        .ok_or(UploadError::InvalidCloudKitUploadedHeicResponse(
+            "uploaded HEIC masterRef record name is malformed",
+        ))
+}
+
+fn validate_uploaded_heic_zone_identity(
+    zone: Option<&Value>,
+    request: &CloudKitUploadedHeicResolveRequest,
+    error: &'static str,
+) -> Result<(), UploadError> {
+    let zone = zone
+        .and_then(Value::as_object)
+        .ok_or(UploadError::InvalidCloudKitUploadedHeicResponse(error))?;
+    if zone.get("zoneName").and_then(Value::as_str) != Some(request.zone_name.as_str()) {
+        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(error));
+    }
+    Ok(())
 }
 
 fn cloudkit_lookup_records(value: &Value) -> Result<&Vec<Value>, UploadError> {
@@ -5528,6 +5582,53 @@ mod tests {
             std::fs::read(&temp_path).expect("streamed temp artifact"),
             resource_bytes
         );
+        server.join().expect("loopback assertions should pass");
+    }
+
+    #[test]
+    fn uploaded_heic_read_transport_uses_explicit_payload_scope_over_session_default() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let port = listener.local_addr().expect("loopback address").port();
+        let endpoint = Url::parse(&format!("http://127.0.0.1:{port}")).expect("loopback endpoint");
+        let server = thread::spawn(move || {
+            for (scope, zone_name) in [
+                ("private", "PrimarySync"),
+                ("shared", "SharedSync-ABCDEF123456"),
+            ] {
+                let (mut lookup, _) = listener.accept().expect("lookup connection");
+                let request = String::from_utf8(read_loopback_request(&mut lookup))
+                    .expect("lookup request UTF-8");
+                assert!(request.to_ascii_lowercase().starts_with(&format!(
+                    "post /database/1/com.apple.photos.cloud/production/{scope}/records/lookup?"
+                )));
+                assert!(request.contains(&format!("\"zoneName\":\"{zone_name}\"")));
+                write_loopback_response(
+                    &mut lookup,
+                    "200 OK",
+                    br#"{"records":[]}"#,
+                    "Content-Type: application/json\r\n",
+                );
+            }
+        });
+        let session = valid_delete_session();
+        assert_eq!(session.database_scope, CloudKitDatabaseScope::Private);
+        let mut transport = ReqwestCloudKitReadTransport::new_for_loopback_test(endpoint)
+            .expect("loopback read transport");
+        for destination in [
+            CloudKitLibraryDestination::primary_sync(),
+            CloudKitLibraryDestination {
+                database_scope: CloudKitDatabaseScope::Shared,
+                zone_name: "SharedSync-ABCDEF123456".to_string(),
+            },
+        ] {
+            validate_library_destination(&destination).expect("validated destination");
+            CloudKitUploadedHeicReadTransport::post_records_lookup(
+                &mut transport,
+                &session,
+                cloudkit_records_lookup_payload(&["asset-record"], &["masterRef"], &destination),
+            )
+            .expect("explicit destination lookup");
+        }
         server.join().expect("loopback assertions should pass");
     }
 

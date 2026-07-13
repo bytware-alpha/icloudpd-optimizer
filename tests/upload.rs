@@ -212,8 +212,16 @@ fn cloudkit_uploaded_heic_asset(asset_name: &str, master_name: &str, change_tag:
             "recordName": asset_name,
             "recordType": "CPLAsset",
             "recordChangeTag": change_tag,
+            "zoneID": {"zoneName": "PrimarySync"},
             "fields": {
-                "masterRef": {"value": {"recordName": master_name}},
+                "masterRef": {
+                    "type": "REFERENCE",
+                    "value": {
+                        "recordName": master_name,
+                        "zoneID": {"zoneName": "PrimarySync"},
+                        "action": "DELETE_SELF"
+                    }
+                },
                 "isDeleted": {"value": 0}
             }
         }]
@@ -226,6 +234,7 @@ fn cloudkit_uploaded_heic_master(master_name: &str, size_bytes: u64, download_ur
             "recordName": master_name,
             "recordType": "CPLMaster",
             "recordChangeTag": "master-change-tag",
+            "zoneID": {"zoneName": "PrimarySync"},
             "fields": {
                 "resOriginalRes": {
                     "value": {
@@ -237,6 +246,35 @@ fn cloudkit_uploaded_heic_master(master_name: &str, size_bytes: u64, download_ur
             }
         }]
     })
+}
+
+struct ObservingUploadedHeicReadTransport {
+    lookup_responses: Vec<Value>,
+    lookup_calls: usize,
+    download_calls: usize,
+}
+
+impl CloudKitUploadedHeicReadTransport for ObservingUploadedHeicReadTransport {
+    fn post_records_lookup(
+        &mut self,
+        _session: &CloudKitDeleteSession,
+        _payload: Value,
+    ) -> Result<Value, UploadError> {
+        self.lookup_calls += 1;
+        Ok(self.lookup_responses.remove(0))
+    }
+
+    fn download_resource(
+        &mut self,
+        _session: &CloudKitDeleteSession,
+        _download_url: &url::Url,
+        _expected_size_bytes: u64,
+    ) -> Result<CloudKitResourceDownload, UploadError> {
+        self.download_calls += 1;
+        Err(UploadError::InvalidSession(
+            "resource download must not be reached".to_string(),
+        ))
+    }
 }
 
 fn original_asset_resolve_request() -> CloudKitOriginalAssetResolveRequest {
@@ -1360,6 +1398,120 @@ fn uploaded_heic_read_client_accepts_lookup_and_download_only_transport() {
     )
     .expect("read-only lookup/download must resolve the exact uploaded asset");
     assert_eq!(resolved.record_name, "CPLAsset-uploaded-heic-123");
+}
+
+#[test]
+fn uploaded_heic_read_client_rejects_lookup_identity_zone_and_declared_size_mismatches_before_download()
+ {
+    let session =
+        CloudKitDeleteSession::from_json(&valid_delete_session_json()).expect("session loads");
+    let bytes = b"read-only-uploaded-heic";
+    let asset_id = "CPLAsset-uploaded-heic-123";
+    let master_id = "CPLMaster-heic-123";
+    let wrong_asset = cloudkit_uploaded_heic_asset("other-asset", master_id, "tag-1");
+    let mut missing_asset_zone = cloudkit_uploaded_heic_asset(asset_id, master_id, "tag-1");
+    missing_asset_zone["records"][0]
+        .as_object_mut()
+        .expect("asset record")
+        .remove("zoneID");
+    let mut wrong_asset_zone = cloudkit_uploaded_heic_asset(asset_id, master_id, "tag-1");
+    wrong_asset_zone["records"][0]["zoneID"]["zoneName"] = json!("OtherSync");
+    let mut missing_master_ref_zone = cloudkit_uploaded_heic_asset(asset_id, master_id, "tag-1");
+    missing_master_ref_zone["records"][0]["fields"]["masterRef"]["value"]
+        .as_object_mut()
+        .expect("masterRef value")
+        .remove("zoneID");
+    let mut wrong_master_ref_zone = cloudkit_uploaded_heic_asset(asset_id, master_id, "tag-1");
+    wrong_master_ref_zone["records"][0]["fields"]["masterRef"]["value"]["zoneID"]["zoneName"] =
+        json!("OtherSync");
+    let wrong_master = cloudkit_uploaded_heic_master(
+        "other-master",
+        bytes.len() as u64,
+        "https://p140-icloud-content.icloud.com/uploaded-heic",
+    );
+    let mut missing_master_zone = cloudkit_uploaded_heic_master(
+        master_id,
+        bytes.len() as u64,
+        "https://p140-icloud-content.icloud.com/uploaded-heic",
+    );
+    missing_master_zone["records"][0]
+        .as_object_mut()
+        .expect("master record")
+        .remove("zoneID");
+    let mut wrong_master_zone = cloudkit_uploaded_heic_master(
+        master_id,
+        bytes.len() as u64,
+        "https://p140-icloud-content.icloud.com/uploaded-heic",
+    );
+    wrong_master_zone["records"][0]["zoneID"]["zoneName"] = json!("OtherSync");
+    let wrong_size_master = cloudkit_uploaded_heic_master(
+        master_id,
+        bytes.len() as u64 + 1,
+        "https://p140-icloud-content.icloud.com/uploaded-heic",
+    );
+    let cases = vec![
+        ("asset recordName", vec![wrong_asset], 1),
+        ("missing asset zone", vec![missing_asset_zone], 1),
+        ("wrong asset zone", vec![wrong_asset_zone], 1),
+        ("missing masterRef zone", vec![missing_master_ref_zone], 1),
+        ("wrong masterRef zone", vec![wrong_master_ref_zone], 1),
+        (
+            "master recordName",
+            vec![
+                cloudkit_uploaded_heic_asset(asset_id, master_id, "tag-1"),
+                wrong_master,
+            ],
+            2,
+        ),
+        (
+            "missing master zone",
+            vec![
+                cloudkit_uploaded_heic_asset(asset_id, master_id, "tag-1"),
+                missing_master_zone,
+            ],
+            2,
+        ),
+        (
+            "wrong master zone",
+            vec![
+                cloudkit_uploaded_heic_asset(asset_id, master_id, "tag-1"),
+                wrong_master_zone,
+            ],
+            2,
+        ),
+        (
+            "master resource size",
+            vec![
+                cloudkit_uploaded_heic_asset(asset_id, master_id, "tag-1"),
+                wrong_size_master,
+            ],
+            2,
+        ),
+    ];
+
+    for (case, responses, expected_lookup_calls) in cases {
+        let mut transport = ObservingUploadedHeicReadTransport {
+            lookup_responses: responses,
+            lookup_calls: 0,
+            download_calls: 0,
+        };
+        let error = CloudKitUploadedHeicReadClient::new(&mut transport)
+            .resolve_uploaded_heic_asset(
+                &session,
+                &primary_uploaded_heic_resolve_request(
+                    asset_id,
+                    sha256_hex(bytes),
+                    bytes.len() as u64,
+                ),
+            )
+            .expect_err(case);
+        assert!(matches!(
+            error,
+            UploadError::InvalidCloudKitUploadedHeicResponse(_)
+        ));
+        assert_eq!(transport.lookup_calls, expected_lookup_calls, "{case}");
+        assert_eq!(transport.download_calls, 0, "{case}");
+    }
 }
 
 fn assert_uploaded_heic_read_only<T: CloudKitUploadedHeicReadTransport>(_transport: T) {}
