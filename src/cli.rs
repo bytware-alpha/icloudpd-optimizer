@@ -1927,14 +1927,9 @@ fn monitor_upload_verified_reverify<W: Write>(
     }
     let updated = reverify_changed_records(&expected, updated);
     let would_change_count = updated.len() as u64;
-    let changed_count = apply_verified_reverify_updates(
-        &config,
-        &state_store,
-        &expected,
-        &updated,
-        args.apply,
-        |_| Ok(()),
-    )?;
+    let mut commit = ProductionReverifyCommitBoundary::new(&config, &state_store);
+    let changed_count =
+        apply_verified_reverify_updates(&mut commit, &expected, &updated, args.apply)?;
     let report = UploadVerifiedReverifyReport {
         target_set_sha256,
         target_count: ids.len() as u64,
@@ -1958,27 +1953,53 @@ fn reverify_needs_writer(apply: bool, changed_records: usize) -> bool {
     apply && changed_records != 0
 }
 
-fn apply_verified_reverify_updates<F>(
-    config: &MonitorConfig,
-    read_store: &AssetStateStore,
+trait ReverifyCommitBoundary {
+    fn read_store(&self) -> &AssetStateStore;
+    fn acquire_writer(&mut self) -> Result<AssetStateStore, CliError>;
+}
+
+struct ProductionReverifyCommitBoundary<'a> {
+    config: &'a MonitorConfig,
+    read_store: &'a AssetStateStore,
+    guard: Option<crate::monitor::MonitorRunGuard>,
+}
+
+impl<'a> ProductionReverifyCommitBoundary<'a> {
+    fn new(config: &'a MonitorConfig, read_store: &'a AssetStateStore) -> Self {
+        Self {
+            config,
+            read_store,
+            guard: None,
+        }
+    }
+}
+
+impl ReverifyCommitBoundary for ProductionReverifyCommitBoundary<'_> {
+    fn read_store(&self) -> &AssetStateStore {
+        self.read_store
+    }
+    fn acquire_writer(&mut self) -> Result<AssetStateStore, CliError> {
+        let mut guard = acquire_monitor_run_guard(self.config)?;
+        let store = guard.state_store(&self.config.manifest_path)?.clone();
+        self.guard = Some(guard);
+        Ok(store)
+    }
+}
+
+fn apply_verified_reverify_updates<B: ReverifyCommitBoundary>(
+    boundary: &mut B,
     expected: &BTreeMap<String, AssetRecord>,
     updated: &[AssetRecord],
     apply: bool,
-    before_cas: F,
-) -> Result<u64, CliError>
-where
-    F: FnOnce(&AssetStateStore) -> Result<(), CliError>,
-{
+) -> Result<u64, CliError> {
     if !apply {
-        read_store.revalidate_immutable_read_snapshot()?;
+        boundary.read_store().revalidate_immutable_read_snapshot()?;
         return Ok(0);
     }
     if !reverify_needs_writer(true, updated.len()) {
         return Ok(0);
     }
-    let mut guard = acquire_monitor_run_guard(config)?;
-    let writer_store = guard.state_store(&config.manifest_path)?.clone();
-    before_cas(&writer_store)?;
+    let writer_store = boundary.acquire_writer()?;
     let current = writer_store.load()?;
     reverify_exact_snapshot_still_current(&current, expected)?;
     writer_store.persist_records_exact_cas_atomic_trusted(updated.iter().map(|updated| {
@@ -2130,6 +2151,22 @@ mod upload_verified_reverify_tests {
         )
     }
 
+    struct DriftCommitBoundary<'a> {
+        production: ProductionReverifyCommitBoundary<'a>,
+        drift: AssetRecord,
+    }
+
+    impl ReverifyCommitBoundary for DriftCommitBoundary<'_> {
+        fn read_store(&self) -> &AssetStateStore {
+            self.production.read_store()
+        }
+        fn acquire_writer(&mut self) -> Result<AssetStateStore, CliError> {
+            let store = self.production.acquire_writer()?;
+            store.persist_record_trusted(&self.drift)?;
+            Ok(store)
+        }
+    }
+
     #[test]
     fn reverify_changed_records_keeps_current_records_byte_identical_and_selects_only_upgrades() {
         let current = record("current", "unchanged");
@@ -2169,10 +2206,8 @@ mod upload_verified_reverify_tests {
         let reader =
             AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("immutable");
         let before = persisted_bytes(&config);
-        let changed =
-            apply_verified_reverify_updates(&config, &reader, &expected, &[], true, |_| {
-                panic!("writer must not open")
-            })
+        let mut boundary = ProductionReverifyCommitBoundary::new(&config, &reader);
+        let changed = apply_verified_reverify_updates(&mut boundary, &expected, &[], true)
             .expect("all-current apply is a no-op");
         assert_eq!(changed, 0);
         assert_eq!(persisted_bytes(&config), before);
@@ -2181,24 +2216,19 @@ mod upload_verified_reverify_tests {
     #[test]
     fn command_commit_mixed_and_rerun_only_persists_legacy_upgrade() {
         let current = record("current", "current");
-        let legacy = record("legacy", "legacy");
+        let legacy = record("legacy", "100.000000000Z");
         let (_tempdir, config, expected) = persisted_fixture(vec![current.clone(), legacy.clone()]);
         let reader =
             AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("immutable");
         let mut upgraded = legacy.clone();
-        upgraded.updated_at = "upgraded".to_string();
+        upgraded.updated_at = "300.000000000Z".to_string();
+        let mut boundary = ProductionReverifyCommitBoundary::new(&config, &reader);
         assert_eq!(
-            apply_verified_reverify_updates(
-                &config,
-                &reader,
-                &expected,
-                &[upgraded.clone()],
-                true,
-                |_| Ok(())
-            )
-            .expect("apply"),
+            apply_verified_reverify_updates(&mut boundary, &expected, &[upgraded.clone()], true)
+                .expect("apply"),
             1
         );
+        drop(boundary);
         let after_first = persisted_bytes(&config);
         let loaded = AssetStateStore::open_read_only(&config.manifest_path)
             .expect("reader")
@@ -2208,16 +2238,10 @@ mod upload_verified_reverify_tests {
         let next_expected = loaded.records().clone();
         let rerun =
             AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("immutable");
+        let mut boundary = ProductionReverifyCommitBoundary::new(&config, &rerun);
         assert_eq!(
-            apply_verified_reverify_updates(
-                &config,
-                &rerun,
-                &next_expected,
-                &[],
-                true,
-                |_| panic!("rerun must not open writer")
-            )
-            .expect("rerun"),
+            apply_verified_reverify_updates(&mut boundary, &next_expected, &[], true)
+                .expect("rerun"),
             0
         );
         assert_eq!(persisted_bytes(&config), after_first);
@@ -2225,47 +2249,32 @@ mod upload_verified_reverify_tests {
 
     #[test]
     fn command_commit_dry_run_and_drift_failure_leave_state_unchanged() {
-        let legacy = record("legacy", "legacy");
+        let legacy = record("legacy", "100.000000000Z");
         let (_tempdir, config, expected) = persisted_fixture(vec![legacy.clone()]);
         let reader =
             AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("immutable");
         let mut upgraded = legacy.clone();
-        upgraded.updated_at = "upgraded".to_string();
+        upgraded.updated_at = "300.000000000Z".to_string();
         let before = persisted_bytes(&config);
+        let mut boundary = ProductionReverifyCommitBoundary::new(&config, &reader);
         assert_eq!(
-            apply_verified_reverify_updates(
-                &config,
-                &reader,
-                &expected,
-                &[upgraded.clone()],
-                false,
-                |_| panic!("dry run must not open writer")
-            )
-            .expect("dry"),
+            apply_verified_reverify_updates(&mut boundary, &expected, &[upgraded.clone()], false)
+                .expect("dry"),
             0
         );
         assert_eq!(persisted_bytes(&config), before);
         let reader =
             AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("immutable");
-        let error = apply_verified_reverify_updates(
-            &config,
-            &reader,
-            &expected,
-            &[upgraded],
-            true,
-            |store| {
-                let mut drifted = legacy.clone();
-                drifted.updated_at = "drifted".to_string();
-                store.persist_record_trusted(&drifted)?;
-                Ok(())
-            },
-        )
-        .expect_err("drift must fail closed");
+        let mut drift = legacy.clone();
+        drift.updated_at = "200.000000000Z".to_string();
+        let mut boundary = DriftCommitBoundary {
+            production: ProductionReverifyCommitBoundary::new(&config, &reader),
+            drift,
+        };
+        let error = apply_verified_reverify_updates(&mut boundary, &expected, &[upgraded], true)
+            .expect_err("drift must fail closed");
         assert!(
-            matches!(
-                error,
-                CliError::OriginalAssetsReconcileGate { .. } | CliError::StateStore(_)
-            ),
+            matches!(error, CliError::OriginalAssetsReconcileGate { .. }),
             "drift path must fail closed: {error}"
         );
         assert_eq!(fs::read(&config.manifest_path).expect("json"), before.0);
@@ -2273,7 +2282,10 @@ mod upload_verified_reverify_tests {
             .expect("reader")
             .load()
             .expect("load");
-        assert_eq!(loaded.get("legacy").expect("legacy").updated_at, "legacy");
+        assert_eq!(
+            loaded.get("legacy").expect("legacy").updated_at,
+            "200.000000000Z"
+        );
     }
 }
 
