@@ -1424,6 +1424,14 @@ fn uploaded_heic_read_client_rejects_lookup_identity_zone_and_declared_size_mism
     let mut wrong_master_ref_zone = cloudkit_uploaded_heic_asset(asset_id, master_id, "tag-1");
     wrong_master_ref_zone["records"][0]["fields"]["masterRef"]["value"]["zoneID"]["zoneName"] =
         json!("OtherSync");
+    let mut malformed_master_ref_type = cloudkit_uploaded_heic_asset(asset_id, master_id, "tag-1");
+    malformed_master_ref_type["records"][0]["fields"]["masterRef"]["type"] = json!("STRING");
+    let mut malformed_master_ref_action =
+        cloudkit_uploaded_heic_asset(asset_id, master_id, "tag-1");
+    malformed_master_ref_action["records"][0]["fields"]["masterRef"]["value"]["action"] =
+        json!("NONE");
+    let mut blank_master_ref_name = cloudkit_uploaded_heic_asset(asset_id, master_id, "tag-1");
+    blank_master_ref_name["records"][0]["fields"]["masterRef"]["value"]["recordName"] = json!(" ");
     let wrong_master = cloudkit_uploaded_heic_master(
         "other-master",
         bytes.len() as u64,
@@ -1455,6 +1463,9 @@ fn uploaded_heic_read_client_rejects_lookup_identity_zone_and_declared_size_mism
         ("wrong asset zone", vec![wrong_asset_zone], 1),
         ("missing masterRef zone", vec![missing_master_ref_zone], 1),
         ("wrong masterRef zone", vec![wrong_master_ref_zone], 1),
+        ("masterRef type", vec![malformed_master_ref_type], 1),
+        ("masterRef action", vec![malformed_master_ref_action], 1),
+        ("masterRef blank recordName", vec![blank_master_ref_name], 1),
         (
             "master recordName",
             vec![

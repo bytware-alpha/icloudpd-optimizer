@@ -44,7 +44,9 @@ use crate::service::{
     DEFAULT_SERVICE_LABEL, ServiceError, ServiceInstallRequest, default_plist_path,
     install_service, service_status, start_service, stop_service, tail_logs, uninstall_service,
 };
-use crate::state_store::{AssetRecordExactCasUpdate, AssetStateStore, AssetStateStoreError};
+use crate::state_store::{
+    AssetRecordExactCasUpdate, AssetStateStore, AssetStateStoreError, JsonCheckpointStatus,
+};
 use crate::upload::{
     CloudKitDatabaseScope, CloudKitDeleteClient, CloudKitDeleteRequest, CloudKitLibraryDestination,
     CloudKitLocalReplacementCandidate, CloudKitOriginalAssetBatchResolveOutcome,
@@ -1806,7 +1808,7 @@ fn monitor_original_assets_reconcile<W: Write>(
     monitor_original_assets_reconcile_with_transport(args, writer, transport)
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct UploadVerifiedReverifyReport {
     target_set_sha256: String,
     target_count: u64,
@@ -1815,6 +1817,8 @@ struct UploadVerifiedReverifyReport {
     would_change_count: u64,
     unchanged_count: u64,
     applied: bool,
+    checkpoint_stale: bool,
+    checkpoint_recovered: bool,
     elapsed_millis: u128,
     targets: Vec<UploadVerifiedReverifyTargetReport>,
 }
@@ -1919,6 +1923,25 @@ fn monitor_upload_verified_reverify_with_reverifier<W: Write, R: UploadVerifiedA
     reverifier: &mut R,
     writer: &mut W,
 ) -> Result<UploadVerifiedReverifyReport, CliError> {
+    let mut commit = ProductionReverifyCommitBoundary::new(input.config, input.state_store);
+    monitor_upload_verified_reverify_with_reverifier_and_commit(
+        input,
+        reverifier,
+        &mut commit,
+        writer,
+    )
+}
+
+fn monitor_upload_verified_reverify_with_reverifier_and_commit<
+    W: Write,
+    R: UploadVerifiedAssetReverifier,
+    B: ReverifyCommitBoundary,
+>(
+    input: UploadVerifiedReverifyExecutorInput<'_>,
+    reverifier: &mut R,
+    commit: &mut B,
+    writer: &mut W,
+) -> Result<UploadVerifiedReverifyReport, CliError> {
     let mut candidates = Vec::with_capacity(input.ids.len());
     let mut candidate_ids = BTreeSet::new();
     for id in input.ids {
@@ -1951,9 +1974,8 @@ fn monitor_upload_verified_reverify_with_reverifier<W: Write, R: UploadVerifiedA
         .iter()
         .map(|record| record.asset_id.as_str())
         .collect::<BTreeSet<_>>();
-    let mut commit = ProductionReverifyCommitBoundary::new(input.config, input.state_store);
-    let changed_count =
-        apply_verified_reverify_updates(&mut commit, input.expected, &updated, input.apply)?;
+    let commit_outcome =
+        apply_verified_reverify_updates(commit, input.expected, &updated, input.apply)?;
     let targets = candidates
         .into_iter()
         .map(
@@ -1976,10 +1998,12 @@ fn monitor_upload_verified_reverify_with_reverifier<W: Write, R: UploadVerifiedA
         target_set_sha256: input.target_set_sha256,
         target_count: input.ids.len() as u64,
         verified_count: input.ids.len() as u64,
-        changed_count,
+        changed_count: commit_outcome.changed_count,
         would_change_count,
         unchanged_count: input.ids.len() as u64 - would_change_count,
         applied: input.apply,
+        checkpoint_stale: commit_outcome.checkpoint_stale,
+        checkpoint_recovered: commit_outcome.checkpoint_recovered,
         elapsed_millis: input.started.elapsed().as_millis(),
         targets,
     };
@@ -2181,6 +2205,14 @@ fn reverify_needs_writer(apply: bool, changed_records: usize) -> bool {
 trait ReverifyCommitBoundary {
     fn read_store(&self) -> &AssetStateStore;
     fn acquire_writer(&mut self) -> Result<AssetStateStore, CliError>;
+    fn export_json(&mut self, writer_store: &AssetStateStore) -> Result<(), CliError>;
+}
+
+#[derive(Debug)]
+struct ReverifyCommitOutcome {
+    changed_count: u64,
+    checkpoint_stale: bool,
+    checkpoint_recovered: bool,
 }
 
 struct ProductionReverifyCommitBoundary<'a> {
@@ -2209,6 +2241,10 @@ impl ReverifyCommitBoundary for ProductionReverifyCommitBoundary<'_> {
         self.guard = Some(guard);
         Ok(store)
     }
+    fn export_json(&mut self, writer_store: &AssetStateStore) -> Result<(), CliError> {
+        writer_store.export_json()?;
+        Ok(())
+    }
 }
 
 fn apply_verified_reverify_updates<B: ReverifyCommitBoundary>(
@@ -2216,13 +2252,23 @@ fn apply_verified_reverify_updates<B: ReverifyCommitBoundary>(
     expected: &BTreeMap<String, AssetRecord>,
     updated: &[AssetRecord],
     apply: bool,
-) -> Result<u64, CliError> {
+) -> Result<ReverifyCommitOutcome, CliError> {
+    let checkpoint_stale =
+        boundary.read_store().json_checkpoint_status()? == JsonCheckpointStatus::Stale;
     if !apply {
         boundary.read_store().revalidate_immutable_read_snapshot()?;
-        return Ok(0);
+        return Ok(ReverifyCommitOutcome {
+            changed_count: 0,
+            checkpoint_stale,
+            checkpoint_recovered: false,
+        });
     }
-    if !reverify_needs_writer(true, updated.len()) {
-        return Ok(0);
+    if !reverify_needs_writer(true, updated.len()) && !checkpoint_stale {
+        return Ok(ReverifyCommitOutcome {
+            changed_count: 0,
+            checkpoint_stale: false,
+            checkpoint_recovered: false,
+        });
     }
     let exact_updates = updated
         .iter()
@@ -2237,12 +2283,29 @@ fn apply_verified_reverify_updates<B: ReverifyCommitBoundary>(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let has_updates = !exact_updates.is_empty();
     let writer_store = boundary.acquire_writer()?;
     let current = writer_store.load()?;
     reverify_exact_snapshot_still_current(&current, expected)?;
-    writer_store.persist_records_exact_cas_atomic_trusted(exact_updates)?;
-    writer_store.export_json()?;
-    Ok(updated.len() as u64)
+    let writer_checkpoint_stale =
+        writer_store.json_checkpoint_status_for_manifest(&current)? == JsonCheckpointStatus::Stale;
+    if has_updates {
+        writer_store.persist_records_exact_cas_atomic_trusted(exact_updates)?;
+    }
+    if has_updates || writer_checkpoint_stale {
+        boundary
+            .export_json(&writer_store)
+            .map_err(|_| CliError::OriginalAssetsReconcileGate {
+                message:
+                    "upload-verified-reverify JSON checkpoint export failed after SQLite commit"
+                        .to_string(),
+            })?;
+    }
+    Ok(ReverifyCommitOutcome {
+        changed_count: updated.len() as u64,
+        checkpoint_stale,
+        checkpoint_recovered: checkpoint_stale && updated.is_empty(),
+    })
 }
 
 fn reverify_exact_snapshot_still_current(
@@ -3177,6 +3240,227 @@ mod upload_verified_reverify_tests {
         drift: AssetRecord,
     }
 
+    struct FailingExportCommitBoundary<'a> {
+        production: ProductionReverifyCommitBoundary<'a>,
+    }
+
+    impl ReverifyCommitBoundary for FailingExportCommitBoundary<'_> {
+        fn read_store(&self) -> &AssetStateStore {
+            self.production.read_store()
+        }
+        fn acquire_writer(&mut self) -> Result<AssetStateStore, CliError> {
+            self.production.acquire_writer()
+        }
+        fn export_json(&mut self, _writer_store: &AssetStateStore) -> Result<(), CliError> {
+            Err(CliError::OriginalAssetsReconcileGate {
+                message: "injected checkpoint export failure".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn command_executor_recovers_json_checkpoint_after_post_cas_export_failure() {
+        let legacy = record("legacy", "100.000000000Z");
+        let mut upgraded = legacy.clone();
+        upgraded.updated_at = "300.000000000Z".to_string();
+        let (_tempdir, config, expected) = persisted_fixture(vec![legacy]);
+        let before = persisted_bytes(&config);
+        let ids = BTreeSet::from(["legacy".to_string()]);
+        let first_store =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("first store");
+        let first_manifest = first_store.load().expect("first manifest");
+        let mut first_reverifier = FakeReverifier {
+            records: BTreeMap::from([("legacy".to_string(), upgraded.clone())]),
+            calls: Vec::new(),
+            fail_on: None,
+        };
+        let mut failing_boundary = FailingExportCommitBoundary {
+            production: ProductionReverifyCommitBoundary::new(&config, &first_store),
+        };
+        let mut failed_output = Vec::new();
+        let error = monitor_upload_verified_reverify_with_reverifier_and_commit(
+            UploadVerifiedReverifyExecutorInput {
+                config: &config,
+                state_store: &first_store,
+                manifest: &first_manifest,
+                expected: &expected,
+                ids: &ids,
+                apply: true,
+                timeout_seconds: 1,
+                target_set_sha256: "x".repeat(64),
+                started: Instant::now(),
+            },
+            &mut first_reverifier,
+            &mut failing_boundary,
+            &mut failed_output,
+        )
+        .expect_err("post-CAS export failure");
+        assert!(matches!(
+            error,
+            CliError::OriginalAssetsReconcileGate { .. }
+        ));
+        assert!(failed_output.is_empty());
+        assert_eq!(
+            fs::read(&config.manifest_path).expect("stale json"),
+            before.0
+        );
+        assert_ne!(
+            fs::read(AssetStateStore::db_path_for_manifest(&config.manifest_path)).expect("db"),
+            before.1
+        );
+        drop(failing_boundary);
+        drop(first_store);
+
+        let retry_store =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("retry store");
+        let retry_manifest = retry_store.load().expect("retry manifest");
+        let retry_expected = retry_manifest.records().clone();
+        let mut retry_reverifier = FakeReverifier {
+            records: BTreeMap::from([("legacy".to_string(), upgraded.clone())]),
+            calls: Vec::new(),
+            fail_on: None,
+        };
+        let mut retry_output = Vec::new();
+        let retry_report = monitor_upload_verified_reverify_with_reverifier(
+            UploadVerifiedReverifyExecutorInput {
+                config: &config,
+                state_store: &retry_store,
+                manifest: &retry_manifest,
+                expected: &retry_expected,
+                ids: &ids,
+                apply: true,
+                timeout_seconds: 1,
+                target_set_sha256: "x".repeat(64),
+                started: Instant::now(),
+            },
+            &mut retry_reverifier,
+            &mut retry_output,
+        )
+        .expect("checkpoint recovery");
+        assert_eq!(retry_report.changed_count, 0);
+        assert_eq!(retry_report.would_change_count, 0);
+        assert_eq!(retry_report.unchanged_count, 1);
+        assert!(retry_report.checkpoint_stale);
+        assert!(retry_report.checkpoint_recovered);
+        assert_eq!(
+            AssetStateStore::open_read_only(&config.manifest_path)
+                .expect("reader")
+                .load()
+                .expect("manifest")
+                .get("legacy")
+                .expect("legacy"),
+            &upgraded
+        );
+        drop(retry_store);
+
+        let before_third = persisted_bytes(&config);
+        let third_store =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("third store");
+        let third_manifest = third_store.load().expect("third manifest");
+        let mut third_reverifier = FakeReverifier {
+            records: BTreeMap::from([("legacy".to_string(), upgraded)]),
+            calls: Vec::new(),
+            fail_on: None,
+        };
+        let mut third_output = Vec::new();
+        let third_report = monitor_upload_verified_reverify_with_reverifier(
+            UploadVerifiedReverifyExecutorInput {
+                config: &config,
+                state_store: &third_store,
+                manifest: &third_manifest,
+                expected: third_manifest.records(),
+                ids: &ids,
+                apply: true,
+                timeout_seconds: 1,
+                target_set_sha256: "x".repeat(64),
+                started: Instant::now(),
+            },
+            &mut third_reverifier,
+            &mut third_output,
+        )
+        .expect("current checkpoint no-op");
+        assert_eq!(third_report.changed_count, 0);
+        assert!(!third_report.checkpoint_stale);
+        assert!(!third_report.checkpoint_recovered);
+        assert_eq!(persisted_bytes(&config), before_third);
+    }
+
+    #[test]
+    fn command_executor_dry_run_reports_stale_checkpoint_without_writer_or_export() {
+        let current = record("current", "100.000000000Z");
+        let (_tempdir, config, expected) = persisted_fixture(vec![current.clone()]);
+        let store =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("store");
+        let manifest = store.load().expect("manifest");
+        let db_before = fs::read(AssetStateStore::db_path_for_manifest(&config.manifest_path))
+            .expect("database");
+        fs::remove_file(&config.manifest_path).expect("remove checkpoint");
+        let lock_path = crate::monitor::monitor_run_lock_path(&config);
+        let mut reverifier = FakeReverifier {
+            records: BTreeMap::from([("current".to_string(), current)]),
+            calls: Vec::new(),
+            fail_on: None,
+        };
+        let mut output = Vec::new();
+        let report = monitor_upload_verified_reverify_with_reverifier(
+            UploadVerifiedReverifyExecutorInput {
+                config: &config,
+                state_store: &store,
+                manifest: &manifest,
+                expected: &expected,
+                ids: &BTreeSet::from(["current".to_string()]),
+                apply: false,
+                timeout_seconds: 1,
+                target_set_sha256: "x".repeat(64),
+                started: Instant::now(),
+            },
+            &mut reverifier,
+            &mut output,
+        )
+        .expect("stale dry-run");
+        assert!(report.checkpoint_stale);
+        assert!(!report.checkpoint_recovered);
+        assert!(!lock_path.exists());
+        assert!(!config.manifest_path.exists());
+        assert_eq!(
+            fs::read(AssetStateStore::db_path_for_manifest(&config.manifest_path))
+                .expect("database"),
+            db_before
+        );
+    }
+
+    #[test]
+    fn command_checkpoint_recovery_rejects_selected_record_drift_without_export() {
+        let current = record("current", "100.000000000Z");
+        let (_tempdir, config, expected) = persisted_fixture(vec![current.clone()]);
+        let reader =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("reader");
+        fs::remove_file(&config.manifest_path).expect("stale checkpoint");
+        let mut drift = current;
+        drift.updated_at = "200.000000000Z".to_string();
+        let mut boundary = DriftCommitBoundary {
+            production: ProductionReverifyCommitBoundary::new(&config, &reader),
+            drift,
+        };
+        let error = apply_verified_reverify_updates(&mut boundary, &expected, &[], true)
+            .expect_err("durable selected-record drift must fail closed");
+        assert!(matches!(
+            error,
+            CliError::OriginalAssetsReconcileGate { .. }
+        ));
+        assert!(!config.manifest_path.exists());
+        assert_eq!(
+            AssetStateStore::open_read_only(&config.manifest_path)
+                .expect("authoritative database")
+                .load()
+                .expect("durable manifest")
+                .get("current")
+                .expect("drifted current")
+                .updated_at,
+            "200.000000000Z"
+        );
+    }
+
     impl ReverifyCommitBoundary for DriftCommitBoundary<'_> {
         fn read_store(&self) -> &AssetStateStore {
             self.production.read_store()
@@ -3185,6 +3469,9 @@ mod upload_verified_reverify_tests {
             let store = self.production.acquire_writer()?;
             store.persist_record_trusted(&self.drift)?;
             Ok(store)
+        }
+        fn export_json(&mut self, writer_store: &AssetStateStore) -> Result<(), CliError> {
+            self.production.export_json(writer_store)
         }
     }
 
@@ -3621,7 +3908,7 @@ mod upload_verified_reverify_tests {
         let mut boundary = ProductionReverifyCommitBoundary::new(&config, &reader);
         let changed = apply_verified_reverify_updates(&mut boundary, &expected, &[], true)
             .expect("all-current apply is a no-op");
-        assert_eq!(changed, 0);
+        assert_eq!(changed.changed_count, 0);
         assert_eq!(persisted_bytes(&config), before);
     }
 
@@ -3637,7 +3924,8 @@ mod upload_verified_reverify_tests {
         let mut boundary = ProductionReverifyCommitBoundary::new(&config, &reader);
         assert_eq!(
             apply_verified_reverify_updates(&mut boundary, &expected, &[upgraded.clone()], true)
-                .expect("apply"),
+                .expect("apply")
+                .changed_count,
             1
         );
         drop(boundary);
@@ -3653,7 +3941,8 @@ mod upload_verified_reverify_tests {
         let mut boundary = ProductionReverifyCommitBoundary::new(&config, &rerun);
         assert_eq!(
             apply_verified_reverify_updates(&mut boundary, &next_expected, &[], true)
-                .expect("rerun"),
+                .expect("rerun")
+                .changed_count,
             0
         );
         assert_eq!(persisted_bytes(&config), after_first);
@@ -3671,7 +3960,8 @@ mod upload_verified_reverify_tests {
         let mut boundary = ProductionReverifyCommitBoundary::new(&config, &reader);
         assert_eq!(
             apply_verified_reverify_updates(&mut boundary, &expected, &[upgraded.clone()], false)
-                .expect("dry"),
+                .expect("dry")
+                .changed_count,
             0
         );
         assert_eq!(persisted_bytes(&config), before);

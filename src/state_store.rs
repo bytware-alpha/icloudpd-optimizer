@@ -100,6 +100,12 @@ pub struct AssetRecordExactCasUpdate<'a> {
     pub updated: &'a AssetRecord,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JsonCheckpointStatus {
+    Current,
+    Stale,
+}
+
 #[derive(Debug)]
 struct WriterLeaseToken {
     owner_id: String,
@@ -244,6 +250,29 @@ impl AssetStateStore {
             return Err(AssetStateStoreError::ImmutableReadSnapshotChanged);
         }
         Ok(())
+    }
+
+    pub fn json_checkpoint_status(&self) -> Result<JsonCheckpointStatus, AssetStateStoreError> {
+        self.revalidate_immutable_read_snapshot()?;
+        let database_manifest = self.load()?;
+        let status = self.json_checkpoint_status_for_manifest(&database_manifest)?;
+        self.revalidate_immutable_read_snapshot()?;
+        Ok(status)
+    }
+
+    pub(crate) fn json_checkpoint_status_for_manifest(
+        &self,
+        database_manifest: &Manifest,
+    ) -> Result<JsonCheckpointStatus, AssetStateStoreError> {
+        let json_manifest = match load_json_checkpoint_no_follow(&self.manifest_path)? {
+            Some(manifest) => manifest,
+            None => return Ok(JsonCheckpointStatus::Stale),
+        };
+        Ok(if json_manifest == *database_manifest {
+            JsonCheckpointStatus::Current
+        } else {
+            JsonCheckpointStatus::Stale
+        })
     }
 
     pub fn open_writer(
@@ -1796,6 +1825,92 @@ fn capture_immutable_read_witness(
     })
 }
 
+#[cfg(unix)]
+fn load_json_checkpoint_no_follow(path: &Path) -> Result<Option<Manifest>, AssetStateStoreError> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(AssetStateStoreError::JsonCheckpointIo {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    validate_json_checkpoint_metadata(path, &before)?;
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options
+        .open(path)
+        .map_err(|source| AssetStateStoreError::JsonCheckpointIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let held_before = file
+        .metadata()
+        .map_err(|source| AssetStateStoreError::JsonCheckpointIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    validate_json_checkpoint_metadata(path, &held_before)?;
+    if !immutable_database_metadata_matches(&before, &held_before) {
+        return Err(AssetStateStoreError::JsonCheckpointChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    let manifest = match Manifest::load_from_reader(&mut file) {
+        Ok(manifest) => manifest,
+        Err(ManifestError::Json(_)) => return Ok(None),
+        Err(ManifestError::Io(source)) => {
+            return Err(AssetStateStoreError::JsonCheckpointIo {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+        Err(error) => return Err(AssetStateStoreError::Manifest(error)),
+    };
+    let held_after = file
+        .metadata()
+        .map_err(|source| AssetStateStoreError::JsonCheckpointIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let path_after =
+        fs::symlink_metadata(path).map_err(|source| AssetStateStoreError::JsonCheckpointIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    validate_json_checkpoint_metadata(path, &held_after)?;
+    validate_json_checkpoint_metadata(path, &path_after)?;
+    if !immutable_database_metadata_matches(&before, &held_after)
+        || !immutable_database_metadata_matches(&held_after, &path_after)
+    {
+        return Err(AssetStateStoreError::JsonCheckpointChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(Some(manifest))
+}
+
+#[cfg(unix)]
+fn validate_json_checkpoint_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), AssetStateStoreError> {
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() || metadata.nlink() != 1
+    {
+        return Err(AssetStateStoreError::JsonCheckpointUnsafe {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn load_json_checkpoint_no_follow(_path: &Path) -> Result<Option<Manifest>, AssetStateStoreError> {
+    Err(AssetStateStoreError::JsonCheckpointUnsupportedPlatform)
+}
+
 fn immutable_wal_len(database_path: &Path) -> Result<u64, AssetStateStoreError> {
     match fs::metadata(sqlite_wal_path(database_path)) {
         Ok(metadata) => Ok(metadata.len()),
@@ -2039,6 +2154,14 @@ pub enum AssetStateStoreError {
     ImmutableReadWitnessRequired,
     #[error("immutable state database snapshot changed during the read")]
     ImmutableReadSnapshotChanged,
+    #[error("JSON checkpoint path is unsafe: {path}")]
+    JsonCheckpointUnsafe { path: PathBuf },
+    #[error("JSON checkpoint changed while being read: {path}")]
+    JsonCheckpointChanged { path: PathBuf },
+    #[error("failed to read JSON checkpoint at {path}: {source}")]
+    JsonCheckpointIo { path: PathBuf, source: io::Error },
+    #[error("JSON checkpoint comparison requires descriptor-safe platform support")]
+    JsonCheckpointUnsupportedPlatform,
     #[error("failed to read immutable state database snapshot: {source}")]
     ImmutableReadDatabaseIo { source: io::Error },
     #[error("state database integrity check failed: {result}")]
@@ -2095,6 +2218,66 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::sync::mpsc;
     use std::thread;
+
+    fn checkpoint_test_store() -> (tempfile::TempDir, PathBuf, AssetStateStore) {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let writer = AssetStateStore::open_writer(
+            &manifest_path,
+            "checkpoint-test",
+            Duration::from_secs(30),
+        )
+        .expect("writer");
+        writer.load_or_import().expect("import");
+        writer
+            .persist_record_trusted(&AssetRecord::new("asset", "/nas/asset.dng"))
+            .expect("record");
+        writer.export_json().expect("checkpoint");
+        drop(writer);
+        let reader = AssetStateStore::open_immutable_read_only(&manifest_path).expect("reader");
+        (tempdir, manifest_path, reader)
+    }
+
+    #[test]
+    fn json_checkpoint_status_marks_missing_and_malformed_json_stale() {
+        let (_tempdir, manifest_path, reader) = checkpoint_test_store();
+        assert_eq!(
+            reader.json_checkpoint_status().expect("current"),
+            JsonCheckpointStatus::Current
+        );
+        fs::remove_file(&manifest_path).expect("remove checkpoint");
+        assert_eq!(
+            reader.json_checkpoint_status().expect("missing"),
+            JsonCheckpointStatus::Stale
+        );
+        fs::write(&manifest_path, b"not json").expect("malformed checkpoint");
+        assert_eq!(
+            reader.json_checkpoint_status().expect("malformed"),
+            JsonCheckpointStatus::Stale
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_checkpoint_status_rejects_symlink_and_nonregular_paths() {
+        use std::os::unix::fs::symlink;
+
+        let (_tempdir, manifest_path, reader) = checkpoint_test_store();
+        let target = manifest_path.with_file_name("target.json");
+        fs::write(&target, b"{}").expect("target");
+        fs::remove_file(&manifest_path).expect("remove checkpoint");
+        symlink(&target, &manifest_path).expect("symlink");
+        assert!(matches!(
+            reader.json_checkpoint_status(),
+            Err(AssetStateStoreError::JsonCheckpointUnsafe { .. })
+        ));
+        fs::remove_file(&manifest_path).expect("remove symlink");
+        fs::create_dir(&manifest_path).expect("directory checkpoint");
+        assert!(matches!(
+            reader.json_checkpoint_status(),
+            Err(AssetStateStoreError::JsonCheckpointUnsafe { .. })
+        ));
+    }
 
     #[cfg(unix)]
     fn create_migratable_v1_database(manifest_path: &Path, record: &AssetRecord) -> String {

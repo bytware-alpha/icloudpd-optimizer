@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -548,7 +548,11 @@ impl Manifest {
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ManifestError> {
         let file = File::open(path)?;
-        let payload: ManifestFile = serde_json::from_reader(file)?;
+        Self::load_from_reader(file)
+    }
+
+    pub(crate) fn load_from_reader(reader: impl Read) -> Result<Self, ManifestError> {
+        let payload: ManifestFile = serde_json::from_reader(reader)?;
         let mut manifest = Self::new();
         for record in payload.records {
             manifest.upsert_trusted(record);
