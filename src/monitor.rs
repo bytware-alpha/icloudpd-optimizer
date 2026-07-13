@@ -21985,7 +21985,7 @@ esac
             temporary.path(),
         );
         let mut initial = Manifest::new();
-        initial.upsert(converted_record_for_verifier("asset", &output));
+        initial.upsert_trusted(converted_record_for_verifier("asset", &output));
         run_rolling_asset_verify(
             &config,
             &state_store,
@@ -22087,7 +22087,7 @@ esac
             temporary.path(),
         );
         let mut manifest = Manifest::new();
-        manifest.upsert(converted_record_for_verifier("asset", &output));
+        manifest.upsert_trusted(converted_record_for_verifier("asset", &output));
         verify_converted_heics(
             &config,
             &state_store,
