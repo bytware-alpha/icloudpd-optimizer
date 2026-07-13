@@ -51,8 +51,9 @@ use crate::upload::{
     CloudKitOriginalAssetReadTransport, CloudKitOriginalAssetResolution,
     CloudKitOriginalAssetResolveDisposition, CloudKitOriginalAssetResolveRequest,
     CloudKitOriginalAssetResolveTarget, IcloudUploadRequest, ReqwestCloudKitDeleteTransport,
-    ReqwestCloudKitReadTransport, UploadError, build_upload_proof, load_cloudkit_delete_session,
-    load_upload_session, run_icloud_upload, validate_library_destination, verify_local_heic,
+    ReqwestCloudKitReadTransport, UploadError, VerifiedUploadSource, build_upload_proof,
+    load_cloudkit_delete_session, load_upload_session, run_icloud_upload,
+    validate_library_destination,
 };
 use crate::workflow::{
     ConversionPerformanceInput, ConversionResultInput, ConversionSourceBinding,
@@ -1020,8 +1021,10 @@ fn run_upload_proof_child_protocol<R: Read, W: Write>(
     if input.version != UPLOAD_PROOF_CHILD_PROTOCOL_VERSION {
         return Err(CliError::InvalidPrivateChildProtocol);
     }
-    let state_store = AssetStateStore::open_read_only(&input.trusted_state_manifest_path)?;
+    let state_store =
+        AssetStateStore::open_immutable_read_only(&input.trusted_state_manifest_path)?;
     let manifest = state_store.load()?;
+    state_store.revalidate_immutable_read_snapshot()?;
     let record = manifest
         .get(&input.asset_id)
         .map_err(WorkflowError::Manifest)?;
@@ -1033,12 +1036,12 @@ fn run_upload_proof_child_protocol<R: Read, W: Write>(
         return Err(CliError::InvalidPrivateChildProtocol);
     }
     let heic = upload_ready_heic_proof(&manifest, &input.asset_id)?;
-    verify_local_heic(&heic)?;
+    let heic_source = VerifiedUploadSource::from_verified_heic(&heic)?;
     load_upload_session(&input.session_path)?;
     let destination = upload_destination_for_asset(&manifest, &input.asset_id)?;
     let response = run_icloud_upload(&IcloudUploadRequest {
         session_path: input.session_path,
-        heic_path: heic.heic_path.clone(),
+        heic_source,
         destination,
     })?;
     serde_json::to_writer(
@@ -4001,6 +4004,31 @@ mod upload_proof_child_protocol_tests {
     }
 
     #[test]
+    fn private_upload_child_rejects_changed_state_db_witness_before_session() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let manifest_path = tempdir.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&manifest_path, "test-writer", Duration::from_secs(30))
+                .unwrap();
+        let mut record = AssetRecord::new("asset", tempdir.path().join("asset.DNG"));
+        record.state = State::ConversionVerified;
+        store.persist_record_trusted(&record).unwrap();
+        let captured = store.load().unwrap().get("asset").unwrap().clone();
+        let mut changed = captured.clone();
+        changed.updated_at = "9999999999.000000000Z".to_string();
+        store.persist_record_trusted(&changed).unwrap();
+
+        assert!(matches!(
+            run_child(&child_input(
+                &manifest_path,
+                &captured,
+                &tempdir.path().join("missing-session.json"),
+            )),
+            Err(CliError::InvalidPrivateChildProtocol)
+        ));
+    }
+
+    #[test]
     fn private_upload_child_rejects_public_writer_sanitized_forged_recipe_before_session() {
         let tempdir = tempfile::tempdir().unwrap();
         let manifest_path = tempdir.path().join("manifest.json");
@@ -4497,12 +4525,12 @@ fn workflow_heic_verified(args: WorkflowHeicVerifiedArgs) -> Result<(), CliError
 fn workflow_upload_heic(args: WorkflowUploadHeicArgs) -> Result<(), CliError> {
     let mut manifest = load_manifest_for_write(&args.manifest)?;
     let heic = upload_ready_heic_proof(&manifest, &args.asset_id)?;
-    verify_local_heic(&heic)?;
+    let heic_source = VerifiedUploadSource::from_verified_heic(&heic)?;
     load_upload_session(&args.session)?;
     let destination = upload_destination_for_asset(&manifest, &args.asset_id)?;
     let response = run_icloud_upload(&IcloudUploadRequest {
         session_path: args.session,
-        heic_path: heic.heic_path.clone(),
+        heic_source,
         destination,
     })?;
     let proof = build_upload_proof(&heic, &response)?;
@@ -4516,12 +4544,12 @@ fn workflow_upload_heic_proof<W: Write>(
 ) -> Result<(), CliError> {
     let manifest = load_manifest_for_write(&args.manifest)?;
     let heic = upload_ready_heic_proof(&manifest, &args.asset_id)?;
-    verify_local_heic(&heic)?;
+    let heic_source = VerifiedUploadSource::from_verified_heic(&heic)?;
     load_upload_session(&args.session)?;
     let destination = upload_destination_for_asset(&manifest, &args.asset_id)?;
     let response = run_icloud_upload(&IcloudUploadRequest {
         session_path: args.session,
-        heic_path: heic.heic_path.clone(),
+        heic_source,
         destination,
     })?;
     let proof = build_upload_proof(&heic, &response)?;

@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::File;
-use std::io::{Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
@@ -39,11 +41,142 @@ const REQUIRED_CLOUDKIT_QUERY_PARAM_NAMES: [&str; 6] = [
     "getCurrentSyncToken",
 ];
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcloudUploadRequest {
     pub session_path: PathBuf,
-    pub heic_path: PathBuf,
+    pub heic_source: VerifiedUploadSource,
     pub destination: CloudKitLibraryDestination,
+}
+
+#[derive(Debug)]
+pub struct VerifiedUploadSource {
+    path: PathBuf,
+    filename: String,
+    size_bytes: u64,
+    last_modified_millis: u64,
+    identity: UploadFileIdentity,
+    file: File,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct UploadFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn upload_file_identity(metadata: &std::fs::Metadata) -> UploadFileIdentity {
+    UploadFileIdentity {
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    }
+}
+
+impl VerifiedUploadSource {
+    pub fn from_verified_heic(proof: &VerifiedHeic) -> Result<Self, UploadError> {
+        let mut source = Self::open_candidate(&proof.heic_path)?;
+        if source.size_bytes != proof.size_bytes {
+            return Err(UploadError::HeicSizeMismatch {
+                path: proof.heic_path.clone(),
+                expected: proof.size_bytes,
+                actual: source.size_bytes,
+            });
+        }
+        let actual = hash_open_heic_file(&mut source.file, &source.path)?;
+        if actual != proof.heic_sha256 {
+            return Err(UploadError::HeicHashMismatch {
+                path: proof.heic_path.clone(),
+                expected: proof.heic_sha256.clone(),
+                actual,
+            });
+        }
+        source.rewind()?;
+        Ok(source)
+    }
+
+    pub fn open_candidate(path: &Path) -> Result<Self, UploadError> {
+        let filename = heic_filename(path)?;
+        validate_heic_extension(path)?;
+        if std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(UploadError::UnsafeHeicSource {
+                path: path.to_path_buf(),
+                reason: "symbolic link",
+            });
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(path).map_err(|source| UploadError::ReadHeic {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let metadata = file.metadata().map_err(|source| UploadError::ReadHeic {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(UploadError::UnsafeHeicSource {
+                path: path.to_path_buf(),
+                reason: "not a regular file",
+            });
+        }
+        if metadata.len() == 0 {
+            return Err(UploadError::EmptyHeic {
+                path: path.to_path_buf(),
+            });
+        }
+        let last_modified_millis = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        Ok(Self {
+            path: path.to_path_buf(),
+            filename,
+            size_bytes: metadata.len(),
+            last_modified_millis,
+            identity: upload_file_identity(&metadata),
+            file,
+        })
+    }
+
+    fn upload_file(&self) -> Result<File, UploadError> {
+        let file = self
+            .file
+            .try_clone()
+            .map_err(|source| UploadError::ReadHeic {
+                path: self.path.clone(),
+                source,
+            })?;
+        let metadata = file.metadata().map_err(|source| UploadError::ReadHeic {
+            path: self.path.clone(),
+            source,
+        })?;
+        if upload_file_identity(&metadata) != self.identity || metadata.len() != self.size_bytes {
+            return Err(UploadError::UnsafeHeicSource {
+                path: self.path.clone(),
+                reason: "held descriptor identity changed",
+            });
+        }
+        Ok(file)
+    }
+
+    fn rewind(&mut self) -> Result<(), UploadError> {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map(|_| ())
+            .map_err(|source| UploadError::ReadHeic {
+                path: self.path.clone(),
+                source,
+            })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -398,9 +531,9 @@ pub fn run_icloud_upload(
 ) -> Result<IcloudUploadOutcome, UploadError> {
     let session = load_upload_session(&request.session_path)?;
     let transport = ReqwestPhotosUploadTransport::new()?;
-    PhotosUploadClient::new(transport).upload_heic_to_library(
+    PhotosUploadClient::new(transport).upload_verified_source_to_library(
         &session,
-        &request.heic_path,
+        &request.heic_source,
         &request.destination,
     )
 }
@@ -446,7 +579,8 @@ pub trait PhotosUploadTransport {
         &mut self,
         session: &UploadSession,
         upload_url: &Url,
-        heic_path: &Path,
+        heic_file: File,
+        heic_size: u64,
     ) -> Result<(SingleFileUploadRequest, String, u64), UploadError>;
 }
 
@@ -530,9 +664,10 @@ impl<T: PhotosUploadTransport + ?Sized> PhotosUploadTransport for &mut T {
         &mut self,
         session: &UploadSession,
         upload_url: &Url,
-        heic_path: &Path,
+        heic_file: File,
+        heic_size: u64,
     ) -> Result<(SingleFileUploadRequest, String, u64), UploadError> {
-        (**self).post_signed_upload(session, upload_url, heic_path)
+        (**self).post_signed_upload(session, upload_url, heic_file, heic_size)
     }
 }
 
@@ -579,21 +714,19 @@ impl<T: PhotosUploadTransport> PhotosUploadClient<T> {
         heic_path: &Path,
         destination: &CloudKitLibraryDestination,
     ) -> Result<IcloudUploadOutcome, UploadError> {
+        let source = VerifiedUploadSource::open_candidate(heic_path)?;
+        self.upload_verified_source_to_library(session, &source, destination)
+    }
+
+    pub fn upload_verified_source_to_library(
+        &mut self,
+        session: &UploadSession,
+        source: &VerifiedUploadSource,
+        destination: &CloudKitLibraryDestination,
+    ) -> Result<IcloudUploadOutcome, UploadError> {
         let total_started = Instant::now();
         validate_library_destination(destination)?;
-        validate_candidate_heic(heic_path)?;
-        let filename = heic_filename(heic_path)?;
-        let metadata = std::fs::metadata(heic_path).map_err(|source| UploadError::ReadHeic {
-            path: heic_path.to_path_buf(),
-            source,
-        })?;
-        let heic_size = metadata.len();
-        let last_modified_millis = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-            .unwrap_or(0);
+        let heic_size = source.size_bytes;
 
         let create_started = Instant::now();
         let create_response = self.transport.post_service_json(
@@ -606,7 +739,7 @@ impl<T: PhotosUploadTransport> PhotosUploadClient<T> {
         let signed_upload_started = Instant::now();
         let (single_file, streamed_heic_sha256, streamed_size_bytes) = self
             .transport
-            .post_signed_upload(session, &upload_url, heic_path)?;
+            .post_signed_upload(session, &upload_url, source.upload_file()?, heic_size)?;
         let signed_upload_wall_time_millis = signed_upload_started.elapsed().as_millis() as u64;
         validate_single_file_upload_request(&single_file)?;
         if single_file.size_bytes != heic_size {
@@ -627,8 +760,8 @@ impl<T: PhotosUploadTransport> PhotosUploadClient<T> {
             session,
             PhotosUploadEndpoint::PutAsset,
             put_asset_payload(
-                &filename,
-                last_modified_millis,
+                &source.filename,
+                source.last_modified_millis,
                 session.time_zone_offset_minutes,
                 &session.local_time_zone_id,
                 &single_file,
@@ -649,7 +782,7 @@ impl<T: PhotosUploadTransport> PhotosUploadClient<T> {
         Ok(IcloudUploadOutcome {
             response: IcloudUploadResponse {
                 asset_id: put_asset.cpl_asset,
-                filename: Some(filename),
+                filename: Some(source.filename.clone()),
                 master_id: Some(put_asset.cpl_master),
                 database_scope: destination.database_scope,
                 zone_name: destination.zone_name.clone(),
@@ -1485,29 +1618,19 @@ impl PhotosUploadTransport for ReqwestPhotosUploadTransport {
         &mut self,
         session: &UploadSession,
         upload_url: &Url,
-        heic_path: &Path,
+        heic_file: File,
+        heic_size: u64,
     ) -> Result<(SingleFileUploadRequest, String, u64), UploadError> {
         validate_signed_upload_url(upload_url)?;
-        let file = File::open(heic_path).map_err(|source| UploadError::ReadHeic {
-            path: heic_path.to_path_buf(),
-            source,
-        })?;
-        let size = file
-            .metadata()
-            .map_err(|source| UploadError::ReadHeic {
-                path: heic_path.to_path_buf(),
-                source,
-            })?
-            .len();
         let progress = Arc::new(Mutex::new(HashProgress::default()));
-        let reader = HashingFile::new(file, Arc::clone(&progress));
+        let reader = HashingFile::new(heic_file, Arc::clone(&progress));
         let response = self
             .client
             .post(upload_url.clone())
             .header(reqwest::header::CONTENT_TYPE, "text/plain")
-            .header(reqwest::header::CONTENT_LENGTH, size)
+            .header(reqwest::header::CONTENT_LENGTH, heic_size)
             .header(reqwest::header::COOKIE, cookie_header(session)?)
-            .body(reqwest::blocking::Body::sized(reader, size))
+            .body(reqwest::blocking::Body::sized(reader, heic_size))
             .send()
             .map_err(|source| UploadError::Network {
                 operation: "signed_upload",
@@ -4961,8 +5084,7 @@ fn heic_filename(path: &Path) -> Result<String, UploadError> {
     Ok(file_name.to_string())
 }
 
-fn validate_candidate_heic(path: &Path) -> Result<(), UploadError> {
-    heic_filename(path)?;
+fn validate_heic_extension(path: &Path) -> Result<(), UploadError> {
     let has_heic_extension = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -4972,19 +5094,6 @@ fn validate_candidate_heic(path: &Path) -> Result<(), UploadError> {
             path: path.to_path_buf(),
         });
     }
-    let metadata = std::fs::metadata(path).map_err(|source| UploadError::ReadHeic {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if metadata.len() == 0 {
-        return Err(UploadError::EmptyHeic {
-            path: path.to_path_buf(),
-        });
-    }
-    File::open(path).map_err(|source| UploadError::ReadHeic {
-        path: path.to_path_buf(),
-        source,
-    })?;
     Ok(())
 }
 
@@ -5529,6 +5638,29 @@ fn hash_file_sha256(path: &Path) -> Result<String, UploadError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn hash_open_heic_file(file: &mut File, path: &Path) -> Result<String, UploadError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| UploadError::ReadHeic {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
+    loop {
+        let bytes_read = file
+            .read(&mut buffer)
+            .map_err(|source| UploadError::ReadHeic {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 #[derive(Debug, Error)]
 pub enum UploadError {
     #[error("failed to read upload session at {path}: {source}")]
@@ -5628,6 +5760,8 @@ pub enum UploadError {
     },
     #[error("verified HEIC is empty at {path}")]
     EmptyHeic { path: PathBuf },
+    #[error("verified HEIC source is unsafe at {path}: {reason}")]
+    UnsafeHeicSource { path: PathBuf, reason: &'static str },
     #[error("verified HEIC filename is missing or is not UTF-8 at {path}")]
     InvalidFilename { path: PathBuf },
     #[error("verified HEIC path must end in .heic: {path}")]

@@ -9,10 +9,9 @@ use icloudpd_optimizer::upload::{
     CloudKitOriginalAssetBatchResolveRequest, CloudKitOriginalAssetReadTransport,
     CloudKitOriginalAssetResolveDisposition, CloudKitOriginalAssetResolveRequest,
     CloudKitOriginalAssetResolveTarget, CloudKitResourceDownload,
-    CloudKitUploadedHeicResolveRequest, IcloudUploadOutcome, IcloudUploadRequest,
-    IcloudUploadResponse, PhotosUploadClient, PhotosUploadEndpoint, PhotosUploadTransport,
-    SingleFileUploadRequest, UploadError, UploadSession, build_upload_proof, load_upload_session,
-    run_icloud_upload,
+    CloudKitUploadedHeicResolveRequest, IcloudUploadOutcome, IcloudUploadResponse,
+    PhotosUploadClient, PhotosUploadEndpoint, PhotosUploadTransport, SingleFileUploadRequest,
+    UploadError, UploadSession, VerifiedUploadSource, build_upload_proof, load_upload_session,
 };
 use icloudpd_optimizer::workflow::VerifiedHeic;
 use serde_json::{Value, json};
@@ -3518,6 +3517,60 @@ fn photos_upload_client_posts_v2_upload_sequence_and_returns_cpl_asset_id() {
 }
 
 #[test]
+fn photos_upload_client_streams_the_held_verified_descriptor_after_path_swap() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let heic_path = tempdir.path().join("IMG_0001.heic");
+    let replacement_path = tempdir.path().join("replacement.heic");
+    fs::write(&heic_path, b"heic-bytes").expect("HEIC should be written");
+    fs::write(&replacement_path, b"swap-bytes").expect("replacement should be written");
+    let source =
+        VerifiedUploadSource::from_verified_heic(&heic_proof(heic_path.clone(), b"heic-bytes"))
+            .expect("verified source should open");
+    fs::rename(&replacement_path, &heic_path).expect("path should be swapped after preflight");
+
+    let session = UploadSession::from_json(&valid_session_json()).expect("session should load");
+    let mut transport = FakePhotosTransport::success();
+    let outcome = PhotosUploadClient::new(&mut transport)
+        .with_status_poll_delay(std::time::Duration::ZERO)
+        .upload_verified_source_to_library(
+            &session,
+            &source,
+            &CloudKitLibraryDestination::primary_sync(),
+        )
+        .expect("held descriptor should upload its verified bytes");
+
+    assert_eq!(outcome.streamed_heic_sha256, sha256_hex(b"heic-bytes"));
+    assert_eq!(outcome.streamed_size_bytes, b"heic-bytes".len() as u64);
+}
+
+#[test]
+fn verified_upload_source_rejects_nonregular_heic_path() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let directory = tempdir.path().join("directory.heic");
+    fs::create_dir(&directory).expect("directory should be created");
+
+    let error = VerifiedUploadSource::open_candidate(&directory)
+        .expect_err("directory must not become an upload source");
+    assert!(matches!(error, UploadError::UnsafeHeicSource { .. }));
+}
+
+#[cfg(unix)]
+#[test]
+fn verified_upload_source_rejects_symlink_heic_path() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let target = tempdir.path().join("target.heic");
+    let link = tempdir.path().join("link.heic");
+    fs::write(&target, b"heic-bytes").expect("target should be written");
+    symlink(&target, &link).expect("symlink should be created");
+
+    let error = VerifiedUploadSource::open_candidate(&link)
+        .expect_err("symlink must not become an upload source");
+    assert!(matches!(error, UploadError::UnsafeHeicSource { .. }));
+}
+
+#[test]
 fn photos_upload_client_rejects_signed_upload_size_mismatch_before_put_asset() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let heic_path = tempdir.path().join("IMG_0001.heic");
@@ -3670,12 +3723,8 @@ fn run_icloud_upload_rejects_empty_heic_before_unsupported_protocol() {
     write_session(&session_path, &valid_session_json());
     fs::write(&empty_heic, b"").expect("empty heic should be written");
 
-    let error = run_icloud_upload(&IcloudUploadRequest {
-        session_path,
-        heic_path: empty_heic,
-        destination: CloudKitLibraryDestination::primary_sync(),
-    })
-    .expect_err("empty HEIC fails");
+    let error = VerifiedUploadSource::open_candidate(&empty_heic)
+        .expect_err("empty HEIC fails before session use");
 
     assert!(matches!(error, UploadError::EmptyHeic { .. }));
 }
@@ -3694,12 +3743,8 @@ fn run_icloud_upload_rejects_non_utf8_filename_before_filesystem_access() {
     ]);
     let heic_path = tempdir.path().join(name);
 
-    let error = run_icloud_upload(&IcloudUploadRequest {
-        session_path,
-        heic_path,
-        destination: CloudKitLibraryDestination::primary_sync(),
-    })
-    .expect_err("non-UTF8 filename should fail before filesystem access");
+    let error = VerifiedUploadSource::open_candidate(&heic_path)
+        .expect_err("non-UTF8 filename should fail before filesystem access");
 
     assert!(matches!(error, UploadError::InvalidFilename { .. }));
 }
@@ -3712,12 +3757,8 @@ fn run_icloud_upload_rejects_png_filename_before_upload_session_use() {
     let png_path = tempdir.path().join("IMG_0001.heic-preview.png");
     fs::write(&png_path, b"png-bytes").expect("png should be written");
 
-    let error = run_icloud_upload(&IcloudUploadRequest {
-        session_path,
-        heic_path: png_path.clone(),
-        destination: CloudKitLibraryDestination::primary_sync(),
-    })
-    .expect_err("PNG preview files must not be accepted as HEIC upload candidates");
+    let error = VerifiedUploadSource::open_candidate(&png_path)
+        .expect_err("PNG preview files must not be accepted as HEIC upload candidates");
 
     assert!(matches!(
         error,
@@ -3915,10 +3956,14 @@ impl PhotosUploadTransport for FakePhotosTransport {
         &mut self,
         _session: &UploadSession,
         upload_url: &url::Url,
-        heic_path: &Path,
+        mut heic_file: std::fs::File,
+        heic_size: u64,
     ) -> Result<(SingleFileUploadRequest, String, u64), UploadError> {
         self.uploaded_urls.push(upload_url.as_str().to_string());
-        let bytes = fs::read(heic_path).expect("fake upload should read HEIC");
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut heic_file, &mut bytes)
+            .expect("fake upload should read held HEIC descriptor");
+        assert_eq!(heic_size, bytes.len() as u64);
         Ok((
             self.single_file.clone(),
             sha256_hex(&bytes),
