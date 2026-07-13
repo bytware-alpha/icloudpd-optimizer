@@ -1951,9 +1951,13 @@ trait UploadVerifiedAssetReverifier {
     ) -> Result<AssetRecord, CliError>;
 }
 
-struct ProductionUploadVerifiedAssetReverifier {
+struct ProductionUploadVerifiedAssetReverifier<
+    T = ReqwestCloudKitReadTransport,
+    V = ProductionUploadVerifiedHeicVerifier,
+> {
     session: crate::upload::CloudKitDeleteSession,
-    transport: ReqwestCloudKitReadTransport,
+    transport: T,
+    heic_verifier: V,
 }
 
 trait UploadVerifiedHeicVerifier {
@@ -2023,11 +2027,27 @@ impl ProductionUploadVerifiedAssetReverifier {
         session: crate::upload::CloudKitDeleteSession,
         transport: ReqwestCloudKitReadTransport,
     ) -> Self {
-        Self { session, transport }
+        Self::with_dependencies(session, transport, ProductionUploadVerifiedHeicVerifier)
     }
 }
 
-impl UploadVerifiedAssetReverifier for ProductionUploadVerifiedAssetReverifier {
+impl<T, V> ProductionUploadVerifiedAssetReverifier<T, V> {
+    fn with_dependencies(
+        session: crate::upload::CloudKitDeleteSession,
+        transport: T,
+        heic_verifier: V,
+    ) -> Self {
+        Self {
+            session,
+            transport,
+            heic_verifier,
+        }
+    }
+}
+
+impl<T: crate::upload::CloudKitUploadedHeicReadTransport, V: UploadVerifiedHeicVerifier>
+    UploadVerifiedAssetReverifier for ProductionUploadVerifiedAssetReverifier<T, V>
+{
     fn reverify(
         &mut self,
         manifest: &Manifest,
@@ -2079,10 +2099,9 @@ impl UploadVerifiedAssetReverifier for ProductionUploadVerifiedAssetReverifier {
                     .to_string(),
             })?;
             let result = (|| {
-                let mut verifier = ProductionUploadVerifiedHeicVerifier;
                 let heic = reverify_sealed_snapshot_with(
                     &snapshot,
-                    &mut verifier,
+                    &mut self.heic_verifier,
                     final_path.clone(),
                     snapshot.final_sha256().to_string(),
                     snapshot.final_size_bytes(),
@@ -2297,6 +2316,253 @@ mod upload_verified_reverify_tests {
                 message: "injected staged verifier failure".to_string(),
             })
         }
+    }
+
+    #[cfg(unix)]
+    enum StagedVerifierFailure {
+        Ordinary,
+        Timeout,
+    }
+
+    #[cfg(unix)]
+    struct FailingProductionStagedVerifier {
+        failure: StagedVerifierFailure,
+        calls: Vec<(PathBuf, PathBuf)>,
+    }
+
+    #[cfg(unix)]
+    impl UploadVerifiedHeicVerifier for FailingProductionStagedVerifier {
+        fn reverify(
+            &mut self,
+            staged_reference_path: &Path,
+            staged_final_path: &Path,
+            _logical_final_path: PathBuf,
+            _logical_final_sha256: String,
+            _logical_final_size_bytes: u64,
+            _timeout_seconds: u64,
+        ) -> Result<HeicVerificationInput, CliError> {
+            self.calls.push((
+                staged_reference_path.to_path_buf(),
+                staged_final_path.to_path_buf(),
+            ));
+            match self.failure {
+                StagedVerifierFailure::Ordinary => Err(CliError::OriginalAssetsReconcileGate {
+                    message: "injected production staged verifier failure".to_string(),
+                }),
+                StagedVerifierFailure::Timeout => {
+                    Err(CliError::Monitor(MonitorError::CommandTimeout {
+                        program: "heif-info",
+                        timeout_seconds: 1,
+                    }))
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct FailingUploadedHeicReadTransport {
+        lookup_calls: usize,
+        download_calls: usize,
+    }
+
+    #[cfg(unix)]
+    impl crate::upload::CloudKitUploadedHeicReadTransport for FailingUploadedHeicReadTransport {
+        fn post_records_lookup(
+            &mut self,
+            _session: &crate::upload::CloudKitDeleteSession,
+            _payload: serde_json::Value,
+        ) -> Result<serde_json::Value, UploadError> {
+            self.lookup_calls += 1;
+            Err(UploadError::InvalidSession(
+                "test transport must not be reached".to_string(),
+            ))
+        }
+
+        fn download_resource(
+            &mut self,
+            _session: &crate::upload::CloudKitDeleteSession,
+            _download_url: &url::Url,
+            _expected_size_bytes: u64,
+        ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
+            self.download_calls += 1;
+            Err(UploadError::InvalidSession(
+                "test transport must not be reached".to_string(),
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    fn production_reverify_test_session() -> crate::upload::CloudKitDeleteSession {
+        crate::upload::CloudKitDeleteSession::from_json(
+            &serde_json::json!({
+                "dsid": "123456789",
+                "ckdatabasews_url": "https://p140-ckdatabasews.icloud.com:443",
+                "cloudkit_query_params": [
+                    {"name": "clientBuildNumber", "value": "2522Project44"},
+                    {"name": "clientMasteringNumber", "value": "2522B2"},
+                    {"name": "clientId", "value": "4f0b58d4-ff9d-4dc5-8f0b-9c4efc4fdb27"},
+                    {"name": "dsid", "value": "123456789"},
+                    {"name": "remapEnums", "value": "True"},
+                    {"name": "getCurrentSyncToken", "value": "True"}
+                ],
+                "cookies": [{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "test-cookie"}]
+            })
+            .to_string(),
+        )
+        .expect("test session")
+    }
+
+    #[cfg(unix)]
+    struct ProductionReverifyFailureFixture {
+        _tempdir: tempfile::TempDir,
+        config: MonitorConfig,
+        store: AssetStateStore,
+        manifest: Manifest,
+        expected: BTreeMap<String, AssetRecord>,
+        ids: BTreeSet<String>,
+        evidence: Vec<(PathBuf, Vec<u8>)>,
+    }
+
+    #[cfg(unix)]
+    fn production_reverify_failure_fixture() -> ProductionReverifyFailureFixture {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let root = tempdir.path().join("download");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let heic_dir = tempdir.path().join("heic");
+        fs::create_dir_all(&root).expect("root");
+        let root = root.canonicalize().expect("canonical root");
+        let mut manifest = Manifest::new();
+        let mut evidence = Vec::new();
+        for asset_id in ["a", "b"] {
+            let final_path = root.join(format!("{asset_id}.heic"));
+            let reference_path = root.join(format!("{asset_id}.oriented-preview.jpg"));
+            let mirror_path = root.join(format!("{asset_id}.mirror.heic"));
+            let final_bytes = format!("final-{asset_id}").into_bytes();
+            let reference_bytes = format!("reference-{asset_id}").into_bytes();
+            fs::write(&final_path, &final_bytes).expect("final");
+            fs::write(&reference_path, &reference_bytes).expect("reference");
+            fs::write(&mirror_path, &final_bytes).expect("mirror");
+            let sha256 = format!("{:x}", Sha256::digest(&final_bytes));
+            let mut record = AssetRecord::new(asset_id, root.join(format!("{asset_id}.dng")));
+            record.state = State::UploadVerified;
+            record.proofs.insert(
+                "upload".to_string(),
+                serde_json::json!({
+                    "uploaded_heic_asset_id": format!("uploaded-{asset_id}"),
+                    "uploaded_heic_sha256": sha256,
+                    "uploaded_heic_path": final_path,
+                }),
+            );
+            record.proofs.insert(
+                "icloudpd_local_mirror".to_string(),
+                serde_json::json!({
+                    "uploaded_heic_asset_id": format!("uploaded-{asset_id}"),
+                    "uploaded_heic_sha256": format!("{:x}", Sha256::digest(&final_bytes)),
+                    "uploaded_heic_path": final_path,
+                    "icloudpd_download_path": mirror_path,
+                    "size_bytes": final_bytes.len(),
+                }),
+            );
+            manifest.upsert_trusted(record);
+            evidence.push((reference_path, reference_bytes));
+            evidence.push((final_path, final_bytes.clone()));
+            evidence.push((mirror_path, final_bytes));
+        }
+        manifest.save_atomic(&manifest_path).expect("manifest");
+        let writer =
+            AssetStateStore::open_writer(&manifest_path, "reverify-test", Duration::from_secs(30))
+                .expect("writer");
+        writer.load_or_import().expect("import");
+        drop(writer);
+        let config = MonitorConfig::new(root, manifest_path, heic_dir);
+        let store =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("store");
+        let snapshot = store.load().expect("snapshot");
+        let expected = snapshot.records().clone();
+        ProductionReverifyFailureFixture {
+            _tempdir: tempdir,
+            config,
+            store,
+            manifest: snapshot,
+            expected,
+            ids: BTreeSet::from(["a".to_string(), "b".to_string()]),
+            evidence,
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_production_reverify_failure_cleans_staging(
+        failure: StagedVerifierFailure,
+        timeout: bool,
+    ) {
+        let fixture = production_reverify_failure_fixture();
+        let before = persisted_bytes(&fixture.config);
+        let lock_path = crate::monitor::monitor_run_lock_path(&fixture.config);
+        let inner = FailingProductionStagedVerifier {
+            failure,
+            calls: Vec::new(),
+        };
+        let mut reverifier = ProductionUploadVerifiedAssetReverifier::with_dependencies(
+            production_reverify_test_session(),
+            FailingUploadedHeicReadTransport::default(),
+            inner,
+        );
+        let mut output = Vec::new();
+        let result = monitor_upload_verified_reverify_with_reverifier(
+            UploadVerifiedReverifyExecutorInput {
+                config: &fixture.config,
+                state_store: &fixture.store,
+                manifest: &fixture.manifest,
+                expected: &fixture.expected,
+                ids: &fixture.ids,
+                apply: true,
+                timeout_seconds: 1,
+                target_set_sha256: "x".repeat(64),
+                started: Instant::now(),
+            },
+            &mut reverifier,
+            &mut output,
+        );
+        if timeout {
+            match result {
+                Err(CliError::Monitor(MonitorError::CommandTimeout { .. })) => {}
+                Err(error) => panic!("unexpected error: {error}"),
+                Ok(_) => panic!("unexpected success"),
+            }
+        } else {
+            match result {
+                Err(CliError::OriginalAssetsReconcileGate { .. }) => {}
+                Err(error) => panic!("unexpected error: {error}"),
+                Ok(_) => panic!("unexpected success"),
+            }
+        }
+        assert_eq!(reverifier.heic_verifier.calls.len(), 1);
+        let (staged_reference, staged_final) = &reverifier.heic_verifier.calls[0];
+        assert_ne!(staged_reference, &fixture.evidence[0].0);
+        assert_ne!(staged_final, &fixture.evidence[1].0);
+        assert!(!staged_reference.exists());
+        assert!(!staged_final.exists());
+        assert_eq!(reverifier.transport.lookup_calls, 0);
+        assert_eq!(reverifier.transport.download_calls, 0);
+        assert!(output.is_empty());
+        assert!(!lock_path.exists());
+        assert_eq!(persisted_bytes(&fixture.config), before);
+        for (path, bytes) in fixture.evidence {
+            assert_eq!(fs::read(path).expect("source evidence"), bytes);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_executor_production_reverifier_error_cleans_staging_before_report_or_commit() {
+        assert_production_reverify_failure_cleans_staging(StagedVerifierFailure::Ordinary, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_executor_production_reverifier_timeout_cleans_staging_before_report_or_commit() {
+        assert_production_reverify_failure_cleans_staging(StagedVerifierFailure::Timeout, true);
     }
 
     #[cfg(unix)]
