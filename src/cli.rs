@@ -2167,6 +2167,29 @@ fn reverify_changed_records(
 mod upload_verified_reverify_tests {
     use super::*;
 
+    struct FakeReverifier {
+        records: BTreeMap<String, AssetRecord>,
+        calls: Vec<String>,
+        fail_on: Option<String>,
+    }
+
+    impl UploadVerifiedAssetReverifier for FakeReverifier {
+        fn reverify(
+            &mut self,
+            _manifest: &Manifest,
+            asset_id: &str,
+            _timeout_seconds: u64,
+        ) -> Result<AssetRecord, CliError> {
+            self.calls.push(asset_id.to_string());
+            if self.fail_on.as_deref() == Some(asset_id) {
+                return Err(CliError::OriginalAssetsReconcileGate {
+                    message: "injected reverifier failure".to_string(),
+                });
+            }
+            Ok(self.records.get(asset_id).expect("fake record").clone())
+        }
+    }
+
     fn record(asset_id: &str, updated_at: &str) -> AssetRecord {
         let mut record = AssetRecord::new(asset_id, PathBuf::from(format!("/nas/{asset_id}.dng")));
         record.updated_at = updated_at.to_string();
@@ -2261,6 +2284,91 @@ mod upload_verified_reverify_tests {
         assert!(!reverify_needs_writer(true, 0));
         assert!(!reverify_needs_writer(false, 1));
         assert!(reverify_needs_writer(true, 1));
+    }
+
+    #[test]
+    fn command_executor_calls_selected_assets_once_in_btreeset_order() {
+        let a = record("a", "100.000000000Z");
+        let b = record("b", "100.000000000Z");
+        let (_tempdir, config, expected) = persisted_fixture(vec![a.clone(), b.clone()]);
+        let store =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("store");
+        let manifest = store.load().expect("manifest");
+        let ids = BTreeSet::from(["b".to_string(), "a".to_string()]);
+        let mut fake = FakeReverifier {
+            records: BTreeMap::from([(a.asset_id.clone(), a), (b.asset_id.clone(), b)]),
+            calls: Vec::new(),
+            fail_on: None,
+        };
+        let mut output = Vec::new();
+        let report = monitor_upload_verified_reverify_with_reverifier(
+            UploadVerifiedReverifyExecutorInput {
+                config: &config,
+                state_store: &store,
+                manifest: &manifest,
+                expected: &expected,
+                ids: &ids,
+                apply: true,
+                timeout_seconds: 1,
+                target_set_sha256: "x".repeat(64),
+                started: Instant::now(),
+            },
+            &mut fake,
+            &mut output,
+        )
+        .expect("executor");
+        assert_eq!(fake.calls, vec!["a", "b"]);
+        assert_eq!(report.changed_count, 0);
+        assert_eq!(report.unchanged_count, 2);
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn command_executor_stops_on_intermediate_reverifier_failure_without_report_or_write() {
+        let a = record("a", "100.000000000Z");
+        let b = record("b", "100.000000000Z");
+        let c = record("c", "100.000000000Z");
+        let (_tempdir, config, expected) = persisted_fixture(vec![a.clone(), b.clone(), c.clone()]);
+        let before = persisted_bytes(&config);
+        let lock_path = crate::monitor::monitor_run_lock_path(&config);
+        assert!(!lock_path.exists());
+        let store =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("store");
+        let manifest = store.load().expect("manifest");
+        let ids = BTreeSet::from(["c".to_string(), "a".to_string(), "b".to_string()]);
+        let mut fake = FakeReverifier {
+            records: BTreeMap::from([
+                (a.asset_id.clone(), a),
+                (b.asset_id.clone(), b),
+                (c.asset_id.clone(), c),
+            ]),
+            calls: Vec::new(),
+            fail_on: Some("b".to_string()),
+        };
+        let mut output = Vec::new();
+        let result = monitor_upload_verified_reverify_with_reverifier(
+            UploadVerifiedReverifyExecutorInput {
+                config: &config,
+                state_store: &store,
+                manifest: &manifest,
+                expected: &expected,
+                ids: &ids,
+                apply: true,
+                timeout_seconds: 1,
+                target_set_sha256: "x".repeat(64),
+                started: Instant::now(),
+            },
+            &mut fake,
+            &mut output,
+        );
+        assert!(matches!(
+            result,
+            Err(CliError::OriginalAssetsReconcileGate { .. })
+        ));
+        assert_eq!(fake.calls, vec!["a", "b"]);
+        assert!(output.is_empty());
+        assert!(!lock_path.exists());
+        assert_eq!(persisted_bytes(&config), before);
     }
 
     #[test]
