@@ -12310,6 +12310,59 @@ esac
     fn private_child_stdin_timeout_kills_parent_and_grandchild() {
         use std::os::unix::fs::PermissionsExt;
 
+        fn read_completed_positive_pid(path: &Path) -> Option<libc::pid_t> {
+            let contents = fs::read_to_string(path).ok()?;
+            let pid = contents.strip_suffix('\n')?;
+            if pid.is_empty() || pid.contains('\n') {
+                return None;
+            }
+            pid.parse::<libc::pid_t>().ok().filter(|pid| *pid > 0)
+        }
+
+        struct PrivateChildCleanup {
+            parent_pid_path: PathBuf,
+            grandchild_pid_path: PathBuf,
+            armed: bool,
+        }
+
+        impl PrivateChildCleanup {
+            fn disarm(&mut self) {
+                self.armed = false;
+            }
+        }
+
+        impl Drop for PrivateChildCleanup {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                let parent_pid = read_completed_positive_pid(&self.parent_pid_path);
+                let grandchild_pid = read_completed_positive_pid(&self.grandchild_pid_path);
+                if let Some(parent_pid) = parent_pid {
+                    unsafe {
+                        libc::kill(-parent_pid, libc::SIGKILL);
+                    }
+                }
+                for pid in [parent_pid, grandchild_pid].into_iter().flatten() {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while [parent_pid, grandchild_pid]
+                    .into_iter()
+                    .flatten()
+                    .any(|pid| {
+                        (unsafe { libc::kill(pid, 0) }) == 0
+                            || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+                    })
+                    && Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+
         let tempdir = tempfile::tempdir().expect("temporary directory should exist");
         let helper_path = tempdir.path().join("stuck-private-child");
         let parent_pid_path = tempdir.path().join("parent.pid");
@@ -12330,74 +12383,66 @@ esac
         fs::set_permissions(&helper_path, permissions).expect("helper should be executable");
 
         let started = Instant::now();
-        let worker = thread::spawn(move || {
-            run_upload_child_with_stdin_timeout(
-                "asset",
-                Command::new(&helper_path),
-                b"private-child-request",
-                1,
-            )
-        });
-        let pid_deadline = Instant::now() + Duration::from_secs(1);
-        let (parent_pid, grandchild_pid) = loop {
-            if let (Ok(parent), Ok(grandchild)) = (
-                fs::read_to_string(&parent_pid_path),
-                fs::read_to_string(&grandchild_pid_path),
-            ) {
-                break (
-                    parent
-                        .trim()
-                        .parse::<libc::pid_t>()
-                        .expect("parent PID should be numeric"),
-                    grandchild
-                        .trim()
-                        .parse::<libc::pid_t>()
-                        .expect("grandchild PID should be numeric"),
-                );
-            }
-            assert!(
-                Instant::now() < pid_deadline,
-                "private child should record both PIDs before timeout"
-            );
-            thread::sleep(Duration::from_millis(10));
-        };
-        struct ProcessGroupCleanup(libc::pid_t);
-        impl Drop for ProcessGroupCleanup {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::kill(-self.0, libc::SIGKILL);
-                }
-            }
-        }
-        let _cleanup = ProcessGroupCleanup(parent_pid);
-        for pid in [parent_pid, grandchild_pid] {
-            assert_eq!(
-                unsafe { libc::kill(pid, 0) },
-                0,
-                "private child process {pid} should be alive before timeout"
-            );
-        }
-        let error = worker
-            .join()
-            .expect("private child worker should not panic")
-            .expect_err("private child must time out");
-        assert!(started.elapsed() < Duration::from_secs(3));
-        assert!(matches!(error, MonitorError::UploadWorkflowTimeout { .. }));
-
-        let deadline = Instant::now() + Duration::from_secs(3);
-        for pid in [parent_pid, grandchild_pid] {
-            loop {
-                let result = unsafe { libc::kill(pid, 0) };
-                if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                    break;
+        thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                run_upload_child_with_stdin_timeout(
+                    "asset",
+                    Command::new(&helper_path),
+                    b"private-child-request",
+                    1,
+                )
+            });
+            let mut cleanup = PrivateChildCleanup {
+                parent_pid_path: parent_pid_path.clone(),
+                grandchild_pid_path: grandchild_pid_path.clone(),
+                armed: true,
+            };
+            let pid_deadline = Instant::now() + Duration::from_secs(1);
+            let (parent_pid, grandchild_pid) = loop {
+                if let (Some(parent_pid), Some(grandchild_pid)) = (
+                    read_completed_positive_pid(&parent_pid_path),
+                    read_completed_positive_pid(&grandchild_pid_path),
+                ) {
+                    break (parent_pid, grandchild_pid);
                 }
                 assert!(
-                    Instant::now() < deadline,
-                    "timed-out private child process {pid} was not reaped"
+                    Instant::now() < pid_deadline,
+                    "private child should record complete positive PIDs before timeout"
                 );
-                thread::sleep(Duration::from_millis(25));
+                thread::sleep(Duration::from_millis(10));
+            };
+            for pid in [parent_pid, grandchild_pid] {
+                assert_eq!(
+                    unsafe { libc::kill(pid, 0) },
+                    0,
+                    "private child process {pid} should be alive before timeout"
+                );
             }
-        }
+            let error = worker
+                .join()
+                .expect("private child worker should not panic")
+                .expect_err("private child must time out");
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(matches!(error, MonitorError::UploadWorkflowTimeout { .. }));
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            for pid in [parent_pid, grandchild_pid] {
+                loop {
+                    let result = unsafe { libc::kill(pid, 0) };
+                    if result == -1
+                        && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed-out private child process {pid} was not reaped"
+                    );
+                    thread::sleep(Duration::from_millis(25));
+                }
+            }
+            cleanup.disarm();
+        });
     }
 
     #[cfg(unix)]
