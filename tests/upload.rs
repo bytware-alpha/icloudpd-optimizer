@@ -8,10 +8,11 @@ use icloudpd_optimizer::upload::{
     CloudKitDeleteTransport, CloudKitLibraryDestination, CloudKitLocalReplacementCandidate,
     CloudKitOriginalAssetBatchResolveRequest, CloudKitOriginalAssetReadTransport,
     CloudKitOriginalAssetResolveDisposition, CloudKitOriginalAssetResolveRequest,
-    CloudKitOriginalAssetResolveTarget, CloudKitResourceDownload,
-    CloudKitUploadedHeicResolveRequest, IcloudUploadOutcome, IcloudUploadResponse,
-    PhotosUploadClient, PhotosUploadEndpoint, PhotosUploadTransport, SingleFileUploadRequest,
-    UploadError, UploadSession, VerifiedUploadSource, build_upload_proof, load_upload_session,
+    CloudKitOriginalAssetResolveTarget, CloudKitResourceDownload, CloudKitUploadedHeicReadClient,
+    CloudKitUploadedHeicReadTransport, CloudKitUploadedHeicResolveRequest, IcloudUploadOutcome,
+    IcloudUploadResponse, PhotosUploadClient, PhotosUploadEndpoint, PhotosUploadTransport,
+    SingleFileUploadRequest, UploadError, UploadSession, VerifiedUploadSource, build_upload_proof,
+    load_upload_session,
 };
 use icloudpd_optimizer::workflow::VerifiedHeic;
 use serde_json::{Value, json};
@@ -281,6 +282,40 @@ impl CloudKitOriginalAssetReadTransport for ReadOnlyOriginalAssetTransport {
         }
         Ok(CloudKitResourceDownload {
             sha256: sha256_hex(&self.resource_body),
+            size_bytes,
+        })
+    }
+}
+
+struct ReadOnlyUploadedHeicTransport {
+    lookup_responses: Vec<Value>,
+    bytes: Vec<u8>,
+}
+
+impl CloudKitUploadedHeicReadTransport for ReadOnlyUploadedHeicTransport {
+    fn post_records_lookup(
+        &mut self,
+        _session: &CloudKitDeleteSession,
+        _payload: Value,
+    ) -> Result<Value, UploadError> {
+        Ok(self.lookup_responses.remove(0))
+    }
+
+    fn download_resource(
+        &mut self,
+        _session: &CloudKitDeleteSession,
+        _download_url: &url::Url,
+        expected_size_bytes: u64,
+    ) -> Result<CloudKitResourceDownload, UploadError> {
+        let size_bytes = self.bytes.len() as u64;
+        if size_bytes != expected_size_bytes {
+            return Err(UploadError::CloudKitOriginalAssetDownloadSizeMismatch {
+                expected: expected_size_bytes,
+                actual: size_bytes,
+            });
+        }
+        Ok(CloudKitResourceDownload {
+            sha256: sha256_hex(&self.bytes),
             size_bytes,
         })
     }
@@ -1278,6 +1313,56 @@ fn cloudkit_delete_client_rejects_already_deleted_uploaded_heic() {
     assert!(transport.payloads.is_empty());
     assert!(transport.downloaded_urls.is_empty());
 }
+
+#[test]
+fn uploaded_heic_read_client_accepts_lookup_and_download_only_transport() {
+    let session =
+        CloudKitDeleteSession::from_json(&valid_delete_session_json()).expect("session loads");
+    let bytes = b"read-only-uploaded-heic";
+    let transport = ReadOnlyUploadedHeicTransport {
+        lookup_responses: vec![
+            cloudkit_uploaded_heic_asset(
+                "CPLAsset-uploaded-heic-123",
+                "CPLMaster-heic-123",
+                "tag-1",
+            ),
+            cloudkit_uploaded_heic_master(
+                "CPLMaster-heic-123",
+                bytes.len() as u64,
+                "https://p140-icloud-content.icloud.com/uploaded-heic",
+            ),
+        ],
+        bytes: bytes.to_vec(),
+    };
+    assert_uploaded_heic_read_only(transport);
+    let resolved = CloudKitUploadedHeicReadClient::new(ReadOnlyUploadedHeicTransport {
+        lookup_responses: vec![
+            cloudkit_uploaded_heic_asset(
+                "CPLAsset-uploaded-heic-123",
+                "CPLMaster-heic-123",
+                "tag-1",
+            ),
+            cloudkit_uploaded_heic_master(
+                "CPLMaster-heic-123",
+                bytes.len() as u64,
+                "https://p140-icloud-content.icloud.com/uploaded-heic",
+            ),
+        ],
+        bytes: bytes.to_vec(),
+    })
+    .resolve_uploaded_heic_asset(
+        &session,
+        &primary_uploaded_heic_resolve_request(
+            "CPLAsset-uploaded-heic-123",
+            sha256_hex(bytes),
+            bytes.len() as u64,
+        ),
+    )
+    .expect("read-only lookup/download must resolve the exact uploaded asset");
+    assert_eq!(resolved.record_name, "CPLAsset-uploaded-heic-123");
+}
+
+fn assert_uploaded_heic_read_only<T: CloudKitUploadedHeicReadTransport>(_transport: T) {}
 
 #[test]
 fn cloudkit_delete_client_deletes_resolved_uploaded_heic_record() {

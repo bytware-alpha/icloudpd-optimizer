@@ -50,10 +50,10 @@ use crate::upload::{
     CloudKitOriginalAssetBatchResolveRequest, CloudKitOriginalAssetInventoryFingerprint,
     CloudKitOriginalAssetReadTransport, CloudKitOriginalAssetResolution,
     CloudKitOriginalAssetResolveDisposition, CloudKitOriginalAssetResolveRequest,
-    CloudKitOriginalAssetResolveTarget, IcloudUploadRequest, ReqwestCloudKitDeleteTransport,
-    ReqwestCloudKitReadTransport, UploadError, VerifiedUploadSource, build_upload_proof,
-    load_cloudkit_delete_session, load_upload_session, run_icloud_upload,
-    validate_library_destination,
+    CloudKitOriginalAssetResolveTarget, CloudKitUploadedHeicReadClient, IcloudUploadRequest,
+    ReqwestCloudKitDeleteTransport, ReqwestCloudKitReadTransport, UploadError,
+    VerifiedUploadSource, build_upload_proof, load_cloudkit_delete_session, load_upload_session,
+    run_icloud_upload, validate_library_destination,
 };
 use crate::workflow::{
     ConversionPerformanceInput, ConversionResultInput, ConversionSourceBinding,
@@ -1926,7 +1926,7 @@ fn monitor_upload_verified_reverify<W: Write>(
         let mut staged = staged;
         staged.upsert_trusted(updated_record.clone());
         let request = uploaded_heic_delete_request(&staged, id)?;
-        CloudKitDeleteClient::new(&mut transport)
+        CloudKitUploadedHeicReadClient::new(&mut transport)
             .resolve_uploaded_heic_asset(&session, &request)?;
         updated.push(updated_record);
     }

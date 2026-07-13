@@ -608,18 +608,6 @@ pub trait CloudKitDeleteTransport {
 }
 
 pub trait CloudKitOriginalAssetReadTransport {
-    /// Read-only lookup. This trait deliberately omits records/modify and all
-    /// upload/delete operations, so callers using it cannot perform mutation.
-    fn post_records_lookup(
-        &mut self,
-        _session: &CloudKitDeleteSession,
-        _payload: Value,
-    ) -> Result<Value, UploadError> {
-        Err(UploadError::InvalidCloudKitOriginalAssetResponse(
-            "read-only transport does not implement records/lookup",
-        ))
-    }
-
     fn post_records_query(
         &mut self,
         session: &CloudKitDeleteSession,
@@ -653,14 +641,6 @@ impl<T: CloudKitDeleteTransport + ?Sized> CloudKitDeleteTransport for &mut T {
 }
 
 impl<T: CloudKitOriginalAssetReadTransport + ?Sized> CloudKitOriginalAssetReadTransport for &mut T {
-    fn post_records_lookup(
-        &mut self,
-        session: &CloudKitDeleteSession,
-        payload: Value,
-    ) -> Result<Value, UploadError> {
-        (**self).post_records_lookup(session, payload)
-    }
-
     fn post_records_query(
         &mut self,
         session: &CloudKitDeleteSession,
@@ -951,7 +931,7 @@ impl<T: CloudKitDeleteTransport> CloudKitDeleteClient<T> {
     }
 }
 
-impl<T: CloudKitOriginalAssetReadTransport> CloudKitDeleteClient<T> {
+impl<T: CloudKitDeleteTransport + CloudKitOriginalAssetReadTransport> CloudKitDeleteClient<T> {
     pub fn resolve_uploaded_heic_asset(
         &mut self,
         session: &CloudKitDeleteSession,
@@ -1012,6 +992,121 @@ impl<T: CloudKitOriginalAssetReadTransport> CloudKitDeleteClient<T> {
             size_bytes: download.size_bytes,
         })
     }
+}
+
+/// A deliberately narrow capability for the audit path: CloudKit
+/// `records/lookup` plus resource download, with no records/modify, upload,
+/// or delete operation in its API.
+pub trait CloudKitUploadedHeicReadTransport {
+    fn post_records_lookup(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError>;
+
+    fn download_resource(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        download_url: &Url,
+        expected_size_bytes: u64,
+    ) -> Result<CloudKitResourceDownload, UploadError>;
+}
+
+impl<T: CloudKitUploadedHeicReadTransport + ?Sized> CloudKitUploadedHeicReadTransport for &mut T {
+    fn post_records_lookup(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        (**self).post_records_lookup(session, payload)
+    }
+
+    fn download_resource(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        download_url: &Url,
+        expected_size_bytes: u64,
+    ) -> Result<CloudKitResourceDownload, UploadError> {
+        (**self).download_resource(session, download_url, expected_size_bytes)
+    }
+}
+
+pub struct CloudKitUploadedHeicReadClient<T> {
+    transport: T,
+}
+
+impl<T> CloudKitUploadedHeicReadClient<T> {
+    pub fn new(transport: T) -> Self {
+        Self { transport }
+    }
+}
+
+impl<T: CloudKitUploadedHeicReadTransport> CloudKitUploadedHeicReadClient<T> {
+    pub fn resolve_uploaded_heic_asset(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        request: &CloudKitUploadedHeicResolveRequest,
+    ) -> Result<CloudKitUploadedHeicAsset, UploadError> {
+        resolve_uploaded_heic_asset_with_transport(&mut self.transport, session, request)
+    }
+}
+
+fn resolve_uploaded_heic_asset_with_transport<T: CloudKitUploadedHeicReadTransport>(
+    transport: &mut T,
+    session: &CloudKitDeleteSession,
+    request: &CloudKitUploadedHeicResolveRequest,
+) -> Result<CloudKitUploadedHeicAsset, UploadError> {
+    validate_uploaded_heic_resolve_request(request)?;
+    let destination = CloudKitLibraryDestination {
+        database_scope: request.database_scope,
+        zone_name: request.zone_name.clone(),
+    };
+    let asset_response = transport.post_records_lookup(
+        session,
+        cloudkit_records_lookup_payload(
+            &[request.uploaded_asset_id.as_str()],
+            &["masterRef", "isDeleted"],
+            &destination,
+        ),
+    )?;
+    let asset = parse_uploaded_heic_asset_lookup_response(asset_response, request)?;
+    let master_response = transport.post_records_lookup(
+        session,
+        cloudkit_records_lookup_payload(
+            &[asset.master_record_name.as_str()],
+            &[
+                "resOriginalRes",
+                "resOriginalFileType",
+                "resOriginalAltRes",
+                "resOriginalAltFileType",
+                "resSidecarRes",
+                "resSidecarFileType",
+                "resOriginalVidComplRes",
+                "resOriginalVidComplFileType",
+            ],
+            &destination,
+        ),
+    )?;
+    let download_url = parse_uploaded_heic_master_lookup_response(
+        master_response,
+        &asset.master_record_name,
+        request.expected_size_bytes,
+    )?;
+    let download =
+        transport.download_resource(session, &download_url, request.expected_size_bytes)?;
+    if download.sha256 != request.expected_heic_sha256 {
+        return Err(UploadError::CloudKitUploadedHeicDownloadHashMismatch {
+            expected: request.expected_heic_sha256.clone(),
+            actual: download.sha256,
+        });
+    }
+    Ok(CloudKitUploadedHeicAsset {
+        record_name: asset.record_name,
+        record_change_tag: asset.record_change_tag,
+        master_record_name: asset.master_record_name,
+        matched_heic_sha256: request.expected_heic_sha256.clone(),
+        size_bytes: download.size_bytes,
+    })
 }
 
 impl<T: CloudKitOriginalAssetReadTransport> CloudKitDeleteClient<T> {
@@ -1986,21 +2081,6 @@ impl ReqwestCloudKitReadTransport {
 }
 
 impl CloudKitOriginalAssetReadTransport for ReqwestCloudKitReadTransport {
-    fn post_records_lookup(
-        &mut self,
-        session: &CloudKitDeleteSession,
-        payload: Value,
-    ) -> Result<Value, UploadError> {
-        let url = self.records_lookup_url(session, payload_database_scope(&payload, session))?;
-        self.transport.post_records_json(
-            session,
-            url,
-            payload,
-            "records_lookup",
-            read_json_response,
-        )
-    }
-
     fn post_records_query(
         &mut self,
         session: &CloudKitDeleteSession,
@@ -2013,6 +2093,33 @@ impl CloudKitOriginalAssetReadTransport for ReqwestCloudKitReadTransport {
             payload,
             "records_query",
             read_cloudkit_json_response,
+        )
+    }
+
+    fn download_resource(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        download_url: &Url,
+        expected_size_bytes: u64,
+    ) -> Result<CloudKitResourceDownload, UploadError> {
+        self.transport
+            .download_resource(session, download_url, expected_size_bytes)
+    }
+}
+
+impl CloudKitUploadedHeicReadTransport for ReqwestCloudKitReadTransport {
+    fn post_records_lookup(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        let url = self.records_lookup_url(session, payload_database_scope(&payload, session))?;
+        self.transport.post_records_json(
+            session,
+            url,
+            payload,
+            "records_lookup",
+            read_json_response,
         )
     }
 
