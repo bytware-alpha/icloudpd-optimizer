@@ -2304,6 +2304,8 @@ fn reverify_changed_records(
 #[cfg(test)]
 mod upload_verified_reverify_tests {
     use super::*;
+    #[cfg(unix)]
+    use std::collections::VecDeque;
 
     struct FakeReverifier {
         records: BTreeMap<String, AssetRecord>,
@@ -2547,6 +2549,322 @@ mod upload_verified_reverify_tests {
     }
 
     #[cfg(unix)]
+    struct SuccessfulProductionStagedVerifier {
+        calls: Vec<(PathBuf, PathBuf, PathBuf)>,
+    }
+
+    #[cfg(unix)]
+    impl UploadVerifiedHeicVerifier for SuccessfulProductionStagedVerifier {
+        fn reverify(
+            &mut self,
+            staged_reference_path: &Path,
+            staged_final_path: &Path,
+            logical_final_path: PathBuf,
+            logical_final_sha256: String,
+            logical_final_size_bytes: u64,
+            _timeout_seconds: u64,
+        ) -> Result<HeicVerificationInput, CliError> {
+            self.calls.push((
+                staged_reference_path.to_path_buf(),
+                staged_final_path.to_path_buf(),
+                logical_final_path.clone(),
+            ));
+            Ok(HeicVerificationInput {
+                heic_path: logical_final_path,
+                heic_sha256: logical_final_sha256,
+                size_bytes: logical_final_size_bytes,
+                heif_info_ok: true,
+                metadata_copied: true,
+                visual_content_ok: true,
+                visual_match_ok: true,
+                visual_rmse_ppm: Some(1),
+                visual_mae_ppm: Some(1),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    struct SequencedUploadedHeicReadTransport {
+        lookup_responses: VecDeque<serde_json::Value>,
+        download_bodies: VecDeque<Vec<u8>>,
+        calls: Vec<String>,
+    }
+
+    #[cfg(unix)]
+    impl crate::upload::CloudKitUploadedHeicReadTransport for SequencedUploadedHeicReadTransport {
+        fn post_records_lookup(
+            &mut self,
+            _session: &crate::upload::CloudKitDeleteSession,
+            payload: serde_json::Value,
+        ) -> Result<serde_json::Value, UploadError> {
+            let record_name = payload["records"][0]["recordName"]
+                .as_str()
+                .expect("lookup record name");
+            self.calls.push(format!("lookup:{record_name}"));
+            Ok(self
+                .lookup_responses
+                .pop_front()
+                .expect("expected lookup response"))
+        }
+
+        fn download_resource(
+            &mut self,
+            _session: &crate::upload::CloudKitDeleteSession,
+            download_url: &url::Url,
+            _expected_size_bytes: u64,
+        ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
+            self.calls.push(format!("download:{}", download_url.path()));
+            let bytes = self
+                .download_bodies
+                .pop_front()
+                .expect("expected download body");
+            Ok(crate::upload::CloudKitResourceDownload {
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+                size_bytes: bytes.len() as u64,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn uploaded_heic_asset_lookup(asset_id: &str, master_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "records": [{
+                "recordName": asset_id,
+                "recordType": "CPLAsset",
+                "recordChangeTag": "change-tag",
+                "fields": {
+                    "masterRef": {"value": {"recordName": master_id}},
+                    "isDeleted": {"value": 0}
+                }
+            }]
+        })
+    }
+
+    #[cfg(unix)]
+    fn uploaded_heic_master_lookup(
+        master_id: &str,
+        size_bytes: u64,
+        download_path: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "records": [{
+                "recordName": master_id,
+                "recordType": "CPLMaster",
+                "recordChangeTag": "master-change-tag",
+                "fields": {
+                    "resOriginalRes": {"value": {
+                        "size": size_bytes,
+                        "downloadURL": format!("https://p140-icloud-content.icloud.com{download_path}")
+                    }},
+                    "resOriginalFileType": {"value": "public.heic"}
+                }
+            }]
+        })
+    }
+
+    #[cfg(unix)]
+    fn legacy_upload_verified_record(root: &Path, asset_id: &str) -> AssetRecord {
+        let raw_path = root.join(format!("{asset_id}.dng"));
+        let final_path = root.join(format!("{asset_id}.heic"));
+        let reference_path = root.join(format!("{asset_id}.oriented-preview.jpg"));
+        let mirror_path = root.join(format!("{asset_id}.mirror.heic"));
+        let raw_bytes = vec![b'r'; 4_096];
+        let final_bytes = format!("final-{asset_id}").into_bytes();
+        fs::write(&raw_path, &raw_bytes).expect("raw");
+        fs::write(&final_path, &final_bytes).expect("final");
+        fs::write(&reference_path, format!("reference-{asset_id}")).expect("reference");
+        fs::write(&mirror_path, &final_bytes).expect("mirror");
+        let raw_sha256 = format!("{:x}", Sha256::digest(&raw_bytes));
+        let final_sha256 = format!("{:x}", Sha256::digest(&final_bytes));
+        let mut manifest = Manifest::new();
+        manifest.upsert_trusted(AssetRecord::new(asset_id, raw_path.clone()));
+        crate::workflow::record_nas_proof(
+            &mut manifest,
+            asset_id,
+            NasRawProof {
+                canonical_path: raw_path,
+                relative_path: PathBuf::from(format!("{asset_id}.dng")),
+                size_bytes: raw_bytes.len() as u64,
+                modified_unix_seconds: 1,
+                age_seconds: crate::proof::MIN_RAW_AGE_SECONDS,
+                sha256: raw_sha256.clone(),
+            },
+        )
+        .expect("nas proof");
+        record_original_asset_proof(
+            &mut manifest,
+            asset_id,
+            OriginalAssetProof {
+                record_name: format!("original-{asset_id}"),
+                record_change_tag: "original-change-tag".to_string(),
+                record_type: "CPLAsset".to_string(),
+                database_scope: CloudKitDatabaseScope::Private,
+                zone_name: "PrimarySync".to_string(),
+                filename: format!("{asset_id}.dng"),
+                size_bytes: raw_bytes.len() as u64,
+                matched_raw_sha256: raw_sha256,
+            },
+        )
+        .expect("original proof");
+        record_source_age_proof(
+            &mut manifest,
+            asset_id,
+            SourceAgeProof {
+                source_captured_unix_seconds: 1,
+                verified_at_unix_seconds: crate::proof::MIN_RAW_AGE_SECONDS + 1,
+                min_age_seconds: crate::proof::MIN_RAW_AGE_SECONDS,
+            },
+        )
+        .expect("source age proof");
+        crate::workflow::record_current_conversion_result(
+            &mut manifest,
+            asset_id,
+            ConversionResultInput {
+                heic_path: final_path.clone(),
+                heic_sha256: final_sha256.clone(),
+                size_bytes: final_bytes.len() as u64,
+                source_binding: ConversionSourceBinding::EmbeddedPreview,
+            },
+        )
+        .expect("conversion proof");
+        crate::workflow::record_current_conversion_performance(
+            &mut manifest,
+            asset_id,
+            ConversionPerformanceInput {
+                measured_at_unix_seconds: 1,
+                conversion_tool: "sips".to_string(),
+                conversion_tool_version: Some("test".to_string()),
+                heic_quality: 90,
+                convert_wall_time_millis: 1,
+                total_wall_time_millis: 1,
+                user_cpu_time_millis: None,
+                system_cpu_time_millis: None,
+                peak_rss_kib: None,
+                conversion_command_timings: Vec::new(),
+            },
+        )
+        .expect("performance proof");
+        crate::workflow::record_current_heic_verification(
+            &mut manifest,
+            asset_id,
+            HeicVerificationInput {
+                heic_path: final_path.clone(),
+                heic_sha256: final_sha256.clone(),
+                size_bytes: final_bytes.len() as u64,
+                heif_info_ok: true,
+                metadata_copied: true,
+                visual_content_ok: true,
+                visual_match_ok: true,
+                visual_rmse_ppm: Some(2),
+                visual_mae_ppm: Some(2),
+            },
+        )
+        .expect("HEIC proof");
+        record_upload_proof(
+            &mut manifest,
+            asset_id,
+            UploadProof {
+                uploaded_heic_asset_id: format!("uploaded-{asset_id}"),
+                uploaded_heic_sha256: final_sha256.clone(),
+                database_scope: CloudKitDatabaseScope::Private,
+                zone_name: "PrimarySync".to_string(),
+                uploaded_heic_path: Some(final_path.clone()),
+            },
+        )
+        .expect("upload proof");
+        record_icloudpd_local_mirror_proof(
+            &mut manifest,
+            asset_id,
+            IcloudpdLocalMirrorProof {
+                uploaded_heic_asset_id: format!("uploaded-{asset_id}"),
+                uploaded_heic_sha256: final_sha256,
+                uploaded_heic_path: final_path,
+                icloudpd_download_path: mirror_path,
+                size_bytes: final_bytes.len() as u64,
+            },
+        )
+        .expect("mirror proof");
+        let mut legacy = manifest.get(asset_id).expect("record").clone();
+        for proof_key in ["conversion", "conversion_performance", "heic"] {
+            legacy.proofs.get_mut(proof_key).expect("recipe proof")["conversion_recipe_id"] =
+                serde_json::json!("legacy-recipe");
+        }
+        legacy
+    }
+
+    #[cfg(unix)]
+    struct ProductionReverifyAtomicityFixture {
+        _tempdir: tempfile::TempDir,
+        config: MonitorConfig,
+        store: AssetStateStore,
+        manifest: Manifest,
+        expected: BTreeMap<String, AssetRecord>,
+        ids: BTreeSet<String>,
+        final_paths: BTreeMap<String, PathBuf>,
+        final_bytes: BTreeMap<String, Vec<u8>>,
+    }
+
+    #[cfg(unix)]
+    fn production_reverify_atomicity_fixture() -> ProductionReverifyAtomicityFixture {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let root = tempdir.path().join("download");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let heic_dir = tempdir.path().join("heic");
+        fs::create_dir_all(&root).expect("root");
+        let root = root.canonicalize().expect("canonical root");
+        let records = [
+            legacy_upload_verified_record(&root, "a"),
+            legacy_upload_verified_record(&root, "b"),
+        ];
+        let final_paths: BTreeMap<String, PathBuf> = records
+            .iter()
+            .map(|record| {
+                (
+                    record.asset_id.clone(),
+                    record.proofs["upload"]["uploaded_heic_path"]
+                        .as_str()
+                        .map(PathBuf::from)
+                        .expect("final path"),
+                )
+            })
+            .collect();
+        let final_bytes: BTreeMap<String, Vec<u8>> = records
+            .iter()
+            .map(|record| {
+                let path = &final_paths[&record.asset_id];
+                (
+                    record.asset_id.clone(),
+                    fs::read(path).expect("final bytes"),
+                )
+            })
+            .collect();
+        let mut manifest = Manifest::new();
+        for record in records {
+            manifest.upsert_trusted(record);
+        }
+        manifest.save_atomic(&manifest_path).expect("manifest");
+        let writer =
+            AssetStateStore::open_writer(&manifest_path, "reverify-test", Duration::from_secs(30))
+                .expect("writer");
+        writer.load_or_import().expect("import");
+        drop(writer);
+        let config = MonitorConfig::new(root, manifest_path, heic_dir);
+        let store =
+            AssetStateStore::open_immutable_read_only(&config.manifest_path).expect("store");
+        let manifest = store.load().expect("snapshot");
+        ProductionReverifyAtomicityFixture {
+            _tempdir: tempdir,
+            config,
+            store,
+            expected: manifest.records().clone(),
+            manifest,
+            ids: BTreeSet::from(["a".to_string(), "b".to_string()]),
+            final_paths,
+            final_bytes,
+        }
+    }
+
+    #[cfg(unix)]
     fn assert_production_reverify_failure_cleans_staging(
         failure: StagedVerifierFailure,
         timeout: bool,
@@ -2618,6 +2936,89 @@ mod upload_verified_reverify_tests {
     #[test]
     fn command_executor_production_reverifier_timeout_cleans_staging_before_report_or_commit() {
         assert_production_reverify_failure_cleans_staging(StagedVerifierFailure::Timeout, true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_executor_production_reverifier_keeps_exact_bindings_all_or_none() {
+        let fixture = production_reverify_atomicity_fixture();
+        let before = persisted_bytes(&fixture.config);
+        let lock_path = crate::monitor::monitor_run_lock_path(&fixture.config);
+        let a_bytes = fixture.final_bytes["a"].clone();
+        let mut bad_b_bytes = fixture.final_bytes["b"].clone();
+        bad_b_bytes[0] ^= 0xff;
+        let transport = SequencedUploadedHeicReadTransport {
+            lookup_responses: VecDeque::from([
+                uploaded_heic_asset_lookup("uploaded-a", "master-a"),
+                uploaded_heic_master_lookup("master-a", a_bytes.len() as u64, "/uploaded-a"),
+                uploaded_heic_asset_lookup("uploaded-b", "master-b"),
+                uploaded_heic_master_lookup("master-b", bad_b_bytes.len() as u64, "/uploaded-b"),
+            ]),
+            download_bodies: VecDeque::from([a_bytes, bad_b_bytes]),
+            calls: Vec::new(),
+        };
+        let inner = SuccessfulProductionStagedVerifier { calls: Vec::new() };
+        let mut reverifier = ProductionUploadVerifiedAssetReverifier::with_dependencies(
+            production_reverify_test_session(),
+            transport,
+            inner,
+        );
+        let mut output = Vec::new();
+
+        let result = monitor_upload_verified_reverify_with_reverifier(
+            UploadVerifiedReverifyExecutorInput {
+                config: &fixture.config,
+                state_store: &fixture.store,
+                manifest: &fixture.manifest,
+                expected: &fixture.expected,
+                ids: &fixture.ids,
+                apply: true,
+                timeout_seconds: 1,
+                target_set_sha256: "x".repeat(64),
+                started: Instant::now(),
+            },
+            &mut reverifier,
+            &mut output,
+        );
+
+        assert!(matches!(
+            result,
+            Err(CliError::Upload(
+                UploadError::CloudKitUploadedHeicDownloadHashMismatch { .. }
+            ))
+        ));
+        assert_eq!(
+            reverifier
+                .heic_verifier
+                .calls
+                .iter()
+                .map(|(_, _, logical_final)| logical_final.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                fixture.final_paths["a"].clone(),
+                fixture.final_paths["b"].clone()
+            ]
+        );
+        assert!(reverifier.heic_verifier.calls.iter().all(
+            |(staged_reference, staged_final, logical_final)| {
+                staged_reference != logical_final && staged_final != logical_final
+            }
+        ));
+        assert_eq!(
+            reverifier.transport.calls,
+            vec![
+                "lookup:uploaded-a",
+                "lookup:master-a",
+                "download:/uploaded-a",
+                "lookup:uploaded-b",
+                "lookup:master-b",
+                "download:/uploaded-b",
+            ]
+        );
+        assert!(output.is_empty());
+        assert!(!lock_path.exists());
+        assert!(!fixture.config.stats_path.exists());
+        assert_eq!(persisted_bytes(&fixture.config), before);
     }
 
     #[cfg(unix)]
