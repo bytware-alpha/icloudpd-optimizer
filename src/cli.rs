@@ -1811,6 +1811,8 @@ struct UploadVerifiedReverifyReport {
     target_count: u64,
     verified_count: u64,
     changed_count: u64,
+    would_change_count: u64,
+    unchanged_count: u64,
     applied: bool,
     elapsed_millis: u128,
 }
@@ -1933,7 +1935,9 @@ fn monitor_upload_verified_reverify<W: Write>(
     if !args.apply {
         state_store.revalidate_immutable_read_snapshot()?;
     }
-    let changed_count = if args.apply {
+    let updated = reverify_changed_records(&expected, updated);
+    let would_change_count = updated.len() as u64;
+    let changed_count = if args.apply && !updated.is_empty() {
         state_store.persist_records_exact_cas_atomic_trusted(
             updated
                 .iter()
@@ -1944,7 +1948,7 @@ fn monitor_upload_verified_reverify<W: Write>(
                 .collect::<Vec<_>>(),
         )?;
         state_store.export_json()?;
-        updated.len() as u64
+        would_change_count
     } else {
         0
     };
@@ -1953,6 +1957,8 @@ fn monitor_upload_verified_reverify<W: Write>(
         target_count: ids.len() as u64,
         verified_count: ids.len() as u64,
         changed_count,
+        would_change_count,
+        unchanged_count: ids.len() as u64 - would_change_count,
         applied: args.apply,
         elapsed_millis: started.elapsed().as_millis(),
     };
@@ -2023,6 +2029,52 @@ fn upload_verified_reverify_target_set_sha256(ids: &BTreeSet<String>) -> String 
         hasher.update(id.as_bytes());
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn reverify_changed_records(
+    expected: &BTreeMap<String, AssetRecord>,
+    candidates: Vec<AssetRecord>,
+) -> Vec<AssetRecord> {
+    candidates
+        .into_iter()
+        .filter(|candidate| expected.get(&candidate.asset_id) != Some(candidate))
+        .collect()
+}
+
+#[cfg(test)]
+mod upload_verified_reverify_tests {
+    use super::*;
+
+    fn record(asset_id: &str, updated_at: &str) -> AssetRecord {
+        let mut record = AssetRecord::new(asset_id, PathBuf::from(format!("/nas/{asset_id}.dng")));
+        record.updated_at = updated_at.to_string();
+        record
+    }
+
+    #[test]
+    fn reverify_changed_records_keeps_current_records_byte_identical_and_selects_only_upgrades() {
+        let current = record("current", "unchanged");
+        let legacy = record("legacy", "before");
+        let mut upgraded = legacy.clone();
+        upgraded.updated_at = "after".to_string();
+        let expected = BTreeMap::from([
+            (current.asset_id.clone(), current.clone()),
+            (legacy.asset_id.clone(), legacy.clone()),
+        ]);
+
+        let changed = reverify_changed_records(&expected, vec![current.clone(), upgraded.clone()]);
+        assert_eq!(changed, vec![upgraded]);
+        assert_eq!(expected["current"], current);
+        assert_eq!(changed.len() as u64, 1);
+        assert_eq!(expected.len() as u64 - changed.len() as u64, 1);
+    }
+
+    #[test]
+    fn reverify_changed_records_is_empty_for_an_idempotent_rerun() {
+        let current = record("current", "unchanged");
+        let expected = BTreeMap::from([(current.asset_id.clone(), current.clone())]);
+        assert!(reverify_changed_records(&expected, vec![current]).is_empty());
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

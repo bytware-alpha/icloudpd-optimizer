@@ -861,7 +861,18 @@ pub fn reverify_upload_verified_record(
     // This validates the complete NAS/original/conversion/performance/HEIC/
     // upload/mirror lineage, including distinct original/replacement identity.
     validate_pre_delete_facts(&candidate, asset_id)?;
-    Ok(candidate.get(asset_id)?.clone())
+    let current = manifest.get(asset_id)?;
+    let desired = candidate.get(asset_id)?;
+    if reverify_owned_proofs_are_current(current, desired) {
+        return Ok(current.clone());
+    }
+    Ok(desired.clone())
+}
+
+fn reverify_owned_proofs_are_current(current: &AssetRecord, desired: &AssetRecord) -> bool {
+    [CONVERSION_PROOF, CONVERSION_PERFORMANCE_PROOF, HEIC_PROOF]
+        .iter()
+        .all(|proof_key| current.proofs.get(*proof_key) == desired.proofs.get(*proof_key))
 }
 
 pub fn record_uploaded_heic_delete<'a>(
@@ -2921,6 +2932,29 @@ fn require_positive_u64(
 mod provenance_tests {
     use super::*;
     use crate::state_store::AssetStateStore;
+
+    #[test]
+    fn reverify_owned_proofs_exactly_identifies_current_record() {
+        let mut current = AssetRecord::new("asset", PathBuf::from("/nas/asset.dng"));
+        current.proofs.insert(
+            CONVERSION_PROOF.to_string(),
+            serde_json::json!({"conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE}),
+        );
+        current.proofs.insert(
+            CONVERSION_PERFORMANCE_PROOF.to_string(),
+            serde_json::json!({"conversion_recipe_id": EMBEDDED_PREVIEW_CONVERSION_RECIPE}),
+        );
+        current.proofs.insert(
+            HEIC_PROOF.to_string(),
+            serde_json::json!({"visual_rmse_ppm": 1, "visual_mae_ppm": 2}),
+        );
+        let desired = current.clone();
+        assert!(reverify_owned_proofs_are_current(&current, &desired));
+
+        let mut changed = desired;
+        changed.proofs.get_mut(HEIC_PROOF).unwrap()["visual_rmse_ppm"] = serde_json::json!(3);
+        assert!(!reverify_owned_proofs_are_current(&current, &changed));
+    }
 
     fn nas_proof() -> NasRawProof {
         NasRawProof {
