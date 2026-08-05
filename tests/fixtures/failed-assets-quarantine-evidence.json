@@ -1,0 +1,23 @@
+[
+  {
+    "asset_id": "asset-alpha",
+    "successful_uploads": 1,
+    "delete_attempts": 1,
+    "deleted_finishes": 2,
+    "mirror_successes": 0
+  },
+  {
+    "asset_id": "asset-beta",
+    "successful_uploads": 0,
+    "delete_attempts": 0,
+    "deleted_finishes": 0,
+    "mirror_successes": 0
+  },
+  {
+    "asset_id": "asset-gamma",
+    "successful_uploads": 0,
+    "delete_attempts": 0,
+    "deleted_finishes": 0,
+    "mirror_successes": 1
+  }
+]

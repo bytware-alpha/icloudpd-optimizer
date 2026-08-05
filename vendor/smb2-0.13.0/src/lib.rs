@@ -1,0 +1,105 @@
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+//! Pure-Rust SMB2/3 client library with pipelined I/O.
+//!
+//! No C dependencies, no FFI. Pipelined reads/writes fill the credit window
+//! so downloads run ~10-25x faster than sequential SMB clients.
+//!
+//! # Quick start
+//!
+//! ```rust,no_run
+//! use smb2::{SmbClient, ClientConfig};
+//!
+//! # async fn example() -> Result<(), smb2::Error> {
+//! let mut client = smb2::connect("192.168.1.100:445", "user", "pass").await?;
+//!
+//! // List shares
+//! let shares = client.list_shares().await?;
+//!
+//! // Connect to a share
+//! let mut share = client.connect_share("Documents").await?;
+//!
+//! // List files
+//! let entries = client.list_directory(&mut share, "projects/").await?;
+//! for entry in &entries {
+//!     println!("{} ({} bytes)", entry.name, entry.size);
+//! }
+//!
+//! // Read a file
+//! let data = client.read_file(&mut share, "report.pdf").await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Modules
+//!
+//! - [`client`] -- High-level API: [`SmbClient`], [`Tree`], [`Pipeline`].
+//!   This is what most users need.
+//! - [`error`] -- Error types and NTSTATUS mapping.
+//! - [`msg`] -- Wire format message structs (advanced/internal use).
+//! - [`pack`] -- Binary serialization primitives (advanced/internal use).
+//! - [`transport`] -- Transport trait and TCP implementation (advanced/internal use).
+//! - [`crypto`] -- Signing and encryption (advanced/internal use).
+//! - [`auth`] -- NTLM authentication (advanced/internal use).
+//! - [`rpc`] -- Named pipe RPC for share enumeration (advanced/internal use).
+//! - [`types`] -- Protocol newtypes and flag types (advanced/internal use).
+
+pub mod auth;
+pub mod client;
+pub mod crypto;
+pub mod error;
+pub mod msg;
+pub mod pack;
+pub mod rpc;
+#[cfg(feature = "testing")]
+pub mod testing;
+pub mod transport;
+pub mod types;
+
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
+
+// ── Re-exports: the simple-case imports ────────────────────────────────
+
+// Error types
+pub use error::{Error, ErrorKind, Result};
+
+// High-level client
+pub use client::{connect, ClientConfig, SmbClient};
+
+// Streaming I/O
+pub use client::stream::{FileDownload, FileReader, FileUpload, FileWriter, Progress};
+
+// Server-side copy (FSCTL_SRV_COPYCHUNK): copy byte ranges between two files
+// on the server without the data crossing the wire.
+pub use client::copy::{
+    CopyChunk, CopyChunkOutcome, CopyChunkResult, ResumeKey, ServerSideCopyLimits,
+};
+
+// Tree and file types
+pub use client::tree::{DirectoryEntry, FileInfo, FsInfo, Tree};
+
+// Pipeline
+pub use client::pipeline::{Op, OpResult, Pipeline};
+
+// Connection-level types (useful for advanced users)
+pub use client::connection::{CompoundOp, Frame, NegotiatedParams};
+pub use client::session::Session;
+
+// Diagnostics: snapshot tree returned by `SmbClient::diagnostics()` /
+// `Connection::diagnostics()`.
+pub use client::diagnostics::{
+    ClientInfo, ClientMetricsSnapshot, CompressionInfo, ConnectionDiagnostics, CreditInfo,
+    DfsCacheEntry, Diagnostics, EncryptionInfo, MetricsSnapshot, NegotiatedSummary,
+    SessionDiagnostics, SigningInfo,
+};
+
+// File watching
+pub use client::watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
+
+// Share enumeration
+pub use rpc::srvsvc::ShareInfo;
+
+// Kerberos authentication
+pub use auth::kerberos::{KerberosAuthenticator, KerberosCredentials};

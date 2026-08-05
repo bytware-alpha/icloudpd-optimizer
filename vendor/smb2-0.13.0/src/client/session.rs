@@ -1,0 +1,865 @@
+//! Authenticated SMB2 session.
+//!
+//! The [`Session`] type manages the multi-round-trip SESSION_SETUP exchange
+//! (NTLM authentication), key derivation, and signing activation.
+
+use log::{debug, info, trace, warn};
+
+use crate::auth::ntlm::{NtlmAuthenticator, NtlmCredentials};
+use crate::client::connection::Connection;
+use crate::crypto::kdf::derive_session_keys;
+use crate::crypto::signing::{algorithm_for_dialect, SigningAlgorithm};
+use crate::error::Result;
+use crate::msg::session_setup::{SessionFlags, SessionSetupRequest, SessionSetupResponse};
+use crate::pack::{ReadCursor, Unpack};
+use crate::types::flags::{Capabilities, SecurityMode};
+use crate::types::status::NtStatus;
+use crate::types::{Command, Dialect, SessionId};
+use crate::Error;
+use zeroize::Zeroizing;
+
+use crate::msg::session_setup::SessionSetupRequestFlags;
+
+/// An authenticated SMB2 session with derived keys.
+#[derive(Debug)]
+pub struct Session {
+    /// The session ID assigned by the server.
+    pub session_id: SessionId,
+    /// Key used to sign outgoing messages.
+    pub signing_key: Zeroizing<Vec<u8>>,
+    /// Key used to encrypt outgoing messages (SMB 3.x).
+    pub encryption_key: Option<Zeroizing<Vec<u8>>>,
+    /// Key used to decrypt incoming messages (SMB 3.x).
+    pub decryption_key: Option<Zeroizing<Vec<u8>>>,
+    /// The signing algorithm to use.
+    pub signing_algorithm: SigningAlgorithm,
+    /// Whether outgoing messages should be signed.
+    pub should_sign: bool,
+    /// Whether outgoing messages should be encrypted.
+    pub should_encrypt: bool,
+    /// Exact flags returned by the server's successful SESSION_SETUP response.
+    ///
+    /// Retained so security-sensitive consumers can reject guest or null
+    /// authentication from wire evidence instead of inferring it indirectly.
+    pub session_flags: SessionFlags,
+}
+
+impl Session {
+    /// Perform the multi-round-trip SESSION_SETUP exchange.
+    ///
+    /// Steps:
+    /// 1. Send NTLM NEGOTIATE_MESSAGE in SESSION_SETUP.
+    /// 2. Receive STATUS_MORE_PROCESSING_REQUIRED with CHALLENGE_MESSAGE.
+    /// 3. Update preauth hash with request+response.
+    /// 4. Send NTLM AUTHENTICATE_MESSAGE in SESSION_SETUP.
+    /// 5. Receive STATUS_SUCCESS with session flags.
+    /// 6. Update preauth hash with request+response.
+    /// 7. Derive signing/encryption keys.
+    /// 8. Activate signing on the connection.
+    pub async fn setup(
+        conn: &mut Connection,
+        username: &str,
+        password: &str,
+        domain: &str,
+    ) -> Result<Session> {
+        let params = conn
+            .params()
+            .ok_or_else(|| Error::invalid_data("negotiate must complete before session setup"))?
+            .clone();
+
+        let mut auth = NtlmAuthenticator::new(NtlmCredentials {
+            username: username.to_string(),
+            password: password.to_string(),
+            domain: domain.to_string(),
+        });
+
+        // Clone the preauth hasher for this session (spec: per-session hash).
+        let mut session_hasher = conn.preauth_hasher().clone();
+
+        // ── Round 1: NEGOTIATE_MESSAGE ──
+        debug!("session: round 1, sending NTLM negotiate");
+
+        let type1_bytes = auth.negotiate();
+
+        let req1 = SessionSetupRequest {
+            flags: SessionSetupRequestFlags(0),
+            security_mode: SecurityMode::new(SecurityMode::SIGNING_ENABLED),
+            capabilities: Capabilities::default(),
+            channel: 0,
+            previous_session_id: 0,
+            security_buffer: type1_bytes,
+        };
+
+        let (frame1, req1_raw) = conn
+            .execute_capturing_request(Command::SessionSetup, &req1, None)
+            .await?;
+
+        // Update session preauth hash with request.
+        session_hasher.update(&req1_raw);
+
+        let resp1_header = frame1.header;
+        let resp1_body = frame1.body;
+
+        // Update session preauth hash with response.
+        session_hasher.update(&frame1.raw);
+
+        if resp1_header.command != Command::SessionSetup {
+            return Err(Error::invalid_data(format!(
+                "expected SessionSetup response, got {:?}",
+                resp1_header.command
+            )));
+        }
+
+        if !resp1_header.status.is_more_processing_required() {
+            if resp1_header.status.is_error() {
+                return Err(Error::Protocol {
+                    status: resp1_header.status,
+                    command: Command::SessionSetup,
+                });
+            }
+            return Err(Error::invalid_data(
+                "expected STATUS_MORE_PROCESSING_REQUIRED, got success on first round",
+            ));
+        }
+
+        // The server assigned a session ID -- use it for subsequent requests.
+        debug!(
+            "session: round 1 complete, status={:?}, session_id={}",
+            resp1_header.status, resp1_header.session_id
+        );
+        conn.set_session_id(resp1_header.session_id);
+
+        // Parse the challenge response.
+        let mut cursor1 = ReadCursor::new(&resp1_body);
+        let setup_resp1 = SessionSetupResponse::unpack(&mut cursor1)?;
+
+        // ── Round 2: AUTHENTICATE_MESSAGE ──
+        debug!("session: round 2, sending NTLM authenticate");
+
+        let type3_bytes = auth.authenticate(&setup_resp1.security_buffer)?;
+
+        let req2 = SessionSetupRequest {
+            flags: SessionSetupRequestFlags(0),
+            security_mode: SecurityMode::new(SecurityMode::SIGNING_ENABLED),
+            capabilities: Capabilities::default(),
+            channel: 0,
+            previous_session_id: 0,
+            security_buffer: type3_bytes,
+        };
+
+        let (frame2, req2_raw) = conn
+            .execute_capturing_request(Command::SessionSetup, &req2, None)
+            .await?;
+
+        // Update session preauth hash with the request ONLY.
+        // The final SESSION_SETUP response (STATUS_SUCCESS) is NOT
+        // included in the preauth hash (spec section 3.2.5.3.1).
+        // Only STATUS_MORE_PROCESSING_REQUIRED responses are hashed.
+        session_hasher.update(&req2_raw);
+
+        let resp2_header = frame2.header;
+        let resp2_body = frame2.body;
+
+        // Do NOT hash the success response -- the preauth hash used for
+        // key derivation contains only messages up to (and including)
+        // the final authenticate request, not the success response.
+
+        if resp2_header.command != Command::SessionSetup {
+            return Err(Error::invalid_data(format!(
+                "expected SessionSetup response, got {:?}",
+                resp2_header.command
+            )));
+        }
+
+        if resp2_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: resp2_header.status,
+                command: Command::SessionSetup,
+            });
+        }
+
+        // Parse the final response.
+        let mut cursor2 = ReadCursor::new(&resp2_body);
+        let setup_resp2 = SessionSetupResponse::unpack(&mut cursor2)?;
+
+        let session_id = resp2_header.session_id;
+        conn.set_session_id(session_id);
+
+        // Get the session key from NTLM.
+        let session_key =
+            exact_ntlm_session_key(auth.session_key().ok_or_else(|| Error::Auth {
+                message: "NTLM did not produce a session key".to_string(),
+            })?)?;
+
+        // Determine signing algorithm.
+        let gmac_negotiated = params.gmac_negotiated;
+        let signing_algorithm = algorithm_for_dialect(params.dialect, gmac_negotiated);
+        debug!(
+            "session: signing_algo={:?}, dialect={}",
+            signing_algorithm, params.dialect
+        );
+
+        // Derive keys for SMB 3.x, or use session key directly for SMB 2.x.
+        trace!(
+            "session: deriving keys, session_key_len={}",
+            session_key.len()
+        );
+        let (signing_key, encryption_key, decryption_key) = match params.dialect {
+            Dialect::Smb3_0 | Dialect::Smb3_0_2 => {
+                let keys = derive_session_keys(&session_key, params.dialect, None, 128);
+                (
+                    keys.signing_key,
+                    Some(keys.encryption_key),
+                    Some(keys.decryption_key),
+                )
+            }
+            Dialect::Smb3_1_1 => {
+                // Key length: 256 bits only for AES-256 ciphers. GMAC signing
+                // uses AES-128-GCM internally, so it needs 128-bit (16-byte) keys.
+                let key_len_bits = match params.cipher {
+                    Some(crate::crypto::encryption::Cipher::Aes256Ccm)
+                    | Some(crate::crypto::encryption::Cipher::Aes256Gcm) => 256,
+                    _ => 128,
+                };
+                let keys = derive_session_keys(
+                    &session_key,
+                    Dialect::Smb3_1_1,
+                    Some(session_hasher.value()),
+                    key_len_bits,
+                );
+                (
+                    keys.signing_key,
+                    Some(keys.encryption_key),
+                    Some(keys.decryption_key),
+                )
+            }
+            _ => {
+                // SMB 2.x: use session key directly for signing.
+                (session_key.clone(), None, None)
+            }
+        };
+
+        // Determine if we should sign.
+        let should_sign = params.signing_required
+            || !setup_resp2.session_flags.is_guest() && !setup_resp2.session_flags.is_null();
+
+        let should_encrypt = setup_resp2.session_flags.encrypt_data();
+
+        // Activate signing on the connection.
+        if should_sign {
+            conn.activate_signing(signing_key.clone(), signing_algorithm)?;
+        }
+
+        // Activate encryption on the connection if the session requires it.
+        // The cipher comes from negotiate contexts (SMB 3.1.1). If the server
+        // didn't send one (for example, Samba with `smb encrypt = required` sometimes
+        // omits the encryption context), fall back to AES-128-CCM which is
+        // universally supported by all SMB 3.x servers.
+        if should_encrypt {
+            let cipher = params
+                .cipher
+                .unwrap_or(crate::crypto::encryption::Cipher::Aes128Ccm);
+            if let (Some(ref enc_key), Some(ref dec_key)) = (&encryption_key, &decryption_key) {
+                conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher)?;
+            } else {
+                warn!(
+                    "session: encryption requested but missing keys, \
+                     enc_key={}, dec_key={}",
+                    encryption_key.is_some(),
+                    decryption_key.is_some(),
+                );
+            }
+        }
+
+        conn.register_established_session(
+            session_id,
+            should_sign,
+            should_encrypt,
+            signing_algorithm,
+        )?;
+
+        info!(
+            "session: established, session_id={}, sign={}, encrypt={}",
+            session_id, should_sign, should_encrypt
+        );
+
+        Ok(Session {
+            session_id,
+            signing_key,
+            encryption_key,
+            decryption_key,
+            signing_algorithm,
+            should_sign,
+            should_encrypt,
+            session_flags: setup_resp2.session_flags,
+        })
+    }
+
+    /// Perform Kerberos-based SESSION_SETUP.
+    ///
+    /// Authenticates against the KDC first (AS + TGS), then sends the
+    /// SPNEGO-wrapped AP-REQ in SESSION_SETUP. Handles both single-round
+    /// (STATUS_SUCCESS) and mutual-auth (STATUS_MORE_PROCESSING_REQUIRED)
+    /// flows.
+    ///
+    /// The session key comes from the Kerberos TGS exchange, not from the
+    /// SMB server response.
+    /// Perform Kerberos-based SESSION_SETUP using a credential cache.
+    ///
+    /// Reads cached tickets from the ccache. If a service ticket for
+    /// `cifs/<server_hostname>` is cached, uses it directly (no KDC needed).
+    /// If only a TGT is cached, does a TGS exchange for the service ticket.
+    pub async fn setup_kerberos_from_ccache(
+        conn: &mut Connection,
+        credentials: &crate::auth::kerberos::KerberosCredentials,
+        server_hostname: &str,
+        ccache: &crate::auth::kerberos::ccache::CCache,
+    ) -> Result<Session> {
+        let mut auth = crate::auth::kerberos::KerberosAuthenticator::new(credentials.clone());
+        auth.authenticate_from_ccache(ccache, server_hostname)
+            .await?;
+        Self::setup_kerberos_with_auth(conn, &mut auth).await
+    }
+
+    /// Perform Kerberos-based SESSION_SETUP.
+    ///
+    /// Authenticates against the KDC first (AS + TGS), then sends the
+    /// SPNEGO-wrapped AP-REQ in SESSION_SETUP. Handles both single-round
+    /// (STATUS_SUCCESS) and mutual-auth (STATUS_MORE_PROCESSING_REQUIRED)
+    /// flows.
+    ///
+    /// The session key comes from the Kerberos TGS exchange, not from the
+    /// SMB server response.
+    pub async fn setup_kerberos(
+        conn: &mut Connection,
+        credentials: &crate::auth::kerberos::KerberosCredentials,
+        server_hostname: &str,
+    ) -> Result<Session> {
+        let mut auth = crate::auth::kerberos::KerberosAuthenticator::new(credentials.clone());
+        auth.authenticate(server_hostname).await?;
+        Self::setup_kerberos_with_auth(conn, &mut auth).await
+    }
+
+    /// Shared Kerberos SESSION_SETUP logic used by both password-based
+    /// and ccache-based authentication paths.
+    async fn setup_kerberos_with_auth(
+        conn: &mut Connection,
+        auth: &mut crate::auth::kerberos::KerberosAuthenticator,
+    ) -> Result<Session> {
+        let params = conn
+            .params()
+            .ok_or_else(|| Error::invalid_data("negotiate must complete before session setup"))?
+            .clone();
+
+        let token = auth
+            .token()
+            .ok_or_else(|| Error::Auth {
+                message: "Kerberos authentication produced no token".to_string(),
+            })?
+            .to_vec();
+
+        debug!("session: Kerberos auth complete, token_len={}", token.len());
+
+        // Clone the preauth hasher for this session.
+        let mut session_hasher = conn.preauth_hasher().clone();
+
+        // Step 2: Send SPNEGO-wrapped AP-REQ in SESSION_SETUP.
+        let req = SessionSetupRequest {
+            flags: SessionSetupRequestFlags(0),
+            security_mode: SecurityMode::new(SecurityMode::SIGNING_ENABLED),
+            capabilities: Capabilities::default(),
+            channel: 0,
+            previous_session_id: 0,
+            security_buffer: token,
+        };
+
+        let (frame, req_raw) = conn
+            .execute_capturing_request(Command::SessionSetup, &req, None)
+            .await?;
+
+        // Hash the request (same as NTLM round 1).
+        session_hasher.update(&req_raw);
+
+        let resp_header = frame.header;
+        let resp_body = frame.body;
+        let resp_raw = frame.raw;
+
+        if resp_header.command != Command::SessionSetup {
+            return Err(Error::invalid_data(format!(
+                "expected SessionSetup response, got {:?}",
+                resp_header.command
+            )));
+        }
+
+        if resp_header.status != NtStatus::SUCCESS
+            && !resp_header.status.is_more_processing_required()
+        {
+            return Err(Error::Protocol {
+                status: resp_header.status,
+                command: Command::SessionSetup,
+            });
+        }
+
+        // The server assigned a session ID.
+        let session_id = resp_header.session_id;
+        conn.set_session_id(session_id);
+
+        let mut cursor = ReadCursor::new(&resp_body);
+        let setup_resp = SessionSetupResponse::unpack(&mut cursor)?;
+
+        if resp_header.status.is_more_processing_required() {
+            debug!(
+                "session: Kerberos got MORE_PROCESSING_REQUIRED, session_id={}",
+                session_id
+            );
+
+            // Hash the response per MS-SMB2 3.2.5.3.1.
+            session_hasher.update(&resp_raw);
+        }
+
+        // Process the SPNEGO response token (AP-REP or KRB-ERROR).
+        // This applies to both STATUS_SUCCESS and MORE_PROCESSING_REQUIRED —
+        // the server may include an AP-REP with a sub-session key in either.
+        if !setup_resp.security_buffer.is_empty() {
+            let spnego_resp =
+                crate::auth::spnego::parse_neg_token_resp(&setup_resp.security_buffer)?;
+            debug!(
+                "session: SPNEGO state={:?}, has_token={}, supported_mech={:02x?}",
+                spnego_resp.neg_state,
+                spnego_resp.response_token.is_some(),
+                spnego_resp.supported_mech.as_deref().unwrap_or(&[]),
+            );
+
+            if let Some(ref token_bytes) = spnego_resp.response_token {
+                auth.process_mutual_auth_token(token_bytes)?;
+            }
+        }
+
+        // Get the session key AFTER processing the AP-REP (the server's
+        // subkey may have overridden ours).
+        //
+        // Per MS-SMB2 3.2.5.3: "Session.SessionKey MUST be set to the first
+        // 16 bytes of the cryptographic key queried from the GSS protocol."
+        let full_key = auth.session_key().ok_or_else(|| Error::Auth {
+            message: "Kerberos authentication produced no session key".to_string(),
+        })?;
+        let session_key = bounded_kerberos_session_key(full_key)?;
+
+        debug!(
+            "session: Kerberos session_key_len={} (truncated from {})",
+            session_key.len(),
+            full_key.len()
+        );
+
+        // Determine signing algorithm.
+        let signing_algorithm = algorithm_for_dialect(params.dialect, params.gmac_negotiated);
+        debug!(
+            "session: Kerberos signing_algo={:?}, dialect={}",
+            signing_algorithm, params.dialect
+        );
+
+        // Derive keys for SMB 3.x using the Kerberos session key.
+        let (signing_key, encryption_key, decryption_key) = match params.dialect {
+            Dialect::Smb3_0 | Dialect::Smb3_0_2 => {
+                let keys = derive_session_keys(&session_key, params.dialect, None, 128);
+                (
+                    keys.signing_key,
+                    Some(keys.encryption_key),
+                    Some(keys.decryption_key),
+                )
+            }
+            Dialect::Smb3_1_1 => {
+                let key_len_bits = match params.cipher {
+                    Some(crate::crypto::encryption::Cipher::Aes256Ccm)
+                    | Some(crate::crypto::encryption::Cipher::Aes256Gcm) => 256,
+                    _ => 128,
+                };
+                let keys = derive_session_keys(
+                    &session_key,
+                    Dialect::Smb3_1_1,
+                    Some(session_hasher.value()),
+                    key_len_bits,
+                );
+                (
+                    keys.signing_key,
+                    Some(keys.encryption_key),
+                    Some(keys.decryption_key),
+                )
+            }
+            _ => (session_key.clone(), None, None),
+        };
+
+        let should_sign = params.signing_required
+            || !setup_resp.session_flags.is_guest() && !setup_resp.session_flags.is_null();
+
+        let should_encrypt = setup_resp.session_flags.encrypt_data();
+
+        if should_sign {
+            conn.activate_signing(signing_key.clone(), signing_algorithm)?;
+        }
+
+        if should_encrypt {
+            let cipher = params
+                .cipher
+                .unwrap_or(crate::crypto::encryption::Cipher::Aes128Ccm);
+            if let (Some(ref enc_key), Some(ref dec_key)) = (&encryption_key, &decryption_key) {
+                conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher)?;
+            }
+        }
+
+        conn.register_established_session(
+            session_id,
+            should_sign,
+            should_encrypt,
+            signing_algorithm,
+        )?;
+
+        info!(
+            "session: Kerberos established, session_id={}, sign={}, encrypt={}",
+            session_id, should_sign, should_encrypt
+        );
+
+        Ok(Session {
+            session_id,
+            signing_key,
+            encryption_key,
+            decryption_key,
+            signing_algorithm,
+            should_sign,
+            should_encrypt,
+            session_flags: setup_resp.session_flags,
+        })
+    }
+}
+
+const SMB_SESSION_KEY_BYTES: usize = 16;
+const MAX_KERBEROS_SESSION_KEY_BYTES: usize = 64;
+
+fn exact_ntlm_session_key(key: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    if key.len() != SMB_SESSION_KEY_BYTES {
+        return Err(Error::Auth {
+            message: "NTLM session key has invalid length".to_string(),
+        });
+    }
+    Ok(Zeroizing::new(key.to_vec()))
+}
+
+fn bounded_kerberos_session_key(key: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    if !(SMB_SESSION_KEY_BYTES..=MAX_KERBEROS_SESSION_KEY_BYTES).contains(&key.len()) {
+        return Err(Error::Auth {
+            message: "Kerberos session key has invalid length".to_string(),
+        });
+    }
+    Ok(Zeroizing::new(key[..SMB_SESSION_KEY_BYTES].to_vec()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::connection::{pack_message, Connection, NegotiatedParams};
+    use crate::msg::header::Header;
+    use crate::msg::session_setup::{SessionFlags, SessionSetupResponse};
+    use crate::pack::Guid;
+    use crate::transport::MockTransport;
+    use crate::types::flags::Capabilities;
+    use crate::types::status::NtStatus;
+    use crate::types::{Command, Dialect, SessionId};
+    use std::sync::Arc;
+
+    /// Build a session setup response with the given status and session ID.
+    fn build_session_setup_response(
+        status: NtStatus,
+        session_id: SessionId,
+        security_buffer: Vec<u8>,
+        session_flags: SessionFlags,
+    ) -> Vec<u8> {
+        let mut h = Header::new_request(Command::SessionSetup);
+        h.flags.set_response();
+        h.credits = 32;
+        h.status = status;
+        h.session_id = session_id;
+
+        let body = SessionSetupResponse {
+            session_flags,
+            security_buffer,
+        };
+
+        pack_message(&h, &body)
+    }
+
+    /// Build a minimal NTLM challenge message (Type 2).
+    ///
+    /// This is a stripped-down challenge that the NtlmAuthenticator can parse.
+    fn build_ntlm_challenge() -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Signature (8 bytes)
+        buf.extend_from_slice(b"NTLMSSP\0");
+        // MessageType = 2 (4 bytes)
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        // TargetNameFields: Len=0, MaxLen=0, Offset=56
+        buf.extend_from_slice(&0u16.to_le_bytes()); // Len
+        buf.extend_from_slice(&0u16.to_le_bytes()); // MaxLen
+        buf.extend_from_slice(&56u32.to_le_bytes()); // Offset
+                                                     // NegotiateFlags
+        let flags: u32 = 0x0000_0001 // UNICODE
+            | 0x0000_0200  // NTLM
+            | 0x0008_0000  // EXTENDED_SESSIONSECURITY
+            | 0x0080_0000  // TARGET_INFO
+            | 0x2000_0000  // 128
+            | 0x4000_0000  // KEY_EXCH
+            | 0x8000_0000  // 56
+            | 0x0000_0010  // SIGN
+            | 0x0000_0020; // SEAL
+        buf.extend_from_slice(&flags.to_le_bytes());
+        // ServerChallenge (8 bytes)
+        buf.extend_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]);
+        // Reserved (8 bytes)
+        buf.extend_from_slice(&[0u8; 8]);
+
+        // TargetInfoFields: Len, MaxLen, Offset (will be at offset 56 + target_name_len)
+        // Build target info: just MsvAvEOL
+        let target_info = build_av_eol();
+        let ti_offset = 56u32; // right after the fixed header
+        buf.extend_from_slice(&(target_info.len() as u16).to_le_bytes()); // Len
+        buf.extend_from_slice(&(target_info.len() as u16).to_le_bytes()); // MaxLen
+        buf.extend_from_slice(&ti_offset.to_le_bytes()); // Offset
+
+        // Ensure we're at offset 56 (pad if needed).
+        while buf.len() < 56 {
+            buf.push(0);
+        }
+
+        // Target info data
+        buf.extend_from_slice(&target_info);
+
+        buf
+    }
+
+    /// Build an AV_PAIR list with just MsvAvEOL.
+    fn build_av_eol() -> Vec<u8> {
+        let mut buf = Vec::new();
+        // MsvAvEOL: AvId=0, AvLen=0
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf
+    }
+
+    #[tokio::test]
+    async fn session_setup_binds_exact_connection_diagnostics() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let session_id = SessionId(0xDEAD_BEEF);
+
+        // Queue the two session setup responses.
+        let challenge = build_ntlm_challenge();
+        mock.queue_response(build_session_setup_response(
+            NtStatus::MORE_PROCESSING_REQUIRED,
+            session_id,
+            challenge,
+            SessionFlags(0),
+        ));
+        mock.queue_response(build_session_setup_response(
+            NtStatus::SUCCESS,
+            session_id,
+            vec![],
+            SessionFlags(0),
+        ));
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        // Set up negotiate params (pretend we already negotiated).
+        // We need to call negotiate or set params manually.
+        // Let's also queue a negotiate response first.
+        // Actually, let's set params directly.
+        set_test_params(&mut conn, Dialect::Smb2_0_2);
+
+        let session = Session::setup(&mut conn, "user", "pass", "").await.unwrap();
+        assert_eq!(session.session_id, session_id);
+        let diagnostic = conn
+            .diagnostics()
+            .session
+            .expect("successful setup must publish its exact session binding");
+        assert_eq!(diagnostic.session_id, session.session_id);
+        assert_eq!(diagnostic.should_sign, session.should_sign);
+        assert_eq!(diagnostic.should_encrypt, session.should_encrypt);
+        assert_eq!(diagnostic.signing_algorithm, session.signing_algorithm);
+    }
+
+    #[tokio::test]
+    async fn session_setup_retains_exact_guest_and_null_flags() {
+        for expected in [
+            SessionFlags(SessionFlags::IS_GUEST),
+            SessionFlags(SessionFlags::IS_NULL),
+        ] {
+            let mock = Arc::new(MockTransport::new());
+            mock.enable_auto_rewrite_msg_id();
+            let session_id = SessionId(0xC0DE);
+            mock.queue_response(build_session_setup_response(
+                NtStatus::MORE_PROCESSING_REQUIRED,
+                session_id,
+                build_ntlm_challenge(),
+                SessionFlags(0),
+            ));
+            mock.queue_response(build_session_setup_response(
+                NtStatus::SUCCESS,
+                session_id,
+                vec![],
+                expected,
+            ));
+            let mut conn =
+                Connection::from_transport(Box::new(mock.clone()), Box::new(mock), "test-server");
+            set_test_params(&mut conn, Dialect::Smb2_0_2);
+
+            let session = Session::setup(&mut conn, "user", "pass", "").await.unwrap();
+            assert_eq!(session.session_flags, expected);
+        }
+    }
+
+    #[test]
+    fn session_key_copies_are_bounded_and_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Zeroizing<Vec<u8>>>();
+
+        assert_eq!(exact_ntlm_session_key(&[0x41; 16]).unwrap().len(), 16);
+        assert!(exact_ntlm_session_key(&[0x41; 15]).is_err());
+        assert!(exact_ntlm_session_key(&[0x41; 17]).is_err());
+
+        for length in [16, 32, 64] {
+            let source = vec![0x42; length];
+            assert_eq!(bounded_kerberos_session_key(&source).unwrap().len(), 16);
+        }
+        assert!(bounded_kerberos_session_key(&[0x42; 15]).is_err());
+        assert!(bounded_kerberos_session_key(&[0x42; 65]).is_err());
+    }
+
+    #[tokio::test]
+    async fn session_setup_derives_signing_key() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let session_id = SessionId(0x1234);
+
+        let challenge = build_ntlm_challenge();
+        mock.queue_response(build_session_setup_response(
+            NtStatus::MORE_PROCESSING_REQUIRED,
+            session_id,
+            challenge,
+            SessionFlags(0),
+        ));
+        mock.queue_response(build_session_setup_response(
+            NtStatus::SUCCESS,
+            session_id,
+            vec![],
+            SessionFlags(0),
+        ));
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        set_test_params(&mut conn, Dialect::Smb2_0_2);
+
+        let session = Session::setup(&mut conn, "user", "pass", "").await.unwrap();
+        assert!(!session.signing_key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_setup_activates_signing() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let session_id = SessionId(0x5678);
+
+        let challenge = build_ntlm_challenge();
+        mock.queue_response(build_session_setup_response(
+            NtStatus::MORE_PROCESSING_REQUIRED,
+            session_id,
+            challenge,
+            SessionFlags(0),
+        ));
+        mock.queue_response(build_session_setup_response(
+            NtStatus::SUCCESS,
+            session_id,
+            vec![],
+            SessionFlags(0),
+        ));
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        set_test_params(&mut conn, Dialect::Smb2_0_2);
+
+        let session = Session::setup(&mut conn, "user", "pass", "").await.unwrap();
+        assert!(session.should_sign);
+        assert_eq!(session.signing_algorithm, SigningAlgorithm::HmacSha256);
+    }
+
+    #[tokio::test]
+    async fn session_setup_error_on_auth_failure() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let session_id = SessionId(0x9999);
+
+        let challenge = build_ntlm_challenge();
+        mock.queue_response(build_session_setup_response(
+            NtStatus::MORE_PROCESSING_REQUIRED,
+            session_id,
+            challenge,
+            SessionFlags(0),
+        ));
+        // Auth fails on second round.
+        mock.queue_response(build_session_setup_response(
+            NtStatus::LOGON_FAILURE,
+            session_id,
+            vec![],
+            SessionFlags(0),
+        ));
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        set_test_params(&mut conn, Dialect::Smb2_0_2);
+
+        let result = Session::setup(&mut conn, "user", "badpass", "").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            conn.diagnostics().session.is_none(),
+            "failed setup must not publish a diagnostic session binding"
+        );
+        assert!(
+            matches!(
+                err,
+                Error::Protocol {
+                    status: NtStatus::LOGON_FAILURE,
+                    ..
+                }
+            ),
+            "expected LOGON_FAILURE, got: {err}"
+        );
+    }
+
+    /// Helper: set fake negotiated params on a connection.
+    fn set_test_params(conn: &mut Connection, dialect: Dialect) {
+        conn.set_test_params(NegotiatedParams {
+            dialect,
+            max_read_size: 65536,
+            max_write_size: 65536,
+            max_transact_size: 65536,
+            server_guid: Guid::ZERO,
+            signing_required: false,
+            capabilities: Capabilities::default(),
+            gmac_negotiated: false,
+            cipher: None,
+            compression_supported: false,
+        });
+    }
+}

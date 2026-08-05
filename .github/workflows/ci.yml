@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+env:
+  RUST_VERSION: "1.95"
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy, rustfmt
+      - name: Install runtime tools
+        run: brew install just libheif imagemagick exiftool
+      - name: Check
+        run: just check
+      - name: Release build
+        run: cargo build --release --locked
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy, rustfmt
+      - name: Install runtime tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libheif-examples \
+            libheif-plugin-libde265 \
+            libheif-plugin-x265 \
+            libimage-exiftool-perl \
+            imagemagick
+      - name: Verify real HEIF tools
+        run: |
+          command -v heif-enc
+          command -v heif-info
+      - name: Real sealed HEIF smoke
+        run: ICLOUDPD_OPTIMIZER_REQUIRE_REAL_HEIF_SMOKE=1 cargo test --locked --lib conversion_execution::tests::linux_real_heif_encoder_accepts_a_sealed_directory_descriptor_jpeg_when_available
+      - name: Test
+        run: cargo test --locked
+      - name: Build production image
+        run: docker build --tag icloudpd-optimizer:ci --file container/Containerfile .
+      - name: Smoke image doctor
+        run: docker run --rm icloudpd-optimizer:ci doctor --json

@@ -1,0 +1,3733 @@
+use std::ffi::{CStr, CString, OsString};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(all(test, target_os = "macos"))]
+use std::cell::RefCell;
+#[cfg(all(test, target_os = "macos"))]
+use std::collections::VecDeque;
+#[cfg(all(test, target_os = "macos"))]
+use std::sync::mpsc::{Receiver, SyncSender};
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
+#[cfg(all(test, target_os = "macos"))]
+use std::time::Duration;
+
+use image::ImageDecoder;
+use image::codecs::jpeg::JpegDecoder;
+use image::metadata::Orientation;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use url::Url;
+use uuid::Uuid;
+
+use crate::upload::{
+    CloudKitDatabaseScope, CloudKitDeleteSession, CloudKitLibraryDestination,
+    validate_cloudkit_resource_download_url, validate_library_destination,
+};
+use crate::workflow::OriginalAssetProof;
+
+pub const ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION: &str = "cloudkit-adjusted-source-v1";
+const ADJUSTED_SOURCE_KIND: &str = "cloudkit_adjusted_res_jpeg_full_res";
+const ADJUSTED_RESOURCE_FIELD: &str = "resJPEGFullRes";
+const ADJUSTED_WIDTH_FIELD: &str = "resJPEGFullWidth";
+const ADJUSTED_HEIGHT_FIELD: &str = "resJPEGFullHeight";
+const ADJUSTED_FILE_TYPE_FIELD: &str = "resJPEGFullFileType";
+const ADJUSTED_FINGERPRINT_FIELD: &str = "resJPEGFullFingerprint";
+pub const MAX_ADJUSTED_SOURCE_ENCODED_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_DECODED_JPEG_BYTES: u64 = 256 * 1024 * 1024;
+const MIN_VISUAL_STDEV: f64 = 0.001;
+const HASH_BUFFER_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudKitAdjustedSourceResolveRequest {
+    pub asset_id: String,
+    pub original_asset: OriginalAssetProof,
+    pub output_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudKitAdjustedSourceDownload {
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+/// Compile-time restricted to CloudKit record lookup and resource download.
+///
+/// ```compile_fail
+/// use icloudpd_optimizer::adjusted_source::CloudKitAdjustedSourceTransport;
+/// use icloudpd_optimizer::upload::{CloudKitDeleteTransport, ReqwestCloudKitReadTransport};
+///
+/// fn requires_delete<T: CloudKitDeleteTransport>(_transport: T) {}
+/// requires_delete(ReqwestCloudKitReadTransport::new().unwrap());
+/// ```
+pub trait CloudKitAdjustedSourceTransport {
+    fn post_records_lookup(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, AdjustedSourceError>;
+
+    /// Streams a resource into the caller-created, create-new destination-directory temp file.
+    fn download_resource_to_create_new(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        download_url: &Url,
+        expected_size_bytes: u64,
+        temp_file: &mut File,
+    ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError>;
+}
+
+impl<T: CloudKitAdjustedSourceTransport + ?Sized> CloudKitAdjustedSourceTransport for &mut T {
+    fn post_records_lookup(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, AdjustedSourceError> {
+        (**self).post_records_lookup(session, payload)
+    }
+
+    fn download_resource_to_create_new(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        download_url: &Url,
+        expected_size_bytes: u64,
+        temp_file: &mut File,
+    ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
+        (**self).download_resource_to_create_new(
+            session,
+            download_url,
+            expected_size_bytes,
+            temp_file,
+        )
+    }
+}
+
+pub struct CloudKitAdjustedSourceResolver<T> {
+    transport: T,
+}
+
+impl<T> CloudKitAdjustedSourceResolver<T> {
+    pub fn new(transport: T) -> Self {
+        Self { transport }
+    }
+
+    pub fn into_inner(self) -> T {
+        self.transport
+    }
+}
+
+#[cfg(unix)]
+impl<T: CloudKitAdjustedSourceTransport> CloudKitAdjustedSourceResolver<T> {
+    pub fn resolve(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        request: &CloudKitAdjustedSourceResolveRequest,
+    ) -> Result<CloudKitAdjustedSourceProof, AdjustedSourceError> {
+        let destination = validate_request(session, request)?;
+        let output = AnchoredOutput::open(&request.output_path)?;
+        let asset = lookup_exact_record(
+            &mut self.transport,
+            session,
+            &request.original_asset.record_name,
+            &request.original_asset.record_change_tag,
+            "CPLAsset",
+            &destination,
+            &[
+                "masterRef",
+                "isDeleted",
+                ADJUSTED_RESOURCE_FIELD,
+                ADJUSTED_WIDTH_FIELD,
+                ADJUSTED_HEIGHT_FIELD,
+                ADJUSTED_FILE_TYPE_FIELD,
+                ADJUSTED_FINGERPRINT_FIELD,
+            ],
+        )?;
+        let asset_fields = record_fields(&asset)?;
+        let source = match parse_adjusted_resource(&asset, None)? {
+            Some(resource) => resource,
+            None => {
+                let master_record_name = parse_master_ref(asset_fields, &destination)?;
+                let master = lookup_exact_record(
+                    &mut self.transport,
+                    session,
+                    &master_record_name,
+                    "",
+                    "CPLMaster",
+                    &destination,
+                    &[
+                        "isDeleted",
+                        ADJUSTED_RESOURCE_FIELD,
+                        ADJUSTED_WIDTH_FIELD,
+                        ADJUSTED_HEIGHT_FIELD,
+                        ADJUSTED_FILE_TYPE_FIELD,
+                        ADJUSTED_FINGERPRINT_FIELD,
+                    ],
+                )?;
+                parse_adjusted_resource(&master, Some(master_record_name))?.ok_or(
+                    AdjustedSourceError::InvalidResponse(
+                        "exact master record omitted resJPEGFullRes",
+                    ),
+                )?
+            }
+        };
+        if source.size_bytes > MAX_ADJUSTED_SOURCE_ENCODED_BYTES {
+            return Err(AdjustedSourceError::DeclaredResourceTooLarge);
+        }
+        let mut temp = output.create_temp()?;
+        let download = self.transport.download_resource_to_create_new(
+            session,
+            &source.download_url,
+            source.size_bytes,
+            temp.file_mut()?,
+        )?;
+        temp.sync_and_close()?;
+        let temp_artifact = temp.open_regular()?;
+        let temp_identity = temp_artifact.identity.clone();
+        if temp_identity.size_bytes != source.size_bytes || download.size_bytes != source.size_bytes
+        {
+            return Err(AdjustedSourceError::DownloadedSizeMismatch);
+        }
+        if !is_sha256(&download.sha256) || temp_identity.sha256 != download.sha256 {
+            return Err(AdjustedSourceError::DownloadedHashMismatch);
+        }
+        verify_jpeg(&temp_artifact.file, source.width, source.height)?;
+
+        let final_artifact = match output.open_final()? {
+            Some(existing) => {
+                if !existing.identity.matches_bytes(&temp_identity) {
+                    return Err(AdjustedSourceError::ExistingOutputMismatch);
+                }
+                existing
+            }
+            None => {
+                let result = temp.install_exclusive(&temp_identity)?;
+                output.final_after_install(&temp_identity, result)?
+            }
+        };
+        verify_jpeg(&final_artifact.file, source.width, source.height)?;
+        final_artifact
+            .file
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        output.fsync_parent()?;
+        output.ensure_final_identity(&final_artifact.identity)?;
+        temp.cleanup()?;
+
+        Ok(CloudKitAdjustedSourceProof {
+            schema_version: ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION.to_string(),
+            source_kind: ADJUSTED_SOURCE_KIND.to_string(),
+            asset_id: request.asset_id.clone(),
+            asset_record_name: request.original_asset.record_name.clone(),
+            asset_record_change_tag: request.original_asset.record_change_tag.clone(),
+            asset_record_type: request.original_asset.record_type.clone(),
+            resource_record_name: source.record_name,
+            resource_record_change_tag: source.record_change_tag,
+            resource_record_type: source.record_type,
+            database_scope: destination.database_scope,
+            zone_name: destination.zone_name,
+            owner_record_name: destination.owner_record_name,
+            master_record_name: source.master_record_name,
+            resource_field: ADJUSTED_RESOURCE_FIELD.to_string(),
+            declared_file_type: source.file_type,
+            declared_fingerprint: source.fingerprint,
+            declared_size_bytes: source.size_bytes,
+            width: source.width,
+            height: source.height,
+            local_path: request.output_path.clone(),
+            downloaded_size_bytes: final_artifact.identity.size_bytes,
+            downloaded_sha256: final_artifact.identity.sha256.clone(),
+            orientation: 1,
+            verified_at_unix_seconds: verified_timestamp()?,
+        })
+    }
+}
+
+#[cfg(not(unix))]
+impl<T: CloudKitAdjustedSourceTransport> CloudKitAdjustedSourceResolver<T> {
+    pub fn resolve(
+        &mut self,
+        _session: &CloudKitDeleteSession,
+        _request: &CloudKitAdjustedSourceResolveRequest,
+    ) -> Result<CloudKitAdjustedSourceProof, AdjustedSourceError> {
+        Err(AdjustedSourceError::Filesystem)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudKitAdjustedSourceProof {
+    pub schema_version: String,
+    pub source_kind: String,
+    pub asset_id: String,
+    pub asset_record_name: String,
+    pub asset_record_change_tag: String,
+    pub asset_record_type: String,
+    pub resource_record_name: String,
+    pub resource_record_change_tag: String,
+    pub resource_record_type: String,
+    pub database_scope: CloudKitDatabaseScope,
+    pub zone_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_record_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub master_record_name: Option<String>,
+    pub resource_field: String,
+    pub declared_file_type: String,
+    pub declared_fingerprint: String,
+    pub declared_size_bytes: u64,
+    pub width: u32,
+    pub height: u32,
+    pub local_path: PathBuf,
+    pub downloaded_size_bytes: u64,
+    pub downloaded_sha256: String,
+    pub orientation: u8,
+    pub verified_at_unix_seconds: u64,
+}
+
+/// Returns the dedicated, output-adjacent location for a proven adjusted JPEG.
+///
+/// This name is deliberately distinct from conversion intermediates so retry
+/// cleanup cannot mistake the proof-bearing source for a disposable preview.
+pub fn adjusted_source_path_for_output(output_path: impl AsRef<Path>) -> PathBuf {
+    let mut adjusted_path = output_path.as_ref().to_path_buf();
+    adjusted_path.set_extension("adjusted-source.jpg");
+    adjusted_path
+}
+
+/// Produces the durable identity used to bind an adjusted conversion result to
+/// the exact CloudKit proof that authorized its JPEG input.
+pub fn adjusted_source_proof_digest(proof: &CloudKitAdjustedSourceProof) -> String {
+    let encoded = serde_json::to_vec(proof)
+        .expect("CloudKitAdjustedSourceProof must always serialize into JSON");
+    format!("{:x}", Sha256::digest(encoded))
+}
+
+/// Validates only durable proof/lineage fields. Callers that will read pixels
+/// must additionally materialize through the descriptor-safe API below.
+pub fn validate_adjusted_source_proof_lineage(
+    proof: &CloudKitAdjustedSourceProof,
+    asset_id: &str,
+    original_asset: &OriginalAssetProof,
+    output_path: impl AsRef<Path>,
+) -> Result<(), AdjustedSourceError> {
+    let expected_path = adjusted_source_path_for_output(output_path);
+    validate_adjusted_source_proof_fields(proof, asset_id, original_asset, &expected_path)
+}
+
+/// A private, descriptor-validated conversion input copied from the durable
+/// adjusted-source proof. Its random 0700 staging directory is owned by this
+/// object and removed on drop; it never owns or removes the proof source.
+#[cfg(unix)]
+pub struct MaterializedAdjustedSource {
+    staging: ConversionSourceStaging,
+    width: u32,
+    height: u32,
+    staged: OpenArtifact,
+}
+
+/// Descriptor-backed, sealed inputs for HEIC reverification. The source files
+/// remain separately held and validated; external tools receive only the
+/// private staged paths.
+#[cfg(unix)]
+pub(crate) struct ReverifyHeicSnapshot {
+    reference_source: AnchoredInput,
+    final_source: AnchoredInput,
+    mirror_source: AnchoredInput,
+    reference_staging: ConversionSourceStaging,
+    final_staging: ConversionSourceStaging,
+    reference_staged: OpenArtifact,
+    final_staged: OpenArtifact,
+}
+
+#[cfg(unix)]
+struct AnchoredInput {
+    parent: File,
+    name: CString,
+    artifact: OpenArtifact,
+}
+
+/// A CLOEXEC duplicate of an immutable staged capability, intended solely for
+/// the encoder child that explicitly opts into inheriting it.
+#[cfg(unix)]
+pub(crate) enum AdjustedSourceEncoderDescriptor {
+    File(File),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Directory(File),
+}
+
+#[cfg(not(unix))]
+pub struct MaterializedAdjustedSource;
+
+#[cfg(not(unix))]
+impl MaterializedAdjustedSource {
+    pub fn path(&self) -> &Path {
+        Path::new("")
+    }
+
+    pub fn revalidate_for_command(&self) -> Result<(), AdjustedSourceError> {
+        Err(AdjustedSourceError::Filesystem)
+    }
+}
+
+#[cfg(unix)]
+impl ReverifyHeicSnapshot {
+    pub(crate) fn reference_path(&self) -> &Path {
+        &self.reference_staging.path
+    }
+
+    pub(crate) fn final_path(&self) -> &Path {
+        &self.final_staging.path
+    }
+
+    pub(crate) fn final_sha256(&self) -> &str {
+        &self.final_source.artifact.identity.sha256
+    }
+
+    pub(crate) fn final_size_bytes(&self) -> u64 {
+        self.final_source.artifact.identity.size_bytes
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), AdjustedSourceError> {
+        self.reference_source.revalidate()?;
+        self.final_source.revalidate()?;
+        self.mirror_source.revalidate()?;
+        validate_staged_file(&self.reference_staging, &self.reference_staged)?;
+        validate_staged_file(&self.final_staging, &self.final_staged)
+    }
+
+    pub(crate) fn cleanup(&mut self) -> Result<(), AdjustedSourceError> {
+        self.final_staging.cleanup()?;
+        self.reference_staging.cleanup()
+    }
+}
+
+#[cfg(unix)]
+impl AnchoredInput {
+    fn revalidate(&self) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        let held = inspect_open_file(
+            self.artifact
+                .file
+                .try_clone()
+                .map_err(|_| AdjustedSourceError::Filesystem)?,
+        )?;
+        if held.identity != self.artifact.identity {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        let named = inspect_open_file(open_regular_at(self.parent.as_raw_fd(), &self.name)?)?;
+        if named.identity != self.artifact.identity {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn validate_staged_file(
+    staging: &ConversionSourceStaging,
+    artifact: &OpenArtifact,
+) -> Result<(), AdjustedSourceError> {
+    let held = inspect_open_file(
+        artifact
+            .file
+            .try_clone()
+            .map_err(|_| AdjustedSourceError::Filesystem)?,
+    )?;
+    if held.identity != artifact.identity {
+        return Err(AdjustedSourceError::ProofLocalFileMismatch);
+    }
+    staging.validate_file_exact(&artifact.identity)
+}
+
+/// Opens all source files with anchored no-follow semantics, validates final
+/// and mirror bytes against durable proofs, and materializes only reference and
+/// final from their held descriptors into sealed private staging.
+#[cfg(unix)]
+pub(crate) fn materialize_reverify_heic_snapshot(
+    reference_path: &Path,
+    final_path: &Path,
+    mirror_path: &Path,
+    expected_final_sha256: &str,
+    expected_final_size_bytes: u64,
+) -> Result<ReverifyHeicSnapshot, AdjustedSourceError> {
+    let reference_source = open_anchored_regular(reference_path)?;
+    let final_source = open_anchored_regular(final_path)?;
+    let mirror_source = open_anchored_regular(mirror_path)?;
+    if final_source.artifact.identity.sha256 != expected_final_sha256
+        || final_source.artifact.identity.size_bytes != expected_final_size_bytes
+        || mirror_source.artifact.identity.sha256 != expected_final_sha256
+        || mirror_source.artifact.identity.size_bytes != expected_final_size_bytes
+    {
+        return Err(AdjustedSourceError::ProofLocalFileMismatch);
+    }
+    let output = AnchoredOutput::open(reference_path)?;
+    let (reference_staging, reference_staged) = materialize_open_artifact(
+        &output,
+        reference_path,
+        c"reference.jpg",
+        &reference_source.artifact,
+    )?;
+    let (final_staging, final_staged) = materialize_open_artifact(
+        &output,
+        reference_path,
+        c"final.heic",
+        &final_source.artifact,
+    )?;
+    Ok(ReverifyHeicSnapshot {
+        reference_source,
+        final_source,
+        mirror_source,
+        reference_staging,
+        final_staging,
+        reference_staged,
+        final_staged,
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn materialize_reverify_heic_snapshot(
+    _reference_path: &Path,
+    _final_path: &Path,
+    _mirror_path: &Path,
+    _expected_final_sha256: &str,
+    _expected_final_size_bytes: u64,
+) -> Result<MaterializedAdjustedSource, AdjustedSourceError> {
+    Err(AdjustedSourceError::Filesystem)
+}
+
+#[cfg(test)]
+static TEST_MATERIALIZATION_SWAP_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static TEST_MATERIALIZATION_SWAP_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) struct TestMaterializationSwapGuard {
+    previous: Option<PathBuf>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacosFchflagsTarget {
+    Source,
+    StagingDirectory,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacosMetadataReadTarget {
+    BeforeClear,
+    AfterClear,
+    Rollback,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+struct TestMacosFchflagsPause {
+    entered: SyncSender<()>,
+    release: Receiver<()>,
+    timeout: Duration,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[derive(Default)]
+struct TestMacosFchflagsState {
+    failures: VecDeque<MacosFchflagsTarget>,
+    calls: Vec<MacosFchflagsTarget>,
+    metadata_failures: VecDeque<MacosMetadataReadTarget>,
+    metadata_calls: Vec<MacosMetadataReadTarget>,
+    source_pause: Option<TestMacosFchflagsPause>,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static TEST_MACOS_FCHFLAGS_STATE: RefCell<TestMacosFchflagsState> = const { RefCell::new(TestMacosFchflagsState {
+        failures: VecDeque::new(),
+        calls: Vec::new(),
+        metadata_failures: VecDeque::new(),
+        metadata_calls: Vec::new(),
+        source_pause: None,
+    }) };
+}
+
+#[cfg(all(test, target_os = "macos"))]
+struct TestMacosFchflagsFailureGuard {
+    previous: TestMacosFchflagsState,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+struct TestMacosFchflagsPauseGuard {
+    previous: Option<TestMacosFchflagsPause>,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl TestMacosFchflagsFailureGuard {
+    fn install() -> Self {
+        let previous = TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(std::mem::take);
+        Self { previous }
+    }
+
+    fn arm(&self, failures: impl IntoIterator<Item = MacosFchflagsTarget>) {
+        TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+            state.failures = failures.into_iter().collect();
+            state.calls.clear();
+        });
+    }
+
+    fn calls(&self) -> Vec<MacosFchflagsTarget> {
+        TEST_MACOS_FCHFLAGS_STATE.with_borrow(|state| state.calls.clone())
+    }
+
+    fn arm_metadata_reads(&self, failures: impl IntoIterator<Item = MacosMetadataReadTarget>) {
+        TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+            state.metadata_failures = failures.into_iter().collect();
+            state.metadata_calls.clear();
+        });
+    }
+
+    fn metadata_calls(&self) -> Vec<MacosMetadataReadTarget> {
+        TEST_MACOS_FCHFLAGS_STATE.with_borrow(|state| state.metadata_calls.clone())
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for TestMacosFchflagsFailureGuard {
+    fn drop(&mut self) {
+        TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+            *state = std::mem::take(&mut self.previous);
+        });
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl TestMacosFchflagsPauseGuard {
+    fn install(entered: SyncSender<()>, release: Receiver<()>, timeout: Duration) -> Self {
+        let previous = TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+            state.source_pause.replace(TestMacosFchflagsPause {
+                entered,
+                release,
+                timeout,
+            })
+        });
+        Self { previous }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for TestMacosFchflagsPauseGuard {
+    fn drop(&mut self) {
+        TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+            state.source_pause = self.previous.take();
+        });
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn assert_test_macos_fchflags_state_is_reset() {
+    TEST_MACOS_FCHFLAGS_STATE.with_borrow(|state| {
+        assert!(state.failures.is_empty());
+        assert!(state.calls.is_empty());
+        assert!(state.metadata_failures.is_empty());
+        assert!(state.metadata_calls.is_empty());
+        assert!(state.source_pause.is_none());
+    });
+}
+
+#[cfg(all(test, target_os = "macos"))]
+struct TestReleaseOnDrop {
+    sender: Option<SyncSender<()>>,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl TestReleaseOnDrop {
+    fn new(sender: SyncSender<()>) -> Self {
+        Self {
+            sender: Some(sender),
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for TestReleaseOnDrop {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.try_send(());
+        }
+    }
+}
+
+#[cfg(test)]
+impl TestMaterializationSwapGuard {
+    pub(crate) fn install(replacement_path: impl AsRef<Path>) -> Self {
+        let lock = TEST_MATERIALIZATION_SWAP_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut configured = TEST_MATERIALIZATION_SWAP_PATH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = configured.replace(replacement_path.as_ref().to_path_buf());
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestMaterializationSwapGuard {
+    fn drop(&mut self) {
+        let mut configured = TEST_MATERIALIZATION_SWAP_PATH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *configured = self.previous.take();
+    }
+}
+
+#[cfg(unix)]
+impl MaterializedAdjustedSource {
+    pub fn path(&self) -> &Path {
+        &self.staging.path
+    }
+
+    /// Validates both the held staged descriptor and its anchored pathname
+    /// immediately before the encoder is launched. The encoder must use a
+    /// descriptor returned below, never this pathname.
+    pub fn revalidate_for_command(&self) -> Result<(), AdjustedSourceError> {
+        self.validate_held_descriptor()?;
+        self.staging
+            .validate_file(&self.staged.identity, self.width, self.height)
+    }
+
+    pub(crate) fn duplicate_file_for_encoder(
+        &self,
+    ) -> Result<AdjustedSourceEncoderDescriptor, AdjustedSourceError> {
+        self.revalidate_for_command()?;
+        duplicate_encoder_descriptor(&self.staged.file, true)
+            .map(AdjustedSourceEncoderDescriptor::File)
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn duplicate_directory_for_encoder(
+        &self,
+    ) -> Result<AdjustedSourceEncoderDescriptor, AdjustedSourceError> {
+        self.revalidate_for_command()?;
+        duplicate_encoder_descriptor(&self.staging.staging, false)
+            .map(AdjustedSourceEncoderDescriptor::Directory)
+    }
+
+    fn validate_held_descriptor(&self) -> Result<(), AdjustedSourceError> {
+        let copy = self
+            .staged
+            .file
+            .try_clone()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        let current = inspect_open_file(copy)?;
+        if current.identity != self.staged.identity {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        verify_jpeg(&current.file, self.width, self.height)
+    }
+}
+
+#[cfg(unix)]
+impl AdjustedSourceEncoderDescriptor {
+    pub(crate) fn raw_fd(&self) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+
+        match self {
+            Self::File(file) | Self::Directory(file) => file.as_raw_fd(),
+        }
+    }
+
+    pub(crate) fn input_path(&self) -> OsString {
+        let descriptor = self.raw_fd();
+        match self {
+            Self::File(_) => OsString::from(format!("/dev/fd/{descriptor}")),
+            Self::Directory(_) => OsString::from(format!("/dev/fd/{descriptor}/source.jpg")),
+        }
+    }
+}
+
+/// Materializes the exact proven adjusted JPEG into an exclusively-owned
+/// conversion staging directory. The copy is made from the already-open source
+/// descriptor, never by reopening the proof pathname after validation.
+#[cfg(unix)]
+pub fn materialize_adjusted_source_for_conversion(
+    proof: &CloudKitAdjustedSourceProof,
+    asset_id: &str,
+    original_asset: &OriginalAssetProof,
+    output_path: impl AsRef<Path>,
+) -> Result<MaterializedAdjustedSource, AdjustedSourceError> {
+    let expected_path = adjusted_source_path_for_output(output_path);
+    let (output, source) =
+        open_validated_adjusted_source(proof, asset_id, original_asset, &expected_path)?;
+    let source_identity = source.identity.clone();
+    let mut staging = ConversionSourceStaging::create(&output, &expected_path)?;
+    staging.copy_from_descriptor(&source.file, &source_identity)?;
+    staging.seal()?;
+    let staged = staging.capture_file(&source_identity, proof.width, proof.height)?;
+    #[cfg(test)]
+    test_swap_original_after_materialization(&proof.local_path)?;
+    Ok(MaterializedAdjustedSource {
+        staging,
+        width: proof.width,
+        height: proof.height,
+        staged,
+    })
+}
+
+#[cfg(not(unix))]
+pub fn materialize_adjusted_source_for_conversion(
+    _proof: &CloudKitAdjustedSourceProof,
+    _asset_id: &str,
+    _original_asset: &OriginalAssetProof,
+    _output_path: impl AsRef<Path>,
+) -> Result<MaterializedAdjustedSource, AdjustedSourceError> {
+    Err(AdjustedSourceError::Filesystem)
+}
+
+/// Re-validates a proof-bearing adjusted JPEG through the same descriptor-safe
+/// path anchoring used by the read-only resolver.
+#[cfg(unix)]
+pub fn validate_installed_adjusted_source_proof(
+    proof: &CloudKitAdjustedSourceProof,
+    asset_id: &str,
+    original_asset: &OriginalAssetProof,
+    output_path: impl AsRef<Path>,
+) -> Result<(), AdjustedSourceError> {
+    let expected_path = adjusted_source_path_for_output(output_path);
+    let _ = open_validated_adjusted_source(proof, asset_id, original_asset, &expected_path)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn validate_installed_adjusted_source_proof(
+    _proof: &CloudKitAdjustedSourceProof,
+    _asset_id: &str,
+    _original_asset: &OriginalAssetProof,
+    _output_path: impl AsRef<Path>,
+) -> Result<(), AdjustedSourceError> {
+    Err(AdjustedSourceError::Filesystem)
+}
+
+#[derive(Debug, Error)]
+pub enum AdjustedSourceError {
+    #[error("adjusted source request is invalid: {0}")]
+    InvalidRequest(&'static str),
+    #[error("adjusted source CloudKit response is invalid: {0}")]
+    InvalidResponse(&'static str),
+    #[error("adjusted source resource URL is invalid")]
+    InvalidResourceUrl,
+    #[error("adjusted source lookup transport failed")]
+    LookupTransport,
+    #[error("adjusted source download transport failed")]
+    DownloadTransport,
+    #[error("adjusted source temporary file is invalid")]
+    InvalidTemporaryFile,
+    #[error("adjusted source output path is unsafe")]
+    UnsafeOutputPath,
+    #[error("adjusted source output already exists with different bytes")]
+    ExistingOutputMismatch,
+    #[error("adjusted source download size did not match the declared resource")]
+    DownloadedSizeMismatch,
+    #[error("adjusted source declared resource exceeds the encoded JPEG limit")]
+    DeclaredResourceTooLarge,
+    #[error("adjusted source download hash did not match the streamed artifact")]
+    DownloadedHashMismatch,
+    #[error("adjusted source installed output did not match the verified temporary artifact")]
+    InstalledOutputMismatch,
+    #[error("adjusted source JPEG validation failed")]
+    InvalidJpeg,
+    #[error("adjusted source proof is malformed")]
+    InvalidProof,
+    #[error("adjusted source proof identity does not match its workflow context")]
+    ProofMismatch,
+    #[error("adjusted source proof local JPEG is missing")]
+    ProofLocalFileMissing,
+    #[error("adjusted source proof local JPEG no longer matches its verified identity")]
+    ProofLocalFileMismatch,
+    #[error("adjusted source filesystem operation failed")]
+    Filesystem,
+    #[error("adjusted source timestamp is unavailable")]
+    Clock,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    size_bytes: u64,
+    sha256: String,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    owner: u32,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    link_count: u64,
+    #[cfg(target_os = "macos")]
+    flags: u32,
+}
+
+impl FileIdentity {
+    fn matches_bytes(&self, other: &Self) -> bool {
+        self.size_bytes == other.size_bytes && self.sha256 == other.sha256
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StagingDirectoryIdentity {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    mode: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MacPrivateTempIdentity {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    mode: u32,
+}
+
+#[derive(Clone, Debug)]
+struct AdjustedResource {
+    record_name: String,
+    record_change_tag: String,
+    record_type: String,
+    master_record_name: Option<String>,
+    download_url: Url,
+    size_bytes: u64,
+    width: u32,
+    height: u32,
+    file_type: String,
+    fingerprint: String,
+}
+
+#[cfg(unix)]
+struct AnchoredOutput {
+    parent: File,
+    final_name: CString,
+}
+
+#[cfg(unix)]
+struct OpenArtifact {
+    file: File,
+    identity: FileIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InstallResult {
+    Installed,
+    AlreadyExists,
+}
+
+#[cfg(unix)]
+struct AnchoredTemp<'a> {
+    output: &'a AnchoredOutput,
+    staging_name: CString,
+    staging: File,
+    staging_identity: StagingDirectoryIdentity,
+    file_name: CString,
+    file: Option<File>,
+    active: bool,
+}
+
+#[cfg(unix)]
+struct ConversionSourceStaging {
+    parent: File,
+    staging: File,
+    staging_name: CString,
+    staging_identity: StagingDirectoryIdentity,
+    file_name: CString,
+    file: Option<File>,
+    source_device: u64,
+    source_inode: u64,
+    path: PathBuf,
+    active: bool,
+    #[cfg(target_os = "macos")]
+    private_tmp_identity: MacPrivateTempIdentity,
+    #[cfg(target_os = "macos")]
+    staging_flags: u32,
+    #[cfg(target_os = "macos")]
+    source_immutable: bool,
+    #[cfg(target_os = "macos")]
+    directory_immutable: bool,
+    #[cfg(target_os = "macos")]
+    directory_state_known: bool,
+}
+
+#[cfg(unix)]
+fn open_parent_and_name(path: &Path) -> Result<(File, CString), AdjustedSourceError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let file_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or(AdjustedSourceError::UnsafeOutputPath)?;
+    let name =
+        CString::new(file_name.as_bytes()).map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
+    let mut parent = if path.is_absolute() {
+        open_directory_at(libc::AT_FDCWD, c"/")?
+    } else {
+        open_directory_at(libc::AT_FDCWD, c".")?
+    };
+    let components = path.components().collect::<Vec<_>>();
+    let final_position = components
+        .iter()
+        .rposition(|component| matches!(component, Component::Normal(_)))
+        .ok_or(AdjustedSourceError::UnsafeOutputPath)?;
+    if final_position != components.len().saturating_sub(1) {
+        return Err(AdjustedSourceError::UnsafeOutputPath);
+    }
+    for component in &components[..final_position] {
+        match component {
+            Component::RootDir if path.is_absolute() => {}
+            Component::Normal(component) => {
+                let component = CString::new(component.as_bytes())
+                    .map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
+                parent = open_directory_at(parent.as_raw_fd(), &component)?;
+            }
+            Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir
+            | Component::Prefix(_) => {
+                return Err(AdjustedSourceError::UnsafeOutputPath);
+            }
+        }
+    }
+    if !parent
+        .metadata()
+        .map_err(|_| AdjustedSourceError::Filesystem)?
+        .is_dir()
+    {
+        return Err(AdjustedSourceError::UnsafeOutputPath);
+    }
+    Ok((parent, name))
+}
+
+#[cfg(unix)]
+fn open_anchored_regular(path: &Path) -> Result<AnchoredInput, AdjustedSourceError> {
+    use std::os::fd::AsRawFd;
+
+    let (parent, name) = open_parent_and_name(path)?;
+    let artifact = inspect_open_file(open_regular_at(parent.as_raw_fd(), &name)?)?;
+    Ok(AnchoredInput {
+        parent,
+        name,
+        artifact,
+    })
+}
+
+#[cfg(unix)]
+fn materialize_open_artifact(
+    output: &AnchoredOutput,
+    expected_path: &Path,
+    file_name: &CStr,
+    source: &OpenArtifact,
+) -> Result<(ConversionSourceStaging, OpenArtifact), AdjustedSourceError> {
+    let mut staging = ConversionSourceStaging::create_named(output, expected_path, file_name)?;
+    staging.copy_from_descriptor(&source.file, &source.identity)?;
+    staging.seal()?;
+    let staged = staging.capture_file_exact(&source.identity)?;
+    Ok((staging, staged))
+}
+
+#[cfg(unix)]
+fn staged_path(
+    parent: &Path,
+    staging_name: &str,
+    file_name: &CStr,
+) -> Result<PathBuf, AdjustedSourceError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let file_name = std::ffi::OsStr::from_bytes(file_name.to_bytes());
+    if !matches!(
+        Path::new(file_name).components().next(),
+        Some(Component::Normal(_))
+    ) || Path::new(file_name).components().count() != 1
+    {
+        return Err(AdjustedSourceError::InvalidTemporaryFile);
+    }
+    Ok(parent.join(staging_name).join(file_name))
+}
+
+#[cfg(unix)]
+impl AnchoredOutput {
+    fn open(path: &Path) -> Result<Self, AdjustedSourceError> {
+        if path.extension() != Some(std::ffi::OsStr::new("jpg")) {
+            return Err(AdjustedSourceError::UnsafeOutputPath);
+        }
+        let (parent, final_name) = open_parent_and_name(path)?;
+        Ok(Self { parent, final_name })
+    }
+
+    fn create_temp(&self) -> Result<AnchoredTemp<'_>, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        let prefix = std::str::from_utf8(self.final_name.to_bytes())
+            .map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
+        for _ in 0..16 {
+            let staging_name =
+                CString::new(format!(".{prefix}.adjusted-{}.staging", Uuid::new_v4()))
+                    .map_err(|_| AdjustedSourceError::Filesystem)?;
+            match create_staging_directory_at(self.parent.as_raw_fd(), &staging_name) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
+                Err(_) => return Err(AdjustedSourceError::Filesystem),
+            }
+            let staging = open_directory_at(self.parent.as_raw_fd(), &staging_name)
+                .map_err(|_| AdjustedSourceError::Filesystem)?;
+            let staging_identity = inspect_staging_directory(&staging)?;
+            let file_name =
+                CString::new("source.jpg").map_err(|_| AdjustedSourceError::Filesystem)?;
+            match open_temp_at(staging.as_raw_fd(), &file_name) {
+                Ok(file) => {
+                    return Ok(AnchoredTemp::new(
+                        self,
+                        staging_name,
+                        staging,
+                        staging_identity,
+                        file_name,
+                        file,
+                    ));
+                }
+                Err(_) => {
+                    let _ = remove_owned_staging_directory(
+                        self,
+                        &staging_name,
+                        &staging,
+                        staging_identity,
+                    );
+                    return Err(AdjustedSourceError::Filesystem);
+                }
+            }
+        }
+        Err(AdjustedSourceError::Filesystem)
+    }
+
+    fn open_final(&self) -> Result<Option<OpenArtifact>, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        open_optional_regular_at(self.parent.as_raw_fd(), &self.final_name)?
+            .map(inspect_open_file)
+            .transpose()
+    }
+
+    fn final_after_install(
+        &self,
+        expected: &FileIdentity,
+        result: InstallResult,
+    ) -> Result<OpenArtifact, AdjustedSourceError> {
+        let final_artifact = self
+            .open_final()?
+            .ok_or(AdjustedSourceError::InstalledOutputMismatch)?;
+        match result {
+            InstallResult::Installed if final_artifact.identity != *expected => {
+                Err(AdjustedSourceError::InstalledOutputMismatch)
+            }
+            InstallResult::AlreadyExists if !final_artifact.identity.matches_bytes(expected) => {
+                Err(AdjustedSourceError::ExistingOutputMismatch)
+            }
+            InstallResult::Installed | InstallResult::AlreadyExists => Ok(final_artifact),
+        }
+    }
+
+    fn fsync_parent(&self) -> Result<(), AdjustedSourceError> {
+        self.parent
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)
+    }
+
+    fn ensure_final_identity(&self, expected: &FileIdentity) -> Result<(), AdjustedSourceError> {
+        let current = self
+            .open_final()?
+            .ok_or(AdjustedSourceError::InstalledOutputMismatch)?;
+        if current.identity != *expected {
+            return Err(AdjustedSourceError::InstalledOutputMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl ConversionSourceStaging {
+    fn create(output: &AnchoredOutput, expected_path: &Path) -> Result<Self, AdjustedSourceError> {
+        Self::create_named(output, expected_path, c"source.jpg")
+    }
+
+    fn create_named(
+        output: &AnchoredOutput,
+        expected_path: &Path,
+        file_name: &CStr,
+    ) -> Result<Self, AdjustedSourceError> {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (output, expected_path);
+            Self::create_macos_private_tmp(file_name)
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            use std::os::fd::AsRawFd;
+
+            let parent_path = expected_path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .ok_or(AdjustedSourceError::UnsafeOutputPath)?;
+            let prefix = std::str::from_utf8(output.final_name.to_bytes())
+                .map_err(|_| AdjustedSourceError::UnsafeOutputPath)?;
+            for _ in 0..16 {
+                let name = format!(".{prefix}.conversion-{}.staging", Uuid::new_v4());
+                let staging_name =
+                    CString::new(name.as_str()).map_err(|_| AdjustedSourceError::Filesystem)?;
+                match create_staging_directory_at(output.parent.as_raw_fd(), &staging_name) {
+                    Ok(()) => {}
+                    Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
+                    Err(_) => return Err(AdjustedSourceError::Filesystem),
+                }
+                let staging = match open_directory_at(output.parent.as_raw_fd(), &staging_name) {
+                    Ok(staging) => staging,
+                    Err(_) => return Err(AdjustedSourceError::Filesystem),
+                };
+                let staging_identity = inspect_staging_directory(&staging)?;
+                let file_name = CString::new(file_name.to_bytes())
+                    .map_err(|_| AdjustedSourceError::Filesystem)?;
+                let path = staged_path(parent_path, &name, &file_name)?;
+                match open_temp_at(staging.as_raw_fd(), &file_name) {
+                    Ok(file) => {
+                        let (source_device, source_inode) = file_location(&file)?;
+                        return Ok(Self {
+                            parent: output
+                                .parent
+                                .try_clone()
+                                .map_err(|_| AdjustedSourceError::Filesystem)?,
+                            staging,
+                            staging_name,
+                            staging_identity,
+                            file_name,
+                            file: Some(file),
+                            source_device,
+                            source_inode,
+                            path,
+                            active: true,
+                        });
+                    }
+                    Err(_) => {
+                        let _ = remove_owned_staging_directory(
+                            output,
+                            &staging_name,
+                            &staging,
+                            staging_identity,
+                        );
+                        return Err(AdjustedSourceError::Filesystem);
+                    }
+                }
+            }
+            Err(AdjustedSourceError::Filesystem)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_macos_private_tmp(file_name: &CStr) -> Result<Self, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        let (parent, private_tmp_identity) = open_macos_private_tmp()?;
+        for _ in 0..16 {
+            let name = format!(".icloudpd-adjusted-{}.staging", Uuid::new_v4());
+            let staging_name =
+                CString::new(name.as_str()).map_err(|_| AdjustedSourceError::Filesystem)?;
+            match create_staging_directory_at(parent.as_raw_fd(), &staging_name) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
+                Err(_) => return Err(AdjustedSourceError::Filesystem),
+            }
+            let staging = match open_directory_at(parent.as_raw_fd(), &staging_name) {
+                Ok(staging) => staging,
+                Err(_) => return Err(AdjustedSourceError::Filesystem),
+            };
+            let staging_identity = inspect_staging_directory(&staging)?;
+            let staging_flags = macos_file_flags(&staging)?;
+            let file_name =
+                CString::new(file_name.to_bytes()).map_err(|_| AdjustedSourceError::Filesystem)?;
+            let path = staged_path(Path::new("/private/tmp"), &name, &file_name)?;
+            match open_temp_at(staging.as_raw_fd(), &file_name) {
+                Ok(file) => {
+                    let (source_device, source_inode) = file_location(&file)?;
+                    return Ok(Self {
+                        parent,
+                        staging,
+                        staging_name,
+                        staging_identity,
+                        file_name,
+                        file: Some(file),
+                        source_device,
+                        source_inode,
+                        path,
+                        active: true,
+                        private_tmp_identity,
+                        staging_flags,
+                        source_immutable: false,
+                        directory_immutable: false,
+                        directory_state_known: true,
+                    });
+                }
+                Err(_) => {
+                    let _ = remove_owned_staging_directory_at(
+                        &parent,
+                        &staging_name,
+                        &staging,
+                        staging_identity,
+                    );
+                    return Err(AdjustedSourceError::Filesystem);
+                }
+            }
+        }
+        Err(AdjustedSourceError::Filesystem)
+    }
+
+    fn copy_from_descriptor(
+        &mut self,
+        source: &File,
+        expected: &FileIdentity,
+    ) -> Result<(), AdjustedSourceError> {
+        let mut source = source
+            .try_clone()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        let destination = self
+            .file
+            .as_mut()
+            .ok_or(AdjustedSourceError::InvalidTemporaryFile)?;
+        let mut hasher = Sha256::new();
+        let mut size_bytes = 0_u64;
+        let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+        loop {
+            let read = source
+                .read(&mut buffer)
+                .map_err(|_| AdjustedSourceError::Filesystem)?;
+            if read == 0 {
+                break;
+            }
+            destination
+                .write_all(&buffer[..read])
+                .map_err(|_| AdjustedSourceError::Filesystem)?;
+            hasher.update(&buffer[..read]);
+            size_bytes = size_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        }
+        destination
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        seal_source_file(destination)?;
+        self.file.take();
+        if size_bytes != expected.size_bytes
+            || format!("{:x}", hasher.finalize()) != expected.sha256
+        {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        Ok(())
+    }
+
+    fn seal(&mut self) -> Result<(), AdjustedSourceError> {
+        if self.file.is_some() {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        self.validate_named_staging()?;
+        self.set_staging_mode(0o500)?;
+        #[cfg(target_os = "macos")]
+        self.seal_macos_immutable()?;
+        self.validate_named_staging()
+    }
+
+    fn capture_file(
+        &self,
+        source_identity: &FileIdentity,
+        width: u32,
+        height: u32,
+    ) -> Result<OpenArtifact, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        self.validate_named_staging()?;
+        let artifact =
+            inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
+        if !self.is_sealed_source(&artifact) || !artifact.identity.matches_bytes(source_identity) {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        verify_jpeg(&artifact.file, width, height)?;
+        let named_staging = open_directory_at(self.parent.as_raw_fd(), &self.staging_name)?;
+        let named =
+            inspect_open_file(open_regular_at(named_staging.as_raw_fd(), &self.file_name)?)?;
+        if named.identity != artifact.identity {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        Ok(artifact)
+    }
+
+    fn capture_file_exact(
+        &self,
+        source_identity: &FileIdentity,
+    ) -> Result<OpenArtifact, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        self.validate_named_staging()?;
+        let artifact =
+            inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
+        if !self.is_sealed_source(&artifact) || !artifact.identity.matches_bytes(source_identity) {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        let named_staging = open_directory_at(self.parent.as_raw_fd(), &self.staging_name)?;
+        let named =
+            inspect_open_file(open_regular_at(named_staging.as_raw_fd(), &self.file_name)?)?;
+        if named.identity != artifact.identity {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        Ok(artifact)
+    }
+
+    fn validate_file(
+        &self,
+        expected: &FileIdentity,
+        width: u32,
+        height: u32,
+    ) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        self.validate_named_staging()?;
+        let artifact =
+            inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
+        if !self.is_sealed_source(&artifact) || artifact.identity != *expected {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        verify_jpeg(&artifact.file, width, height)?;
+        let named_staging = open_directory_at(self.parent.as_raw_fd(), &self.staging_name)?;
+        let named =
+            inspect_open_file(open_regular_at(named_staging.as_raw_fd(), &self.file_name)?)?;
+        if named.identity != *expected {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_file_exact(&self, expected: &FileIdentity) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        self.validate_named_staging()?;
+        let artifact =
+            inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
+        if !self.is_sealed_source(&artifact) || artifact.identity != *expected {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        let named_staging = open_directory_at(self.parent.as_raw_fd(), &self.staging_name)?;
+        let named =
+            inspect_open_file(open_regular_at(named_staging.as_raw_fd(), &self.file_name)?)?;
+        if named.identity != *expected {
+            return Err(AdjustedSourceError::ProofLocalFileMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_named_staging(&self) -> Result<(), AdjustedSourceError> {
+        #[cfg(target_os = "macos")]
+        self.validate_macos_private_tmp()?;
+        self.validate_named_staging_identity()
+    }
+
+    fn validate_named_staging_identity(&self) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        #[cfg(target_os = "macos")]
+        self.validate_macos_private_tmp_identity()?;
+        if inspect_staging_directory(&self.staging)? != self.staging_identity
+            || staging_link_count(&self.staging)? < 2
+        {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        let named = open_directory_at(self.parent.as_raw_fd(), &self.staging_name)?;
+        if inspect_staging_directory(&named)? != self.staging_identity
+            || staging_link_count(&named)? < 2
+        {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        Ok(())
+    }
+
+    fn is_sealed_source(&self, artifact: &OpenArtifact) -> bool {
+        let sealed = self.has_sealed_source_identity(artifact);
+        #[cfg(target_os = "macos")]
+        {
+            sealed && self.source_immutable && artifact.identity.flags & libc::UF_IMMUTABLE != 0
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            sealed
+        }
+    }
+
+    fn has_sealed_source_identity(&self, artifact: &OpenArtifact) -> bool {
+        artifact.identity.device == self.source_device
+            && artifact.identity.inode == self.source_inode
+            && artifact.identity.owner == unsafe { libc::geteuid() }
+            && artifact.identity.mode == 0o400
+            && artifact.identity.link_count == 1
+    }
+
+    fn set_staging_mode(&mut self, mode: u32) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        if unsafe { libc::fchmod(self.staging.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        let identity = inspect_staging_directory(&self.staging)?;
+        if identity.mode != mode {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        self.staging_identity = identity;
+        self.staging
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        self.parent
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn validate_macos_private_tmp(&self) -> Result<(), AdjustedSourceError> {
+        self.validate_macos_private_tmp_identity()?;
+        if !self.directory_state_known {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        let staging_flags = macos_file_flags(&self.staging)?;
+        if staging_flags != self.staging_flags
+            || self.directory_immutable != (staging_flags & libc::UF_IMMUTABLE != 0)
+        {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn validate_macos_private_tmp_identity(&self) -> Result<(), AdjustedSourceError> {
+        let (current_parent, identity) = open_macos_private_tmp()?;
+        if identity != self.private_tmp_identity
+            || inspect_macos_private_tmp(&self.parent)? != self.private_tmp_identity
+            || inspect_macos_private_tmp(&current_parent)? != self.private_tmp_identity
+        {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn seal_macos_immutable(&mut self) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        // Same-EUID hostile processes are out of scope: they own workflow state and CloudKit credentials.
+        if self.source_immutable || self.directory_immutable {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        let source =
+            inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
+        if !self.has_sealed_source_identity(&source) {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        let source_flags = macos_file_flags(&source.file)?;
+        let staging_flags = macos_file_flags(&self.staging)?;
+        if source_flags & libc::UF_IMMUTABLE != 0 || staging_flags & libc::UF_IMMUTABLE != 0 {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        set_macos_file_flags(
+            &source.file,
+            source_flags | libc::UF_IMMUTABLE,
+            MacosFchflagsTarget::Source,
+        )?;
+        self.source_immutable = true;
+        if macos_file_flags(&source.file)? != source_flags | libc::UF_IMMUTABLE {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        set_macos_file_flags(
+            &self.staging,
+            staging_flags | libc::UF_IMMUTABLE,
+            MacosFchflagsTarget::StagingDirectory,
+        )?;
+        self.staging_flags = staging_flags | libc::UF_IMMUTABLE;
+        self.directory_immutable = true;
+        self.directory_state_known = true;
+        self.staging
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        self.parent
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        self.validate_macos_private_tmp()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn unseal_macos_immutable(&mut self) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        if !self.source_immutable && !self.directory_immutable && self.directory_state_known {
+            return Ok(());
+        }
+        let source =
+            inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)?;
+        let source_flags = macos_file_flags(&source.file)?;
+        self.source_immutable = source_flags & libc::UF_IMMUTABLE != 0;
+        if !self.source_immutable {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        let directory_flags =
+            match read_macos_transaction_flags(&self.staging, MacosMetadataReadTarget::BeforeClear)
+            {
+                Ok(flags) => flags,
+                Err(_) => {
+                    self.directory_state_known = false;
+                    return Err(AdjustedSourceError::Filesystem);
+                }
+            };
+        self.staging_flags = directory_flags;
+        self.directory_immutable = directory_flags & libc::UF_IMMUTABLE != 0;
+        self.directory_state_known = true;
+        if self.directory_immutable {
+            if set_macos_file_flags(
+                &self.staging,
+                self.staging_flags & !libc::UF_IMMUTABLE,
+                MacosFchflagsTarget::StagingDirectory,
+            )
+            .is_err()
+            {
+                return Err(AdjustedSourceError::Filesystem);
+            }
+            self.staging_flags &= !libc::UF_IMMUTABLE;
+            self.directory_immutable = false;
+            self.directory_state_known = true;
+            let directory_clear_verified =
+                read_macos_transaction_flags(&self.staging, MacosMetadataReadTarget::AfterClear);
+            match directory_clear_verified {
+                Ok(flags) if flags & libc::UF_IMMUTABLE == 0 => {
+                    self.staging_flags = flags;
+                }
+                Ok(flags) => {
+                    self.staging_flags = flags;
+                    self.directory_immutable = true;
+                    return self.rollback_macos_directory_unseal_failure();
+                }
+                Err(_) => {
+                    self.directory_state_known = false;
+                    return self.rollback_macos_directory_unseal_failure();
+                }
+            }
+        }
+        let source_clear_failed = set_macos_file_flags(
+            &source.file,
+            source_flags & !libc::UF_IMMUTABLE,
+            MacosFchflagsTarget::Source,
+        )
+        .is_err();
+        let source_remains_immutable = match macos_file_flags(&source.file) {
+            Ok(flags) => flags & libc::UF_IMMUTABLE != 0,
+            Err(_) => true,
+        };
+        if source_clear_failed || source_remains_immutable {
+            return self.rollback_macos_source_unseal_failure(&source.file, source_flags);
+        }
+        self.source_immutable = false;
+        self.staging
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        self.parent
+            .sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn rollback_macos_source_unseal_failure(
+        &mut self,
+        source: &File,
+        source_flags: u32,
+    ) -> Result<(), AdjustedSourceError> {
+        let source_restored = macos_file_flags(source)
+            .is_ok_and(|flags| flags & libc::UF_IMMUTABLE != 0)
+            || (set_macos_file_flags(
+                source,
+                source_flags | libc::UF_IMMUTABLE,
+                MacosFchflagsTarget::Source,
+            )
+            .is_ok()
+                && macos_file_flags(source).is_ok_and(|flags| flags & libc::UF_IMMUTABLE != 0));
+        self.source_immutable = source_restored;
+        let _ = self.rollback_macos_directory_unseal_failure();
+        Err(AdjustedSourceError::Filesystem)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn rollback_macos_directory_unseal_failure(&mut self) -> Result<(), AdjustedSourceError> {
+        if set_macos_file_flags(
+            &self.staging,
+            self.staging_flags | libc::UF_IMMUTABLE,
+            MacosFchflagsTarget::StagingDirectory,
+        )
+        .is_err()
+        {
+            self.directory_state_known = false;
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        match read_macos_transaction_flags(&self.staging, MacosMetadataReadTarget::Rollback) {
+            Ok(flags) if flags & libc::UF_IMMUTABLE != 0 => {
+                self.staging_flags = flags;
+                self.directory_immutable = true;
+                self.directory_state_known = true;
+            }
+            Ok(flags) => {
+                self.staging_flags = flags;
+                self.directory_immutable = false;
+                self.directory_state_known = true;
+            }
+            Err(_) => {
+                self.directory_state_known = false;
+            }
+        }
+        Err(AdjustedSourceError::Filesystem)
+    }
+
+    fn cleanup(&mut self) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        if !self.active {
+            return Ok(());
+        }
+        self.file.take();
+        #[cfg(target_os = "macos")]
+        {
+            self.validate_named_staging_identity()?;
+            self.unseal_macos_immutable()?;
+            self.validate_named_staging()?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.validate_named_staging()?;
+        self.set_staging_mode(0o700)?;
+        let unlink =
+            unsafe { libc::unlinkat(self.staging.as_raw_fd(), self.file_name.as_ptr(), 0) };
+        if unlink != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        remove_owned_staging_directory_at(
+            &self.parent,
+            &self.staging_name,
+            &self.staging,
+            self.staging_identity,
+        )?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ConversionSourceStaging {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+#[cfg(unix)]
+impl<'a> AnchoredTemp<'a> {
+    fn new(
+        output: &'a AnchoredOutput,
+        staging_name: CString,
+        staging: File,
+        staging_identity: StagingDirectoryIdentity,
+        file_name: CString,
+        file: File,
+    ) -> Self {
+        Self {
+            output,
+            staging_name,
+            staging,
+            staging_identity,
+            file_name,
+            file: Some(file),
+            active: true,
+        }
+    }
+
+    fn file_mut(&mut self) -> Result<&mut File, AdjustedSourceError> {
+        self.file
+            .as_mut()
+            .ok_or(AdjustedSourceError::InvalidTemporaryFile)
+    }
+
+    fn open_regular(&self) -> Result<OpenArtifact, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        self.validate_staging()?;
+        inspect_open_file(open_regular_at(self.staging.as_raw_fd(), &self.file_name)?)
+    }
+
+    fn sync_and_close(&mut self) -> Result<(), AdjustedSourceError> {
+        let file = self
+            .file
+            .as_ref()
+            .ok_or(AdjustedSourceError::InvalidTemporaryFile)?;
+        file.sync_all()
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        self.file.take();
+        Ok(())
+    }
+
+    fn install_exclusive(
+        &self,
+        expected: &FileIdentity,
+    ) -> Result<InstallResult, AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        let current = self.open_regular()?;
+        if current.identity != *expected {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        match rename_without_overwrite_at(
+            self.staging.as_raw_fd(),
+            &self.file_name,
+            self.output.parent.as_raw_fd(),
+            &self.output.final_name,
+        ) {
+            Ok(()) => Ok(InstallResult::Installed),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Ok(InstallResult::AlreadyExists)
+            }
+            Err(_) => Err(AdjustedSourceError::Filesystem),
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<(), AdjustedSourceError> {
+        use std::os::fd::AsRawFd;
+
+        if !self.active {
+            return Ok(());
+        }
+        self.file.take();
+        self.validate_staging()?;
+        let unlink =
+            unsafe { libc::unlinkat(self.staging.as_raw_fd(), self.file_name.as_ptr(), 0) };
+        if unlink != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        self.remove_empty_staging_directory()?;
+        self.active = false;
+        Ok(())
+    }
+
+    fn validate_staging(&self) -> Result<(), AdjustedSourceError> {
+        if inspect_staging_directory(&self.staging)? != self.staging_identity {
+            return Err(AdjustedSourceError::InvalidTemporaryFile);
+        }
+        Ok(())
+    }
+
+    fn remove_empty_staging_directory(&self) -> Result<(), AdjustedSourceError> {
+        remove_owned_staging_directory(
+            self.output,
+            &self.staging_name,
+            &self.staging,
+            self.staging_identity,
+        )
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AnchoredTemp<'_> {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+#[cfg(not(unix))]
+struct AnchoredOutput;
+
+#[cfg(not(unix))]
+impl AnchoredOutput {
+    fn open(_path: &Path) -> Result<Self, AdjustedSourceError> {
+        Err(AdjustedSourceError::Filesystem)
+    }
+}
+
+fn validate_request(
+    session: &CloudKitDeleteSession,
+    request: &CloudKitAdjustedSourceResolveRequest,
+) -> Result<CloudKitLibraryDestination, AdjustedSourceError> {
+    if request.asset_id.trim().is_empty() {
+        return Err(AdjustedSourceError::InvalidRequest("asset ID is empty"));
+    }
+    if request.original_asset.record_name.trim().is_empty()
+        || request.original_asset.record_change_tag.trim().is_empty()
+        || request.original_asset.record_type != "CPLAsset"
+        || request.original_asset.zone_name.trim().is_empty()
+    {
+        return Err(AdjustedSourceError::InvalidRequest(
+            "original asset proof identity is invalid",
+        ));
+    }
+    let destination = CloudKitLibraryDestination {
+        database_scope: request.original_asset.database_scope,
+        zone_name: request.original_asset.zone_name.clone(),
+        owner_record_name: request.original_asset.owner_record_name.clone(),
+    };
+    validate_library_destination(&destination).map_err(|_| {
+        AdjustedSourceError::InvalidRequest("original asset proof destination is invalid")
+    })?;
+    if session.database_scope != destination.database_scope || session.zone != destination {
+        return Err(AdjustedSourceError::InvalidRequest(
+            "session destination differs from original asset proof",
+        ));
+    }
+    Ok(destination)
+}
+
+fn lookup_exact_record<T: CloudKitAdjustedSourceTransport>(
+    transport: &mut T,
+    session: &CloudKitDeleteSession,
+    record_name: &str,
+    expected_change_tag: &str,
+    expected_type: &'static str,
+    destination: &CloudKitLibraryDestination,
+    desired_keys: &[&str],
+) -> Result<Value, AdjustedSourceError> {
+    let payload = json!({
+        "records": [{"recordName": record_name}],
+        "desiredKeys": desired_keys,
+        "zoneID": destination.zone_id_payload(),
+    });
+    let response = transport
+        .post_records_lookup(session, payload)
+        .map_err(|_| AdjustedSourceError::LookupTransport)?;
+    let records = response.get("records").and_then(Value::as_array).ok_or(
+        AdjustedSourceError::InvalidResponse("lookup response omitted records"),
+    )?;
+    if records.len() != 1 {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "lookup response did not contain exactly one record",
+        ));
+    }
+    let record = records[0].clone();
+    if record.get("serverErrorCode").is_some() || record.get("serverErrorReason").is_some() {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "lookup response returned a record error",
+        ));
+    }
+    require_non_deleted(&record)?;
+    if record_string(&record, "recordName")? != record_name
+        || record_string(&record, "recordType")? != expected_type
+    {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "lookup response identity differs from requested record",
+        ));
+    }
+    let change_tag = record_string(&record, "recordChangeTag")?;
+    if change_tag.is_empty()
+        || (!expected_change_tag.is_empty() && change_tag != expected_change_tag)
+    {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "lookup response change tag differs from the required record",
+        ));
+    }
+    validate_record_destination(&record, destination)?;
+    Ok(record)
+}
+
+fn validate_record_destination(
+    record: &Value,
+    destination: &CloudKitLibraryDestination,
+) -> Result<(), AdjustedSourceError> {
+    let zone = record
+        .get("zoneID")
+        .ok_or(AdjustedSourceError::InvalidResponse(
+            "lookup record omitted zone identity",
+        ))?;
+    let zone = zone
+        .as_object()
+        .ok_or(AdjustedSourceError::InvalidResponse(
+            "lookup record zone is malformed",
+        ))?;
+    if zone.get("zoneName").and_then(Value::as_str) != Some(destination.zone_name.as_str()) {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "lookup record zone differs from the original asset proof",
+        ));
+    }
+    if zone.get("ownerRecordName").and_then(Value::as_str)
+        != destination.owner_record_name.as_deref()
+    {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "lookup record zone differs from the original asset proof",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_adjusted_resource(
+    record: &Value,
+    master_record_name: Option<String>,
+) -> Result<Option<AdjustedResource>, AdjustedSourceError> {
+    let fields = record_fields(record)?;
+    let adjusted_fields = [
+        ADJUSTED_RESOURCE_FIELD,
+        ADJUSTED_WIDTH_FIELD,
+        ADJUSTED_HEIGHT_FIELD,
+        ADJUSTED_FILE_TYPE_FIELD,
+        ADJUSTED_FINGERPRINT_FIELD,
+    ];
+    let present = adjusted_fields
+        .iter()
+        .filter(|field| fields.contains_key(**field))
+        .count();
+    if present == 0 {
+        return Ok(None);
+    }
+    if present != adjusted_fields.len() {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "adjusted resource fields are partial",
+        ));
+    }
+    let resource = wrapped_value_object(fields, ADJUSTED_RESOURCE_FIELD, "ASSETID")?;
+    let download_url = required_nonempty_object_string(resource, "downloadURL")?;
+    let download_url =
+        Url::parse(download_url).map_err(|_| AdjustedSourceError::InvalidResourceUrl)?;
+    validate_cloudkit_resource_download_url(&download_url)
+        .map_err(|_| AdjustedSourceError::InvalidResourceUrl)?;
+    let size_bytes = resource
+        .get("size")
+        .and_then(Value::as_u64)
+        .filter(|size| *size > 0)
+        .ok_or(AdjustedSourceError::InvalidResponse(
+            "resJPEGFullRes size is missing or zero",
+        ))?;
+    let file_checksum = required_nonempty_object_string(resource, "fileChecksum")?;
+    let _reference_checksum = required_nonempty_object_string(resource, "referenceChecksum")?;
+    let _wrapping_key = required_nonempty_object_string(resource, "wrappingKey")?;
+    let width = wrapped_positive_u32(fields, ADJUSTED_WIDTH_FIELD)?;
+    let height = wrapped_positive_u32(fields, ADJUSTED_HEIGHT_FIELD)?;
+    let file_type = wrapped_nonempty_string(fields, ADJUSTED_FILE_TYPE_FIELD)?;
+    if !matches!(file_type.as_str(), "public.jpeg" | "image/jpeg") {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "resJPEGFullRes file type is not JPEG",
+        ));
+    }
+    let fingerprint = wrapped_nonempty_string(fields, ADJUSTED_FINGERPRINT_FIELD)?;
+    if fingerprint != file_checksum {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "resJPEGFullRes fingerprint differs from fileChecksum",
+        ));
+    }
+    Ok(Some(AdjustedResource {
+        record_name: record_string(record, "recordName")?.to_string(),
+        record_change_tag: record_string(record, "recordChangeTag")?.to_string(),
+        record_type: record_string(record, "recordType")?.to_string(),
+        master_record_name,
+        download_url,
+        size_bytes,
+        width,
+        height,
+        file_type: "public.jpeg".to_string(),
+        fingerprint,
+    }))
+}
+
+fn parse_master_ref(
+    fields: &Map<String, Value>,
+    destination: &CloudKitLibraryDestination,
+) -> Result<String, AdjustedSourceError> {
+    let master_ref = wrapped_value_object(fields, "masterRef", "REFERENCE")?;
+    if master_ref.get("action").and_then(Value::as_str) != Some("DELETE_SELF") {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "masterRef action is not DELETE_SELF",
+        ));
+    }
+    validate_zone_identity(
+        master_ref.get("zoneID"),
+        destination,
+        "masterRef zone differs from the original asset proof",
+    )?;
+    master_ref
+        .get("recordName")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(ToString::to_string)
+        .ok_or(AdjustedSourceError::InvalidResponse(
+            "masterRef record name is malformed",
+        ))
+}
+
+fn record_fields(record: &Value) -> Result<&Map<String, Value>, AdjustedSourceError> {
+    record
+        .get("fields")
+        .and_then(Value::as_object)
+        .ok_or(AdjustedSourceError::InvalidResponse(
+            "lookup record fields are malformed",
+        ))
+}
+
+fn record_string<'a>(record: &'a Value, key: &'static str) -> Result<&'a str, AdjustedSourceError> {
+    record
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(AdjustedSourceError::InvalidResponse(
+            "lookup record identity is malformed",
+        ))
+}
+
+fn require_non_deleted(record: &Value) -> Result<(), AdjustedSourceError> {
+    let fields = record_fields(record)?;
+    let Some(deleted) = fields.get("isDeleted") else {
+        return Ok(());
+    };
+    let deleted = deleted
+        .as_object()
+        .ok_or(AdjustedSourceError::InvalidResponse(
+            "lookup record isDeleted is malformed",
+        ))?;
+    let value = deleted
+        .get("value")
+        .ok_or(AdjustedSourceError::InvalidResponse(
+            "lookup record isDeleted is malformed",
+        ))?;
+    let is_deleted = match deleted.get("type").and_then(Value::as_str) {
+        Some("INT64") => match value.as_i64() {
+            Some(0) => false,
+            Some(1) => true,
+            _ => {
+                return Err(AdjustedSourceError::InvalidResponse(
+                    "lookup record isDeleted is malformed",
+                ));
+            }
+        },
+        Some("BOOLEAN") => match value.as_bool() {
+            Some(value) => value,
+            None => {
+                return Err(AdjustedSourceError::InvalidResponse(
+                    "lookup record isDeleted is malformed",
+                ));
+            }
+        },
+        _ => {
+            return Err(AdjustedSourceError::InvalidResponse(
+                "lookup record isDeleted is malformed",
+            ));
+        }
+    };
+    if is_deleted {
+        return Err(AdjustedSourceError::InvalidResponse(
+            "lookup record is deleted",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_zone_identity(
+    zone: Option<&Value>,
+    destination: &CloudKitLibraryDestination,
+    error: &'static str,
+) -> Result<(), AdjustedSourceError> {
+    let zone = zone
+        .and_then(Value::as_object)
+        .ok_or(AdjustedSourceError::InvalidResponse(error))?;
+    if zone.get("zoneName").and_then(Value::as_str) != Some(destination.zone_name.as_str()) {
+        return Err(AdjustedSourceError::InvalidResponse(error));
+    }
+    if zone.get("ownerRecordName").and_then(Value::as_str)
+        != destination.owner_record_name.as_deref()
+    {
+        return Err(AdjustedSourceError::InvalidResponse(error));
+    }
+    Ok(())
+}
+
+fn wrapped_value_object<'a>(
+    fields: &'a Map<String, Value>,
+    field_name: &'static str,
+    expected_type: &'static str,
+) -> Result<&'a Map<String, Value>, AdjustedSourceError> {
+    fields
+        .get(field_name)
+        .and_then(Value::as_object)
+        .filter(|wrapper| wrapper.get("type").and_then(Value::as_str) == Some(expected_type))
+        .and_then(|wrapper| wrapper.get("value"))
+        .and_then(Value::as_object)
+        .ok_or(AdjustedSourceError::InvalidResponse(
+            "adjusted resource wrapper is malformed",
+        ))
+}
+
+fn wrapped_positive_u32(
+    fields: &Map<String, Value>,
+    name: &'static str,
+) -> Result<u32, AdjustedSourceError> {
+    fields
+        .get(name)
+        .and_then(Value::as_object)
+        .filter(|wrapper| wrapper.get("type").and_then(Value::as_str) == Some("INT64"))
+        .and_then(|wrapper| wrapper.get("value"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or(AdjustedSourceError::InvalidResponse(
+            "adjusted resource dimensions are malformed",
+        ))
+}
+
+fn wrapped_nonempty_string(
+    fields: &Map<String, Value>,
+    name: &'static str,
+) -> Result<String, AdjustedSourceError> {
+    fields
+        .get(name)
+        .and_then(Value::as_object)
+        .filter(|wrapper| wrapper.get("type").and_then(Value::as_str) == Some("STRING"))
+        .and_then(|wrapper| wrapper.get("value"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .ok_or(AdjustedSourceError::InvalidResponse(
+            "adjusted resource metadata is malformed",
+        ))
+}
+
+fn required_nonempty_object_string<'a>(
+    object: &'a Map<String, Value>,
+    field_name: &'static str,
+) -> Result<&'a str, AdjustedSourceError> {
+    object
+        .get(field_name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(AdjustedSourceError::InvalidResponse(
+            "adjusted resource asset metadata is malformed",
+        ))
+}
+
+#[cfg(unix)]
+fn open_directory_at(dirfd: libc::c_int, name: &CStr) -> Result<File, AdjustedSourceError> {
+    use std::os::fd::FromRawFd;
+
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(AdjustedSourceError::UnsafeOutputPath);
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_private_tmp() -> Result<(File, MacPrivateTempIdentity), AdjustedSourceError> {
+    use std::os::fd::AsRawFd;
+
+    let root = open_directory_at(libc::AT_FDCWD, c"/")?;
+    inspect_macos_root_stable_directory(&root)?;
+    let private = open_directory_at(root.as_raw_fd(), c"private")?;
+    inspect_macos_root_stable_directory(&private)?;
+    let tmp = open_directory_at(private.as_raw_fd(), c"tmp")?;
+    let identity = inspect_macos_private_tmp(&tmp)?;
+    Ok((tmp, identity))
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_macos_root_stable_directory(directory: &File) -> Result<(), AdjustedSourceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = directory
+        .metadata()
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(AdjustedSourceError::InvalidTemporaryFile);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_macos_private_tmp(
+    directory: &File,
+) -> Result<MacPrivateTempIdentity, AdjustedSourceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = directory
+        .metadata()
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    let mode = metadata.mode() & 0o7777;
+    if !metadata.is_dir() || metadata.uid() != 0 || mode != 0o1777 {
+        return Err(AdjustedSourceError::InvalidTemporaryFile);
+    }
+    Ok(MacPrivateTempIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner: metadata.uid(),
+        mode,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_flags(file: &File) -> Result<u32, AdjustedSourceError> {
+    use std::os::darwin::fs::MetadataExt;
+
+    file.metadata()
+        .map(|metadata| metadata.st_flags())
+        .map_err(|_| AdjustedSourceError::Filesystem)
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_file_flags(
+    file: &File,
+    flags: u32,
+    target: MacosFchflagsTarget,
+) -> Result<(), AdjustedSourceError> {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(not(test))]
+    let _ = target;
+    #[cfg(test)]
+    {
+        let (failed, pause) = TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+            state.calls.push(target);
+            let failed = if state.failures.front().copied() == Some(target) {
+                state.failures.pop_front();
+                true
+            } else {
+                false
+            };
+            let pause = if target == MacosFchflagsTarget::Source {
+                state.source_pause.take()
+            } else {
+                None
+            };
+            (failed, pause)
+        });
+        if let Some(pause) = pause
+            && (pause.entered.try_send(()).is_err()
+                || pause.release.recv_timeout(pause.timeout).is_err())
+        {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+        if failed {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+    }
+    if unsafe { libc::fchflags(file.as_raw_fd(), flags) } != 0 {
+        return Err(AdjustedSourceError::Filesystem);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_transaction_flags(
+    file: &File,
+    target: MacosMetadataReadTarget,
+) -> Result<u32, AdjustedSourceError> {
+    #[cfg(not(test))]
+    let _ = target;
+    #[cfg(test)]
+    {
+        let failed = TEST_MACOS_FCHFLAGS_STATE.with_borrow_mut(|state| {
+            state.metadata_calls.push(target);
+            if state.metadata_failures.front().copied() == Some(target) {
+                state.metadata_failures.pop_front();
+                true
+            } else {
+                false
+            }
+        });
+        if failed {
+            return Err(AdjustedSourceError::Filesystem);
+        }
+    }
+    macos_file_flags(file)
+}
+
+#[cfg(unix)]
+fn open_temp_at(dirfd: libc::c_int, name: &CStr) -> io::Result<File> {
+    use std::os::fd::FromRawFd;
+
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn create_staging_directory_at(dirfd: libc::c_int, name: &CStr) -> io::Result<()> {
+    let result = unsafe { libc::mkdirat(dirfd, name.as_ptr(), 0o700) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn open_regular_at(dirfd: libc::c_int, name: &CStr) -> Result<File, AdjustedSourceError> {
+    open_optional_regular_at(dirfd, name)?.ok_or(AdjustedSourceError::Filesystem)
+}
+
+#[cfg(unix)]
+fn open_optional_regular_at(
+    dirfd: libc::c_int,
+    name: &CStr,
+) -> Result<Option<File>, AdjustedSourceError> {
+    use std::os::fd::FromRawFd;
+
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOENT) => Ok(None),
+            Some(libc::ELOOP) => Err(AdjustedSourceError::UnsafeOutputPath),
+            _ => Err(AdjustedSourceError::Filesystem),
+        };
+    }
+    Ok(Some(unsafe { File::from_raw_fd(fd) }))
+}
+
+#[cfg(unix)]
+fn inspect_staging_directory(
+    directory: &File,
+) -> Result<StagingDirectoryIdentity, AdjustedSourceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = directory
+        .metadata()
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    let mode = metadata.mode() & 0o777;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || !matches!(mode, 0o700 | 0o500)
+    {
+        return Err(AdjustedSourceError::InvalidTemporaryFile);
+    }
+    Ok(StagingDirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner: metadata.uid(),
+        mode,
+    })
+}
+
+#[cfg(unix)]
+fn staging_link_count(directory: &File) -> Result<u64, AdjustedSourceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    directory
+        .metadata()
+        .map(|metadata| metadata.nlink())
+        .map_err(|_| AdjustedSourceError::Filesystem)
+}
+
+#[cfg(unix)]
+fn remove_owned_staging_directory(
+    output: &AnchoredOutput,
+    staging_name: &CStr,
+    staging: &File,
+    expected: StagingDirectoryIdentity,
+) -> Result<(), AdjustedSourceError> {
+    remove_owned_staging_directory_at(&output.parent, staging_name, staging, expected)?;
+    output.fsync_parent()
+}
+
+#[cfg(unix)]
+fn remove_owned_staging_directory_at(
+    parent: &File,
+    staging_name: &CStr,
+    staging: &File,
+    expected: StagingDirectoryIdentity,
+) -> Result<(), AdjustedSourceError> {
+    use std::os::fd::AsRawFd;
+
+    if inspect_staging_directory(staging)? != expected || staging_link_count(staging)? < 2 {
+        return Err(AdjustedSourceError::InvalidTemporaryFile);
+    }
+    let named_staging = open_directory_at(parent.as_raw_fd(), staging_name)
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    if inspect_staging_directory(&named_staging)? != expected
+        || staging_link_count(&named_staging)? < 2
+    {
+        return Err(AdjustedSourceError::InvalidTemporaryFile);
+    }
+    let remove = unsafe {
+        libc::unlinkat(
+            parent.as_raw_fd(),
+            staging_name.as_ptr(),
+            libc::AT_REMOVEDIR,
+        )
+    };
+    if remove != 0 {
+        return Err(AdjustedSourceError::Filesystem);
+    }
+    parent
+        .sync_all()
+        .map_err(|_| AdjustedSourceError::Filesystem)
+}
+
+#[cfg(unix)]
+fn inspect_open_file(file: File) -> Result<OpenArtifact, AdjustedSourceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    if !metadata.file_type().is_file() {
+        return Err(AdjustedSourceError::UnsafeOutputPath);
+    }
+    Ok(OpenArtifact {
+        identity: FileIdentity {
+            size_bytes: metadata.len(),
+            sha256: hash_open_file(&file)?,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            owner: metadata.uid(),
+            mode: metadata.mode() & 0o777,
+            link_count: metadata.nlink(),
+            #[cfg(target_os = "macos")]
+            flags: macos_file_flags(&file)?,
+        },
+        file,
+    })
+}
+
+#[cfg(unix)]
+fn file_location(file: &File) -> Result<(u64, u64), AdjustedSourceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    file.metadata()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+        .map_err(|_| AdjustedSourceError::Filesystem)
+}
+
+#[cfg(unix)]
+fn seal_source_file(file: &File) -> Result<(), AdjustedSourceError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o400) } != 0 {
+        return Err(AdjustedSourceError::Filesystem);
+    }
+    file.sync_all()
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    if metadata.mode() & 0o777 != 0o400 || metadata.nlink() != 1 {
+        return Err(AdjustedSourceError::InvalidTemporaryFile);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn duplicate_encoder_descriptor(
+    source: &File,
+    reset_offset: bool,
+) -> Result<File, AdjustedSourceError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let descriptor = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
+    if descriptor < 0 {
+        return Err(AdjustedSourceError::Filesystem);
+    }
+    if reset_offset && unsafe { libc::lseek(descriptor, 0, libc::SEEK_SET) } < 0 {
+        let _ = unsafe { libc::close(descriptor) };
+        return Err(AdjustedSourceError::Filesystem);
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn hash_open_file(file: &File) -> Result<String, AdjustedSourceError> {
+    let mut file = file
+        .try_clone()
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| AdjustedSourceError::Filesystem)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+    loop {
+        let bytes_read = file
+            .read(&mut buffer)
+            .map_err(|_| AdjustedSourceError::Filesystem)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn verify_jpeg(file: &File, width: u32, height: u32) -> Result<(), AdjustedSourceError> {
+    let mut file = file
+        .try_clone()
+        .map_err(|_| AdjustedSourceError::InvalidJpeg)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| AdjustedSourceError::InvalidJpeg)?;
+    let mut decoder =
+        JpegDecoder::new(BufReader::new(file)).map_err(|_| AdjustedSourceError::InvalidJpeg)?;
+    if decoder.dimensions() != (width, height)
+        || decoder
+            .orientation()
+            .map_err(|_| AdjustedSourceError::InvalidJpeg)?
+            != Orientation::NoTransforms
+    {
+        return Err(AdjustedSourceError::InvalidJpeg);
+    }
+    let decoded_size = decoder.total_bytes();
+    if decoded_size > MAX_DECODED_JPEG_BYTES {
+        return Err(AdjustedSourceError::InvalidJpeg);
+    }
+    let decoded_size =
+        usize::try_from(decoded_size).map_err(|_| AdjustedSourceError::InvalidJpeg)?;
+    let channels = decoder.color_type().bytes_per_pixel() as usize;
+    let mut decoded = vec![0_u8; decoded_size];
+    decoder
+        .read_image(&mut decoded)
+        .map_err(|_| AdjustedSourceError::InvalidJpeg)?;
+    let standard_deviation = rgb_standard_deviation(&decoded, channels)?;
+    if standard_deviation < MIN_VISUAL_STDEV {
+        return Err(AdjustedSourceError::InvalidJpeg);
+    }
+    Ok(())
+}
+
+fn rgb_standard_deviation(decoded: &[u8], channels: usize) -> Result<f64, AdjustedSourceError> {
+    if channels == 0 || decoded.is_empty() || !decoded.len().is_multiple_of(channels) {
+        return Err(AdjustedSourceError::InvalidJpeg);
+    }
+    let count = decoded.len() as f64;
+    let mean = decoded
+        .iter()
+        .map(|value| f64::from(*value) / 255.0)
+        .sum::<f64>()
+        / count;
+    let variance = decoded
+        .iter()
+        .map(|value| {
+            let delta = f64::from(*value) / 255.0 - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / count;
+    Ok(variance.sqrt())
+}
+
+#[cfg(target_os = "macos")]
+fn rename_without_overwrite_at(
+    from_dirfd: libc::c_int,
+    from: &CStr,
+    to_dirfd: libc::c_int,
+    to: &CStr,
+) -> io::Result<()> {
+    let result = unsafe {
+        libc::renameatx_np(
+            from_dirfd,
+            from.as_ptr(),
+            to_dirfd,
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_without_overwrite_at(
+    from_dirfd: libc::c_int,
+    from: &CStr,
+    to_dirfd: libc::c_int,
+    to: &CStr,
+) -> io::Result<()> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            from_dirfd,
+            from.as_ptr(),
+            to_dirfd,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_without_overwrite_at(
+    _from_dirfd: libc::c_int,
+    _from: &CStr,
+    _to_dirfd: libc::c_int,
+    _to: &CStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "rename unsupported",
+    ))
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_adjusted_source_proof_fields(
+    proof: &CloudKitAdjustedSourceProof,
+    asset_id: &str,
+    original_asset: &OriginalAssetProof,
+    expected_path: &Path,
+) -> Result<(), AdjustedSourceError> {
+    if validate_library_destination(&CloudKitLibraryDestination {
+        database_scope: proof.database_scope,
+        zone_name: proof.zone_name.clone(),
+        owner_record_name: proof.owner_record_name.clone(),
+    })
+    .is_err()
+    {
+        return Err(AdjustedSourceError::InvalidProof);
+    }
+    if proof.schema_version != ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION
+        || proof.source_kind != ADJUSTED_SOURCE_KIND
+        || proof.resource_field != ADJUSTED_RESOURCE_FIELD
+        || proof.declared_file_type != "public.jpeg"
+        || proof.orientation != 1
+        || proof.asset_id.trim().is_empty()
+        || proof.resource_record_name.trim().is_empty()
+        || proof.resource_record_change_tag.trim().is_empty()
+        || proof.resource_record_type.trim().is_empty()
+        || proof.zone_name.trim().is_empty()
+        || proof.declared_fingerprint.trim().is_empty()
+        || proof.verified_at_unix_seconds == 0
+        || proof.width == 0
+        || proof.height == 0
+        || proof.declared_size_bytes == 0
+        || proof.declared_size_bytes > MAX_ADJUSTED_SOURCE_ENCODED_BYTES
+        || proof.downloaded_size_bytes == 0
+        || proof.downloaded_size_bytes != proof.declared_size_bytes
+        || !is_sha256(&proof.downloaded_sha256)
+    {
+        return Err(AdjustedSourceError::InvalidProof);
+    }
+    if proof.asset_id != asset_id
+        || proof.asset_record_name != original_asset.record_name
+        || proof.asset_record_change_tag != original_asset.record_change_tag
+        || proof.asset_record_type != original_asset.record_type
+        || proof.database_scope != original_asset.database_scope
+        || proof.zone_name != original_asset.zone_name
+        || proof.owner_record_name != original_asset.owner_record_name
+        || proof.local_path != expected_path
+    {
+        return Err(AdjustedSourceError::ProofMismatch);
+    }
+    if proof.asset_record_type != "CPLAsset" {
+        return Err(AdjustedSourceError::InvalidProof);
+    }
+    match proof.master_record_name.as_deref() {
+        None => {
+            if proof.resource_record_name != proof.asset_record_name
+                || proof.resource_record_change_tag != proof.asset_record_change_tag
+                || proof.resource_record_type != proof.asset_record_type
+            {
+                return Err(AdjustedSourceError::ProofMismatch);
+            }
+        }
+        Some(master_record_name) => {
+            if master_record_name.trim().is_empty()
+                || proof.resource_record_type != "CPLMaster"
+                || proof.resource_record_name != master_record_name
+                || proof.resource_record_name == proof.asset_record_name
+                || proof.resource_record_change_tag == proof.asset_record_change_tag
+            {
+                return Err(AdjustedSourceError::InvalidProof);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_validated_adjusted_source(
+    proof: &CloudKitAdjustedSourceProof,
+    asset_id: &str,
+    original_asset: &OriginalAssetProof,
+    expected_path: &Path,
+) -> Result<(AnchoredOutput, OpenArtifact), AdjustedSourceError> {
+    validate_adjusted_source_proof_fields(proof, asset_id, original_asset, expected_path)?;
+    let output = AnchoredOutput::open(expected_path)?;
+    let artifact = output
+        .open_final()?
+        .ok_or(AdjustedSourceError::ProofLocalFileMissing)?;
+    if !has_single_link(&artifact.file)? {
+        return Err(AdjustedSourceError::UnsafeOutputPath);
+    }
+    if artifact.identity.size_bytes != proof.downloaded_size_bytes
+        || artifact.identity.sha256 != proof.downloaded_sha256
+    {
+        return Err(AdjustedSourceError::ProofLocalFileMismatch);
+    }
+    verify_jpeg(&artifact.file, proof.width, proof.height)?;
+    output.ensure_final_identity(&artifact.identity)?;
+    Ok((output, artifact))
+}
+
+#[cfg(unix)]
+fn has_single_link(file: &File) -> Result<bool, AdjustedSourceError> {
+    use std::os::unix::fs::MetadataExt;
+
+    file.metadata()
+        .map(|metadata| metadata.nlink() == 1)
+        .map_err(|_| AdjustedSourceError::Filesystem)
+}
+
+fn verified_timestamp() -> Result<u64, AdjustedSourceError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| AdjustedSourceError::Clock)
+}
+
+#[cfg(test)]
+fn test_swap_original_after_materialization(source_path: &Path) -> Result<(), AdjustedSourceError> {
+    let replacement = TEST_MATERIALIZATION_SWAP_PATH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(replacement) = replacement {
+        std::fs::rename(replacement, source_path).map_err(|_| AdjustedSourceError::Filesystem)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    struct StaticAdjustedSourceLookupTransport {
+        response: Value,
+    }
+
+    impl CloudKitAdjustedSourceTransport for StaticAdjustedSourceLookupTransport {
+        fn post_records_lookup(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _payload: Value,
+        ) -> Result<Value, AdjustedSourceError> {
+            Ok(self.response.clone())
+        }
+
+        fn download_resource_to_create_new(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _download_url: &Url,
+            _expected_size_bytes: u64,
+            _temp_file: &mut File,
+        ) -> Result<CloudKitAdjustedSourceDownload, AdjustedSourceError> {
+            Err(AdjustedSourceError::DownloadTransport)
+        }
+    }
+
+    fn test_lookup_session() -> CloudKitDeleteSession {
+        CloudKitDeleteSession {
+            dsid: "123456789".to_string(),
+            ckdatabasews_url: Url::parse("https://p140-ckdatabasews.icloud.com:443")
+                .expect("session URL should parse"),
+            cloudkit_query_params: vec![],
+            cookies: vec![],
+            database_scope: CloudKitDatabaseScope::Private,
+            zone: CloudKitLibraryDestination::primary_sync(),
+        }
+    }
+
+    fn unmarked_lookup_record(
+        record_name: &str,
+        record_type: &str,
+        record_change_tag: &str,
+        zone: Value,
+        fields: Value,
+    ) -> Value {
+        json!({
+            "recordName": record_name,
+            "recordType": record_type,
+            "recordChangeTag": record_change_tag,
+            "zoneID": zone,
+            "fields": fields,
+        })
+    }
+
+    #[test]
+    fn unmarked_active_asset_and_master_exact_lookups_are_accepted() {
+        let destination = CloudKitLibraryDestination::primary_sync();
+        let session = test_lookup_session();
+        for (record_name, record_type, record_change_tag, expected_change_tag) in [
+            ("asset-record", "CPLAsset", "asset-tag", "asset-tag"),
+            ("master-record", "CPLMaster", "master-tag", ""),
+        ] {
+            let record = unmarked_lookup_record(
+                record_name,
+                record_type,
+                record_change_tag,
+                json!({"zoneName": destination.zone_name}),
+                json!({}),
+            );
+            let mut transport = StaticAdjustedSourceLookupTransport {
+                response: json!({"records": [record]}),
+            };
+            let resolved = lookup_exact_record(
+                &mut transport,
+                &session,
+                record_name,
+                expected_change_tag,
+                record_type,
+                &destination,
+                &[],
+            );
+            assert!(
+                resolved.is_ok(),
+                "unmarked {record_type} record should be accepted: {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unmarked_records_still_reject_bad_identity_and_binding() {
+        let destination = CloudKitLibraryDestination::primary_sync();
+        let session = test_lookup_session();
+
+        let identity_record = unmarked_lookup_record(
+            "different-record",
+            "CPLAsset",
+            "asset-tag",
+            json!({"zoneName": destination.zone_name}),
+            json!({}),
+        );
+        let mut identity_transport = StaticAdjustedSourceLookupTransport {
+            response: json!({"records": [identity_record]}),
+        };
+        let identity_error = lookup_exact_record(
+            &mut identity_transport,
+            &session,
+            "asset-record",
+            "asset-tag",
+            "CPLAsset",
+            &destination,
+            &[],
+        )
+        .expect_err("unmarked record with mismatched identity must fail closed");
+        assert!(matches!(
+            identity_error,
+            AdjustedSourceError::InvalidResponse(
+                "lookup response identity differs from requested record"
+            )
+        ));
+
+        let binding_record = unmarked_lookup_record(
+            "asset-record",
+            "CPLAsset",
+            "asset-tag",
+            json!({"zoneName": "OtherSync"}),
+            json!({}),
+        );
+        let mut binding_transport = StaticAdjustedSourceLookupTransport {
+            response: json!({"records": [binding_record]}),
+        };
+        let binding_error = lookup_exact_record(
+            &mut binding_transport,
+            &session,
+            "asset-record",
+            "asset-tag",
+            "CPLAsset",
+            &destination,
+            &[],
+        )
+        .expect_err("unmarked record with mismatched zone must fail closed");
+        assert!(matches!(
+            binding_error,
+            AdjustedSourceError::InvalidResponse(
+                "lookup record zone differs from the original asset proof"
+            )
+        ));
+    }
+
+    #[test]
+    fn is_deleted_marker_accepts_only_active_values_and_rejects_malformed_values() {
+        for marker in [
+            json!({"type": "INT64", "value": 0}),
+            json!({"type": "BOOLEAN", "value": false}),
+        ] {
+            assert!(require_non_deleted(&json!({"fields": {"isDeleted": marker}})).is_ok());
+        }
+
+        for marker in [
+            json!({"type": "INT64", "value": 1}),
+            json!({"type": "BOOLEAN", "value": true}),
+        ] {
+            assert!(matches!(
+                require_non_deleted(&json!({"fields": {"isDeleted": marker}})),
+                Err(AdjustedSourceError::InvalidResponse(
+                    "lookup record is deleted"
+                ))
+            ));
+        }
+
+        for marker in [
+            json!(null),
+            json!({"type": "INT64"}),
+            json!({"type": "INT64", "value": 2}),
+            json!({"type": "INT64", "value": "0"}),
+            json!({"type": "BOOLEAN", "value": 0}),
+            json!({"type": "STRING", "value": "0"}),
+        ] {
+            assert!(matches!(
+                require_non_deleted(&json!({"fields": {"isDeleted": marker}})),
+                Err(AdjustedSourceError::InvalidResponse(
+                    "lookup record isDeleted is malformed"
+                ))
+            ));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sealed_macos_staging_for_unseal_test() -> ConversionSourceStaging {
+        let source_directory = tempfile::tempdir().expect("source test directory");
+        let source_path = source_directory.path().join("source.jpg");
+        std::fs::write(&source_path, b"sealed adjusted test bytes")
+            .expect("source bytes should be written");
+        let source = inspect_open_file(File::open(&source_path).expect("source should open"))
+            .expect("source identity should inspect");
+        let output_directory = tempfile::tempdir().expect("output test directory");
+        let output_path = output_directory
+            .path()
+            .canonicalize()
+            .expect("output test directory should canonicalize")
+            .join("output.heic");
+        let expected_path = adjusted_source_path_for_output(&output_path);
+        let output = AnchoredOutput::open(&expected_path).expect("output should anchor");
+        let mut staging = ConversionSourceStaging::create(&output, &expected_path)
+            .expect("staging should create");
+        staging
+            .copy_from_descriptor(&source.file, &source.identity)
+            .expect("source should copy");
+        staging.seal().expect("staging should seal");
+        staging
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_staging_source_flags(staging: &ConversionSourceStaging) -> u32 {
+        use std::os::fd::AsRawFd;
+
+        let source = inspect_open_file(
+            open_regular_at(staging.staging.as_raw_fd(), &staging.file_name)
+                .expect("sealed source should open"),
+        )
+        .expect("sealed source should inspect");
+        macos_file_flags(&source.file).expect("sealed source flags should inspect")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_macos_unseal_failure_residual(
+        staging: &ConversionSourceStaging,
+        directory_is_immutable: bool,
+    ) {
+        assert_ne!(
+            macos_staging_source_flags(staging) & libc::UF_IMMUTABLE,
+            0,
+            "a failed unseal must leave immutable source bytes"
+        );
+        assert_eq!(
+            macos_file_flags(&staging.staging).expect("staging flags should inspect")
+                & libc::UF_IMMUTABLE
+                != 0,
+            directory_is_immutable,
+            "failed cleanup must leave an auditable staging directory state"
+        );
+        assert!(
+            staging.path.exists(),
+            "failed cleanup must retain the source"
+        );
+        assert!(
+            staging.path.parent().is_some_and(Path::exists),
+            "failed cleanup must retain the staging namespace"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    struct TestMaterializedAdjustedSourceFixture {
+        _directory: tempfile::TempDir,
+        source: MaterializedAdjustedSource,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn materialize_unrelated_adjusted_source_for_thread_isolation_test()
+    -> TestMaterializedAdjustedSourceFixture {
+        use image::codecs::jpeg::JpegEncoder;
+        use image::{DynamicImage, Rgb, RgbImage};
+
+        let directory = tempfile::tempdir().expect("materialization test directory");
+        let output_path = directory
+            .path()
+            .canonicalize()
+            .expect("materialization test directory should canonicalize")
+            .join("unrelated.heic");
+        let adjusted_path = adjusted_source_path_for_output(&output_path);
+        let mut image = RgbImage::new(2, 2);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = Rgb([(x * 80) as u8, (y * 80) as u8, 37]);
+        }
+        let mut bytes = Vec::new();
+        JpegEncoder::new_with_quality(&mut bytes, 100)
+            .encode_image(&DynamicImage::ImageRgb8(image))
+            .expect("test adjusted JPEG should encode");
+        std::fs::write(&adjusted_path, &bytes).expect("test adjusted JPEG should write");
+
+        let original = OriginalAssetProof {
+            record_name: "unrelated-original-record".to_string(),
+            record_change_tag: "unrelated-original-tag".to_string(),
+            record_type: "CPLAsset".to_string(),
+            database_scope: Default::default(),
+            zone_name: "PrimarySync".to_string(),
+            owner_record_name: None,
+            filename: "unrelated.dng".to_string(),
+            size_bytes: 1,
+            matched_raw_sha256: "0".repeat(64),
+        };
+        let proof = CloudKitAdjustedSourceProof {
+            schema_version: ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION.to_string(),
+            source_kind: ADJUSTED_SOURCE_KIND.to_string(),
+            asset_id: "unrelated-asset".to_string(),
+            asset_record_name: original.record_name.clone(),
+            asset_record_change_tag: original.record_change_tag.clone(),
+            asset_record_type: original.record_type.clone(),
+            resource_record_name: original.record_name.clone(),
+            resource_record_change_tag: original.record_change_tag.clone(),
+            resource_record_type: "CPLAsset".to_string(),
+            database_scope: original.database_scope,
+            zone_name: original.zone_name.clone(),
+            owner_record_name: original.owner_record_name.clone(),
+            master_record_name: None,
+            resource_field: ADJUSTED_RESOURCE_FIELD.to_string(),
+            declared_file_type: "public.jpeg".to_string(),
+            declared_fingerprint: "unrelated-fingerprint".to_string(),
+            declared_size_bytes: bytes.len() as u64,
+            width: 2,
+            height: 2,
+            local_path: adjusted_path,
+            downloaded_size_bytes: bytes.len() as u64,
+            downloaded_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            orientation: 1,
+            verified_at_unix_seconds: 1,
+        };
+
+        let source = materialize_adjusted_source_for_conversion(
+            &proof,
+            &proof.asset_id,
+            &original,
+            &output_path,
+        )
+        .expect("unrelated adjusted source should materialize");
+        TestMaterializedAdjustedSourceFixture {
+            _directory: directory,
+            source,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unseal_directory_clear_failure_leaves_auditable_immutable_residual() {
+        let guard = TestMacosFchflagsFailureGuard::install();
+        let mut staging = sealed_macos_staging_for_unseal_test();
+        guard.arm([MacosFchflagsTarget::StagingDirectory]);
+
+        let cleanup = staging.cleanup();
+        assert!(
+            matches!(cleanup, Err(AdjustedSourceError::Filesystem)),
+            "unexpected cleanup result {cleanup:?}; calls: {:?}; source_immutable={}; directory_immutable={}",
+            guard.calls(),
+            staging.source_immutable,
+            staging.directory_immutable
+        );
+        assert_eq!(guard.calls(), vec![MacosFchflagsTarget::StagingDirectory]);
+        assert_macos_unseal_failure_residual(&staging, true);
+
+        drop(guard);
+        let retry = staging.cleanup();
+        assert!(
+            retry.is_ok(),
+            "retry result {retry:?}; source_flags={:x}; staging_flags={:x}; source_immutable={}; directory_immutable={}",
+            macos_staging_source_flags(&staging),
+            macos_file_flags(&staging.staging).expect("staging flags should inspect"),
+            staging.source_immutable,
+            staging.directory_immutable
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unseal_source_clear_failure_rolls_back_the_directory() {
+        let guard = TestMacosFchflagsFailureGuard::install();
+        let mut staging = sealed_macos_staging_for_unseal_test();
+        guard.arm([MacosFchflagsTarget::Source]);
+
+        let cleanup = staging.cleanup();
+        assert!(
+            matches!(cleanup, Err(AdjustedSourceError::Filesystem)),
+            "unexpected cleanup result {cleanup:?}; calls: {:?}; source_immutable={}; directory_immutable={}",
+            guard.calls(),
+            staging.source_immutable,
+            staging.directory_immutable
+        );
+        assert_eq!(
+            guard.calls(),
+            vec![
+                MacosFchflagsTarget::StagingDirectory,
+                MacosFchflagsTarget::Source,
+                MacosFchflagsTarget::StagingDirectory,
+            ]
+        );
+        assert_macos_unseal_failure_residual(&staging, true);
+
+        drop(guard);
+        staging
+            .cleanup()
+            .expect("retry should clean the rolled-back residual");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_fchflags_fault_is_thread_local_during_unrelated_adjusted_materialization() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+        let (entered_source, source_entered) = mpsc::sync_channel(1);
+        let (release_materializer, materializer_released) = mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let source = scope.spawn(move || {
+                let guard = TestMacosFchflagsFailureGuard::install();
+                let mut staging = sealed_macos_staging_for_unseal_test();
+                guard.arm([MacosFchflagsTarget::Source]);
+                let _release = TestReleaseOnDrop::new(release_materializer);
+                source_entered
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("unrelated materializer should pause in its Source fchflags wrapper");
+
+                assert!(matches!(
+                    staging.cleanup(),
+                    Err(AdjustedSourceError::Filesystem)
+                ));
+                assert_eq!(
+                    guard.calls(),
+                    vec![
+                        MacosFchflagsTarget::StagingDirectory,
+                        MacosFchflagsTarget::Source,
+                        MacosFchflagsTarget::StagingDirectory,
+                    ]
+                );
+                assert_macos_unseal_failure_residual(&staging, true);
+                drop(guard);
+                assert_test_macos_fchflags_state_is_reset();
+                let retry_guard = TestMacosFchflagsFailureGuard::install();
+                staging
+                    .cleanup()
+                    .expect("thread-local fault residual should clean on retry");
+                drop(retry_guard);
+                assert_test_macos_fchflags_state_is_reset();
+            });
+
+            let materializer = scope.spawn(move || {
+                let _state_guard = TestMacosFchflagsFailureGuard::install();
+                let _pause_guard = TestMacosFchflagsPauseGuard::install(
+                    entered_source,
+                    materializer_released,
+                    TEST_TIMEOUT,
+                );
+                let fixture = materialize_unrelated_adjusted_source_for_thread_isolation_test();
+                let staging_path = fixture.source.path().to_path_buf();
+                let descriptor_observation =
+                    fixture
+                        .source
+                        .duplicate_file_for_encoder()
+                        .ok()
+                        .map(|descriptor| {
+                            let observed = descriptor.raw_fd() >= 0;
+                            drop(descriptor);
+                            observed
+                        });
+                assert_eq!(
+                    descriptor_observation,
+                    Some(true),
+                    "unrelated materialization must retain an open encoder descriptor"
+                );
+                drop(fixture);
+                assert!(
+                    !staging_path.exists(),
+                    "unrelated materialization should clean its sealed staging directory"
+                );
+            });
+
+            source.join().expect("armed source thread should complete");
+            materializer
+                .join()
+                .expect("unrelated materializer thread should complete");
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unseal_rollback_failure_keeps_immutable_source_and_residual() {
+        let guard = TestMacosFchflagsFailureGuard::install();
+        let mut staging = sealed_macos_staging_for_unseal_test();
+        guard.arm([
+            MacosFchflagsTarget::Source,
+            MacosFchflagsTarget::StagingDirectory,
+        ]);
+
+        let cleanup = staging.cleanup();
+        assert!(
+            matches!(cleanup, Err(AdjustedSourceError::Filesystem)),
+            "unexpected cleanup result {cleanup:?}; calls: {:?}; source_immutable={}; directory_immutable={}",
+            guard.calls(),
+            staging.source_immutable,
+            staging.directory_immutable
+        );
+        assert_eq!(
+            guard.calls(),
+            vec![
+                MacosFchflagsTarget::StagingDirectory,
+                MacosFchflagsTarget::Source,
+                MacosFchflagsTarget::StagingDirectory,
+            ]
+        );
+        assert_macos_unseal_failure_residual(&staging, false);
+
+        drop(guard);
+        staging
+            .cleanup()
+            .expect("retry should clean the retained residual");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unseal_directory_metadata_failure_rolls_back_before_source_unseal() {
+        let guard = TestMacosFchflagsFailureGuard::install();
+        let mut staging = sealed_macos_staging_for_unseal_test();
+        guard.arm_metadata_reads([MacosMetadataReadTarget::AfterClear]);
+
+        assert!(matches!(
+            staging.cleanup(),
+            Err(AdjustedSourceError::Filesystem)
+        ));
+        assert_eq!(
+            guard.metadata_calls(),
+            vec![
+                MacosMetadataReadTarget::BeforeClear,
+                MacosMetadataReadTarget::AfterClear,
+                MacosMetadataReadTarget::Rollback,
+            ]
+        );
+        assert_macos_unseal_failure_residual(&staging, true);
+
+        drop(guard);
+        staging
+            .cleanup()
+            .expect("retry must inspect held flags and clean the residual");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unseal_rollback_metadata_failure_leaves_retry_safe_residual() {
+        let guard = TestMacosFchflagsFailureGuard::install();
+        let mut staging = sealed_macos_staging_for_unseal_test();
+        guard.arm_metadata_reads([
+            MacosMetadataReadTarget::AfterClear,
+            MacosMetadataReadTarget::Rollback,
+        ]);
+
+        assert!(matches!(
+            staging.cleanup(),
+            Err(AdjustedSourceError::Filesystem)
+        ));
+        assert_eq!(
+            guard.metadata_calls(),
+            vec![
+                MacosMetadataReadTarget::BeforeClear,
+                MacosMetadataReadTarget::AfterClear,
+                MacosMetadataReadTarget::Rollback,
+            ]
+        );
+        assert_macos_unseal_failure_residual(&staging, true);
+        assert!(
+            !staging.directory_state_known,
+            "a rollback verification error must retain explicit unknown directory state"
+        );
+
+        drop(guard);
+        staging
+            .cleanup()
+            .expect("retry must inspect held flags after rollback verification failure");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_rename_never_overwrites_an_existing_destination() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let output_path = directory
+            .path()
+            .canonicalize()
+            .expect("stable test directory")
+            .join("adjusted.jpg");
+        let output = AnchoredOutput::open(&output_path).expect("anchored output");
+        let mut temp = output.create_temp().expect("create-new temp");
+        temp.file_mut()
+            .expect("open temp")
+            .write_all(b"verified JPEG bytes")
+            .expect("write temp");
+        temp.sync_and_close().expect("sync temp");
+        let expected = temp.open_regular().expect("reopen temp").identity;
+        std::fs::write(&output_path, b"existing output").expect("existing destination");
+
+        let result = temp
+            .install_exclusive(&expected)
+            .expect("occupied destination is a normal race outcome");
+
+        assert!(matches!(result, InstallResult::AlreadyExists));
+        assert_eq!(
+            std::fs::read(&output_path).expect("existing output bytes"),
+            b"existing output"
+        );
+        temp.cleanup().expect("cleanup staging directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reverify_snapshot_rejects_symlink_and_nonregular_sources() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let reference = root.join("reference.jpg");
+        let final_path = root.join("final.heic");
+        let mirror = root.join("mirror.heic");
+        std::fs::write(&reference, b"reference").expect("reference");
+        std::fs::write(&final_path, b"final").expect("final");
+        std::fs::write(&mirror, b"final").expect("mirror");
+        let hash = format!("{:x}", Sha256::digest(b"final"));
+
+        std::fs::remove_file(&reference).expect("remove reference");
+        std::os::unix::fs::symlink(&final_path, &reference).expect("reference symlink");
+        assert!(
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &hash, 5).is_err()
+        );
+        std::fs::remove_file(&reference).expect("remove symlink");
+        std::fs::write(&reference, b"reference").expect("restore reference");
+
+        std::fs::remove_file(&final_path).expect("remove final");
+        std::fs::create_dir(&final_path).expect("final directory");
+        assert!(
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &hash, 5).is_err()
+        );
+        std::fs::remove_dir(&final_path).expect("remove final directory");
+        std::fs::write(&final_path, b"final").expect("restore final");
+
+        std::fs::remove_file(&mirror).expect("remove mirror");
+        std::os::unix::fs::symlink(&final_path, &mirror).expect("mirror symlink");
+        assert!(
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &hash, 5).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_path_uses_the_exact_validated_file_name() {
+        let parent = Path::new("/private/tmp");
+        assert_eq!(
+            staged_path(parent, ".snapshot-a.staging", c"reference.jpg").expect("reference path"),
+            parent.join(".snapshot-a.staging/reference.jpg")
+        );
+        assert_eq!(
+            staged_path(parent, ".snapshot-b.staging", c"final.heic").expect("final path"),
+            parent.join(".snapshot-b.staging/final.heic")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reverify_snapshot_paths_match_held_staged_descriptors() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let reference = root.join("reference.jpg");
+        let final_path = root.join("final.heic");
+        let mirror = root.join("mirror.heic");
+        std::fs::write(&reference, b"reference").expect("reference");
+        std::fs::write(&final_path, b"final").expect("final");
+        std::fs::write(&mirror, b"final").expect("mirror");
+        let hash = format!("{:x}", Sha256::digest(b"final"));
+        let mut snapshot =
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &hash, 5)
+                .expect("snapshot");
+        let staged_reference = snapshot.reference_path();
+        let staged_final = snapshot.final_path();
+        assert_eq!(
+            staged_reference.file_name(),
+            Some(std::ffi::OsStr::new("reference.jpg"))
+        );
+        assert_eq!(
+            staged_final.file_name(),
+            Some(std::ffi::OsStr::new("final.heic"))
+        );
+        assert_eq!(
+            std::fs::read(staged_reference).expect("staged reference"),
+            b"reference"
+        );
+        assert_eq!(std::fs::read(staged_final).expect("staged final"), b"final");
+        let reference_metadata = std::fs::metadata(staged_reference).expect("reference metadata");
+        let final_metadata = std::fs::metadata(staged_final).expect("final metadata");
+        assert_eq!(
+            reference_metadata.dev(),
+            snapshot.reference_staged.identity.device
+        );
+        assert_eq!(
+            reference_metadata.ino(),
+            snapshot.reference_staged.identity.inode
+        );
+        assert_eq!(final_metadata.dev(), snapshot.final_staged.identity.device);
+        assert_eq!(final_metadata.ino(), snapshot.final_staged.identity.inode);
+        snapshot.cleanup().expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reverify_snapshot_holds_staged_bytes_and_cleans_only_owned_namespaces() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let reference = root.join("reference.jpg");
+        let final_path = root.join("final.heic");
+        let mirror = root.join("mirror.heic");
+        let reference_bytes = b"reference before";
+        let final_bytes = b"final before";
+        std::fs::write(&reference, reference_bytes).expect("reference");
+        std::fs::write(&final_path, final_bytes).expect("final");
+        std::fs::write(&mirror, final_bytes).expect("mirror");
+        let hash = format!("{:x}", Sha256::digest(final_bytes));
+
+        let mut snapshot = materialize_reverify_heic_snapshot(
+            &reference,
+            &final_path,
+            &mirror,
+            &hash,
+            final_bytes.len() as u64,
+        )
+        .expect("snapshot");
+        let staged_reference = snapshot.reference_path().to_path_buf();
+        let staged_final = snapshot.final_path().to_path_buf();
+        let parked_final = root.join("parked-final.heic");
+        std::fs::rename(&final_path, &parked_final).expect("park original final");
+        std::fs::write(&final_path, b"attacker final").expect("replacement final");
+        std::fs::remove_file(&final_path).expect("remove replacement final");
+        std::fs::rename(&parked_final, &final_path).expect("restore original final");
+
+        assert_eq!(
+            std::fs::read(&staged_reference).expect("staged reference"),
+            reference_bytes
+        );
+        assert_eq!(
+            std::fs::read(&staged_final).expect("staged final"),
+            final_bytes
+        );
+        snapshot
+            .revalidate()
+            .expect("restored source must not change staged bytes");
+        std::fs::write(&reference, b"reference after").expect("replace reference");
+        assert!(snapshot.revalidate().is_err());
+        snapshot.cleanup().expect("owned staging cleanup");
+        assert!(!staged_reference.exists());
+        assert!(!staged_final.exists());
+        assert!(reference.exists());
+        assert!(final_path.exists());
+        assert!(mirror.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reverify_snapshot_rejects_final_or_mirror_proof_mismatch() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let reference = root.join("reference.jpg");
+        let final_path = root.join("final.heic");
+        let mirror = root.join("mirror.heic");
+        std::fs::write(&reference, b"reference").expect("reference");
+        std::fs::write(&final_path, b"final").expect("final");
+        std::fs::write(&mirror, b"mirror").expect("mirror");
+        let final_hash = format!("{:x}", Sha256::digest(b"final"));
+
+        assert!(
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &final_hash, 5)
+                .is_err()
+        );
+        std::fs::write(&mirror, b"final").expect("restore mirror");
+        assert!(
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &final_hash, 6)
+                .is_err()
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn reverify_snapshot_rejects_replaced_staged_path() {
+        use std::os::fd::AsRawFd;
+
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let reference = root.join("reference.jpg");
+        let final_path = root.join("final.heic");
+        let mirror = root.join("mirror.heic");
+        std::fs::write(&reference, b"reference").expect("reference");
+        std::fs::write(&final_path, b"final").expect("final");
+        std::fs::write(&mirror, b"final").expect("mirror");
+        let hash = format!("{:x}", Sha256::digest(b"final"));
+        let mut snapshot =
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &hash, 5)
+                .expect("snapshot");
+        assert_eq!(
+            unsafe { libc::fchmod(snapshot.reference_staging.staging.as_raw_fd(), 0o700) },
+            0
+        );
+        std::fs::remove_file(snapshot.reference_path()).expect("remove staged file");
+        std::os::unix::fs::symlink(&reference, snapshot.reference_path())
+            .expect("replace staged path");
+        assert!(snapshot.revalidate().is_err());
+        let _ = snapshot.cleanup();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reverify_snapshot_staging_is_immutable() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = directory.path().canonicalize().expect("canonical root");
+        let reference = root.join("reference.jpg");
+        let final_path = root.join("final.heic");
+        let mirror = root.join("mirror.heic");
+        std::fs::write(&reference, b"reference").expect("reference");
+        std::fs::write(&final_path, b"final").expect("final");
+        std::fs::write(&mirror, b"final").expect("mirror");
+        let hash = format!("{:x}", Sha256::digest(b"final"));
+        let mut snapshot =
+            materialize_reverify_heic_snapshot(&reference, &final_path, &mirror, &hash, 5)
+                .expect("snapshot");
+        assert_ne!(
+            snapshot.reference_staged.identity.flags & libc::UF_IMMUTABLE,
+            0
+        );
+        assert_ne!(snapshot.final_staged.identity.flags & libc::UF_IMMUTABLE, 0);
+        snapshot
+            .revalidate()
+            .expect("immutable identity revalidation");
+        snapshot.cleanup().expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn already_exists_with_identical_bytes_accepts_the_concurrent_winner() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let output_path = directory
+            .path()
+            .canonicalize()
+            .expect("stable test directory")
+            .join("adjusted.jpg");
+        let output = AnchoredOutput::open(&output_path).expect("anchored output");
+        let bytes = b"verified JPEG bytes";
+        let mut temp = output.create_temp().expect("create-new temp");
+        temp.file_mut()
+            .expect("open temp")
+            .write_all(bytes)
+            .expect("write temp");
+        temp.sync_and_close().expect("sync temp");
+        let expected = temp.open_regular().expect("reopen temp").identity;
+        std::fs::write(&output_path, bytes).expect("concurrent winner");
+
+        let result = temp
+            .install_exclusive(&expected)
+            .expect("occupied destination is a normal race outcome");
+        let winner = output
+            .final_after_install(&expected, result)
+            .expect("identical concurrent winner must be accepted");
+
+        assert!(matches!(result, InstallResult::AlreadyExists));
+        assert!(winner.identity.matches_bytes(&expected));
+        assert_ne!(
+            winner.identity, expected,
+            "concurrent winner has another inode"
+        );
+        temp.cleanup().expect("cleanup staging directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn already_exists_with_different_bytes_rejects_the_concurrent_winner() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let output_path = directory
+            .path()
+            .canonicalize()
+            .expect("stable test directory")
+            .join("adjusted.jpg");
+        let output = AnchoredOutput::open(&output_path).expect("anchored output");
+        let mut temp = output.create_temp().expect("create-new temp");
+        temp.file_mut()
+            .expect("open temp")
+            .write_all(b"verified JPEG bytes")
+            .expect("write temp");
+        temp.sync_and_close().expect("sync temp");
+        let expected = temp.open_regular().expect("reopen temp").identity;
+        std::fs::write(&output_path, b"different winner").expect("concurrent winner");
+
+        let result = temp
+            .install_exclusive(&expected)
+            .expect("occupied destination is a normal race outcome");
+        let error = match output.final_after_install(&expected, result) {
+            Ok(_) => panic!("different concurrent winner must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(result, InstallResult::AlreadyExists));
+        assert!(matches!(error, AdjustedSourceError::ExistingOutputMismatch));
+        assert_eq!(
+            std::fs::read(&output_path).expect("winner remains"),
+            b"different winner"
+        );
+        temp.cleanup().expect("cleanup staging directory");
+    }
+}

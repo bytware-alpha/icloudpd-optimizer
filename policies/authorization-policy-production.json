@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "mode": "production",
+  "authority_kind": "apple_development_team",
+  "team_id": "3B86NGN2ZD",
+  "helper_designated_requirement": "designated => anchor apple generic and identifier \"com.icloudpd-optimizer.helper\" and certificate leaf[subject.OU] = \"3B86NGN2ZD\"",
+  "dashboard_designated_requirement": "designated => anchor apple generic and identifier \"com.icloudpd-optimizer.dashboard\" and certificate leaf[subject.OU] = \"3B86NGN2ZD\"",
+  "service_designated_requirement": "designated => anchor apple generic and identifier \"com.icloudpd-optimizer.monitor\" and certificate leaf[subject.OU] = \"3B86NGN2ZD\"",
+  "dashboard_bundle_identifier": "com.icloudpd-optimizer.dashboard",
+  "service_bundle_identifier": "com.icloudpd-optimizer.monitor",
+  "helper_identifier": "com.icloudpd-optimizer.helper",
+  "service_install_relative_path": "Library/Application Support/iCloudPD Optimizer/Service/iCloudPD Optimizer Service.app",
+  "helper_relative_path": "Contents/Resources/icloudpd-optimizer",
+  "owner": "effective_user",
+  "item": { "class": "internet_password", "protocol": "smb ", "security_domain": "com.icloudpd-optimizer.smb.v2", "path": null, "port": 0, "authentication_type": 1953261156, "server_source": "smb_mount_binding.service_name", "account_source": "smb_mount_binding.account", "uniqueness": "exactly_one" }
+}
