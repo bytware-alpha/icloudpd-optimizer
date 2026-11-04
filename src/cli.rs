@@ -76,12 +76,14 @@ use crate::state_store::{
     AssetRecordExactCasUpdate, AssetStateStore, AssetStateStoreError, JsonCheckpointStatus,
 };
 use crate::upload::{
-    CloudKitDatabaseScope, CloudKitDeleteClient, CloudKitDeleteRequest, CloudKitLibraryDestination,
-    CloudKitLocalReplacementCandidate, CloudKitOriginalAssetBatchResolveOutcome,
-    CloudKitOriginalAssetBatchResolveRequest, CloudKitOriginalAssetInventoryFingerprint,
-    CloudKitOriginalAssetReadTransport, CloudKitOriginalAssetResolution,
-    CloudKitOriginalAssetResolveDisposition, CloudKitOriginalAssetResolveRequest,
-    CloudKitOriginalAssetResolveTarget, CloudKitUploadedHeicInitialState,
+    CloudKitDatabaseScope, CloudKitDeleteBatchRequest, CloudKitDeleteBatchSendError,
+    CloudKitDeleteClient, CloudKitDeleteRequest, CloudKitDeleteSession, CloudKitDeleteTransport,
+    CloudKitLibraryDestination, CloudKitLocalReplacementCandidate,
+    CloudKitOriginalAssetBatchResolveOutcome, CloudKitOriginalAssetBatchResolveRequest,
+    CloudKitOriginalAssetInventoryFingerprint, CloudKitOriginalAssetReadTransport,
+    CloudKitOriginalAssetResolution, CloudKitOriginalAssetResolveDisposition,
+    CloudKitOriginalAssetResolveRequest, CloudKitOriginalAssetResolveTarget,
+    CloudKitRecentlyDeletedProof, CloudKitUploadedHeicInitialState,
     CloudKitUploadedHeicInitialStateLookupMode, CloudKitUploadedHeicReadClient,
     IcloudUploadRequest, ReqwestCloudKitDeleteTransport, ReqwestCloudKitReadTransport, UploadError,
     VerifiedUploadSource, build_upload_proof, load_cloudkit_delete_session, load_upload_session,
@@ -91,15 +93,20 @@ use crate::workflow::{
     ConversionPerformanceInput, ConversionResultInput, ConversionSourceBinding,
     HeicVerificationInput, IcloudpdLocalMirrorProof, IcloudpdLocalMirrorProofDisposition,
     OriginalAssetProof, SourceAgeProof, UploadProof, WorkflowError, approve_delete,
-    approved_original_delete_request, build_delete_plan, icloudpd_local_mirror_proof_disposition,
-    icloudpd_local_mirror_ready_proofs, mark_delete_eligible, prove_and_record_nas,
-    record_conversion_performance, record_conversion_result, record_delete_execution,
-    record_heic_verification, record_icloudpd_local_mirror_proof,
-    record_original_asset_batch_proofs, record_original_asset_proof, record_source_age_proof,
+    build_delete_plan, hold_delete_for_review, icloudpd_local_mirror_proof_disposition,
+    icloudpd_local_mirror_ready_proofs, mark_delete_eligible, prepare_delete_reconciliation,
+    prevalidate_approved_original_delete, prove_and_record_nas, record_conversion_performance,
+    record_conversion_result, record_heic_verification, record_icloudpd_local_mirror_proof,
+    record_original_asset_batch_proofs, record_original_asset_proof,
+    record_prevalidated_delete_execution_with_recently_deleted_proof,
+    record_reconciled_delete_execution_with_recently_deleted_proof, record_source_age_proof,
     record_stage_failure, record_upload_proof, record_uploaded_heic_delete,
     reverify_upload_verified_record, upload_ready_heic_proof, uploaded_heic_delete_request,
 };
 const DAY_SECONDS: u64 = 24 * 60 * 60;
+const CLI_RECENTLY_DELETED_START_RANK: u64 = 0;
+const CLI_RECENTLY_DELETED_PAGE_SIZE: u64 = 200;
+const CLI_RECENTLY_DELETED_MAX_PAGES: u64 = 2000;
 const ORIGINAL_ASSETS_TARGET_SET_FINGERPRINT_VERSION: &[u8] = b"original-assets-target-set-v2";
 const FAILED_ASSETS_QUARANTINE_TARGET_SET_FINGERPRINT_VERSION: &[u8] =
     b"failed-assets-quarantine-target-set-v2";
@@ -11353,15 +11360,237 @@ fn workflow_delete_plan<W: Write>(args: WorkflowAssetArgs, writer: &mut W) -> Re
     Ok(())
 }
 
+fn lookup_cli_recently_deleted_proof<T>(
+    client: &mut CloudKitDeleteClient<T>,
+    session: &CloudKitDeleteSession,
+    request: &CloudKitDeleteBatchRequest,
+) -> Result<CloudKitRecentlyDeletedProof, CliError>
+where
+    T: CloudKitDeleteTransport + CloudKitOriginalAssetReadTransport,
+{
+    let lookup = client.lookup_recently_deleted(
+        session,
+        request,
+        CLI_RECENTLY_DELETED_START_RANK,
+        CLI_RECENTLY_DELETED_PAGE_SIZE,
+        CLI_RECENTLY_DELETED_MAX_PAGES,
+    )?;
+    if !lookup.unconfirmed.is_empty() || lookup.confirmed.len() != 1 {
+        return Err(CliError::Upload(
+            UploadError::InvalidCloudKitRecentlyDeletedResponse(
+                "Recently Deleted query did not prove exactly one requested original asset",
+            ),
+        ));
+    }
+    lookup.confirmed.into_iter().next().ok_or(CliError::Upload(
+        UploadError::InvalidCloudKitRecentlyDeletedResponse(
+            "Recently Deleted query returned no proof",
+        ),
+    ))
+}
+
+fn hold_cli_delete_for_review(
+    manifest: &mut Manifest,
+    manifest_path: &Path,
+    asset_id: &str,
+    message: &str,
+) -> Result<(), CliError> {
+    hold_delete_for_review(
+        manifest,
+        asset_id,
+        message,
+        serde_json::json!({
+            "disposition": "needs_review",
+            "reason": message,
+        }),
+    )?;
+    save_manifest(manifest, manifest_path)
+}
+
 fn workflow_delete_execute(args: WorkflowDeleteExecuteArgs) -> Result<(), CliError> {
     let mut manifest = load_operational_manifest_for_asset(&args.manifest, &args.asset_id)?;
-    let request = approved_original_delete_request(&manifest, &args.asset_id)?;
+    let prevalidated = prevalidate_approved_original_delete(&manifest, &args.asset_id)?;
+    let uploaded_heic = uploaded_heic_delete_request(&manifest, &args.asset_id)?;
     let session = load_cloudkit_delete_session(&args.session)?;
+    let mut destination_session = session.clone();
+    destination_session.database_scope = prevalidated.request().database_scope;
+    destination_session.zone = CloudKitLibraryDestination {
+        database_scope: prevalidated.request().database_scope,
+        zone_name: prevalidated.request().zone_name.clone(),
+        owner_record_name: prevalidated.request().owner_record_name.clone(),
+    };
+
+    // The replacement must still exist remotely and match the expected local
+    // HEIC immediately before the original delete is submitted.
+    let heic_transport = ReqwestCloudKitDeleteTransport::new()?;
+    let mut heic_client = CloudKitUploadedHeicReadClient::new(heic_transport);
+    heic_client.resolve_uploaded_heic_asset(&destination_session, &uploaded_heic)?;
+
     let transport = ReqwestCloudKitDeleteTransport::new()?;
     let mut client = CloudKitDeleteClient::new(transport);
-    let outcome = client.delete_original(&session, &request)?;
-    record_delete_execution(&mut manifest, &args.asset_id, outcome)?;
+    let request = CloudKitDeleteBatchRequest {
+        requests: vec![prevalidated.request().clone()],
+    };
+    let send = client.delete_originals_batch_with_preflight(&destination_session, &request, |_| {
+        prevalidated
+            .validate_live_raw(Duration::from_secs(30))
+            .map_err(|error| error)
+    });
+    match send {
+        Ok(mut outcomes) => {
+            if outcomes.len() != 1 {
+                let error = CliError::Upload(UploadError::InvalidCloudKitDeleteResponse(
+                    "original delete returned an unexpected number of outcomes",
+                ));
+                quarantine_cli_delete_effect_unknown(
+                    &mut manifest,
+                    &args.manifest,
+                    &args.asset_id,
+                    "CloudKit delete returned an unpaired outcome; reconcile before retrying",
+                )?;
+                return Err(error);
+            }
+            let recently_deleted_proof = match lookup_cli_recently_deleted_proof(
+                &mut client,
+                &destination_session,
+                &request,
+            ) {
+                Ok(proof) => proof,
+                Err(error) => {
+                    let message = format!(
+                        "CloudKit original delete was dispatched but independent Recently Deleted proof failed: {error}"
+                    );
+                    hold_cli_delete_for_review(
+                        &mut manifest,
+                        &args.manifest,
+                        &args.asset_id,
+                        &message,
+                    )?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = record_prevalidated_delete_execution_with_recently_deleted_proof(
+                &mut manifest,
+                prevalidated,
+                outcomes.remove(0),
+                Some(recently_deleted_proof),
+            ) {
+                let cli_error = CliError::Workflow(error);
+                quarantine_cli_delete_effect_unknown(
+                    &mut manifest,
+                    &args.manifest,
+                    &args.asset_id,
+                    "CloudKit delete succeeded remotely but local state could not be committed; reconcile before retrying",
+                )?;
+                return Err(cli_error);
+            }
+        }
+        Err(CloudKitDeleteBatchSendError::InvalidRequest(error)) => {
+            return Err(CliError::Upload(error));
+        }
+        Err(CloudKitDeleteBatchSendError::Preflight(error)) => {
+            return Err(CliError::Workflow(error));
+        }
+        Err(CloudKitDeleteBatchSendError::Remote(modify_error)) => {
+            // A remote transport failure leaves the effect unknown. Perform
+            // exactly one read-only reconciliation and never blindly retry.
+            match client.lookup_delete_states(&destination_session, &request) {
+                Ok(lookup)
+                    if lookup.unconfirmed.is_empty() && lookup.confirmed_deleted.len() == 1 =>
+                {
+                    let recently_deleted_proof = match lookup_cli_recently_deleted_proof(
+                        &mut client,
+                        &destination_session,
+                        &request,
+                    ) {
+                        Ok(proof) => proof,
+                        Err(error) => {
+                            let message = format!(
+                                "CloudKit original delete may have been dispatched but independent Recently Deleted proof failed: {error}"
+                            );
+                            hold_cli_delete_for_review(
+                                &mut manifest,
+                                &args.manifest,
+                                &args.asset_id,
+                                &message,
+                            )?;
+                            return Err(error);
+                        }
+                    };
+                    let reconciliation = match prepare_delete_reconciliation(
+                        &manifest,
+                        &args.asset_id,
+                    ) {
+                        Ok(reconciliation) => reconciliation,
+                        Err(error) => {
+                            let cli_error = CliError::Workflow(error);
+                            quarantine_cli_delete_effect_unknown(
+                                &mut manifest,
+                                &args.manifest,
+                                &args.asset_id,
+                                "CloudKit delete was confirmed but local reconciliation could not be prepared",
+                            )?;
+                            return Err(cli_error);
+                        }
+                    };
+                    if let Err(error) =
+                        record_reconciled_delete_execution_with_recently_deleted_proof(
+                            &mut manifest,
+                            reconciliation,
+                            lookup
+                                .confirmed_deleted
+                                .into_iter()
+                                .next()
+                                .expect("one outcome"),
+                            Some(recently_deleted_proof),
+                        )
+                    {
+                        let cli_error = CliError::Workflow(error);
+                        quarantine_cli_delete_effect_unknown(
+                            &mut manifest,
+                            &args.manifest,
+                            &args.asset_id,
+                            "CloudKit delete was confirmed but local reconciliation could not be committed",
+                        )?;
+                        return Err(cli_error);
+                    }
+                }
+                Ok(_) => {
+                    let message = if modify_error.is_reauthentication_required() {
+                        "CloudKit delete effect is unknown; obtain a fresh authenticated session before retrying"
+                    } else {
+                        "CloudKit delete effect is unknown; refusing an automatic retry"
+                    };
+                    record_stage_failure(&mut manifest, &args.asset_id, "delete", message)?;
+                    save_manifest(&manifest, &args.manifest)?;
+                    return Err(CliError::Upload(modify_error));
+                }
+                Err(lookup_error) => {
+                    let message = if modify_error.is_reauthentication_required()
+                        || lookup_error.is_reauthentication_required()
+                    {
+                        "CloudKit delete effect is unknown; obtain a fresh authenticated session before retrying"
+                    } else {
+                        "CloudKit delete effect is unknown; refusing an automatic retry"
+                    };
+                    record_stage_failure(&mut manifest, &args.asset_id, "delete", message)?;
+                    save_manifest(&manifest, &args.manifest)?;
+                    return Err(CliError::Upload(lookup_error));
+                }
+            }
+        }
+    }
     save_manifest(&manifest, &args.manifest)
+}
+
+fn quarantine_cli_delete_effect_unknown(
+    manifest: &mut Manifest,
+    manifest_path: &Path,
+    asset_id: &str,
+    message: &str,
+) -> Result<(), CliError> {
+    record_stage_failure(manifest, asset_id, "delete", message)?;
+    save_manifest(manifest, manifest_path)
 }
 
 fn load_manifest_for_write(path: &Path) -> Result<Manifest, CliError> {

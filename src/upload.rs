@@ -368,6 +368,32 @@ pub struct CloudKitDeleteOutcome {
     pub record_change_tag: String,
 }
 
+pub const CLOUDKIT_RECENTLY_DELETED_QUERY_RECORD_TYPE: &str =
+    "CPLAssetAndMasterDeletedByExpungedDate";
+
+/// Independent, read-only proof that a CPLAsset is present in Photos' Recently
+/// Deleted index.  The destination is retained so callers cannot accidentally
+/// use a proof from another CloudKit library or zone.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CloudKitRecentlyDeletedProof {
+    pub record_name: String,
+    pub record_change_tag: String,
+    pub database_scope: CloudKitDatabaseScope,
+    pub zone_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_record_name: Option<String>,
+    pub query_record_type: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudKitRecentlyDeletedLookupResult {
+    pub confirmed: Vec<CloudKitRecentlyDeletedProof>,
+    /// Assets that were not independently proven.  This includes assets that
+    /// were absent from the fully scanned query and assets whose marker was
+    /// false or missing.
+    pub unconfirmed: Vec<CloudKitDeleteRequest>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CloudKitDeleteStateLookupResult {
     pub confirmed_deleted: Vec<CloudKitDeleteOutcome>,
@@ -1373,6 +1399,123 @@ fn resolve_uploaded_heic_asset_with_transport<T: CloudKitUploadedHeicReadTranspo
 }
 
 impl<T: CloudKitOriginalAssetReadTransport> CloudKitDeleteClient<T> {
+    /// Query the authoritative Photos Recently Deleted index and prove each
+    /// requested CPLAsset in the exact database/zone/owner destination.
+    ///
+    /// The query is deliberately exhaustive (subject to `max_pages`) and
+    /// read-only.  A continuation marker that cannot be exhausted is an
+    /// error, never a negative proof.  The caller must keep unconfirmed
+    /// requests out of the Deleted state.
+    pub fn lookup_recently_deleted(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        request: &CloudKitDeleteBatchRequest,
+        start_rank: u64,
+        page_size: u64,
+        max_pages: u64,
+    ) -> Result<CloudKitRecentlyDeletedLookupResult, UploadError> {
+        validate_cloudkit_delete_batch_request(request)?;
+        if max_pages == 0 {
+            return Err(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+                "Recently Deleted query max_pages must be greater than zero",
+            ));
+        }
+        let first = request
+            .requests
+            .first()
+            .ok_or(UploadError::InvalidCloudKitDeleteRequest(
+                "at least one original asset delete request is required",
+            ))?;
+        let destination = CloudKitLibraryDestination {
+            database_scope: first.database_scope,
+            zone_name: first.zone_name.clone(),
+            owner_record_name: first.owner_record_name.clone(),
+        };
+        if request.requests.iter().any(|item| {
+            item.database_scope != destination.database_scope
+                || item.zone_name != destination.zone_name
+                || item.owner_record_name != destination.owner_record_name
+        }) {
+            return Err(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+                "Recently Deleted request mixes database or zone destinations",
+            ));
+        }
+        validate_session_destination(session, &destination)?;
+
+        let requested = request
+            .requests
+            .iter()
+            .map(|item| item.record_name.clone())
+            .collect::<BTreeSet<_>>();
+        let mut confirmed = BTreeMap::new();
+        let mut seen_record_names = BTreeSet::new();
+        let mut continuation_marker = None;
+        let mut pages_read = 0_u64;
+
+        loop {
+            if pages_read >= max_pages {
+                if continuation_marker.is_some() {
+                    return Err(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+                        "Recently Deleted query reached max_pages before exhaustion",
+                    ));
+                }
+                break;
+            }
+            let payload = cloudkit_recently_deleted_query_payload(
+                start_rank,
+                page_size,
+                continuation_marker.as_deref(),
+                &destination,
+            );
+            let response = self.transport.post_records_query(session, payload)?;
+            pages_read = pages_read.saturating_add(1);
+            let page =
+                parse_cloudkit_recently_deleted_query_response(response, &destination, &requested)?;
+            for record_name in page.unconfirmed {
+                if !seen_record_names.insert(record_name) {
+                    return Err(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+                        "Recently Deleted query returned duplicate CPLAsset recordName",
+                    ));
+                }
+            }
+            for (record_name, proof) in page.confirmed {
+                if !seen_record_names.insert(record_name.clone())
+                    || confirmed.insert(record_name, proof).is_some()
+                {
+                    return Err(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+                        "Recently Deleted query returned duplicate CPLAsset recordName",
+                    ));
+                }
+            }
+            continuation_marker = page.continuation_marker;
+            if continuation_marker.is_none() {
+                break;
+            }
+        }
+
+        let mut confirmed_proofs = Vec::new();
+        let mut unconfirmed_requests = Vec::new();
+        for item in &request.requests {
+            if let Some(proof) = confirmed.remove(&item.record_name) {
+                confirmed_proofs.push(proof);
+            } else {
+                // A false/missing marker is intentionally indistinguishable
+                // from an absent record to the state machine: neither is a
+                // Recently Deleted proof.
+                unconfirmed_requests.push(item.clone());
+            }
+        }
+        if !confirmed.is_empty() {
+            return Err(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+                "Recently Deleted query returned an unrequested CPLAsset",
+            ));
+        }
+        Ok(CloudKitRecentlyDeletedLookupResult {
+            confirmed: confirmed_proofs,
+            unconfirmed: unconfirmed_requests,
+        })
+    }
+
     pub fn resolve_original_asset(
         &mut self,
         session: &CloudKitDeleteSession,
@@ -2316,6 +2459,26 @@ impl CloudKitOriginalAssetReadTransport for ReqwestCloudKitDeleteTransport {
     }
 }
 
+impl CloudKitUploadedHeicReadTransport for ReqwestCloudKitDeleteTransport {
+    fn post_records_lookup(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        payload: Value,
+    ) -> Result<Value, UploadError> {
+        <Self as CloudKitDeleteTransport>::post_records_lookup(self, session, payload)
+    }
+
+    fn download_resource(
+        &mut self,
+        session: &CloudKitDeleteSession,
+        download_url: &Url,
+        expected_size_bytes: u64,
+    ) -> Result<CloudKitResourceDownload, UploadError> {
+        self.transport
+            .download_resource(session, download_url, expected_size_bytes)
+    }
+}
+
 /// CloudKit transport restricted to original-asset queries and resource downloads.
 ///
 /// ```compile_fail
@@ -2742,6 +2905,38 @@ fn cloudkit_original_asset_query_payload(
             "resOriginalVidComplWidth",
             "resOriginalVidComplHeight"
         ],
+        "zoneID": destination.zone_id_payload()
+    });
+    if let Some(marker) = continuation_marker {
+        payload["continuationMarker"] = json!(marker);
+    }
+    payload
+}
+
+fn cloudkit_recently_deleted_query_payload(
+    start_rank: u64,
+    page_size: u64,
+    continuation_marker: Option<&str>,
+    destination: &CloudKitLibraryDestination,
+) -> Value {
+    let mut payload = json!({
+        "query": {
+            "recordType": CLOUDKIT_RECENTLY_DELETED_QUERY_RECORD_TYPE,
+            "filterBy": [
+                {
+                    "fieldName": "direction",
+                    "comparator": "EQUALS",
+                    "fieldValue": {"type": "STRING", "value": "ASCENDING"}
+                },
+                {
+                    "fieldName": "startRank",
+                    "comparator": "EQUALS",
+                    "fieldValue": {"type": "INT64", "value": start_rank}
+                }
+            ]
+        },
+        "resultsLimit": page_size.max(2),
+        "desiredKeys": ["isDeleted"],
         "zoneID": destination.zone_id_payload()
     });
     if let Some(marker) = continuation_marker {
@@ -4119,6 +4314,151 @@ fn parse_cloudkit_continuation_marker(value: &Value) -> Result<Option<String>, U
             "records/query continuationMarker must be a non-empty string",
         ))?;
     Ok(Some(marker.to_string()))
+}
+
+#[derive(Debug)]
+struct CloudKitRecentlyDeletedQueryPage {
+    continuation_marker: Option<String>,
+    confirmed: Vec<(String, CloudKitRecentlyDeletedProof)>,
+    unconfirmed: BTreeSet<String>,
+}
+
+fn parse_cloudkit_recently_deleted_query_response(
+    value: Value,
+    destination: &CloudKitLibraryDestination,
+    requested: &BTreeSet<String>,
+) -> Result<CloudKitRecentlyDeletedQueryPage, UploadError> {
+    let records = value.get("records").and_then(Value::as_array).ok_or(
+        UploadError::InvalidCloudKitRecentlyDeletedResponse(
+            "Recently Deleted records/query response must include records",
+        ),
+    )?;
+    let continuation_marker = parse_recently_deleted_continuation_marker(&value)?;
+    let mut confirmed = Vec::new();
+    let mut unconfirmed = BTreeSet::new();
+    let mut seen_requested_record_names = BTreeSet::new();
+    for record in records {
+        if record.get("serverErrorCode").is_some() {
+            return Err(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+                "Recently Deleted records/query returned a record error",
+            ));
+        }
+        let record_type = record.get("recordType").and_then(Value::as_str).ok_or(
+            UploadError::InvalidCloudKitRecentlyDeletedResponse(
+                "Recently Deleted record missing recordType",
+            ),
+        )?;
+        let record_name = record.get("recordName").and_then(Value::as_str);
+        let known_record_type = matches!(
+            record_type,
+            CLOUDKIT_RECENTLY_DELETED_QUERY_RECORD_TYPE
+                | "CPLAssetDeletedByExpungedDate"
+                | "CPLAsset"
+                | "CPLMaster"
+        );
+        if !known_record_type {
+            if record_name.is_some_and(|name| requested.contains(name)) {
+                return Err(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+                    "Recently Deleted response returned an unknown recordType for a requested record",
+                ));
+            }
+            continue;
+        }
+        validate_recently_deleted_zone_identity(record, destination)?;
+        if record_type == "CPLMaster" {
+            continue;
+        }
+        let record_name = record_name.filter(|name| !name.trim().is_empty()).ok_or(
+            UploadError::InvalidCloudKitRecentlyDeletedResponse(
+                "Recently Deleted CPLAsset missing recordName",
+            ),
+        )?;
+        if !requested.contains(record_name) {
+            // Query responses may include assets outside this delete batch;
+            // they are still destination-validated but do not become proof.
+            continue;
+        }
+        if !seen_requested_record_names.insert(record_name.to_string()) {
+            return Err(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+                "Recently Deleted query returned duplicate CPLAsset recordName",
+            ));
+        }
+        let record_change_tag = record
+            .get("recordChangeTag")
+            .and_then(Value::as_str)
+            .filter(|tag| !tag.trim().is_empty())
+            .ok_or(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+                "Recently Deleted CPLAsset missing recordChangeTag",
+            ))?;
+        let is_deleted = record
+            .get("fields")
+            .and_then(|fields| fields.get("isDeleted"))
+            .and_then(|field| field.get("value"));
+        if !is_deleted.is_some_and(cloudkit_truthy) {
+            unconfirmed.insert(record_name.to_string());
+            continue;
+        }
+        confirmed.push((
+            record_name.to_string(),
+            CloudKitRecentlyDeletedProof {
+                record_name: record_name.to_string(),
+                record_change_tag: record_change_tag.to_string(),
+                database_scope: destination.database_scope,
+                zone_name: destination.zone_name.clone(),
+                owner_record_name: destination.owner_record_name.clone(),
+                query_record_type: CLOUDKIT_RECENTLY_DELETED_QUERY_RECORD_TYPE.to_string(),
+            },
+        ));
+    }
+    Ok(CloudKitRecentlyDeletedQueryPage {
+        continuation_marker,
+        confirmed,
+        unconfirmed,
+    })
+}
+
+fn parse_recently_deleted_continuation_marker(
+    value: &Value,
+) -> Result<Option<String>, UploadError> {
+    let response = value
+        .as_object()
+        .ok_or(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+            "Recently Deleted records/query response must be an object",
+        ))?;
+    let Some(marker) = response.get("continuationMarker") else {
+        return Ok(None);
+    };
+    let marker = marker
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+            "Recently Deleted continuationMarker must be a non-empty string",
+        ))?;
+    Ok(Some(marker.to_string()))
+}
+
+fn validate_recently_deleted_zone_identity(
+    record: &Value,
+    destination: &CloudKitLibraryDestination,
+) -> Result<(), UploadError> {
+    let zone = record.get("zoneID").and_then(Value::as_object).ok_or(
+        UploadError::InvalidCloudKitRecentlyDeletedResponse(
+            "Recently Deleted record missing zoneID",
+        ),
+    )?;
+    if zone.get("zoneName").and_then(Value::as_str) != Some(destination.zone_name.as_str()) {
+        return Err(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+            "Recently Deleted record zone differs from the requested destination",
+        ));
+    }
+    if zone.get("ownerRecordName").and_then(Value::as_str)
+        != destination.owner_record_name.as_deref()
+    {
+        return Err(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+            "Recently Deleted record owner differs from the requested destination",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_cloudkit_asset_record(
@@ -5951,6 +6291,7 @@ mod tests {
     use super::*;
     use crate::adjusted_source::{AdjustedSourceError, CloudKitAdjustedSourceTransport};
     use serde_json::json;
+    use std::collections::VecDeque;
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
@@ -6131,6 +6472,233 @@ mod tests {
             error,
             UploadError::InvalidCloudKitDeleteLookupResponse(_)
         ));
+    }
+
+    fn recently_deleted_test_destination() -> CloudKitLibraryDestination {
+        CloudKitLibraryDestination::primary_sync()
+    }
+
+    fn recently_deleted_test_record(
+        destination: &CloudKitLibraryDestination,
+        is_deleted: Option<Value>,
+    ) -> Value {
+        let mut fields = Map::new();
+        if let Some(is_deleted) = is_deleted {
+            fields.insert("isDeleted".to_string(), json!({"value": is_deleted}));
+        }
+        json!({
+            "recordName": "asset-record",
+            "recordType": "CPLAsset",
+            "recordChangeTag": "new-tag",
+            "zoneID": destination.zone_id_payload(),
+            "fields": fields,
+        })
+    }
+
+    struct RecentlyDeletedQueryTransport {
+        responses: VecDeque<Value>,
+    }
+
+    impl CloudKitDeleteTransport for RecentlyDeletedQueryTransport {
+        fn post_records_modify(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _payload: Value,
+        ) -> Result<Value, UploadError> {
+            unreachable!("Recently Deleted tests do not modify records")
+        }
+
+        fn post_records_lookup(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _payload: Value,
+        ) -> Result<Value, UploadError> {
+            unreachable!("Recently Deleted tests do not look up delete state")
+        }
+    }
+
+    impl CloudKitOriginalAssetReadTransport for RecentlyDeletedQueryTransport {
+        fn post_records_query(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _payload: Value,
+        ) -> Result<Value, UploadError> {
+            self.responses
+                .pop_front()
+                .ok_or(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+                    "test transport ran out of query responses",
+                ))
+        }
+
+        fn download_resource(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _download_url: &Url,
+            _expected_size_bytes: u64,
+        ) -> Result<CloudKitResourceDownload, UploadError> {
+            unreachable!("Recently Deleted tests do not download resources")
+        }
+    }
+
+    #[test]
+    fn recently_deleted_query_marker_only_is_not_a_proof() {
+        let destination = recently_deleted_test_destination();
+        let page = parse_cloudkit_recently_deleted_query_response(
+            json!({"records": [], "continuationMarker": "next"}),
+            &destination,
+            &BTreeSet::from(["asset-record".to_string()]),
+        )
+        .expect("marker-only page should be readable");
+        assert!(page.confirmed.is_empty());
+        assert!(page.unconfirmed.is_empty());
+        assert_eq!(page.continuation_marker.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn recently_deleted_query_missing_marker_is_unconfirmed() {
+        let destination = recently_deleted_test_destination();
+        let page = parse_cloudkit_recently_deleted_query_response(
+            json!({"records": [recently_deleted_test_record(&destination, None)]}),
+            &destination,
+            &BTreeSet::from(["asset-record".to_string()]),
+        )
+        .expect("missing marker should remain parseable");
+        assert!(page.confirmed.is_empty());
+        assert!(page.unconfirmed.contains("asset-record"));
+    }
+
+    #[test]
+    fn recently_deleted_query_false_marker_is_unconfirmed() {
+        let destination = recently_deleted_test_destination();
+        let page = parse_cloudkit_recently_deleted_query_response(
+            json!({"records": [recently_deleted_test_record(&destination, Some(json!(false)))]}),
+            &destination,
+            &BTreeSet::from(["asset-record".to_string()]),
+        )
+        .expect("false marker should remain parseable");
+        assert!(page.confirmed.is_empty());
+        assert!(page.unconfirmed.contains("asset-record"));
+    }
+
+    #[test]
+    fn recently_deleted_query_rejects_false_and_true_duplicate_in_one_page() {
+        let destination = recently_deleted_test_destination();
+        let false_record = recently_deleted_test_record(&destination, Some(json!(false)));
+        let true_record = recently_deleted_test_record(&destination, Some(json!(true)));
+        let error = parse_cloudkit_recently_deleted_query_response(
+            json!({"records": [false_record, true_record]}),
+            &destination,
+            &BTreeSet::from(["asset-record".to_string()]),
+        )
+        .expect_err("contradictory duplicate records must not prove deletion");
+        assert!(matches!(
+            error,
+            UploadError::InvalidCloudKitRecentlyDeletedResponse(_)
+        ));
+    }
+
+    #[test]
+    fn recently_deleted_query_rejects_false_and_true_duplicate_across_pages() {
+        let destination = recently_deleted_test_destination();
+        let mut false_page = recently_deleted_test_record(&destination, Some(json!(false)));
+        let true_page = recently_deleted_test_record(&destination, Some(json!(true)));
+        false_page["recordChangeTag"] = json!("false-tag");
+        let session = valid_delete_session();
+        let request = CloudKitDeleteBatchRequest {
+            requests: vec![CloudKitDeleteRequest {
+                record_name: "asset-record".to_string(),
+                record_change_tag: "old-tag".to_string(),
+                database_scope: destination.database_scope,
+                zone_name: destination.zone_name.clone(),
+                owner_record_name: destination.owner_record_name.clone(),
+            }],
+        };
+        let mut client = CloudKitDeleteClient::new(RecentlyDeletedQueryTransport {
+            responses: VecDeque::from([
+                json!({"records": [false_page], "continuationMarker": "next"}),
+                json!({"records": [true_page]}),
+            ]),
+        });
+        let error = client
+            .lookup_recently_deleted(&session, &request, 0, 200, 2)
+            .expect_err("contradictory records across pages must not prove deletion");
+        assert!(matches!(
+            error,
+            UploadError::InvalidCloudKitRecentlyDeletedResponse(_)
+        ));
+    }
+
+    #[test]
+    fn recently_deleted_query_rejects_unknown_type_for_requested_record() {
+        let destination = recently_deleted_test_destination();
+        let mut record = recently_deleted_test_record(&destination, Some(json!(true)));
+        record["recordType"] = json!("UnexpectedDeletedType");
+        let error = parse_cloudkit_recently_deleted_query_response(
+            json!({"records": [record]}),
+            &destination,
+            &BTreeSet::from(["asset-record".to_string()]),
+        )
+        .expect_err("unknown type for a requested record must not be proof");
+        assert!(matches!(
+            error,
+            UploadError::InvalidCloudKitRecentlyDeletedResponse(_)
+        ));
+    }
+
+    #[test]
+    fn recently_deleted_query_rejects_wrong_zone_and_owner() {
+        let mut destination = recently_deleted_test_destination();
+        let wrong_zone = {
+            let mut record = recently_deleted_test_record(&destination, Some(json!(1)));
+            record["zoneID"]["zoneName"] = json!("SharedSync-wrong");
+            record
+        };
+        let zone_error = parse_cloudkit_recently_deleted_query_response(
+            json!({"records": [wrong_zone]}),
+            &destination,
+            &BTreeSet::from(["asset-record".to_string()]),
+        )
+        .expect_err("wrong zone must not prove an asset");
+        assert!(matches!(
+            zone_error,
+            UploadError::InvalidCloudKitRecentlyDeletedResponse(_)
+        ));
+
+        destination.owner_record_name = Some("owner".to_string());
+        let wrong_owner = recently_deleted_test_record(&destination, Some(json!(1)));
+        let mut wrong_owner = wrong_owner;
+        wrong_owner["zoneID"]["ownerRecordName"] = json!("other-owner");
+        let owner_error = parse_cloudkit_recently_deleted_query_response(
+            json!({"records": [wrong_owner]}),
+            &destination,
+            &BTreeSet::from(["asset-record".to_string()]),
+        )
+        .expect_err("wrong owner must not prove an asset");
+        assert!(matches!(
+            owner_error,
+            UploadError::InvalidCloudKitRecentlyDeletedResponse(_)
+        ));
+    }
+
+    #[test]
+    fn recently_deleted_query_positive_record_proves_exact_destination() {
+        let destination = recently_deleted_test_destination();
+        let page = parse_cloudkit_recently_deleted_query_response(
+            json!({"records": [recently_deleted_test_record(&destination, Some(json!(1)))]}),
+            &destination,
+            &BTreeSet::from(["asset-record".to_string()]),
+        )
+        .expect("positive Recently Deleted record should parse");
+        assert_eq!(page.unconfirmed.len(), 0);
+        let (record_name, proof) = page.confirmed.into_iter().next().expect("proof");
+        assert_eq!(record_name, "asset-record");
+        assert_eq!(proof.database_scope, CloudKitDatabaseScope::Private);
+        assert_eq!(proof.zone_name, "PrimarySync");
+        assert_eq!(proof.owner_record_name, None);
+        assert_eq!(
+            proof.query_record_type,
+            "CPLAssetAndMasterDeletedByExpungedDate"
+        );
     }
 
     fn read_loopback_request(stream: &mut TcpStream) -> Vec<u8> {
@@ -6740,6 +7308,8 @@ pub enum UploadError {
     InvalidCloudKitDeleteResponse(&'static str),
     #[error("invalid CloudKit delete lookup response: {0}")]
     InvalidCloudKitDeleteLookupResponse(&'static str),
+    #[error("invalid CloudKit Recently Deleted response: {0}")]
+    InvalidCloudKitRecentlyDeletedResponse(&'static str),
     #[error("invalid CloudKit original asset request: {0}")]
     InvalidCloudKitOriginalAssetRequest(&'static str),
     #[error("invalid CloudKit original asset response: {0}")]
@@ -6805,6 +7375,22 @@ pub enum UploadError {
     StreamedHeicSizeMismatch { expected: u64, actual: u64 },
     #[error("streamed HEIC SHA-256 mismatch")]
     StreamedHeicHashMismatch { expected: String, actual: String },
+}
+
+impl UploadError {
+    /// HTTP 421 from iCloud means the authenticated session is not currently
+    /// usable. Retrying the same upload or delete with the same session can
+    /// repeat the side effect or spin forever, so callers must stop and obtain
+    /// a fresh session before attempting another mutation.
+    pub fn is_reauthentication_required(&self) -> bool {
+        matches!(
+            self,
+            Self::UploadHttpStatus {
+                status: 421,
+                operation: _,
+            }
+        )
+    }
 }
 
 #[cfg(test)]

@@ -24,6 +24,24 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[test]
+fn http_421_requires_a_fresh_authenticated_session_without_retry() {
+    assert!(
+        UploadError::UploadHttpStatus {
+            operation: "records_modify",
+            status: 421,
+        }
+        .is_reauthentication_required()
+    );
+    assert!(
+        !UploadError::UploadHttpStatus {
+            operation: "records_modify",
+            status: 500,
+        }
+        .is_reauthentication_required()
+    );
+}
+
 fn heic_proof(path: PathBuf, bytes: &[u8]) -> VerifiedHeic {
     VerifiedHeic {
         heic_path: path,

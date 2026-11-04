@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>Label</key>
+    <string>com.icloudpd-optimizer.audit-deleted</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/michelle/icloudpd-optimizer/recovery-20261103/audit_deleted.py</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>StartInterval</key><integer>300</integer>
+    <key>ProcessType</key><string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/Users/michelle/icloudpd-optimizer/service/recovery-20261103/audit-deleted.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/michelle/icloudpd-optimizer/service/recovery-20261103/audit-deleted.stderr.log</string>
+</dict></plist>
