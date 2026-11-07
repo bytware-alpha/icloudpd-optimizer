@@ -51,10 +51,16 @@ fn shared_sync_private_scope_is_local_misconfiguration_not_authentication() {
     );
     assert!(!diagnostic.network_contacted);
     assert!(!diagnostic.authenticated);
+    assert!(!diagnostic.restores_upload_pipeline);
     assert!(
         diagnostic
             .supported_requirement
             .contains("no supported provider setup")
+    );
+    assert!(
+        diagnostic
+            .missing_upstream_capability
+            .contains("no documented export")
     );
     let rendered = serde_json::to_string(&diagnostic).unwrap();
     assert!(!rendered.contains("SENTINEL_COOKIE_VALUE"));
@@ -82,6 +88,47 @@ fn shared_sync_private_scope_is_local_misconfiguration_not_authentication() {
 }
 
 #[test]
+fn diagnosis_reports_the_missing_upstream_capability_without_a_setup_procedure() {
+    let upload = diagnose_provider_session(
+        ProviderSessionRole::Upload,
+        &json!({
+            "dsid": "123456789",
+            "photosupload_url": "https://p140-photosupload.icloud.com",
+            "cookies": [
+                {"name": "X-APPLE-WEBAUTH-TOKEN", "value": "SENTINEL_COOKIE_VALUE"}
+            ]
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        upload.class,
+        ProviderSessionDiagnosticClass::LocalConfigurationValid
+    );
+    assert!(!upload.authenticated);
+    assert!(!upload.network_contacted);
+    assert!(!upload.restores_upload_pipeline);
+    let requirement = upload.missing_upstream_capability;
+    assert!(requirement.contains("no documented export"));
+    assert!(requirement.contains("image/jpeg"));
+    assert!(requirement.contains("HTTP 415"));
+    assert!(requirement.contains("not HEIC upload into a Shared library"));
+    assert!(requirement.contains("does not restore the upload pipeline"));
+    let rendered = serde_json::to_string(&upload).unwrap();
+    for absent in [
+        "pyicloud --",
+        "copy the cookie",
+        "copy cookies",
+        "rewrite database_scope",
+        "export the session",
+    ] {
+        assert!(
+            !rendered.contains(absent),
+            "diagnosis must not prescribe {absent}"
+        );
+    }
+}
+
+#[test]
 fn shared_schema_can_be_locally_valid_without_becoming_authenticated() {
     let diagnostic = diagnose_provider_session(
         ProviderSessionRole::CloudKitRead,
@@ -93,6 +140,7 @@ fn shared_schema_can_be_locally_valid_without_becoming_authenticated() {
     );
     assert!(!diagnostic.authenticated);
     assert!(!diagnostic.network_contacted);
+    assert!(!diagnostic.restores_upload_pipeline);
     assert_eq!(
         classify_provider_transport_failure(&UploadError::PhotosPutAssetRejected {
             status: 403,

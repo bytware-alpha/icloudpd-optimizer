@@ -11295,15 +11295,12 @@ fn workflow_provider_session_diagnose<W: Write>(
     };
     let diagnostic = match fs::read_to_string(&args.session) {
         Ok(json) => crate::upload::diagnose_provider_session(role, &json),
-        Err(_) => crate::upload::ProviderSessionDiagnostic {
+        Err(_) => crate::upload::ProviderSessionDiagnostic::local(
             role,
-            class: crate::upload::ProviderSessionDiagnosticClass::LocalMisconfiguration,
-            code: "session_unreadable",
-            message: "session file could not be read".to_string(),
-            network_contacted: false,
-            authenticated: false,
-            supported_requirement: crate::upload::PROVIDER_SESSION_SUPPORTED_REQUIREMENT,
-        },
+            crate::upload::ProviderSessionDiagnosticClass::LocalMisconfiguration,
+            "session_unreadable",
+            "session file could not be read",
+        ),
     };
     serde_json::to_writer_pretty(&mut *writer, &diagnostic)?;
     writeln!(writer)?;

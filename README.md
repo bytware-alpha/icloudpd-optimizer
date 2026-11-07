@@ -835,8 +835,21 @@ stop matching Apple's private upload API.
 
 The optimizer does not create Apple sessions and has no supported provider setup
 or credential handoff. It only reads an externally prepared session JSON file.
-Apple ID, password, MFA, an `icloudpd` keyring, and cookie directories are not
-session sources. A file that passes local validation is not authenticated.
+Apple ID, password, MFA, an `icloudpd` or `docker-icloudpd` keyring, and cookie
+directories are not session sources. A `cookiejar` path inside the JSON is
+ignored. A file that passes local validation is not authenticated, and this
+check does not restore the upload pipeline.
+
+The missing upstream capability is a producer of that file. `icloudpd` and
+`docker-icloudpd` do not emit it. pyicloud's documented normal-auth CLI persists
+pyicloud's own session and has no documented export into this schema.
+pyicloud's documented Photos upload accepts JPEG (`image/jpeg`) and rejects
+unsupported media with HTTP 415. Its documented Shared Library operations are
+reads and favorite mutation, not HEIC upload into a Shared library. No
+supported command creates the file. The schema below is the shape this
+repository can read. It is not a setup procedure, and `workflow upload-heic`
+cannot restore the upload pipeline.
+
 Authentication rejection is only an HTTP 401 or 403 returned by CloudKit or
 Photos after a request. Local structural failures, including a `SharedSync-`
 zone stored with `database_scope` `private`, are configuration errors and are
@@ -850,8 +863,10 @@ icloudpd-optimizer workflow provider-session-diagnose \
   --role cloudkit-read
 ```
 
-The JSON report has `network_contacted: false` and `authenticated: false`.
-`class` is `local_configuration_valid` or `local_misconfiguration`. A shared
+The JSON report has `network_contacted: false`, `authenticated: false`, and
+`restores_upload_pipeline: false`. `missing_upstream_capability` names the
+absent producer. `class` is `local_configuration_valid` or
+`local_misconfiguration`. A shared
 library read session must use `database_scope` `shared`, a zone name starting
 with `SharedSync-`, and `owner_record_name`. The same command with `--role
 upload` checks an upload session. Cookie and token values are not printed.
@@ -890,9 +905,10 @@ icloudpd-optimizer workflow upload-heic \
 
 Before upload, the tool rechecks the local HEIC size and SHA-256 against the verified
 manifest proof. If the session is invalid, the iCloud service rejects the upload, or the
-local file changes, the manifest is not updated. Until a supported session handoff
-exists, prefer recording upload proof with `workflow upload-verified` after an operator
-has independently verified the iCloud asset id and uploaded HEIC identity.
+local file changes, the manifest is not updated. `workflow upload-verified`
+records an asset id only after an operator has independently verified that id
+and the uploaded HEIC identity. It does not create a session and it is not
+remote readback.
 
 Upload proof is not remote readback. After one asset is upload-verified, download
 its HEIC and record the hash with the same library identity. The result is

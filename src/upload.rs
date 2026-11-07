@@ -592,7 +592,11 @@ pub fn load_upload_session(path: &Path) -> Result<UploadSession, UploadError> {
     raw.validate()
 }
 
-pub const PROVIDER_SESSION_SUPPORTED_REQUIREMENT: &str = "The optimizer does not create Apple sessions and has no supported provider setup or credential handoff. It only reads an externally prepared session JSON file. Apple ID, password, MFA, an icloudpd keyring, and cookie directories are not session sources. A file that matches this schema is not authenticated. Authentication rejection is only an HTTP 401 or 403 from CloudKit or Photos after a request is sent. A CloudKit read session needs dsid, ckdatabasews_url or webservices.ckdatabasews.url, cloudkit_query_params clientBuildNumber, clientMasteringNumber, clientId, dsid, remapEnums=True, and getCurrentSyncToken=True, plus cookies including X-APPLE-WEBAUTH-TOKEN. SharedSync zones require database_scope \"shared\", a zone name starting with SharedSync-, and owner_record_name. An explicit private scope on a SharedSync zone is a local misconfiguration and is not rewritten. An upload session needs dsid, photosupload_url or webservices.photosupload.url, and cookies including X-APPLE-WEBAUTH-TOKEN.";
+pub const PROVIDER_SESSION_SUPPORTED_REQUIREMENT: &str = "The optimizer does not create Apple sessions and has no supported provider setup or credential handoff. It only reads an externally prepared session JSON file. Apple ID, password, MFA, an icloudpd or docker-icloudpd keyring, and cookie directories are not session sources. A cookiejar path in the JSON is ignored. A file that matches this schema is not authenticated. Authentication rejection is only an HTTP 401 or 403 from CloudKit or Photos after a request is sent. A CloudKit read session needs dsid, ckdatabasews_url or webservices.ckdatabasews.url, cloudkit_query_params clientBuildNumber, clientMasteringNumber, clientId, dsid, remapEnums=True, and getCurrentSyncToken=True, plus cookies including X-APPLE-WEBAUTH-TOKEN. SharedSync zones require database_scope \"shared\", a zone name starting with SharedSync-, and owner_record_name. An explicit private scope on a SharedSync zone is a local misconfiguration and is not rewritten. An upload session needs dsid, photosupload_url or webservices.photosupload.url, and cookies including X-APPLE-WEBAUTH-TOKEN.";
+
+/// There is no supported producer of an optimizer session file in this
+/// repository or in the documented upstream tools checked for this diagnosis.
+pub const MISSING_UPSTREAM_PROVIDER_CAPABILITY: &str = "Missing upstream capability: this repository has no provider setup or session handoff. icloudpd and docker-icloudpd cookies and keyrings are not an upload-session source. pyicloud's documented normal-auth CLI persists pyicloud's own session and has no documented export into this optimizer schema. pyicloud's documented Photos upload accepts JPEG (image/jpeg) and rejects unsupported media with HTTP 415; its documented Shared Library operations are reads and favorite mutation, not HEIC upload into a Shared library. No supported command produces an optimizer session file. Local diagnosis does not restore the upload pipeline.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -624,7 +628,31 @@ pub struct ProviderSessionDiagnostic {
     pub message: String,
     pub network_contacted: bool,
     pub authenticated: bool,
+    /// Always false. A local schema match is not an upload-pipeline restore.
+    pub restores_upload_pipeline: bool,
+    pub missing_upstream_capability: &'static str,
     pub supported_requirement: &'static str,
+}
+
+impl ProviderSessionDiagnostic {
+    pub fn local(
+        role: ProviderSessionRole,
+        class: ProviderSessionDiagnosticClass,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            role,
+            class,
+            code,
+            message: message.into(),
+            network_contacted: false,
+            authenticated: false,
+            restores_upload_pipeline: false,
+            missing_upstream_capability: MISSING_UPSTREAM_PROVIDER_CAPABILITY,
+            supported_requirement: PROVIDER_SESSION_SUPPORTED_REQUIREMENT,
+        }
+    }
 }
 
 /// Validates a session file locally. This never contacts Apple and never
@@ -638,26 +666,18 @@ pub fn diagnose_provider_session(
         ProviderSessionRole::CloudKitRead => CloudKitDeleteSession::from_json(json).map(|_| ()),
     };
     match result {
-        Ok(()) => ProviderSessionDiagnostic {
+        Ok(()) => ProviderSessionDiagnostic::local(
             role,
-            class: ProviderSessionDiagnosticClass::LocalConfigurationValid,
-            code: "local_configuration_valid",
-            message:
-                "session file matches the supported local schema; this check did not authenticate"
-                    .to_string(),
-            network_contacted: false,
-            authenticated: false,
-            supported_requirement: PROVIDER_SESSION_SUPPORTED_REQUIREMENT,
-        },
-        Err(error) => ProviderSessionDiagnostic {
+            ProviderSessionDiagnosticClass::LocalConfigurationValid,
+            "local_configuration_valid",
+            "session file matches the supported local schema; this check did not authenticate and does not restore the upload pipeline",
+        ),
+        Err(error) => ProviderSessionDiagnostic::local(
             role,
-            class: ProviderSessionDiagnosticClass::LocalMisconfiguration,
-            code: local_session_diagnostic_code(&error),
-            message: local_session_diagnostic_message(&error),
-            network_contacted: false,
-            authenticated: false,
-            supported_requirement: PROVIDER_SESSION_SUPPORTED_REQUIREMENT,
-        },
+            ProviderSessionDiagnosticClass::LocalMisconfiguration,
+            local_session_diagnostic_code(&error),
+            local_session_diagnostic_message(&error),
+        ),
     }
 }
 
