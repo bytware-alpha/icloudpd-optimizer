@@ -900,6 +900,10 @@ icloudpd-optimizer workflow photos-import-handoff-rollback \
 Removing the staged file does not remove an item already imported into Photos.
 That removal is a separate action in Photos and is not performed here.
 
+Do not roll back by running a binary from before `operation_hold`. That binary
+ignores holds and can schedule a held asset. Roll back with this build, or
+with a later build that still enforces `operation_hold`.
+
 The HTTP client used by an externally supplied session keeps one verified
 rustls pool per process, reuses HTTP/1.1 keep-alive connections, and allows at
 most two idle connections per host. Upload and adjusted-source work share two

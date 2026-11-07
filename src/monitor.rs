@@ -1976,6 +1976,9 @@ fn run_rolling_lifecycle_delete_batch(
     if !config.auto_delete {
         return Ok(());
     }
+    if rolling_network_auth_paused() {
+        return Ok(());
+    }
     let admitted = admit_rolling_lifecycle_delete_asset_ids(
         manifest,
         config,
@@ -4740,6 +4743,9 @@ fn resolve_original_asset_batches(
     if target_batches.is_empty() {
         return Ok(());
     }
+    if rolling_network_auth_paused() {
+        return Ok(());
+    }
 
     let session_path = required_path(&config.delete_session_path, "delete_session_path")?;
     let session = load_cloudkit_delete_session(session_path)?;
@@ -5146,7 +5152,7 @@ fn upload_verified_heics(
             }
         }
     }
-    let upload_slots = config.jobs.max(1).min(MAX_ROLLING_NETWORK_SLOTS);
+    let upload_slots = config.jobs.clamp(1, MAX_ROLLING_NETWORK_SLOTS);
     for chunk in upload_asset_ids.chunks(upload_slots) {
         if rolling_network_auth_paused() {
             break;
@@ -25216,6 +25222,60 @@ mod per_photo_hold_scheduling_tests {
         assert_eq!(outcome, RollingAssetStepOutcome::skipped());
         assert!(!*called.lock().unwrap());
         assert_eq!(summary.lock().unwrap().uploads_attempted, 0);
+        clear_rolling_network_auth_pause();
+    }
+
+    #[test]
+    fn auth_pause_skips_later_original_asset_resolution_without_a_session() {
+        clear_rolling_network_auth_pause();
+        pause_rolling_network_auth();
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut manifest = Manifest::new();
+        let mut record = AssetRecord::new("needs-resolve", "/raw/needs-resolve.DNG");
+        record.state = State::NasVerified;
+        record.proofs.insert(
+            "nas".to_string(),
+            json!({
+                "canonical_path": "/raw/needs-resolve.DNG",
+                "relative_path": "needs-resolve.DNG",
+                "size_bytes": 10,
+                "modified_unix_seconds": 1_700_000_000,
+                "age_seconds": 40 * 24 * 60 * 60,
+                "sha256": "raw-sha"
+            }),
+        );
+        record.proofs.insert(
+            "source_age".to_string(),
+            json!({
+                "source_captured_unix_seconds": 1_700_000_000,
+                "verified_at_unix_seconds": 1_800_000_000,
+                "min_age_seconds": 30 * 24 * 60 * 60
+            }),
+        );
+        manifest.upsert_trusted(record);
+        let path = tempdir.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&path, "auth-pause-resolve", Duration::from_secs(30))
+                .unwrap();
+        let mut config = MonitorConfig::new(tempdir.path(), &path, tempdir.path().join("heic"));
+        config.full_lifecycle = true;
+        config.delete_session_path = None;
+        let mut summary = MonitorScanSummary::default();
+        resolve_original_assets(
+            &config,
+            &store,
+            &mut manifest,
+            &mut summary,
+            &["needs-resolve".to_string()],
+        )
+        .expect("auth pause must stop CloudKit resolution before a session is required");
+        assert!(
+            !manifest
+                .get("needs-resolve")
+                .unwrap()
+                .proofs
+                .contains_key("original_asset")
+        );
         clear_rolling_network_auth_pause();
     }
 
