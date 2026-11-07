@@ -12,6 +12,8 @@ pub mod manifest;
 pub mod manifest_lock;
 pub mod metrics;
 pub mod monitor;
+pub mod operation_hold;
+pub mod photos_import_handoff;
 pub mod proof;
 pub mod reconciliation;
 pub mod service;

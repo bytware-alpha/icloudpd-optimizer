@@ -833,6 +833,114 @@ accept an Apple ID, Apple account password, or MFA input. `icloudpd` and
 directories are not a supported upload-session source. External sessions can expire or
 stop matching Apple's private upload API.
 
+The optimizer does not create Apple sessions and has no supported provider setup
+or credential handoff. It only reads an externally prepared session JSON file.
+Apple ID, password, MFA, an `icloudpd` or `docker-icloudpd` keyring, and cookie
+directories are not session sources. A `cookiejar` path inside the JSON is
+ignored. A file that passes local validation is not authenticated, and this
+check does not restore the upload pipeline.
+
+The missing upstream capability is a producer of that file. `icloudpd` and
+`docker-icloudpd` do not emit it. pyicloud's documented normal-auth CLI persists
+pyicloud's own session and has no documented export into this schema.
+pyicloud's documented Photos upload accepts JPEG (`image/jpeg`) and rejects
+unsupported media with HTTP 415. Its documented Shared Library operations are
+reads and favorite mutation, not HEIC upload into a Shared library. No
+supported command creates the file. The schema below is the shape this
+repository can read. It is not a setup procedure, and `workflow upload-heic`
+cannot restore the upload pipeline.
+
+The documented placement path is two user steps in Photos on the Mac, not a
+session file and not an unattended job. Published Photos import adds the file
+to the personal library. Apple's Shared Library guide then says to choose
+View > Personal Library, select the exact items, and choose Image > Move
+[n] Photos to Shared Library
+(https://support.apple.com/guide/photos/add-photos-to-a-shared-library-pht9a3599aac/mac).
+That menu is documented UI. Apple's Shortcuts guide documents Save to Photo
+Album and does not document a per-item Shared Library move. This repository
+does not script that menu, does not query the Photos library database, and
+does not check the signed-in account, system library, or participant role.
+
+Only the new HEIC replacement is staged. The NAS original is not the import
+file. A personal-library import is not recorded as Shared placement. Shared
+placement stays unrecorded until an independent cloud readback of that HEIC.
+The handoff command does not perform the readback.
+
+Stage one verified HEIC for that sequence. The command copies the file, leaves
+the NAS original and the verified HEIC in place, and records
+`photos_import_handoff`. That proof is not an upload and not a remote
+readback. Automatic upload stays blocked until the handoff is rolled back.
+Deletion stays blocked because there is still no upload proof.
+
+```sh
+icloudpd-optimizer workflow photos-import-handoff \
+  --manifest manifest.json \
+  --asset-id IMG_0001 \
+  --handoff-dir /path/to/empty-canary-dir
+```
+
+On the Mac, after the signed-in account, system photo library, and Shared
+Library role are confirmed there: keep Photos > Settings > General > Copy
+items to the Photos library selected, and import only the staged HEIC.
+Published import lands in the personal library. Then choose View > Personal
+Library, select that imported HEIC, and choose Image > Move [n] Photos to
+Shared Library. Do not select the NAS original. Leave both the staged file
+and the NAS original in place. This command cannot confirm that Photos
+imported the file or moved it.
+
+Roll the local stage back without deleting the verified HEIC, the RAW, or any
+iCloud item:
+
+```sh
+icloudpd-optimizer workflow photos-import-handoff-rollback \
+  --manifest manifest.json \
+  --asset-id IMG_0001
+```
+
+Removing the staged file does not remove an item already imported into Photos.
+That removal is a separate action in Photos and is not performed here.
+
+Do not roll back by running a binary from before `operation_hold`. That binary
+ignores holds and can schedule a held asset. Roll back with this build, or
+with a later build that still enforces `operation_hold`.
+
+The HTTP client used by an externally supplied session keeps one verified
+rustls pool per process, reuses HTTP/1.1 keep-alive connections, and allows at
+most two idle connections per host. Upload and adjusted-source work share two
+network slots. An HTTP 401 or 403 pauses further authenticated calls for the
+rest of that monitor scan. The next scan can try again after the scan interval.
+Certificate checks stay enabled. Those limits were checked with local synthetic
+tests. They are not a reading of a live download or of the home network.
+
+Authentication rejection is only an HTTP 401 or 403 returned by CloudKit or
+Photos after a request. Local structural failures, including a `SharedSync-`
+zone stored with `database_scope` `private`, are configuration errors and are
+not rewritten into a different scope.
+
+Check a file without contacting Apple:
+
+```sh
+icloudpd-optimizer workflow provider-session-diagnose \
+  --session /path/to/delete-session.json \
+  --role cloudkit-read
+```
+
+The JSON report has `network_contacted: false`, `authenticated: false`, and
+`restores_upload_pipeline: false`. `missing_upstream_capability` names the
+absent session producer. `documented_user_mediated_import` names the personal
+import plus the Image > Move menu and still reports that this check did not
+import anything.
+`class` is `local_configuration_valid` or `local_misconfiguration`. A shared
+library read session must use `database_scope` `shared`, a zone name starting
+with `SharedSync-`, and `owner_record_name`. The same command with `--role
+upload` checks an upload session. Cookie and token values are not printed.
+
+A CloudKit read session needs `dsid`, `ckdatabasews_url` or
+`webservices.ckdatabasews.url`, `cloudkit_query_params` named
+`clientBuildNumber`, `clientMasteringNumber`, `clientId`, `dsid`,
+`remapEnums` (`True`), and `getCurrentSyncToken` (`True`), plus cookies
+including `X-APPLE-WEBAUTH-TOKEN`.
+
 The session file must contain a DSID, a Photos upload service URL, and cookies
 including `X-APPLE-WEBAUTH-TOKEN`:
 
@@ -861,9 +969,52 @@ icloudpd-optimizer workflow upload-heic \
 
 Before upload, the tool rechecks the local HEIC size and SHA-256 against the verified
 manifest proof. If the session is invalid, the iCloud service rejects the upload, or the
-local file changes, the manifest is not updated. Until a supported session handoff
-exists, prefer recording upload proof with `workflow upload-verified` after an operator
-has independently verified the iCloud asset id and uploaded HEIC identity.
+local file changes, the manifest is not updated. `workflow upload-verified`
+records an asset id only after an operator has independently verified that id
+and the uploaded HEIC identity. It does not create a session and it is not
+remote readback.
+
+Upload proof is not remote readback. After one asset is upload-verified, download
+its HEIC and record the hash with the same library identity. The result is
+committed with an exact compare-and-swap against the pre-download record. A
+hold or any other change applied while the download is in progress is kept,
+the readback is not written, and other assets are not rewritten. Historical
+`native_raw` proofs may be the string `native_raw` or an object
+`{"native_raw": { ... }}`. Both decode with their original fields and neither
+passes the current quality gate:
+
+```sh
+icloudpd-optimizer workflow remote-readback \
+  --manifest manifest.json \
+  --asset-id IMG_0001 \
+  --session /path/to/delete-session.json
+```
+
+That command reads one asset. It does not delete the original, move the RAW, or
+mark any other asset verified. A missing readback proof stays unverified.
+
+An uncertain upload or move can be excluded without marking the asset failed and
+without changing its other proofs:
+
+```sh
+icloudpd-optimizer monitor operation-hold \
+  --config ~/.config/icloudpd-optimizer/monitor.json \
+  --action apply \
+  --asset-id IMG_0001 \
+  --operation upload \
+  --database-scope shared \
+  --zone-name SharedSync-EXAMPLE \
+  --owner-record-name OWNER_RECORD \
+  --recorded-at-unix-seconds 1700000000
+```
+
+Use `--operation move` for an uncertain move. The hold is per asset, survives
+restart, and is enforced by the queue and by upload, mirror, and delete
+dispatch. Release the same arguments with `--action release` only after explicit
+reconciliation. Until then the asset is not retried, and other eligible assets
+continue independently. Historical conversion proofs that say `native_raw` can
+be decoded, but they are not treated as embedded-preview or adjusted-source
+verification.
 
 After upload verification, record `workflow icloudpd-local-mirror` with the explicit
 path that `icloudpd` will use for the uploaded HEIC before requesting delete

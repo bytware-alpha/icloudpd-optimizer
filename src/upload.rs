@@ -592,6 +592,138 @@ pub fn load_upload_session(path: &Path) -> Result<UploadSession, UploadError> {
     raw.validate()
 }
 
+pub const PROVIDER_SESSION_SUPPORTED_REQUIREMENT: &str = "The optimizer does not create Apple sessions and has no supported provider setup or credential handoff. It only reads an externally prepared session JSON file. Apple ID, password, MFA, an icloudpd or docker-icloudpd keyring, and cookie directories are not session sources. A cookiejar path in the JSON is ignored. A file that matches this schema is not authenticated. Authentication rejection is only an HTTP 401 or 403 from CloudKit or Photos after a request is sent. A CloudKit read session needs dsid, ckdatabasews_url or webservices.ckdatabasews.url, cloudkit_query_params clientBuildNumber, clientMasteringNumber, clientId, dsid, remapEnums=True, and getCurrentSyncToken=True, plus cookies including X-APPLE-WEBAUTH-TOKEN. SharedSync zones require database_scope \"shared\", a zone name starting with SharedSync-, and owner_record_name. An explicit private scope on a SharedSync zone is a local misconfiguration and is not rewritten. An upload session needs dsid, photosupload_url or webservices.photosupload.url, and cookies including X-APPLE-WEBAUTH-TOKEN.";
+
+/// There is no supported producer of an optimizer session file in this
+/// repository or in the documented upstream tools checked for this diagnosis.
+pub const MISSING_UPSTREAM_PROVIDER_CAPABILITY: &str = "Missing upstream capability: this repository has no provider setup or session handoff. icloudpd and docker-icloudpd cookies and keyrings are not an upload-session source. pyicloud's documented normal-auth CLI persists pyicloud's own session and has no documented export into this optimizer schema. pyicloud's documented Photos upload accepts JPEG (image/jpeg) and rejects unsupported media with HTTP 415; its documented Shared Library operations are reads and favorite mutation, not HEIC upload into a Shared library. No supported command produces an optimizer session file. Local diagnosis does not restore the upload pipeline.";
+
+/// Apple's documented placement path. Diagnosis does not perform it.
+pub const DOCUMENTED_USER_MEDIATED_IMPORT: &str = "Documented user-mediated path: published Photos import adds a file to the personal library. Shared placement is a later Photos menu: View > Personal Library, select the imported HEIC replacements, then Image > Move [n] Photos to Shared Library. That menu is documented UI. Apple's Shortcuts guide documents Save to Photo Album and does not document a per-item Shared Library move. This diagnosis does not run Photos, does not query the Photos library, does not move originals, does not verify the signed-in account or system library, and does not record upload or remote readback.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSessionRole {
+    Upload,
+    CloudKitRead,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSessionDiagnosticClass {
+    LocalConfigurationValid,
+    LocalMisconfiguration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTransportFailureClass {
+    LocalMisconfiguration,
+    AuthRejection,
+    RemoteFailure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProviderSessionDiagnostic {
+    pub role: ProviderSessionRole,
+    pub class: ProviderSessionDiagnosticClass,
+    pub code: &'static str,
+    pub message: String,
+    pub network_contacted: bool,
+    pub authenticated: bool,
+    /// Always false. A local schema match is not an upload-pipeline restore.
+    pub restores_upload_pipeline: bool,
+    pub missing_upstream_capability: &'static str,
+    pub documented_user_mediated_import: &'static str,
+    pub supported_requirement: &'static str,
+}
+
+impl ProviderSessionDiagnostic {
+    pub fn local(
+        role: ProviderSessionRole,
+        class: ProviderSessionDiagnosticClass,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            role,
+            class,
+            code,
+            message: message.into(),
+            network_contacted: false,
+            authenticated: false,
+            restores_upload_pipeline: false,
+            missing_upstream_capability: MISSING_UPSTREAM_PROVIDER_CAPABILITY,
+            documented_user_mediated_import: DOCUMENTED_USER_MEDIATED_IMPORT,
+            supported_requirement: PROVIDER_SESSION_SUPPORTED_REQUIREMENT,
+        }
+    }
+}
+
+/// Validates a session file locally. This never contacts Apple and never
+/// reports authentication success or an authentication rejection.
+pub fn diagnose_provider_session(
+    role: ProviderSessionRole,
+    json: &str,
+) -> ProviderSessionDiagnostic {
+    let result = match role {
+        ProviderSessionRole::Upload => UploadSession::from_json(json).map(|_| ()),
+        ProviderSessionRole::CloudKitRead => CloudKitDeleteSession::from_json(json).map(|_| ()),
+    };
+    match result {
+        Ok(()) => ProviderSessionDiagnostic::local(
+            role,
+            ProviderSessionDiagnosticClass::LocalConfigurationValid,
+            "local_configuration_valid",
+            "session file matches the supported local schema; this check did not authenticate and does not restore the upload pipeline",
+        ),
+        Err(error) => ProviderSessionDiagnostic::local(
+            role,
+            ProviderSessionDiagnosticClass::LocalMisconfiguration,
+            local_session_diagnostic_code(&error),
+            local_session_diagnostic_message(&error),
+        ),
+    }
+}
+
+pub fn classify_provider_transport_failure(error: &UploadError) -> ProviderTransportFailureClass {
+    match error {
+        UploadError::ReadSession { .. }
+        | UploadError::DecodeSession { .. }
+        | UploadError::InvalidSession(_) => ProviderTransportFailureClass::LocalMisconfiguration,
+        UploadError::UploadHttpStatus { status, .. }
+        | UploadError::PhotosPutAssetRejected { status, .. }
+            if matches!(*status, 401 | 403) =>
+        {
+            ProviderTransportFailureClass::AuthRejection
+        }
+        _ => ProviderTransportFailureClass::RemoteFailure,
+    }
+}
+
+fn local_session_diagnostic_code(error: &UploadError) -> &'static str {
+    match error {
+        UploadError::ReadSession { .. } => "session_unreadable",
+        UploadError::DecodeSession { .. } => "session_undecodable",
+        UploadError::InvalidSession(message)
+            if message.contains("SharedSync zones must use the shared CloudKit database scope") =>
+        {
+            "shared_sync_requires_shared_scope"
+        }
+        UploadError::InvalidSession(_) => "local_session_invalid",
+        _ => "local_session_invalid",
+    }
+}
+
+fn local_session_diagnostic_message(error: &UploadError) -> String {
+    match error {
+        UploadError::ReadSession { .. } => "session file could not be read".to_string(),
+        UploadError::DecodeSession { .. } => "session JSON could not be decoded".to_string(),
+        UploadError::InvalidSession(message) => message.clone(),
+        _ => "session file is not locally valid".to_string(),
+    }
+}
+
 pub fn load_cloudkit_delete_session(path: &Path) -> Result<CloudKitDeleteSession, UploadError> {
     let json = std::fs::read_to_string(path).map_err(|source| UploadError::ReadSession {
         path: path.to_path_buf(),
@@ -2002,14 +2134,27 @@ pub struct ReqwestPhotosUploadTransport {
     client: reqwest::blocking::Client,
 }
 
+const BLOCKING_CLIENT_POOL_IDLE_PER_HOST: usize = 2;
+const BLOCKING_CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
+const BLOCKING_CLIENT_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+
+fn blocking_verified_client() -> Result<reqwest::blocking::Client, UploadError> {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(BLOCKING_CLIENT_TIMEOUT)
+        .connect_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(BLOCKING_CLIENT_POOL_IDLE_PER_HOST)
+        .tcp_keepalive(BLOCKING_CLIENT_TCP_KEEPALIVE)
+        .http1_only()
+        .build()
+        .map_err(|source| UploadError::HttpClient { source })
+}
+
 impl ReqwestPhotosUploadTransport {
     pub fn new() -> Result<Self, UploadError> {
-        let client = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(120))
-            .build()
-            .map_err(|source| UploadError::HttpClient { source })?;
-        Ok(Self { client })
+        Ok(Self {
+            client: blocking_verified_client()?,
+        })
     }
 }
 
@@ -2082,12 +2227,9 @@ const CLOUDKIT_BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS 
 
 impl ReqwestCloudKitTransport {
     pub fn new() -> Result<Self, UploadError> {
-        let client = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(120))
-            .build()
-            .map_err(|source| UploadError::HttpClient { source })?;
-        Ok(Self { client })
+        Ok(Self {
+            client: blocking_verified_client()?,
+        })
     }
 
     fn post_records_json(
@@ -6079,6 +6221,139 @@ mod tests {
         assert_eq!(second.streamed_heic_sha256, expected_hash);
         assert_eq!(second.streamed_size_bytes, bytes.len() as u64);
         assert_eq!(client.transport.uploaded_bodies, vec![bytes.clone(), bytes]);
+    }
+
+    #[test]
+    fn upload_http_rejection_is_not_retried() {
+        struct OnceTransport {
+            calls: usize,
+        }
+
+        impl PhotosUploadTransport for OnceTransport {
+            fn post_service_json(
+                &mut self,
+                _session: &UploadSession,
+                _endpoint: PhotosUploadEndpoint,
+                _payload: Value,
+            ) -> Result<Value, UploadError> {
+                self.calls += 1;
+                Err(UploadError::UploadHttpStatus {
+                    operation: "createUploadUrl",
+                    status: 401,
+                })
+            }
+
+            fn post_signed_upload(
+                &mut self,
+                _session: &UploadSession,
+                _upload_url: &Url,
+                _heic_file: File,
+                _heic_size: u64,
+            ) -> Result<(SingleFileUploadRequest, String, u64), UploadError> {
+                self.calls += 1;
+                Err(UploadError::UploadHttpStatus {
+                    operation: "signed_upload",
+                    status: 401,
+                })
+            }
+        }
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let heic_path = tempdir.path().join("IMG_0001.heic");
+        std::fs::write(&heic_path, b"heic").expect("HEIC bytes should be written");
+        let source = VerifiedUploadSource::open_candidate(&heic_path).expect("source should open");
+        let session = UploadSession {
+            dsid: "123456789".to_owned(),
+            photosupload_url: Url::parse("https://photos.example.com").expect("session URL"),
+            cookies: vec![],
+            local_time_zone_id: "UTC".to_owned(),
+            time_zone_offset_minutes: 0,
+        };
+        let mut transport = OnceTransport { calls: 0 };
+        let error = PhotosUploadClient::new(&mut transport)
+            .upload_verified_source_to_library(
+                &session,
+                &source,
+                &CloudKitLibraryDestination::primary_sync(),
+            )
+            .expect_err("authentication rejection must fail closed");
+        assert!(matches!(
+            error,
+            UploadError::UploadHttpStatus { status: 401, .. }
+        ));
+        assert_eq!(transport.calls, 1);
+    }
+
+    #[test]
+    fn verified_client_reuses_one_keepalive_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("listener should be nonblocking");
+        let port = listener.local_addr().expect("loopback address").port();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_connections = Arc::clone(&connections);
+        let server_requests = Arc::clone(&requests);
+        let server = thread::spawn(move || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(5) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        server_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(400)))
+                            .expect("read timeout");
+                        stream
+                            .set_nonblocking(false)
+                            .expect("accepted stream should block");
+                        loop {
+                            let request =
+                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    read_loopback_request(&mut stream)
+                                })) {
+                                    Ok(request) => request,
+                                    Err(_) => break,
+                                };
+                            if request.is_empty() {
+                                break;
+                            }
+                            server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            write!(
+                                stream,
+                                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                            )
+                            .expect("keepalive response");
+                            stream.flush().expect("keepalive flush");
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if server_requests.load(std::sync::atomic::Ordering::SeqCst) >= 4 {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("loopback accept failed: {error}"),
+                }
+            }
+        });
+
+        let client = blocking_verified_client().expect("client");
+        for index in 0..4 {
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/item/{index}"))
+                .send()
+                .expect("keepalive request");
+            assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        }
+        drop(client);
+        server.join().expect("keepalive server");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one client should reuse one HTTP/1.1 connection"
+        );
     }
 
     fn valid_delete_session() -> CloudKitDeleteSession {

@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -14,13 +14,15 @@ use crate::adjusted_source::{
     validate_adjusted_source_proof_lineage, validate_installed_adjusted_source_proof,
 };
 use crate::manifest::{AssetRecord, FailureKind, Manifest, ManifestError, State};
+use crate::operation_hold::{self, OperationHoldError};
 use crate::proof::{
     MIN_RAW_AGE_SECONDS, NasRawProof, ProofError, RawFileFingerprint, prove_nas_raw,
     prove_nas_raw_with_min_age_seconds_and_fingerprint,
 };
 use crate::upload::{
-    CloudKitDatabaseScope, CloudKitDeleteOutcome, CloudKitDeleteRequest,
-    CloudKitLibraryDestination, CloudKitUploadedHeicAsset, CloudKitUploadedHeicResolveRequest,
+    CloudKitDatabaseScope, CloudKitDeleteOutcome, CloudKitDeleteRequest, CloudKitDeleteSession,
+    CloudKitLibraryDestination, CloudKitUploadedHeicAsset, CloudKitUploadedHeicReadClient,
+    CloudKitUploadedHeicReadTransport, CloudKitUploadedHeicResolveRequest, UploadError,
     validate_library_destination,
 };
 
@@ -32,6 +34,7 @@ pub(crate) const CONVERSION_PERFORMANCE_PROOF: &str = "conversion_performance";
 pub(crate) const HEIC_PROOF: &str = "heic";
 const SOURCE_AGE_PROOF: &str = "source_age";
 pub(crate) const UPLOAD_PROOF: &str = "upload";
+pub(crate) const REMOTE_READBACK_PROOF: &str = "remote_readback";
 const UPLOADED_HEIC_DELETE_PROOF: &str = "uploaded_heic_delete";
 pub(crate) const ICLOUDPD_LOCAL_MIRROR_PROOF: &str = "icloudpd_local_mirror";
 const DELETE_ELIGIBILITY_PROOF: &str = "delete_eligibility";
@@ -80,8 +83,7 @@ pub(crate) struct ConversionResultProof {
     pub source_binding: ConversionSourceBinding,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum ConversionSourceBinding {
     #[default]
     EmbeddedPreview,
@@ -90,6 +92,121 @@ pub enum ConversionSourceBinding {
         adjusted_jpeg_sha256: String,
         adjusted_jpeg_path: PathBuf,
     },
+    /// Historical claim that the conversion consumed the camera-native RAW.
+    /// A bare string and a historical object are both preserved. Neither is an
+    /// embedded-preview or adjusted-source verification.
+    NativeRaw(NativeRawSource),
+}
+
+/// Provenance stored with a historical `native_raw` conversion source.
+///
+/// `object_fields` is `None` for the string token `"native_raw"` and `Some`
+/// for the externally tagged object `{"native_raw": { ... }}`. Every field in
+/// that object is retained and none of them grants a current quality pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NativeRawSource {
+    object_fields: Option<serde_json::Map<String, Value>>,
+}
+
+impl NativeRawSource {
+    pub fn token() -> Self {
+        Self {
+            object_fields: None,
+        }
+    }
+
+    pub fn object(fields: serde_json::Map<String, Value>) -> Self {
+        Self {
+            object_fields: Some(fields),
+        }
+    }
+
+    pub fn object_fields(&self) -> Option<&serde_json::Map<String, Value>> {
+        self.object_fields.as_ref()
+    }
+}
+
+impl ConversionSourceBinding {
+    pub fn historical_native_raw_token() -> Self {
+        Self::NativeRaw(NativeRawSource::token())
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct AdjustedSourceWire {
+    adjusted_source_proof_digest: String,
+    adjusted_jpeg_sha256: String,
+    adjusted_jpeg_path: PathBuf,
+}
+
+impl Serialize for ConversionSourceBinding {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::EmbeddedPreview => serializer.serialize_str("embedded_preview"),
+            Self::AdjustedSource {
+                adjusted_source_proof_digest,
+                adjusted_jpeg_sha256,
+                adjusted_jpeg_path,
+            } => {
+                let wire = AdjustedSourceWire {
+                    adjusted_source_proof_digest: adjusted_source_proof_digest.clone(),
+                    adjusted_jpeg_sha256: adjusted_jpeg_sha256.clone(),
+                    adjusted_jpeg_path: adjusted_jpeg_path.clone(),
+                };
+                serde_json::json!({ "adjusted_source": wire }).serialize(serializer)
+            }
+            Self::NativeRaw(source) => match &source.object_fields {
+                None => serializer.serialize_str("native_raw"),
+                Some(fields) => serde_json::json!({ "native_raw": fields }).serialize(serializer),
+            },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ConversionSourceBinding {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        conversion_source_binding_from_value(value).map_err(de::Error::custom)
+    }
+}
+
+fn conversion_source_binding_from_value(value: Value) -> Result<ConversionSourceBinding, String> {
+    match value {
+        Value::String(token) if token == "embedded_preview" => {
+            Ok(ConversionSourceBinding::EmbeddedPreview)
+        }
+        Value::String(token) if token == "native_raw" => {
+            Ok(ConversionSourceBinding::historical_native_raw_token())
+        }
+        Value::String(token) => Err(format!("unknown conversion source binding {token}")),
+        Value::Object(map) if map.len() == 1 && map.contains_key("adjusted_source") => {
+            let wire: AdjustedSourceWire = serde_json::from_value(
+                map.get("adjusted_source").cloned().unwrap_or(Value::Null),
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(ConversionSourceBinding::AdjustedSource {
+                adjusted_source_proof_digest: wire.adjusted_source_proof_digest,
+                adjusted_jpeg_sha256: wire.adjusted_jpeg_sha256,
+                adjusted_jpeg_path: wire.adjusted_jpeg_path,
+            })
+        }
+        Value::Object(map) if map.len() == 1 && map.contains_key("native_raw") => {
+            match map.get("native_raw") {
+                Some(Value::Object(fields)) => Ok(ConversionSourceBinding::NativeRaw(
+                    NativeRawSource::object(fields.clone()),
+                )),
+                _ => Err(
+                    "historical native_raw conversion source must be a string or an object"
+                        .to_string(),
+                ),
+            }
+        }
+        Value::Object(_) => Err(
+            "conversion source binding object is not a supported historical native_raw or adjusted source"
+                .to_string(),
+        ),
+        _ => Err("conversion source binding must be a string or object".to_string()),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -730,6 +847,7 @@ pub fn record_upload_proof<'a>(
     asset_id: &str,
     proof: UploadProof,
 ) -> Result<&'a AssetRecord, WorkflowError> {
+    ensure_remote_mutation_allowed(manifest, asset_id)?;
     require_non_empty("uploaded_heic_asset_id", &proof.uploaded_heic_asset_id)?;
     require_non_empty("uploaded_heic_sha256", &proof.uploaded_heic_sha256)?;
     require_valid_library_destination(
@@ -897,6 +1015,7 @@ pub fn record_uploaded_heic_delete<'a>(
     resolved: CloudKitUploadedHeicAsset,
     outcome: CloudKitDeleteOutcome,
 ) -> Result<&'a AssetRecord, WorkflowError> {
+    ensure_remote_mutation_allowed(manifest, asset_id)?;
     let (upload, heic) = uploaded_heic_delete_inputs(manifest, asset_id)?;
     require_matching_str(
         UPLOADED_HEIC_DELETE_PROOF,
@@ -940,6 +1059,7 @@ pub fn record_icloudpd_local_mirror_proof<'a>(
     asset_id: &str,
     proof: IcloudpdLocalMirrorProof,
 ) -> Result<&'a AssetRecord, WorkflowError> {
+    ensure_remote_mutation_allowed(manifest, asset_id)?;
     let state = manifest.get(asset_id)?.state;
     if !matches!(
         state,
@@ -1041,6 +1161,30 @@ fn validate_batch_original_asset_unique_records(
     Ok(())
 }
 
+/// Dispatch gate for one photo upload. A durable hold or an existing upload
+/// proof refuses the send. Upload proof alone is not remote readback.
+pub fn ensure_upload_dispatch_allowed(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<VerifiedHeic, WorkflowError> {
+    let record = manifest.get(asset_id)?;
+    ensure_remote_mutation_allowed_record(record)?;
+    if record
+        .proofs
+        .contains_key(crate::photos_import_handoff::PHOTOS_IMPORT_HANDOFF_PROOF)
+    {
+        return Err(WorkflowError::PhotosImportHandoffPending {
+            asset_id: asset_id.to_string(),
+        });
+    }
+    if record.proofs.contains_key(UPLOAD_PROOF) {
+        return Err(WorkflowError::UploadAlreadyRecorded {
+            asset_id: asset_id.to_string(),
+        });
+    }
+    upload_ready_heic_proof(manifest, asset_id)
+}
+
 pub fn upload_ready_heic_proof(
     manifest: &Manifest,
     asset_id: &str,
@@ -1058,10 +1202,192 @@ pub fn upload_ready_heic_proof(
     Ok(VerifiedHeic::from(&proof))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalConversionSource {
+    pub source_binding: ConversionSourceBinding,
+    /// True only when the stored token is a current embedded-preview or
+    /// adjusted-source claim. `native_raw` stays false and is not rewritten.
+    pub current_policy_source: bool,
+}
+
+/// Decodes a stored conversion proof, including historical `native_raw`.
+/// This does not admit the proof to upload, delete, or quality verification.
+pub fn decode_historical_conversion_source(
+    asset_id: &str,
+    proof: &Value,
+) -> Result<HistoricalConversionSource, WorkflowError> {
+    let parsed: ConversionResultProof =
+        serde_json::from_value(proof.clone()).map_err(|source| WorkflowError::ProofDecode {
+            asset_id: asset_id.to_string(),
+            proof_key: CONVERSION_PROOF,
+            source,
+        })?;
+    Ok(HistoricalConversionSource {
+        current_policy_source: !matches!(
+            parsed.source_binding,
+            ConversionSourceBinding::NativeRaw(_)
+        ),
+        source_binding: parsed.source_binding,
+    })
+}
+
+/// Confirms a historical conversion proof decodes and returns it unchanged.
+/// `native_raw` is not upgraded to `embedded_preview` or `adjusted_source`.
+pub fn identity_migrate_historical_conversion_proof(
+    asset_id: &str,
+    proof: &Value,
+) -> Result<Value, WorkflowError> {
+    let decoded = decode_historical_conversion_source(asset_id, proof)?;
+    let encoded = serde_json::to_value(&decoded.source_binding)?;
+    match proof.get("source_binding") {
+        Some(stored) if stored == &encoded => Ok(proof.clone()),
+        Some(_) => Err(WorkflowError::InvalidProofField {
+            proof_key: CONVERSION_PROOF,
+            field: "source_binding",
+            reason: "stored conversion source does not round-trip",
+        }),
+        None => Ok(proof.clone()),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteReadbackProof {
+    schema_version: u8,
+    uploaded_heic_asset_id: String,
+    matched_heic_sha256: String,
+    size_bytes: u64,
+    database_scope: CloudKitDatabaseScope,
+    zone_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_record_name: Option<String>,
+    record_change_tag: String,
+    master_record_name: String,
+}
+
+/// True only when a downloaded remote hash was recorded and still matches the
+/// upload and HEIC proofs. Upload proof and session metadata are not enough.
+pub fn remote_readback_is_verified(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<bool, WorkflowError> {
+    let record = manifest.get(asset_id)?;
+    let Some(value) = record.proofs.get(REMOTE_READBACK_PROOF) else {
+        return Ok(false);
+    };
+    let readback: RemoteReadbackProof =
+        serde_json::from_value(value.clone()).map_err(|source| WorkflowError::ProofDecode {
+            asset_id: asset_id.to_string(),
+            proof_key: REMOTE_READBACK_PROOF,
+            source,
+        })?;
+    let upload = stored_proof::<UploadProof>(manifest, asset_id, UPLOAD_PROOF)?;
+    let heic = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
+    Ok(remote_readback_matches(&readback, &upload, &heic))
+}
+
+/// Downloads the uploaded HEIC for one asset and records readback only when the
+/// bytes match. A hold is left in place. Nothing is deleted.
+pub fn verify_remote_readback<T: CloudKitUploadedHeicReadTransport>(
+    manifest: &mut Manifest,
+    asset_id: &str,
+    session: &CloudKitDeleteSession,
+    transport: &mut T,
+) -> Result<(), WorkflowError> {
+    let request = uploaded_heic_delete_request(manifest, asset_id)?;
+    let resolved = CloudKitUploadedHeicReadClient::new(&mut *transport)
+        .resolve_uploaded_heic_asset(session, &request)
+        .map_err(WorkflowError::RemoteReadback)?;
+    record_remote_readback(manifest, asset_id, &resolved)
+}
+
+fn record_remote_readback(
+    manifest: &mut Manifest,
+    asset_id: &str,
+    resolved: &CloudKitUploadedHeicAsset,
+) -> Result<(), WorkflowError> {
+    let upload = stored_proof::<UploadProof>(manifest, asset_id, UPLOAD_PROOF)?;
+    let heic = stored_proof::<HeicVerificationProof>(manifest, asset_id, HEIC_PROOF)?;
+    if manifest.get(asset_id)?.state != State::UploadVerified {
+        return Err(WorkflowError::UploadUnavailable {
+            asset_id: asset_id.to_string(),
+            state: manifest.get(asset_id)?.state,
+        });
+    }
+    if resolved.record_name != upload.uploaded_heic_asset_id
+        || resolved.matched_heic_sha256 != upload.uploaded_heic_sha256
+        || resolved.matched_heic_sha256 != heic.heic_sha256
+        || resolved.size_bytes != heic.size_bytes
+        || resolved.record_change_tag.trim().is_empty()
+        || resolved.master_record_name.trim().is_empty()
+    {
+        return Err(WorkflowError::RemoteReadback(
+            UploadError::CloudKitUploadedHeicDownloadHashMismatch {
+                expected: upload.uploaded_heic_sha256,
+                actual: resolved.matched_heic_sha256.clone(),
+            },
+        ));
+    }
+    let proof = RemoteReadbackProof {
+        schema_version: 1,
+        uploaded_heic_asset_id: upload.uploaded_heic_asset_id.clone(),
+        matched_heic_sha256: resolved.matched_heic_sha256.clone(),
+        size_bytes: resolved.size_bytes,
+        database_scope: upload.database_scope,
+        zone_name: upload.zone_name.clone(),
+        owner_record_name: upload.owner_record_name.clone(),
+        record_change_tag: resolved.record_change_tag.clone(),
+        master_record_name: resolved.master_record_name.clone(),
+    };
+    if let Some(value) = manifest.get(asset_id)?.proofs.get(REMOTE_READBACK_PROOF) {
+        let existing: RemoteReadbackProof =
+            serde_json::from_value(value.clone()).map_err(|source| WorkflowError::ProofDecode {
+                asset_id: asset_id.to_string(),
+                proof_key: REMOTE_READBACK_PROOF,
+                source,
+            })?;
+        if existing == proof {
+            return Ok(());
+        }
+        return Err(WorkflowError::ProofMismatch {
+            proof_key: REMOTE_READBACK_PROOF,
+            field: "remote_readback",
+            expected: "the recorded remote readback".to_string(),
+            actual: "a different remote readback".to_string(),
+        });
+    }
+    insert_workflow_proof(manifest, asset_id, REMOTE_READBACK_PROOF, &proof)?;
+    if manifest.get(asset_id)?.state != State::UploadVerified {
+        return Err(WorkflowError::UploadUnavailable {
+            asset_id: asset_id.to_string(),
+            state: manifest.get(asset_id)?.state,
+        });
+    }
+    Ok(())
+}
+
+fn remote_readback_matches(
+    readback: &RemoteReadbackProof,
+    upload: &UploadProof,
+    heic: &HeicVerificationProof,
+) -> bool {
+    readback.schema_version == 1
+        && readback.uploaded_heic_asset_id == upload.uploaded_heic_asset_id
+        && readback.matched_heic_sha256 == upload.uploaded_heic_sha256
+        && readback.matched_heic_sha256 == heic.heic_sha256
+        && readback.size_bytes == heic.size_bytes
+        && readback.database_scope == upload.database_scope
+        && readback.zone_name == upload.zone_name
+        && readback.owner_record_name == upload.owner_record_name
+        && !readback.record_change_tag.trim().is_empty()
+        && !readback.master_record_name.trim().is_empty()
+}
+
 pub fn icloudpd_local_mirror_ready_proofs(
     manifest: &Manifest,
     asset_id: &str,
 ) -> Result<(UploadProof, VerifiedHeic), WorkflowError> {
+    ensure_remote_mutation_allowed(manifest, asset_id)?;
     let state = manifest.get(asset_id)?.state;
     if !matches!(
         state,
@@ -1133,6 +1459,7 @@ pub fn mark_delete_eligible<'a>(
     manifest: &'a mut Manifest,
     asset_id: &str,
 ) -> Result<&'a AssetRecord, WorkflowError> {
+    ensure_remote_mutation_allowed(manifest, asset_id)?;
     let record = manifest.get(asset_id)?;
     if record.state != State::UploadVerified {
         return Err(WorkflowError::DeleteEligibilityUnavailable {
@@ -1159,6 +1486,7 @@ pub fn approve_delete<'a>(
     asset_id: &str,
     operator: &str,
 ) -> Result<&'a AssetRecord, WorkflowError> {
+    ensure_remote_mutation_allowed(manifest, asset_id)?;
     require_valid_conversion_performance(manifest, asset_id)?;
 
     let operator = operator.trim();
@@ -1193,6 +1521,7 @@ pub fn record_delete_execution<'a>(
     asset_id: &str,
     outcome: CloudKitDeleteOutcome,
 ) -> Result<&'a AssetRecord, WorkflowError> {
+    ensure_remote_mutation_allowed(manifest, asset_id)?;
     let record = manifest.get(asset_id)?;
     if record.state != State::DeleteApproved {
         return Err(WorkflowError::Manifest(ManifestError::InvalidTransition {
@@ -1225,6 +1554,7 @@ pub fn record_prevalidated_delete_execution(
     prevalidated: PrevalidatedDelete,
     outcome: CloudKitDeleteOutcome,
 ) -> Result<&AssetRecord, WorkflowError> {
+    ensure_remote_mutation_allowed(manifest, prevalidated.asset_id())?;
     let record = manifest.get(prevalidated.asset_id())?;
     if record.state != State::DeleteApproved {
         return Err(WorkflowError::Manifest(ManifestError::InvalidTransition {
@@ -1255,6 +1585,7 @@ pub fn record_reconciled_delete_execution(
     reconciliation: DeleteReconciliation,
     outcome: CloudKitDeleteOutcome,
 ) -> Result<&AssetRecord, WorkflowError> {
+    ensure_remote_mutation_allowed(manifest, reconciliation.asset_id())?;
     let record = manifest.get(reconciliation.asset_id())?;
     if record.state != State::DeleteApproved {
         return Err(WorkflowError::Manifest(ManifestError::InvalidTransition {
@@ -1290,6 +1621,7 @@ pub fn prevalidate_approved_original_delete(
     manifest: &Manifest,
     asset_id: &str,
 ) -> Result<PrevalidatedDelete, WorkflowError> {
+    ensure_remote_mutation_allowed(manifest, asset_id)?;
     let record = manifest.get(asset_id)?;
     if record.state != State::DeleteApproved {
         return Err(WorkflowError::DeletePlanUnavailable {
@@ -2588,9 +2920,22 @@ fn validate_conversion_source_binding(
     asset_id: &str,
     conversion: &ConversionResultProof,
 ) -> Result<Option<CloudKitAdjustedSourceProof>, WorkflowError> {
+    if matches!(
+        conversion.source_binding,
+        ConversionSourceBinding::NativeRaw(_)
+    ) {
+        return Err(WorkflowError::HistoricalNativeRawUnverified {
+            asset_id: asset_id.to_string(),
+        });
+    }
     let adjusted_source =
         stored_adjusted_source_for_conversion(manifest, asset_id, &conversion.heic_path)?;
     match (&adjusted_source, &conversion.source_binding) {
+        (_, ConversionSourceBinding::NativeRaw(_)) => {
+            Err(WorkflowError::HistoricalNativeRawUnverified {
+                asset_id: asset_id.to_string(),
+            })
+        }
         (None, ConversionSourceBinding::EmbeddedPreview) => Ok(None),
         (None, ConversionSourceBinding::AdjustedSource { .. }) => {
             Err(WorkflowError::ConversionSourceBindingMismatch {
@@ -3427,4 +3772,611 @@ pub enum WorkflowError {
         expected: &'static str,
         actual: String,
     },
+    #[error(
+        "historical conversion source native_raw for {asset_id} is not a current quality verification"
+    )]
+    HistoricalNativeRawUnverified { asset_id: String },
+    #[error("remote upload or move for {asset_id} is held until explicit reconciliation")]
+    RemoteOperationHeld { asset_id: String },
+    #[error("upload for {asset_id} is already recorded; refusing a duplicate upload")]
+    UploadAlreadyRecorded { asset_id: String },
+    #[error(
+        "asset {asset_id} has a Photos import handoff pending; automatic upload stays blocked until that handoff is rolled back"
+    )]
+    PhotosImportHandoffPending { asset_id: String },
+    #[error("operation hold for {asset_id} could not be changed: {reason}")]
+    OperationHold {
+        asset_id: String,
+        reason: &'static str,
+    },
+    #[error("remote readback failed")]
+    RemoteReadback(#[source] UploadError),
+}
+
+pub(crate) fn ensure_remote_mutation_allowed(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<(), WorkflowError> {
+    let record = manifest.get(asset_id)?;
+    ensure_remote_mutation_allowed_record(record)
+}
+
+fn ensure_remote_mutation_allowed_record(record: &AssetRecord) -> Result<(), WorkflowError> {
+    operation_hold::ensure_remote_mutation_allowed(record).map_err(|error| match error {
+        OperationHoldError::Held { asset_id } => WorkflowError::RemoteOperationHeld { asset_id },
+        OperationHoldError::Malformed { asset_id } => WorkflowError::OperationHold {
+            asset_id,
+            reason: "malformed hold remains in force",
+        },
+        OperationHoldError::Conflict { asset_id } => WorkflowError::OperationHold {
+            asset_id,
+            reason: "a different hold is already recorded",
+        },
+        OperationHoldError::UnknownAsset { asset_id } => WorkflowError::OperationHold {
+            asset_id,
+            reason: "asset was not found",
+        },
+        OperationHoldError::InvalidHold { .. } => WorkflowError::OperationHold {
+            asset_id: record.asset_id.clone(),
+            reason: "hold is invalid",
+        },
+        OperationHoldError::Manifest(source) => WorkflowError::Manifest(source),
+    })
+}
+
+#[cfg(test)]
+mod per_photo_lifecycle_tests {
+    use super::*;
+    use crate::operation_hold::{HeldRemoteOperation, OperationHold, apply_operation_hold};
+    use crate::state_store::AssetStateStore;
+    use crate::upload::{
+        CloudKitDatabaseScope, CloudKitDeleteSession, CloudKitResourceDownload,
+        CloudKitUploadedHeicReadTransport,
+    };
+    use sha2::Digest;
+    use std::time::Duration;
+
+    fn raw_sha() -> String {
+        "cd".repeat(32)
+    }
+
+    fn heic_bytes() -> &'static [u8] {
+        b"verified-heic-bytes-24b!"
+    }
+
+    fn heic_sha() -> String {
+        format!("{:x}", sha2::Sha256::digest(heic_bytes()))
+    }
+
+    fn nas() -> NasRawProof {
+        NasRawProof {
+            canonical_path: PathBuf::from("/nas/IMG_0001.dng"),
+            relative_path: PathBuf::from("IMG_0001.dng"),
+            size_bytes: 42,
+            modified_unix_seconds: 1_700_000_000,
+            age_seconds: 40 * 24 * 60 * 60,
+            sha256: raw_sha(),
+        }
+    }
+
+    fn conversion_input(binding: ConversionSourceBinding) -> ConversionResultInput {
+        ConversionResultInput {
+            heic_path: PathBuf::from("/staging/IMG_0001.heic"),
+            heic_sha256: heic_sha(),
+            size_bytes: 24,
+            source_binding: binding,
+        }
+    }
+
+    fn performance() -> ConversionPerformanceInput {
+        ConversionPerformanceInput {
+            measured_at_unix_seconds: 1_800_000_000,
+            conversion_tool: "sips".to_string(),
+            conversion_tool_version: Some("test".to_string()),
+            heic_quality: 90,
+            convert_wall_time_millis: 10,
+            total_wall_time_millis: 20,
+            user_cpu_time_millis: None,
+            system_cpu_time_millis: None,
+            peak_rss_kib: None,
+            conversion_command_timings: Vec::new(),
+        }
+    }
+
+    fn heic() -> HeicVerificationInput {
+        HeicVerificationInput {
+            heic_path: PathBuf::from("/staging/IMG_0001.heic"),
+            heic_sha256: heic_sha(),
+            size_bytes: 24,
+            heif_info_ok: true,
+            metadata_copied: true,
+            visual_content_ok: true,
+            visual_match_ok: true,
+            visual_rmse_ppm: Some(1),
+            visual_mae_ppm: Some(1),
+        }
+    }
+
+    fn original() -> OriginalAssetProof {
+        OriginalAssetProof {
+            record_name: "CPLAsset-original".to_string(),
+            record_change_tag: "tag-1".to_string(),
+            record_type: "CPLAsset".to_string(),
+            database_scope: CloudKitDatabaseScope::Private,
+            zone_name: "PrimarySync".to_string(),
+            owner_record_name: None,
+            filename: "IMG_0001.dng".to_string(),
+            size_bytes: 42,
+            matched_raw_sha256: raw_sha(),
+        }
+    }
+
+    fn upload_proof() -> UploadProof {
+        UploadProof {
+            uploaded_heic_asset_id: "CPLAsset-heic".to_string(),
+            uploaded_heic_sha256: heic_sha(),
+            database_scope: CloudKitDatabaseScope::Private,
+            zone_name: "PrimarySync".to_string(),
+            owner_record_name: None,
+            uploaded_heic_path: Some(PathBuf::from("/staging/IMG_0001.heic")),
+        }
+    }
+
+    fn current_conversion_verified(asset_id: &str) -> Manifest {
+        let mut manifest = Manifest::new();
+        discover_raw_asset(&mut manifest, asset_id, "/nas/IMG_0001.dng").unwrap();
+        record_nas_proof(&mut manifest, asset_id, nas()).unwrap();
+        record_current_conversion_result(
+            &mut manifest,
+            asset_id,
+            conversion_input(ConversionSourceBinding::EmbeddedPreview),
+        )
+        .unwrap();
+        record_current_conversion_performance(&mut manifest, asset_id, performance()).unwrap();
+        record_current_heic_verification(&mut manifest, asset_id, heic()).unwrap();
+        record_original_asset_proof(&mut manifest, asset_id, original()).unwrap();
+        manifest
+    }
+
+    fn hold_for(record_name_scope: CloudKitDatabaseScope) -> OperationHold {
+        let destination = if record_name_scope == CloudKitDatabaseScope::Shared {
+            CloudKitLibraryDestination {
+                database_scope: CloudKitDatabaseScope::Shared,
+                zone_name: "SharedSync-LIBRARY".to_string(),
+                owner_record_name: Some("_shared-owner".to_string()),
+            }
+        } else {
+            CloudKitLibraryDestination::primary_sync()
+        };
+        OperationHold::uncertain(HeldRemoteOperation::Upload, destination, 1_800_000_000).unwrap()
+    }
+
+    #[test]
+    fn native_raw_round_trip_preserves_meaning_and_stays_fail_closed() {
+        let mut manifest = current_conversion_verified("asset");
+        assert!(upload_ready_heic_proof(&manifest, "asset").is_ok());
+        let before = manifest.get("asset").unwrap().clone();
+        let mut historical = before.clone();
+        historical.proofs.get_mut(CONVERSION_PROOF).unwrap()["source_binding"] =
+            serde_json::json!("native_raw");
+        manifest.upsert_trusted(historical.clone());
+
+        let proof = &manifest.get("asset").unwrap().proofs[CONVERSION_PROOF];
+        let decoded = decode_historical_conversion_source("asset", proof).unwrap();
+        assert_eq!(
+            decoded.source_binding,
+            ConversionSourceBinding::historical_native_raw_token()
+        );
+        assert!(!decoded.current_policy_source);
+        assert!(
+            decoded.source_binding == ConversionSourceBinding::NativeRaw(NativeRawSource::token())
+        );
+        assert_eq!(
+            identity_migrate_historical_conversion_proof("asset", proof).unwrap(),
+            *proof
+        );
+        assert_eq!(proof["source_binding"], "native_raw");
+        assert_eq!(
+            manifest.get("asset").unwrap().proofs[HEIC_PROOF],
+            before.proofs[HEIC_PROOF]
+        );
+        assert_eq!(
+            manifest.get("asset").unwrap().state,
+            State::ConversionVerified
+        );
+
+        let error = upload_ready_heic_proof(&manifest, "asset")
+            .expect_err("native_raw must not pass the quality gate");
+        assert!(matches!(
+            error,
+            WorkflowError::HistoricalNativeRawUnverified { .. }
+        ));
+        assert!(!remote_readback_is_verified(&manifest, "asset").unwrap());
+
+        let invalid = serde_json::json!({"source_binding": "native_raw"});
+        assert!(decode_historical_conversion_source("asset", &invalid).is_err());
+        let unknown = proof.clone();
+        let mut unknown = unknown;
+        unknown["source_binding"] = serde_json::json!("sensor_render");
+        assert!(decode_historical_conversion_source("asset", &unknown).is_err());
+
+        let mut fresh = Manifest::new();
+        discover_raw_asset(&mut fresh, "asset", "/nas/IMG_0001.dng").unwrap();
+        record_nas_proof(&mut fresh, "asset", nas()).unwrap();
+        let untouched = fresh.clone();
+        let error = record_current_conversion_result(
+            &mut fresh,
+            "asset",
+            conversion_input(ConversionSourceBinding::historical_native_raw_token()),
+        )
+        .expect_err("new native_raw proof must not be recorded");
+        assert!(matches!(
+            error,
+            WorkflowError::HistoricalNativeRawUnverified { .. }
+        ));
+        assert_eq!(fresh, untouched);
+
+        let mut object_fields = BTreeMap::new();
+        object_fields.insert("raw_sha256".to_string(), serde_json::json!("cd".repeat(32)));
+        object_fields.insert(
+            "raw_path".to_string(),
+            serde_json::json!("/nas/PrimarySync/IMG_0001.DNG"),
+        );
+        object_fields.insert(
+            "converter".to_string(),
+            serde_json::json!("dcraw_emu+magick+heif-enc"),
+        );
+        object_fields.insert("quality_verified".to_string(), serde_json::json!(true));
+        object_fields.insert(
+            "provenance".to_string(),
+            serde_json::json!({
+                "library": "primary",
+                "asset_ref": "raw-122ae80b2d2fb76c"
+            }),
+        );
+        let historical_object = serde_json::json!({ "native_raw": object_fields.clone() });
+        let mut object_record = before.clone();
+        object_record.proofs.get_mut(CONVERSION_PROOF).unwrap()["source_binding"] =
+            historical_object.clone();
+        let mut object_manifest = Manifest::new();
+        object_manifest.upsert_trusted(object_record);
+        let stored = &object_manifest.get("asset").unwrap().proofs[CONVERSION_PROOF];
+        let decoded = decode_historical_conversion_source("asset", stored).unwrap();
+        assert!(!decoded.current_policy_source);
+        assert_eq!(
+            serde_json::to_value(&decoded.source_binding).unwrap(),
+            historical_object
+        );
+        let ConversionSourceBinding::NativeRaw(source) = &decoded.source_binding else {
+            panic!("object native_raw must stay native_raw");
+        };
+        assert_eq!(
+            source
+                .object_fields()
+                .and_then(|fields| fields.get("provenance")),
+            Some(&serde_json::json!({
+                "library": "primary",
+                "asset_ref": "raw-122ae80b2d2fb76c"
+            }))
+        );
+        assert_eq!(
+            source
+                .object_fields()
+                .and_then(|fields| fields.get("quality_verified")),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            identity_migrate_historical_conversion_proof("asset", stored).unwrap()["source_binding"],
+            historical_object
+        );
+        let error = upload_ready_heic_proof(&object_manifest, "asset")
+            .expect_err("object native_raw must not gain a quality pass");
+        assert!(matches!(
+            error,
+            WorkflowError::HistoricalNativeRawUnverified { .. }
+        ));
+        for malformed in [
+            serde_json::json!({"native_raw": "not-an-object"}),
+            serde_json::json!({"sensor_render": {}}),
+            serde_json::json!("not_a_source"),
+            serde_json::json!({"native_raw": {"raw_sha256": "abc"}, "extra": true}),
+        ] {
+            let mut broken = before.clone();
+            broken.proofs.get_mut(CONVERSION_PROOF).unwrap()["source_binding"] = malformed;
+            let mut manifest = Manifest::new();
+            manifest.upsert_trusted(broken);
+            let proof = &manifest.get("asset").unwrap().proofs[CONVERSION_PROOF];
+            assert!(
+                decode_historical_conversion_source("asset", proof).is_err(),
+                "malformed historical source must fail closed"
+            );
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&path, "native-raw-object", Duration::from_secs(30))
+                .unwrap();
+        store
+            .persist_manifest_records_trusted(&object_manifest)
+            .unwrap();
+        drop(store);
+        let loaded = AssetStateStore::open_read_only(&path)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(
+            loaded.get("asset").unwrap().proofs[CONVERSION_PROOF]["source_binding"],
+            historical_object
+        );
+        assert!(matches!(
+            upload_ready_heic_proof(&loaded, "asset"),
+            Err(WorkflowError::HistoricalNativeRawUnverified { .. })
+        ));
+    }
+
+    struct ReadbackTransport {
+        responses: Vec<Value>,
+        bytes: Vec<u8>,
+        lookups: usize,
+        downloads: usize,
+    }
+
+    impl CloudKitUploadedHeicReadTransport for ReadbackTransport {
+        fn post_records_lookup(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _payload: Value,
+        ) -> Result<Value, UploadError> {
+            self.lookups += 1;
+            Ok(self.responses.remove(0))
+        }
+
+        fn download_resource(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _download_url: &url::Url,
+            expected_size_bytes: u64,
+        ) -> Result<CloudKitResourceDownload, UploadError> {
+            self.downloads += 1;
+            let size_bytes = self.bytes.len() as u64;
+            if size_bytes != expected_size_bytes {
+                return Err(UploadError::CloudKitOriginalAssetDownloadSizeMismatch {
+                    expected: expected_size_bytes,
+                    actual: size_bytes,
+                });
+            }
+            Ok(CloudKitResourceDownload {
+                sha256: format!("{:x}", sha2::Sha256::digest(&self.bytes)),
+                size_bytes,
+            })
+        }
+    }
+
+    fn delete_session_json(scope: &str, zone: &str, owner: Option<&str>) -> String {
+        let mut value = serde_json::json!({
+            "dsid": "123456789",
+            "ckdatabasews_url": "https://p140-ckdatabasews.icloud.com",
+            "database_scope": scope,
+            "zone_name": zone,
+            "cloudkit_query_params": [
+                {"name": "clientBuildNumber", "value": "2522Project44"},
+                {"name": "clientMasteringNumber", "value": "2522B2"},
+                {"name": "clientId", "value": "4f0b58d4-ff9d-4dc5-8f0b-9c4efc4fdb27"},
+                {"name": "dsid", "value": "123456789"},
+                {"name": "remapEnums", "value": "True"},
+                {"name": "getCurrentSyncToken", "value": "True"}
+            ],
+            "cookies": [
+                {"name": "X-APPLE-WEBAUTH-TOKEN", "value": "SENTINEL_COOKIE"},
+                {"name": "session", "value": "abc123"}
+            ]
+        });
+        if let Some(owner) = owner {
+            value["owner_record_name"] = serde_json::json!(owner);
+        }
+        value.to_string()
+    }
+
+    fn asset_lookup(asset: &str, master: &str) -> Value {
+        serde_json::json!({
+            "records": [{
+                "recordName": asset,
+                "recordType": "CPLAsset",
+                "recordChangeTag": "heic-change",
+                "fields": {
+                    "masterRef": {
+                        "type": "REFERENCE",
+                        "value": {
+                            "recordName": master,
+                            "zoneID": {
+                                "zoneName": "PrimarySync",
+                                "ownerRecordName": "opaque-private-owner"
+                            },
+                            "action": "DELETE_SELF"
+                        }
+                    },
+                    "isDeleted": {"value": 0}
+                }
+            }]
+        })
+    }
+
+    fn master_lookup(master: &str, size: u64) -> Value {
+        serde_json::json!({
+            "records": [{
+                "recordName": master,
+                "recordType": "CPLMaster",
+                "recordChangeTag": "master-change",
+                "fields": {
+                    "resOriginalRes": {"value": {
+                        "size": size,
+                        "downloadURL": "https://p140-icloud-content.icloud.com/heic"
+                    }},
+                    "resOriginalFileType": {"value": "public.heic"}
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn remote_readback_requires_downloaded_bytes_and_leaves_a_sibling_alone() {
+        let mut good = current_conversion_verified("good");
+        record_upload_proof(&mut good, "good", upload_proof()).unwrap();
+        assert!(!remote_readback_is_verified(&good, "good").unwrap());
+        assert!(
+            !good
+                .get("good")
+                .unwrap()
+                .proofs
+                .contains_key(REMOTE_READBACK_PROOF)
+        );
+
+        let mut other = current_conversion_verified("other");
+        let mut other_upload = upload_proof();
+        other_upload.uploaded_heic_asset_id = "CPLAsset-other".to_string();
+        record_upload_proof(&mut other, "other", other_upload).unwrap();
+        let other_before = other.get("other").unwrap().clone();
+
+        let session =
+            CloudKitDeleteSession::from_json(&delete_session_json("private", "PrimarySync", None))
+                .unwrap();
+        let bytes = heic_bytes();
+        assert_eq!(bytes.len(), 24);
+        let mut wrong = ReadbackTransport {
+            responses: vec![
+                asset_lookup("CPLAsset-heic", "CPLMaster-heic"),
+                master_lookup("CPLMaster-heic", 24),
+            ],
+            bytes: b"0123456789abcdefghijklmn".to_vec(),
+            lookups: 0,
+            downloads: 0,
+        };
+        let error = verify_remote_readback(&mut good, "good", &session, &mut wrong)
+            .expect_err("mismatched download must not record readback");
+        assert!(matches!(error, WorkflowError::RemoteReadback(_)));
+        assert!(!remote_readback_is_verified(&good, "good").unwrap());
+        assert_eq!(good.get("good").unwrap().state, State::UploadVerified);
+
+        let mut transport = ReadbackTransport {
+            responses: vec![
+                asset_lookup("CPLAsset-heic", "CPLMaster-heic"),
+                master_lookup("CPLMaster-heic", 24),
+            ],
+            bytes: bytes.to_vec(),
+            lookups: 0,
+            downloads: 0,
+        };
+        let downloaded = heic_sha();
+        verify_remote_readback(&mut good, "good", &session, &mut transport).unwrap();
+        assert_eq!(transport.downloads, 1);
+        assert!(remote_readback_is_verified(&good, "good").unwrap());
+        assert_eq!(good.get("good").unwrap().state, State::UploadVerified);
+        assert!(!good.get("good").unwrap().proofs.contains_key("delete"));
+        let readback = &good.get("good").unwrap().proofs[REMOTE_READBACK_PROOF];
+        assert_eq!(readback["matched_heic_sha256"], downloaded);
+        assert_eq!(readback["database_scope"], "private");
+        assert!(readback.get("cookie").is_none());
+
+        assert_eq!(other.get("other").unwrap(), &other_before);
+        assert!(!remote_readback_is_verified(&other, "other").unwrap());
+
+        let shared = CloudKitDeleteSession::from_json(&delete_session_json(
+            "shared",
+            "SharedSync-LIBRARY",
+            Some("_shared-owner"),
+        ))
+        .unwrap();
+        let mut scoped = ReadbackTransport {
+            responses: vec![
+                asset_lookup("CPLAsset-heic", "CPLMaster-heic"),
+                master_lookup("CPLMaster-heic", 24),
+            ],
+            bytes: bytes.to_vec(),
+            lookups: 0,
+            downloads: 0,
+        };
+        assert!(verify_remote_readback(&mut good, "good", &shared, &mut scoped).is_err());
+        assert_eq!(scoped.lookups, 0);
+        assert_eq!(scoped.downloads, 0);
+    }
+
+    #[test]
+    fn held_asset_stays_blocked_across_restart_while_eligible_upload_is_not_repeated() {
+        let mut held_manifest = current_conversion_verified("held");
+        let before = held_manifest.get("held").unwrap().clone();
+        let hold = hold_for(CloudKitDatabaseScope::Private);
+        assert!(apply_operation_hold(&mut held_manifest, "held", hold.clone()).unwrap());
+        assert!(!apply_operation_hold(&mut held_manifest, "held", hold.clone()).unwrap());
+        let held_record = held_manifest.get("held").unwrap().clone();
+        assert_eq!(held_record.state, before.state);
+        assert_eq!(held_record.state, State::ConversionVerified);
+        assert_eq!(held_record.failures, before.failures);
+        assert_eq!(held_record.raw_path, before.raw_path);
+        assert!(!held_record.proofs.contains_key("failure_quarantine"));
+        for (key, value) in &before.proofs {
+            assert_eq!(held_record.proofs.get(key), Some(value));
+        }
+
+        let mut manifest = current_conversion_verified("eligible");
+        manifest.upsert_trusted(held_record);
+        let held_error = ensure_upload_dispatch_allowed(&manifest, "held")
+            .expect_err("held asset must not dispatch");
+        assert!(matches!(
+            held_error,
+            WorkflowError::RemoteOperationHeld { .. }
+        ));
+        let before_dispatch = manifest.clone();
+        assert!(matches!(
+            record_upload_proof(&mut manifest, "held", upload_proof()),
+            Err(WorkflowError::RemoteOperationHeld { .. })
+        ));
+        assert_eq!(manifest, before_dispatch);
+
+        assert!(ensure_upload_dispatch_allowed(&manifest, "eligible").is_ok());
+        record_upload_proof(&mut manifest, "eligible", upload_proof()).unwrap();
+        assert!(!remote_readback_is_verified(&manifest, "eligible").unwrap());
+        assert!(
+            !manifest
+                .get("held")
+                .unwrap()
+                .proofs
+                .contains_key(UPLOAD_PROOF)
+        );
+        let uploaded = manifest.get("eligible").unwrap().proofs[UPLOAD_PROOF].clone();
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&path, "per-photo-test", Duration::from_secs(30)).unwrap();
+        store.persist_manifest_records_trusted(&manifest).unwrap();
+        drop(store);
+        let loaded = AssetStateStore::open_read_only(&path)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert!(matches!(
+            ensure_upload_dispatch_allowed(&loaded, "held"),
+            Err(WorkflowError::RemoteOperationHeld { .. })
+        ));
+        assert!(matches!(
+            ensure_upload_dispatch_allowed(&loaded, "eligible"),
+            Err(WorkflowError::UploadAlreadyRecorded { .. })
+        ));
+        assert_eq!(
+            loaded.get("eligible").unwrap().proofs[UPLOAD_PROOF],
+            uploaded
+        );
+        assert!(!remote_readback_is_verified(&loaded, "eligible").unwrap());
+
+        let mut retry = loaded;
+        assert!(record_upload_proof(&mut retry, "eligible", upload_proof()).is_err());
+        assert_eq!(
+            retry.get("eligible").unwrap().proofs[UPLOAD_PROOF],
+            uploaded
+        );
+        crate::operation_hold::release_operation_hold(&mut retry, "held", &hold).unwrap();
+        assert_eq!(retry.get("held").unwrap().state, State::ConversionVerified);
+        assert!(ensure_upload_dispatch_allowed(&retry, "held").is_ok());
+    }
 }

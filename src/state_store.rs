@@ -35,6 +35,7 @@ use crate::manifest::{
 };
 #[cfg(unix)]
 use crate::manifest_lock::{ManifestLockError, acquire_existing_manifest_lock};
+use crate::operation_hold::OPERATION_HOLD_PROOF_NAME;
 
 const SCHEMA_VERSION: i32 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -738,6 +739,128 @@ impl AssetStateStore {
         self.persist_records_exact_cas_atomic_with_owned_lease(updates, None)
     }
 
+    /// Inserts new assets and replaces existing assets only when each expected
+    /// snapshot still matches durable state. Other assets are not written.
+    pub(crate) fn persist_asset_changes_trusted<'a>(
+        &self,
+        replaces: impl IntoIterator<Item = AssetRecordExactCasUpdate<'a>>,
+        inserts: impl IntoIterator<Item = &'a AssetRecord>,
+    ) -> Result<(), AssetStateStoreError> {
+        let replaces = replaces.into_iter().collect::<Vec<_>>();
+        let inserts = inserts.into_iter().collect::<Vec<_>>();
+        if replaces.iter().any(|update| {
+            record_has_reserved_internal_proof(update.expected)
+                || record_has_reserved_internal_proof(update.updated)
+        }) || inserts
+            .iter()
+            .any(|record| record_has_reserved_internal_proof(record))
+        {
+            return Err(AssetStateStoreError::ReservedInternalProofRequiresAuthority);
+        }
+        if replaces.is_empty() && inserts.is_empty() {
+            return Ok(());
+        }
+        let _mutation_guard = self.mutation_guard();
+        let token = self.writer_token()?;
+        let mut asset_ids = BTreeSet::new();
+        for update in &replaces {
+            if update.expected.asset_id != update.updated.asset_id {
+                return Err(AssetStateStoreError::ExactCasMismatchedIds {
+                    expected_asset_id: update.expected.asset_id.clone(),
+                    updated_asset_id: update.updated.asset_id.clone(),
+                });
+            }
+            if !asset_ids.insert(update.expected.asset_id.clone()) {
+                return Err(AssetStateStoreError::DuplicateRecord {
+                    asset_id: update.expected.asset_id.clone(),
+                });
+            }
+        }
+        for record in &inserts {
+            if !asset_ids.insert(record.asset_id.clone()) {
+                return Err(AssetStateStoreError::DuplicateRecord {
+                    asset_id: record.asset_id.clone(),
+                });
+            }
+        }
+        let mut connection = self.connect_writer()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.validate_writer_lease(&transaction, token)?;
+        {
+            let mut statement = transaction
+                .prepare("SELECT state, updated_at, record_json FROM assets WHERE asset_id = ?1")?;
+            for update in &replaces {
+                let expected_json = encode_record(update.expected)?;
+                let persisted = statement
+                    .query_row([update.expected.asset_id.as_str()], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .optional()?;
+                if persisted
+                    .as_ref()
+                    .is_none_or(|(state, updated_at, record_json)| {
+                        state != update.expected.state.as_str()
+                            || updated_at != &update.expected.updated_at
+                            || record_json != &expected_json
+                    })
+                {
+                    return Err(AssetStateStoreError::ExactCasMismatch {
+                        asset_id: update.expected.asset_id.clone(),
+                    });
+                }
+            }
+            for record in &inserts {
+                let existing = statement
+                    .query_row([record.asset_id.as_str()], |row| row.get::<_, String>(0))
+                    .optional()?;
+                if existing.is_some() {
+                    return Err(AssetStateStoreError::ExactCasMismatch {
+                        asset_id: record.asset_id.clone(),
+                    });
+                }
+            }
+        }
+        for update in &replaces {
+            let updated_json = encode_record(update.updated)?;
+            let changed = transaction.execute(
+                "UPDATE assets
+                 SET state = ?1, updated_at = ?2, record_json = ?3
+                 WHERE asset_id = ?4",
+                params![
+                    update.updated.state.as_str(),
+                    update.updated.updated_at,
+                    updated_json,
+                    update.updated.asset_id,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(AssetStateStoreError::ExactCasMismatch {
+                    asset_id: update.updated.asset_id.clone(),
+                });
+            }
+        }
+        for record in &inserts {
+            let record_json = encode_record(record)?;
+            transaction.execute(
+                "INSERT INTO assets (asset_id, state, updated_at, record_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    record.asset_id,
+                    record.state.as_str(),
+                    record.updated_at,
+                    record_json,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        checkpoint_owned_wal(&connection);
+        Ok(())
+    }
+
     pub(crate) fn persist_records_exact_cas_atomic_with_legacy_upload_migration_authority<'a>(
         &self,
         authority: &LegacyUploadMigrationStateStoreWriteAuthority,
@@ -1082,6 +1205,14 @@ impl AssetStateStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.validate_writer_lease(&transaction, token)?;
         reject_persisted_reserved_internal_proof(&transaction, &record.asset_id)?;
+        let persisted_json: Option<String> = transaction
+            .query_row(
+                "SELECT record_json FROM assets WHERE asset_id = ?1",
+                [&record.asset_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        reject_operation_hold_loss(&record.asset_id, persisted_json.as_deref(), record)?;
         let changed = upsert_record(&transaction, record)?;
         reject_stale_record(&transaction, record, changed)?;
         transaction.commit()?;
@@ -2656,7 +2787,38 @@ fn validate_requested_record(
                 asset_id: record.asset_id.clone(),
             })
         }
-        _ => Ok(()),
+        Some((_, persisted_json)) => {
+            reject_operation_hold_loss(&record.asset_id, Some(persisted_json), record)
+        }
+        None => Ok(()),
+    }
+}
+
+fn reject_operation_hold_loss(
+    asset_id: &str,
+    persisted_json: Option<&str>,
+    requested: &AssetRecord,
+) -> Result<(), AssetStateStoreError> {
+    let Some(persisted_json) = persisted_json else {
+        return Ok(());
+    };
+    let persisted: serde_json::Value = serde_json::from_str(persisted_json).map_err(|source| {
+        AssetStateStoreError::DecodeRecord {
+            asset_id: asset_id.to_string(),
+            source,
+        }
+    })?;
+    let persisted_hold = persisted
+        .get("proofs")
+        .and_then(|proofs| proofs.get(OPERATION_HOLD_PROOF_NAME));
+    let Some(persisted_hold) = persisted_hold else {
+        return Ok(());
+    };
+    match requested.proofs.get(OPERATION_HOLD_PROOF_NAME) {
+        Some(requested_hold) if requested_hold == persisted_hold => Ok(()),
+        _ => Err(AssetStateStoreError::OperationHoldLost {
+            asset_id: asset_id.to_string(),
+        }),
     }
 }
 
@@ -2799,6 +2961,10 @@ pub enum AssetStateStoreError {
     RecordColumnMismatch { asset_id: String },
     #[error("refusing to overwrite newer durable state for {asset_id}")]
     StaleRecord { asset_id: String },
+    #[error(
+        "refusing to drop the active operation hold for {asset_id}; the durable record was left unchanged"
+    )]
+    OperationHoldLost { asset_id: String },
     #[error("atomic state batch contains duplicate asset ID {asset_id}")]
     DuplicateRecord { asset_id: String },
     #[error(
@@ -3258,8 +3424,28 @@ mod tests {
         let db_path_for_hook = db_path.clone();
 
         set_migration_precommit_hook_for_current_thread(move || {
-            fs::rename(&db_path_for_hook, &moved_db_path).expect("move verified database path");
-            fs::rename(&moved_db_path, &db_path_for_hook).expect("restore verified database path");
+            let parent = db_path_for_hook
+                .parent()
+                .expect("database path should have a parent")
+                .to_path_buf();
+            let started = fs::metadata(&parent).expect("database directory metadata");
+            for _ in 0..40 {
+                thread::sleep(Duration::from_millis(25));
+                fs::rename(&db_path_for_hook, &moved_db_path).expect("move verified database path");
+                fs::rename(&moved_db_path, &db_path_for_hook)
+                    .expect("restore verified database path");
+                let current = fs::metadata(&parent).expect("database directory metadata");
+                if current.mtime() != started.mtime()
+                    || current.mtime_nsec() != started.mtime_nsec()
+                    || current.ctime() != started.ctime()
+                    || current.ctime_nsec() != started.ctime_nsec()
+                {
+                    return;
+                }
+            }
+            panic!(
+                "filesystem did not update directory timestamps after renaming the database; the directory witness was not given a visible change to reject"
+            );
         });
         let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
             .expect_err("database path ABA must roll back before commit");
@@ -3289,6 +3475,54 @@ mod tests {
         let summary = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
             .expect("restored verified path should migrate normally");
         assert_eq!(summary.database_id, expected_database_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_only_migration_rejects_a_different_inode_left_at_the_database_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let record = AssetRecord::new("asset-1", "/photos/asset-1.dng");
+        let record_json = create_migratable_v1_database(&manifest_path, &record);
+        let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
+        let moved_db_path = tempdir.path().join("moved-state.sqlite3");
+        let digest_before = format!("{:x}", Sha256::digest(record_json.as_bytes()));
+        let original_inode = fs::metadata(&db_path).expect("database metadata").ino();
+        let hook_db_path = db_path.clone();
+        let hook_moved_db_path = moved_db_path.clone();
+
+        set_migration_precommit_hook_for_current_thread(move || {
+            fs::rename(&hook_db_path, &hook_moved_db_path).expect("move verified database path");
+            fs::write(&hook_db_path, b"replacement-database-bytes")
+                .expect("leave a different file at the database path");
+        });
+        let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+            .expect_err("a different inode at the database path must roll back");
+
+        assert!(matches!(
+            error,
+            AssetStateStoreError::MigrationDatabaseIdentityChanged { .. }
+        ));
+        assert_ne!(
+            fs::metadata(&db_path).expect("replacement metadata").ino(),
+            original_inode
+        );
+        let connection = Connection::open(&moved_db_path).expect("reopen original database inode");
+        let version: i32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read original schema version");
+        assert_eq!(version, 1);
+        let durable_json: String = connection
+            .query_row(
+                "SELECT record_json FROM assets WHERE asset_id = 'asset-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read original asset record");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(durable_json.as_bytes())),
+            digest_before
+        );
     }
 
     #[test]
