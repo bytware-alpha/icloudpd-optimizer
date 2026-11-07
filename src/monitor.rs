@@ -11,7 +11,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -95,6 +95,33 @@ const DEFAULT_CLOUDKIT_MAX_PAGES: u64 = 2000;
 const DEFAULT_SCAN_ROOT_PREFLIGHT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_LOCAL_MIRROR_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_UPLOAD_TIMEOUT_SECONDS: u64 = 600;
+const MAX_ROLLING_NETWORK_SLOTS: usize = 2;
+static ROLLING_NETWORK_AUTH_PAUSED: AtomicBool = AtomicBool::new(false);
+
+fn clear_rolling_network_auth_pause() {
+    ROLLING_NETWORK_AUTH_PAUSED.store(false, Ordering::Relaxed);
+}
+
+fn pause_rolling_network_auth() {
+    ROLLING_NETWORK_AUTH_PAUSED.store(true, Ordering::Relaxed);
+}
+
+fn rolling_network_auth_paused() -> bool {
+    ROLLING_NETWORK_AUTH_PAUSED.load(Ordering::Relaxed)
+}
+
+fn note_provider_auth_rejection(message: &str) {
+    if provider_auth_rejection_text(message) {
+        pause_rolling_network_auth();
+    }
+}
+
+pub(crate) fn provider_auth_rejection_text(message: &str) -> bool {
+    message.contains("returned HTTP 401 ")
+        || message.contains("returned HTTP 403 ")
+        || message.contains("rejected the upload with status 401:")
+        || message.contains("rejected the upload with status 403:")
+}
 const DEFAULT_HEIC_VERIFY_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_MAX_ORIGINAL_RESOLVER_RETRIES_PER_SCAN: usize = 16;
 const DEFAULT_ORIGINAL_RESOLVER_RETRY_MIN_AGE_SECONDS: u64 = 24 * 60 * 60;
@@ -694,6 +721,7 @@ pub fn run_monitor_once(
     config: &MonitorConfig,
     guard: &mut MonitorRunGuard,
 ) -> Result<MonitorScanSummary, MonitorError> {
+    clear_rolling_network_auth_pause();
     clear_pending_monitor_failure_correlation();
     config.validate()?;
     let preclassified_state =
@@ -2069,6 +2097,7 @@ where
         summary.started_unix_seconds,
         json!({
             "worker_slots": worker_count,
+            "network_stage_slots": MAX_ROLLING_NETWORK_SLOTS,
             "cpu_stage_slots": cpu_stage_jobs,
             "convert_stage_slots": convert_stage_jobs,
             "mirror_stage_slots": mirror_stage_jobs,
@@ -2354,14 +2383,15 @@ enum RollingStagePermitPolicy {
     Cpu,
     CpuAndConvert,
     Mirror,
+    Network,
 }
 
 fn rolling_asset_step_permit_policy(step: RollingAssetStep) -> RollingStagePermitPolicy {
     match step {
-        RollingAssetStep::ResolveAdjustedSource => RollingStagePermitPolicy::None,
+        RollingAssetStep::ResolveAdjustedSource => RollingStagePermitPolicy::Network,
         RollingAssetStep::ConvertHeic => RollingStagePermitPolicy::CpuAndConvert,
         RollingAssetStep::VerifyConvertedHeics => RollingStagePermitPolicy::Cpu,
-        RollingAssetStep::UploadVerifiedHeics => RollingStagePermitPolicy::None,
+        RollingAssetStep::UploadVerifiedHeics => RollingStagePermitPolicy::Network,
         RollingAssetStep::RecordLocalMirrors => RollingStagePermitPolicy::Mirror,
     }
 }
@@ -2384,6 +2414,7 @@ struct RollingStagePermitState {
     available_cpu_stage_slots: usize,
     available_convert_stage_slots: usize,
     available_mirror_stage_slots: usize,
+    available_network_slots: usize,
     waiting_cpu_only_slots: usize,
 }
 
@@ -2400,6 +2431,7 @@ impl RollingStagePermits {
                 available_cpu_stage_slots: cpu_stage_slots,
                 available_convert_stage_slots: convert_stage_slots,
                 available_mirror_stage_slots: mirror_stage_slots,
+                available_network_slots: MAX_ROLLING_NETWORK_SLOTS,
                 waiting_cpu_only_slots: 0,
             }),
             available: Condvar::new(),
@@ -2443,6 +2475,13 @@ impl RollingStagePermits {
                 Ok(Some(RollingStagePermitGuard {
                     permits: Arc::clone(self),
                     policy: RollingStagePermitPolicy::Mirror,
+                }))
+            }
+            RollingStagePermitPolicy::Network => {
+                self.acquire_network_slot()?;
+                Ok(Some(RollingStagePermitGuard {
+                    permits: Arc::clone(self),
+                    policy: RollingStagePermitPolicy::Network,
                 }))
             }
         }
@@ -2495,6 +2534,24 @@ impl RollingStagePermits {
         Ok(())
     }
 
+    fn acquire_network_slot(&self) -> Result<(), MonitorError> {
+        let mut state = self.state.lock().map_err(|_| MonitorError::CommandFailed {
+            program: "icloudpd-optimizer",
+            message: "rolling lifecycle permit lock poisoned".to_string(),
+        })?;
+        while state.available_network_slots == 0 {
+            state = self
+                .available
+                .wait(state)
+                .map_err(|_| MonitorError::CommandFailed {
+                    program: "icloudpd-optimizer",
+                    message: "rolling lifecycle permit wait failed".to_string(),
+                })?;
+        }
+        state.available_network_slots -= 1;
+        Ok(())
+    }
+
     fn release_cpu_slots(&self, convert_slot: bool) {
         if let Ok(mut state) = self.state.lock() {
             state.available_cpu_stage_slots =
@@ -2511,6 +2568,14 @@ impl RollingStagePermits {
         if let Ok(mut state) = self.state.lock() {
             state.available_mirror_stage_slots =
                 (state.available_mirror_stage_slots + 1).min(self.mirror_stage_slots);
+            self.available.notify_all();
+        }
+    }
+
+    fn release_network_slot(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.available_network_slots =
+                (state.available_network_slots + 1).min(MAX_ROLLING_NETWORK_SLOTS);
             self.available.notify_all();
         }
     }
@@ -2535,6 +2600,7 @@ impl Drop for RollingStagePermitGuard {
             RollingStagePermitPolicy::Cpu => self.permits.release_cpu_slots(false),
             RollingStagePermitPolicy::CpuAndConvert => self.permits.release_cpu_slots(true),
             RollingStagePermitPolicy::Mirror => self.permits.release_mirror_slot(),
+            RollingStagePermitPolicy::Network => self.permits.release_network_slot(),
             RollingStagePermitPolicy::None => {}
         }
     }
@@ -2756,6 +2822,12 @@ fn rolling_lifecycle_next_worker_step(
     conversion_capacity_available: bool,
 ) -> Option<RollingAssetStep> {
     if blocks_scheduled_remote_mutation(record) {
+        return None;
+    }
+    if record
+        .proofs
+        .contains_key(crate::photos_import_handoff::PHOTOS_IMPORT_HANDOFF_PROOF)
+    {
         return None;
     }
     match record.state {
@@ -3071,6 +3143,9 @@ fn run_rolling_adjusted_source_resolution<T: CloudKitAdjustedSourceTransport>(
     base_read_session: &CloudKitDeleteSession,
     resolver: &mut CloudKitAdjustedSourceResolver<T>,
 ) -> Result<RollingAssetStepOutcome, MonitorError> {
+    if rolling_network_auth_paused() {
+        return Ok(RollingAssetStepOutcome::skipped());
+    }
     if !execution.config.full_lifecycle || !execution.config.rolling_lifecycle {
         return Ok(RollingAssetStepOutcome::skipped());
     }
@@ -3824,6 +3899,9 @@ fn run_rolling_asset_upload_with_child<F>(
 where
     F: FnOnce(&Path, &str, &AssetRecord, &Path, u64) -> Result<Vec<u8>, MonitorError>,
 {
+    if rolling_network_auth_paused() {
+        return Ok(RollingAssetStepOutcome::skipped());
+    }
     let session_path = required_path(&config.upload_session_path, "upload_session_path")?;
     let (heic, destination, record) = {
         let manifest = lock_shared(manifest, "rolling lifecycle manifest")?;
@@ -3921,6 +3999,7 @@ where
         }
         Err(error) => {
             let message = error.to_string();
+            note_provider_auth_rejection(&message);
             let should_fail_record = upload_error_should_fail_record(&error);
             {
                 let mut summary = lock_shared(summary, "rolling lifecycle summary")?;
@@ -5026,6 +5105,9 @@ fn upload_verified_heics(
     let asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
         active_lifecycle_allows(Some(active_lifecycle_asset_ids), &record.asset_id)
             && !remote_mutation_blocked(record)
+            && !record
+                .proofs
+                .contains_key(crate::photos_import_handoff::PHOTOS_IMPORT_HANDOFF_PROOF)
             && record.state == State::ConversionVerified
             && record.proofs.contains_key("original_asset")
             && !record.proofs.contains_key("upload")
@@ -5064,7 +5146,11 @@ fn upload_verified_heics(
             }
         }
     }
-    for chunk in upload_asset_ids.chunks(config.jobs.max(1)) {
+    let upload_slots = config.jobs.max(1).min(MAX_ROLLING_NETWORK_SLOTS);
+    for chunk in upload_asset_ids.chunks(upload_slots) {
+        if rolling_network_auth_paused() {
+            break;
+        }
         let manifest_path = config.manifest_path.clone();
         let session_path = session_path.to_path_buf();
         let timeout_seconds = config.upload_timeout_seconds;
@@ -5111,6 +5197,10 @@ fn upload_verified_heics(
                 }
                 Err(error) => {
                     let message = error.to_string();
+                    note_provider_auth_rejection(&message);
+                    if provider_auth_rejection_text(&message) {
+                        should_stop = true;
+                    }
                     if upload_error_should_fail_record(&error) {
                         record_stage_failure(manifest, &outcome.asset_id, "upload", &message)?;
                         manifest_changed = true;
@@ -14290,7 +14380,11 @@ printf '%s\n' "$workspace" >> '{}'
         );
         assert_eq!(
             rolling_asset_step_permit_policy(RollingAssetStep::UploadVerifiedHeics),
-            RollingStagePermitPolicy::None
+            RollingStagePermitPolicy::Network
+        );
+        assert_eq!(
+            rolling_asset_step_permit_policy(RollingAssetStep::ResolveAdjustedSource),
+            RollingStagePermitPolicy::Network
         );
         assert_eq!(
             rolling_asset_step_permit_policy(RollingAssetStep::RecordLocalMirrors),
@@ -24378,6 +24472,7 @@ printf '%s\n' "$workspace" >> '{}'
             available_cpu_stage_slots: 1,
             available_convert_stage_slots: 1,
             available_mirror_stage_slots: 1,
+            available_network_slots: 2,
             waiting_cpu_only_slots: 1,
         };
 
@@ -25083,5 +25178,109 @@ mod per_photo_hold_scheduling_tests {
             .unwrap();
         assert!(!loaded.get("held").unwrap().proofs.contains_key("upload"));
         assert_eq!(loaded.get("held").unwrap().state, State::ConversionVerified);
+    }
+
+    #[test]
+    fn auth_pause_skips_the_next_upload_without_opening_another_request() {
+        clear_rolling_network_auth_pause();
+        pause_rolling_network_auth();
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut manifest = Manifest::new();
+        manifest.upsert_trusted(held_upload_candidate("eligible", 10));
+        let manifest = Arc::new(Mutex::new(manifest));
+        let summary = Arc::new(Mutex::new(MonitorScanSummary::default()));
+        let path = tempdir.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&path, "auth-pause", Duration::from_secs(30)).unwrap();
+        store
+            .persist_manifest_records_trusted(&manifest.lock().unwrap())
+            .unwrap();
+        let mut config = MonitorConfig::new(tempdir.path(), &path, tempdir.path().join("heic"));
+        config.full_lifecycle = true;
+        config.auto_delete = false;
+        config.upload_session_path = Some(tempdir.path().join("upload-session.json"));
+        let called = Arc::new(Mutex::new(false));
+        let called_flag = Arc::clone(&called);
+        let outcome = run_rolling_asset_upload_with_child(
+            &config,
+            &store,
+            "eligible",
+            &manifest,
+            &summary,
+            move |_, _, _, _, _| {
+                *called_flag.lock().unwrap() = true;
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, RollingAssetStepOutcome::skipped());
+        assert!(!*called.lock().unwrap());
+        assert_eq!(summary.lock().unwrap().uploads_attempted, 0);
+        clear_rolling_network_auth_pause();
+    }
+
+    #[test]
+    fn provider_auth_rejection_text_matches_only_the_stable_status_lines() {
+        assert!(provider_auth_rejection_text(
+            "icloudpd-optimizer failed: exited with 1: iCloud upload returned HTTP 401 during createUploadUrl"
+        ));
+        assert!(provider_auth_rejection_text(
+            "iCloud Photos putAsset rejected the upload with status 403: denied"
+        ));
+        assert!(!provider_auth_rejection_text(
+            "iCloud upload returned HTTP 500 during createUploadUrl"
+        ));
+        assert!(!provider_auth_rejection_text(
+            "asset HTTP 401 in a filename"
+        ));
+    }
+
+    #[test]
+    fn photos_import_handoff_is_not_scheduled_for_upload() {
+        let mut manifest = Manifest::new();
+        let mut record = held_upload_candidate("canary", 10);
+        record.proofs.insert(
+            crate::photos_import_handoff::PHOTOS_IMPORT_HANDOFF_PROOF.to_string(),
+            json!({"schema_version": 1}),
+        );
+        manifest.upsert_trusted(record);
+        let mut config = MonitorConfig::new("/photos", "/manifest.json", "/heic");
+        config.full_lifecycle = true;
+        config.rolling_lifecycle = true;
+        config.auto_delete = false;
+        let record = manifest.get("canary").unwrap();
+        assert!(rolling_lifecycle_next_worker_step(&manifest, record, &config, true).is_none());
+    }
+
+    #[test]
+    fn network_permits_keep_a_third_remote_step_waiting() {
+        let permits = Arc::new(RollingStagePermits::new(4, 2, 4));
+        let first = permits
+            .acquire(RollingAssetStep::UploadVerifiedHeics)
+            .unwrap()
+            .unwrap();
+        let second = permits
+            .acquire(RollingAssetStep::ResolveAdjustedSource)
+            .unwrap()
+            .unwrap();
+        let waiting = Arc::clone(&permits);
+        let started = Arc::new(AtomicBool::new(false));
+        let started_flag = Arc::clone(&started);
+        let handle = thread::spawn(move || {
+            started_flag.store(true, Ordering::SeqCst);
+            waiting
+                .acquire(RollingAssetStep::UploadVerifiedHeics)
+                .unwrap()
+                .unwrap();
+        });
+        while !started.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(40));
+        assert!(!handle.is_finished());
+        drop(first);
+        handle.join().unwrap();
+        drop(second);
+        clear_rolling_network_auth_pause();
     }
 }

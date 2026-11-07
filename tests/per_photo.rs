@@ -113,6 +113,17 @@ fn diagnosis_reports_the_missing_upstream_capability_without_a_setup_procedure()
     assert!(requirement.contains("HTTP 415"));
     assert!(requirement.contains("not HEIC upload into a Shared library"));
     assert!(requirement.contains("does not restore the upload pipeline"));
+    assert!(
+        upload
+            .documented_user_mediated_import
+            .contains("Shared Library")
+    );
+    assert!(
+        upload
+            .documented_user_mediated_import
+            .contains("does not record upload")
+    );
+    assert!(!upload.documented_user_mediated_import.contains("osascript"));
     let rendered = serde_json::to_string(&upload).unwrap();
     for absent in [
         "pyicloud --",

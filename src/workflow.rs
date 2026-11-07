@@ -1169,6 +1169,14 @@ pub fn ensure_upload_dispatch_allowed(
 ) -> Result<VerifiedHeic, WorkflowError> {
     let record = manifest.get(asset_id)?;
     ensure_remote_mutation_allowed_record(record)?;
+    if record
+        .proofs
+        .contains_key(crate::photos_import_handoff::PHOTOS_IMPORT_HANDOFF_PROOF)
+    {
+        return Err(WorkflowError::PhotosImportHandoffPending {
+            asset_id: asset_id.to_string(),
+        });
+    }
     if record.proofs.contains_key(UPLOAD_PROOF) {
         return Err(WorkflowError::UploadAlreadyRecorded {
             asset_id: asset_id.to_string(),
@@ -3772,6 +3780,10 @@ pub enum WorkflowError {
     RemoteOperationHeld { asset_id: String },
     #[error("upload for {asset_id} is already recorded; refusing a duplicate upload")]
     UploadAlreadyRecorded { asset_id: String },
+    #[error(
+        "asset {asset_id} has a Photos import handoff pending; automatic upload stays blocked until that handoff is rolled back"
+    )]
+    PhotosImportHandoffPending { asset_id: String },
     #[error("operation hold for {asset_id} could not be changed: {reason}")]
     OperationHold {
         asset_id: String,

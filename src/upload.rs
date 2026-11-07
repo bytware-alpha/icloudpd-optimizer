@@ -598,6 +598,9 @@ pub const PROVIDER_SESSION_SUPPORTED_REQUIREMENT: &str = "The optimizer does not
 /// repository or in the documented upstream tools checked for this diagnosis.
 pub const MISSING_UPSTREAM_PROVIDER_CAPABILITY: &str = "Missing upstream capability: this repository has no provider setup or session handoff. icloudpd and docker-icloudpd cookies and keyrings are not an upload-session source. pyicloud's documented normal-auth CLI persists pyicloud's own session and has no documented export into this optimizer schema. pyicloud's documented Photos upload accepts JPEG (image/jpeg) and rejects unsupported media with HTTP 415; its documented Shared Library operations are reads and favorite mutation, not HEIC upload into a Shared library. No supported command produces an optimizer session file. Local diagnosis does not restore the upload pipeline.";
 
+/// Apple's documented placement path. Diagnosis does not perform it.
+pub const DOCUMENTED_USER_MEDIATED_IMPORT: &str = "Documented user-mediated path: Photos on macOS File > Import can add a file already on disk, and the Add To menu offers Shared Library when the user participates in an iCloud Shared Photo Library. iCloud Photos stores HEIF at full resolution, and sharing through iCloud Photos keeps the original format. Copy items to the Photos library must stay enabled, because referenced files are not stored in iCloud. iCloud.com upload does not place items in the Shared Photo Library. This diagnosis does not run Photos, does not choose the library, and does not record upload or remote readback.";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderSessionRole {
@@ -631,6 +634,7 @@ pub struct ProviderSessionDiagnostic {
     /// Always false. A local schema match is not an upload-pipeline restore.
     pub restores_upload_pipeline: bool,
     pub missing_upstream_capability: &'static str,
+    pub documented_user_mediated_import: &'static str,
     pub supported_requirement: &'static str,
 }
 
@@ -650,6 +654,7 @@ impl ProviderSessionDiagnostic {
             authenticated: false,
             restores_upload_pipeline: false,
             missing_upstream_capability: MISSING_UPSTREAM_PROVIDER_CAPABILITY,
+            documented_user_mediated_import: DOCUMENTED_USER_MEDIATED_IMPORT,
             supported_requirement: PROVIDER_SESSION_SUPPORTED_REQUIREMENT,
         }
     }
@@ -2129,14 +2134,27 @@ pub struct ReqwestPhotosUploadTransport {
     client: reqwest::blocking::Client,
 }
 
+const BLOCKING_CLIENT_POOL_IDLE_PER_HOST: usize = 2;
+const BLOCKING_CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
+const BLOCKING_CLIENT_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+
+fn blocking_verified_client() -> Result<reqwest::blocking::Client, UploadError> {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(BLOCKING_CLIENT_TIMEOUT)
+        .connect_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(BLOCKING_CLIENT_POOL_IDLE_PER_HOST)
+        .tcp_keepalive(BLOCKING_CLIENT_TCP_KEEPALIVE)
+        .http1_only()
+        .build()
+        .map_err(|source| UploadError::HttpClient { source })
+}
+
 impl ReqwestPhotosUploadTransport {
     pub fn new() -> Result<Self, UploadError> {
-        let client = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(120))
-            .build()
-            .map_err(|source| UploadError::HttpClient { source })?;
-        Ok(Self { client })
+        Ok(Self {
+            client: blocking_verified_client()?,
+        })
     }
 }
 
@@ -2209,12 +2227,9 @@ const CLOUDKIT_BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS 
 
 impl ReqwestCloudKitTransport {
     pub fn new() -> Result<Self, UploadError> {
-        let client = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(120))
-            .build()
-            .map_err(|source| UploadError::HttpClient { source })?;
-        Ok(Self { client })
+        Ok(Self {
+            client: blocking_verified_client()?,
+        })
     }
 
     fn post_records_json(
@@ -6206,6 +6221,139 @@ mod tests {
         assert_eq!(second.streamed_heic_sha256, expected_hash);
         assert_eq!(second.streamed_size_bytes, bytes.len() as u64);
         assert_eq!(client.transport.uploaded_bodies, vec![bytes.clone(), bytes]);
+    }
+
+    #[test]
+    fn upload_http_rejection_is_not_retried() {
+        struct OnceTransport {
+            calls: usize,
+        }
+
+        impl PhotosUploadTransport for OnceTransport {
+            fn post_service_json(
+                &mut self,
+                _session: &UploadSession,
+                _endpoint: PhotosUploadEndpoint,
+                _payload: Value,
+            ) -> Result<Value, UploadError> {
+                self.calls += 1;
+                Err(UploadError::UploadHttpStatus {
+                    operation: "createUploadUrl",
+                    status: 401,
+                })
+            }
+
+            fn post_signed_upload(
+                &mut self,
+                _session: &UploadSession,
+                _upload_url: &Url,
+                _heic_file: File,
+                _heic_size: u64,
+            ) -> Result<(SingleFileUploadRequest, String, u64), UploadError> {
+                self.calls += 1;
+                Err(UploadError::UploadHttpStatus {
+                    operation: "signed_upload",
+                    status: 401,
+                })
+            }
+        }
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let heic_path = tempdir.path().join("IMG_0001.heic");
+        std::fs::write(&heic_path, b"heic").expect("HEIC bytes should be written");
+        let source = VerifiedUploadSource::open_candidate(&heic_path).expect("source should open");
+        let session = UploadSession {
+            dsid: "123456789".to_owned(),
+            photosupload_url: Url::parse("https://photos.example.com").expect("session URL"),
+            cookies: vec![],
+            local_time_zone_id: "UTC".to_owned(),
+            time_zone_offset_minutes: 0,
+        };
+        let mut transport = OnceTransport { calls: 0 };
+        let error = PhotosUploadClient::new(&mut transport)
+            .upload_verified_source_to_library(
+                &session,
+                &source,
+                &CloudKitLibraryDestination::primary_sync(),
+            )
+            .expect_err("authentication rejection must fail closed");
+        assert!(matches!(
+            error,
+            UploadError::UploadHttpStatus { status: 401, .. }
+        ));
+        assert_eq!(transport.calls, 1);
+    }
+
+    #[test]
+    fn verified_client_reuses_one_keepalive_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("listener should be nonblocking");
+        let port = listener.local_addr().expect("loopback address").port();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_connections = Arc::clone(&connections);
+        let server_requests = Arc::clone(&requests);
+        let server = thread::spawn(move || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(5) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        server_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(400)))
+                            .expect("read timeout");
+                        stream
+                            .set_nonblocking(false)
+                            .expect("accepted stream should block");
+                        loop {
+                            let request =
+                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    read_loopback_request(&mut stream)
+                                })) {
+                                    Ok(request) => request,
+                                    Err(_) => break,
+                                };
+                            if request.is_empty() {
+                                break;
+                            }
+                            server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            write!(
+                                stream,
+                                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                            )
+                            .expect("keepalive response");
+                            stream.flush().expect("keepalive flush");
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if server_requests.load(std::sync::atomic::Ordering::SeqCst) >= 4 {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("loopback accept failed: {error}"),
+                }
+            }
+        });
+
+        let client = blocking_verified_client().expect("client");
+        for index in 0..4 {
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/item/{index}"))
+                .send()
+                .expect("keepalive request");
+            assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        }
+        drop(client);
+        server.join().expect("keepalive server");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one client should reuse one HTTP/1.1 connection"
+        );
     }
 
     fn valid_delete_session() -> CloudKitDeleteSession {
