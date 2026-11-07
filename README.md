@@ -850,21 +850,27 @@ supported command creates the file. The schema below is the shape this
 repository can read. It is not a setup procedure, and `workflow upload-heic`
 cannot restore the upload pipeline.
 
-The documented placement path is a user step in Photos on the Mac, not a
-session file. Apple's Photos guide says File > Import shows an Add To menu with
-Your Library or Shared Library when the user participates in an iCloud Shared
-Photo Library. iCloud Photos stores HEIF at full resolution, and sharing
-through iCloud Photos keeps the original format. Copy items to the Photos
-library must stay selected, because referenced files are not stored in iCloud.
-iCloud.com upload does not place items in the Shared Photo Library. Shared
-Albums are a different destination. This repository does not run Photos and
-does not choose the library.
+The documented placement path is two user steps in Photos on the Mac, not a
+session file and not an unattended job. Published Photos import adds the file
+to the personal library. Apple's Shared Library guide then says to choose
+View > Personal Library, select the exact items, and choose Image > Move
+[n] Photos to Shared Library
+(https://support.apple.com/guide/photos/add-photos-to-a-shared-library-pht9a3599aac/mac).
+That menu is documented UI. Apple's Shortcuts guide documents Save to Photo
+Album and does not document a per-item Shared Library move. This repository
+does not script that menu, does not query the Photos library database, and
+does not check the signed-in account, system library, or participant role.
 
-Stage one verified HEIC for that step. The command copies the file, leaves the
-NAS original and the verified HEIC in place, and records `photos_import_handoff`.
-That proof is not an upload and not a remote readback. Automatic upload stays
-blocked until the handoff is rolled back. Deletion stays blocked because there
-is still no upload proof.
+Only the new HEIC replacement is staged. The NAS original is not the import
+file. A personal-library import is not recorded as Shared placement. Shared
+placement stays unrecorded until an independent cloud readback of that HEIC.
+The handoff command does not perform the readback.
+
+Stage one verified HEIC for that sequence. The command copies the file, leaves
+the NAS original and the verified HEIC in place, and records
+`photos_import_handoff`. That proof is not an upload and not a remote
+readback. Automatic upload stays blocked until the handoff is rolled back.
+Deletion stays blocked because there is still no upload proof.
 
 ```sh
 icloudpd-optimizer workflow photos-import-handoff \
@@ -873,11 +879,14 @@ icloudpd-optimizer workflow photos-import-handoff \
   --handoff-dir /path/to/empty-canary-dir
 ```
 
-On the Mac, with Photos > Settings > General > Copy items to the Photos library
-selected, choose File > Import, select the staged HEIC, click Review for
-Import, and choose Shared Library from Add To. Your Library would place the
-file in the personal library instead. Leave both the staged file and the NAS
-original in place. This command cannot confirm that Photos accepted the file.
+On the Mac, after the signed-in account, system photo library, and Shared
+Library role are confirmed there: keep Photos > Settings > General > Copy
+items to the Photos library selected, and import only the staged HEIC.
+Published import lands in the personal library. Then choose View > Personal
+Library, select that imported HEIC, and choose Image > Move [n] Photos to
+Shared Library. Do not select the NAS original. Leave both the staged file
+and the NAS original in place. This command cannot confirm that Photos
+imported the file or moved it.
 
 Roll the local stage back without deleting the verified HEIC, the RAW, or any
 iCloud item:
@@ -896,7 +905,8 @@ rustls pool per process, reuses HTTP/1.1 keep-alive connections, and allows at
 most two idle connections per host. Upload and adjusted-source work share two
 network slots. An HTTP 401 or 403 pauses further authenticated calls for the
 rest of that monitor scan. The next scan can try again after the scan interval.
-Certificate checks stay enabled.
+Certificate checks stay enabled. Those limits were checked with local synthetic
+tests. They are not a reading of a live download or of the home network.
 
 Authentication rejection is only an HTTP 401 or 403 returned by CloudKit or
 Photos after a request. Local structural failures, including a `SharedSync-`
@@ -913,8 +923,9 @@ icloudpd-optimizer workflow provider-session-diagnose \
 
 The JSON report has `network_contacted: false`, `authenticated: false`, and
 `restores_upload_pipeline: false`. `missing_upstream_capability` names the
-absent session producer. `documented_user_mediated_import` names the Photos
-File > Import step and still reports that this check did not import anything.
+absent session producer. `documented_user_mediated_import` names the personal
+import plus the Image > Move menu and still reports that this check did not
+import anything.
 `class` is `local_configuration_valid` or `local_misconfiguration`. A shared
 library read session must use `database_scope` `shared`, a zone name starting
 with `SharedSync-`, and `owner_record_name`. The same command with `--role

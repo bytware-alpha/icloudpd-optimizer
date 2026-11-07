@@ -14,12 +14,13 @@ use crate::manifest::{Manifest, ManifestError, State};
 use crate::workflow::{WorkflowError, ensure_upload_dispatch_allowed};
 
 pub const PHOTOS_IMPORT_HANDOFF_PROOF: &str = "photos_import_handoff";
-const HANDOFF_SCHEMA_VERSION: u64 = 1;
-const REQUIRED_LIBRARY_CHOICE: &str = "shared_library";
+const HANDOFF_SCHEMA_VERSION: u64 = 2;
+const IMPORT_LANDS_IN_PERSONAL: &str = "personal_library";
+const SHARED_MOVE_ROUTE: &str = "image_menu_move_selected_heic";
 
-/// Steps taken from Apple's Photos and iCloud Photos support articles.
-/// The optimizer does not perform them.
-pub const PHOTOS_APP_SHARED_LIBRARY_USER_STEP: &str = "On the Mac, keep Photos > Settings > General > Copy items to the Photos library selected. Referenced files are not stored in iCloud. Choose File > Import, select this staged HEIC, click Review for Import, and choose Shared Library from the Add To menu. Your Library is the personal library and is a different destination. Leave the NAS original and this staged file in place. This handoff does not upload, does not record remote readback, and does not choose the library.";
+/// Documented Photos UI from Apple's Shared Library guide. This command does
+/// not perform the import or the move.
+pub const PHOTOS_APP_SHARED_LIBRARY_USER_STEP: &str = "Import only this staged HEIC replacement with Photos. Published import lands in the personal library; keep Copy items to the Photos library selected. Then choose View > Personal Library, select that imported HEIC, and choose Image > Move [n] Photos to Shared Library. Do not select the NAS original. The move is a documented menu, not a verified per-item script, and this command does not run it. The signed-in account, system library, and participant role still have to be checked on the Mac. Shared placement stays unrecorded until an independent cloud readback of this HEIC.";
 
 #[derive(Debug, Error)]
 pub enum PhotosImportHandoffError {
@@ -50,11 +51,35 @@ pub struct PhotosImportHandoffProof {
     pub staged_heic_sha256: String,
     pub staged_size_bytes: u64,
     pub source_heic_sha256: String,
-    pub library_choice_required: String,
+    /// Published Photos import lands here. This is not Shared placement.
+    pub import_lands_in: String,
+    /// Documented UI move of the imported HEIC. Not a scripted call.
+    pub shared_move_route: String,
+    pub moves_originals: bool,
+    pub scripted_shared_move_documented: bool,
+    pub unattended: bool,
+    pub account_system_library_role_verified: bool,
+    pub shared_placement_recorded: bool,
     pub records_upload: bool,
     pub records_remote_readback: bool,
     pub cloud_import_performed: bool,
     pub user_step: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PhotosReplacementRouteAssessment {
+    pub asset_id: String,
+    pub import_lands_in: String,
+    pub shared_move_route: String,
+    pub unattended: bool,
+    pub scripted_shared_move_documented: bool,
+    pub moves_originals: bool,
+    pub shared_placement_recorded: bool,
+    pub remote_readback_recorded: bool,
+    pub account_system_library_role_verified: bool,
+    /// Stays false until a later local account check and a shared-library
+    /// readback both exist. This crate does not record either from the handoff.
+    pub route_complete: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -85,12 +110,7 @@ pub fn stage_verified_heic_for_photos_import(
         let existing: PhotosImportHandoffProof =
             serde_json::from_value(existing).map_err(WorkflowError::from)?;
         let staged_path = handoff_dir.join(format!("{asset_id}.heic"));
-        if existing.staged_path != staged_path
-            || existing.records_upload
-            || existing.records_remote_readback
-            || existing.cloud_import_performed
-            || existing.library_choice_required != REQUIRED_LIBRARY_CHOICE
-        {
+        if existing.staged_path != staged_path || accepted_handoff_plan(&existing).is_err() {
             return Err(PhotosImportHandoffError::StagedFileConflict);
         }
         let staged =
@@ -130,7 +150,11 @@ pub fn stage_verified_heic_for_photos_import(
         return Err(PhotosImportHandoffError::HandoffDirectory);
     }
     let staged_path = handoff_dir.join(format!("{asset_id}.heic"));
-    if same_file(&heic.heic_path, &staged_path).map_err(PhotosImportHandoffError::Io)? {
+    let raw_path = manifest.get(asset_id)?.raw_path.clone();
+    if same_file(&heic.heic_path, &staged_path).map_err(PhotosImportHandoffError::Io)?
+        || same_file(&raw_path, &staged_path).map_err(PhotosImportHandoffError::Io)?
+        || same_file(&raw_path, &heic.heic_path).map_err(PhotosImportHandoffError::Io)?
+    {
         return Err(PhotosImportHandoffError::RefusingToDeleteSource);
     }
     if staged_path.exists() {
@@ -147,12 +171,19 @@ pub fn stage_verified_heic_for_photos_import(
         staged_heic_sha256: source_bytes.sha256.clone(),
         staged_size_bytes: source_bytes.size_bytes,
         source_heic_sha256: source_bytes.sha256,
-        library_choice_required: REQUIRED_LIBRARY_CHOICE.to_string(),
+        import_lands_in: IMPORT_LANDS_IN_PERSONAL.to_string(),
+        shared_move_route: SHARED_MOVE_ROUTE.to_string(),
+        moves_originals: false,
+        scripted_shared_move_documented: false,
+        unattended: false,
+        account_system_library_role_verified: false,
+        shared_placement_recorded: false,
         records_upload: false,
         records_remote_readback: false,
         cloud_import_performed: false,
         user_step: PHOTOS_APP_SHARED_LIBRARY_USER_STEP.to_string(),
     };
+    accepted_handoff_plan(&proof)?;
     let value = serde_json::to_value(&proof).map_err(WorkflowError::from)?;
     manifest.record_proof(asset_id, PHOTOS_IMPORT_HANDOFF_PROOF, value)?;
     let state = manifest.get(asset_id)?.state;
@@ -162,6 +193,59 @@ pub fn stage_verified_heic_for_photos_import(
         changed: true,
         proof,
     })
+}
+
+pub fn assess_photos_replacement_route(
+    manifest: &Manifest,
+    asset_id: &str,
+) -> Result<PhotosReplacementRouteAssessment, PhotosImportHandoffError> {
+    let record = manifest.get(asset_id)?;
+    let proof: PhotosImportHandoffProof = serde_json::from_value(
+        record
+            .proofs
+            .get(PHOTOS_IMPORT_HANDOFF_PROOF)
+            .cloned()
+            .ok_or(PhotosImportHandoffError::StagedBytesMismatch)?,
+    )
+    .map_err(|_| PhotosImportHandoffError::StagedFileConflict)?;
+    accepted_handoff_plan(&proof)?;
+    if same_file(&proof.staged_path, &record.raw_path).map_err(PhotosImportHandoffError::Io)? {
+        return Err(PhotosImportHandoffError::RefusingToDeleteSource);
+    }
+    let remote_readback_recorded =
+        crate::workflow::remote_readback_is_verified(manifest, asset_id).unwrap_or(false);
+    Ok(PhotosReplacementRouteAssessment {
+        asset_id: asset_id.to_string(),
+        import_lands_in: proof.import_lands_in,
+        shared_move_route: proof.shared_move_route,
+        unattended: false,
+        scripted_shared_move_documented: false,
+        moves_originals: false,
+        shared_placement_recorded: false,
+        remote_readback_recorded,
+        account_system_library_role_verified: false,
+        route_complete: false,
+    })
+}
+
+fn accepted_handoff_plan(proof: &PhotosImportHandoffProof) -> Result<(), PhotosImportHandoffError> {
+    if proof.schema_version == HANDOFF_SCHEMA_VERSION
+        && proof.import_lands_in == IMPORT_LANDS_IN_PERSONAL
+        && proof.shared_move_route == SHARED_MOVE_ROUTE
+        && !proof.moves_originals
+        && !proof.scripted_shared_move_documented
+        && !proof.unattended
+        && !proof.account_system_library_role_verified
+        && !proof.shared_placement_recorded
+        && !proof.records_upload
+        && !proof.records_remote_readback
+        && !proof.cloud_import_performed
+        && proof.user_step == PHOTOS_APP_SHARED_LIBRARY_USER_STEP
+    {
+        Ok(())
+    } else {
+        Err(PhotosImportHandoffError::StagedFileConflict)
+    }
 }
 
 pub fn rollback_photos_import_handoff(
@@ -398,8 +482,26 @@ mod tests {
         assert!(!report.proof.records_upload);
         assert!(!report.proof.records_remote_readback);
         assert!(!report.proof.cloud_import_performed);
-        assert_eq!(report.proof.library_choice_required, "shared_library");
-        assert!(report.proof.user_step.contains("Shared Library"));
+        assert!(!report.proof.moves_originals);
+        assert!(!report.proof.scripted_shared_move_documented);
+        assert!(!report.proof.unattended);
+        assert!(!report.proof.shared_placement_recorded);
+        assert_eq!(report.proof.import_lands_in, "personal_library");
+        assert_eq!(
+            report.proof.shared_move_route,
+            "image_menu_move_selected_heic"
+        );
+        assert!(report.proof.user_step.contains("Image > Move"));
+        assert!(report.proof.user_step.contains("Personal Library"));
+        assert!(report.proof.user_step.contains("NAS original"));
+        let route = assess_photos_replacement_route(&manifest, "IMG_0001").unwrap();
+        assert!(!route.route_complete);
+        assert!(!route.remote_readback_recorded);
+        assert!(!route.account_system_library_role_verified);
+        assert_ne!(
+            manifest.get("IMG_0001").unwrap().raw_path,
+            report.proof.staged_path
+        );
         assert_eq!(
             fs::read(&report.proof.staged_path).unwrap(),
             heic_bytes.as_slice()
@@ -475,5 +577,32 @@ mod tests {
         ));
         assert!(!handoff_dir.join("IMG_0001.heic").exists());
         assert_eq!(fs::read(heic_path).unwrap(), b"held-heic");
+    }
+
+    #[test]
+    fn a_claim_that_the_move_already_happened_does_not_complete_the_route() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut manifest, _) = verified_manifest(root.path(), b"route-heic");
+        let handoff_dir = root.path().join("handoff");
+        stage_verified_heic_for_photos_import(&mut manifest, "IMG_0001", &handoff_dir).unwrap();
+        let mut record = manifest.get("IMG_0001").unwrap().clone();
+        record.proofs.get_mut(PHOTOS_IMPORT_HANDOFF_PROOF).unwrap()["shared_placement_recorded"] =
+            serde_json::json!(true);
+        record.proofs.get_mut(PHOTOS_IMPORT_HANDOFF_PROOF).unwrap()["unattended"] =
+            serde_json::json!(true);
+        manifest.upsert_trusted(record);
+        let error = assess_photos_replacement_route(&manifest, "IMG_0001")
+            .expect_err("a local claim must not complete shared placement");
+        assert!(matches!(
+            error,
+            PhotosImportHandoffError::StagedFileConflict
+        ));
+        assert!(
+            !manifest
+                .get("IMG_0001")
+                .unwrap()
+                .proofs
+                .contains_key("remote_readback")
+        );
     }
 }
