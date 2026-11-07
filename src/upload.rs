@@ -592,6 +592,113 @@ pub fn load_upload_session(path: &Path) -> Result<UploadSession, UploadError> {
     raw.validate()
 }
 
+pub const PROVIDER_SESSION_SUPPORTED_REQUIREMENT: &str = "The optimizer does not create Apple sessions and has no supported provider setup or credential handoff. It only reads an externally prepared session JSON file. Apple ID, password, MFA, an icloudpd keyring, and cookie directories are not session sources. A file that matches this schema is not authenticated. Authentication rejection is only an HTTP 401 or 403 from CloudKit or Photos after a request is sent. A CloudKit read session needs dsid, ckdatabasews_url or webservices.ckdatabasews.url, cloudkit_query_params clientBuildNumber, clientMasteringNumber, clientId, dsid, remapEnums=True, and getCurrentSyncToken=True, plus cookies including X-APPLE-WEBAUTH-TOKEN. SharedSync zones require database_scope \"shared\", a zone name starting with SharedSync-, and owner_record_name. An explicit private scope on a SharedSync zone is a local misconfiguration and is not rewritten. An upload session needs dsid, photosupload_url or webservices.photosupload.url, and cookies including X-APPLE-WEBAUTH-TOKEN.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSessionRole {
+    Upload,
+    CloudKitRead,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSessionDiagnosticClass {
+    LocalConfigurationValid,
+    LocalMisconfiguration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTransportFailureClass {
+    LocalMisconfiguration,
+    AuthRejection,
+    RemoteFailure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProviderSessionDiagnostic {
+    pub role: ProviderSessionRole,
+    pub class: ProviderSessionDiagnosticClass,
+    pub code: &'static str,
+    pub message: String,
+    pub network_contacted: bool,
+    pub authenticated: bool,
+    pub supported_requirement: &'static str,
+}
+
+/// Validates a session file locally. This never contacts Apple and never
+/// reports authentication success or an authentication rejection.
+pub fn diagnose_provider_session(
+    role: ProviderSessionRole,
+    json: &str,
+) -> ProviderSessionDiagnostic {
+    let result = match role {
+        ProviderSessionRole::Upload => UploadSession::from_json(json).map(|_| ()),
+        ProviderSessionRole::CloudKitRead => CloudKitDeleteSession::from_json(json).map(|_| ()),
+    };
+    match result {
+        Ok(()) => ProviderSessionDiagnostic {
+            role,
+            class: ProviderSessionDiagnosticClass::LocalConfigurationValid,
+            code: "local_configuration_valid",
+            message:
+                "session file matches the supported local schema; this check did not authenticate"
+                    .to_string(),
+            network_contacted: false,
+            authenticated: false,
+            supported_requirement: PROVIDER_SESSION_SUPPORTED_REQUIREMENT,
+        },
+        Err(error) => ProviderSessionDiagnostic {
+            role,
+            class: ProviderSessionDiagnosticClass::LocalMisconfiguration,
+            code: local_session_diagnostic_code(&error),
+            message: local_session_diagnostic_message(&error),
+            network_contacted: false,
+            authenticated: false,
+            supported_requirement: PROVIDER_SESSION_SUPPORTED_REQUIREMENT,
+        },
+    }
+}
+
+pub fn classify_provider_transport_failure(error: &UploadError) -> ProviderTransportFailureClass {
+    match error {
+        UploadError::ReadSession { .. }
+        | UploadError::DecodeSession { .. }
+        | UploadError::InvalidSession(_) => ProviderTransportFailureClass::LocalMisconfiguration,
+        UploadError::UploadHttpStatus { status, .. }
+        | UploadError::PhotosPutAssetRejected { status, .. }
+            if matches!(*status, 401 | 403) =>
+        {
+            ProviderTransportFailureClass::AuthRejection
+        }
+        _ => ProviderTransportFailureClass::RemoteFailure,
+    }
+}
+
+fn local_session_diagnostic_code(error: &UploadError) -> &'static str {
+    match error {
+        UploadError::ReadSession { .. } => "session_unreadable",
+        UploadError::DecodeSession { .. } => "session_undecodable",
+        UploadError::InvalidSession(message)
+            if message.contains("SharedSync zones must use the shared CloudKit database scope") =>
+        {
+            "shared_sync_requires_shared_scope"
+        }
+        UploadError::InvalidSession(_) => "local_session_invalid",
+        _ => "local_session_invalid",
+    }
+}
+
+fn local_session_diagnostic_message(error: &UploadError) -> String {
+    match error {
+        UploadError::ReadSession { .. } => "session file could not be read".to_string(),
+        UploadError::DecodeSession { .. } => "session JSON could not be decoded".to_string(),
+        UploadError::InvalidSession(message) => message.clone(),
+        _ => "session file is not locally valid".to_string(),
+    }
+}
+
 pub fn load_cloudkit_delete_session(path: &Path) -> Result<CloudKitDeleteSession, UploadError> {
     let json = std::fs::read_to_string(path).map_err(|source| UploadError::ReadSession {
         path: path.to_path_buf(),

@@ -97,7 +97,7 @@ use crate::workflow::{
     record_heic_verification, record_icloudpd_local_mirror_proof,
     record_original_asset_batch_proofs, record_original_asset_proof, record_source_age_proof,
     record_stage_failure, record_upload_proof, record_uploaded_heic_delete,
-    reverify_upload_verified_record, upload_ready_heic_proof, uploaded_heic_delete_request,
+    reverify_upload_verified_record, uploaded_heic_delete_request,
 };
 const DAY_SECONDS: u64 = 24 * 60 * 60;
 const ORIGINAL_ASSETS_TARGET_SET_FINGERPRINT_VERSION: &[u8] = b"original-assets-target-set-v2";
@@ -323,6 +323,11 @@ enum MonitorCommand {
         about = "Atomically quarantine audited failed assets with historical remote side effects"
     )]
     FailedAssetsQuarantine(MonitorFailedAssetsQuarantineArgs),
+    #[command(
+        name = "operation-hold",
+        about = "Durably hold or release one uncertain upload or move without changing its state"
+    )]
+    OperationHold(MonitorOperationHoldArgs),
     #[command(
         name = "legacy-failures-classify",
         about = "Offline audited migration for exact legacy missing-preview failures"
@@ -572,6 +577,38 @@ struct MonitorUploadVerifiedReverifyArgs {
     expected_target_set_sha256: String,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     apply: bool,
+}
+
+#[derive(Debug, Args)]
+struct MonitorOperationHoldArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long, value_enum)]
+    action: OperationHoldActionArg,
+    #[arg(long)]
+    asset_id: String,
+    #[arg(long, value_enum)]
+    operation: OperationHoldOperationArg,
+    #[arg(long, value_enum)]
+    database_scope: WorkflowCloudKitDatabaseScopeArg,
+    #[arg(long)]
+    zone_name: String,
+    #[arg(long)]
+    owner_record_name: Option<String>,
+    #[arg(long)]
+    recorded_at_unix_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum OperationHoldActionArg {
+    Apply,
+    Release,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum OperationHoldOperationArg {
+    Upload,
+    Move,
 }
 
 #[derive(Debug, Args)]
@@ -925,6 +962,16 @@ enum WorkflowCommand {
     HeicVerified(WorkflowHeicVerifiedArgs),
     #[command(about = "Upload with an external Photos upload session not produced by icloudpd")]
     UploadHeic(WorkflowUploadHeicArgs),
+    #[command(
+        name = "remote-readback",
+        about = "Download the uploaded HEIC and record a hash readback for one asset"
+    )]
+    RemoteReadback(WorkflowRemoteReadbackArgs),
+    #[command(
+        name = "provider-session-diagnose",
+        about = "Classify a local provider session file without contacting Apple"
+    )]
+    ProviderSessionDiagnose(WorkflowProviderSessionDiagnoseArgs),
     #[command(name = "upload-heic-proof", hide = true)]
     UploadHeicProof(WorkflowUploadHeicArgs),
     UploadVerified(WorkflowUploadVerifiedArgs),
@@ -1089,6 +1136,35 @@ struct WorkflowUploadHeicArgs {
         help = "External Photos upload session JSON; not produced by icloudpd"
     )]
     session: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct WorkflowRemoteReadbackArgs {
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+    #[arg(long)]
+    asset_id: String,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Externally prepared CloudKit read session JSON. Upload success is not readback."
+    )]
+    session: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct WorkflowProviderSessionDiagnoseArgs {
+    #[arg(long, value_name = "PATH")]
+    session: PathBuf,
+    #[arg(long, value_enum)]
+    role: ProviderSessionRoleArg,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ProviderSessionRoleArg {
+    Upload,
+    #[value(name = "cloudkit-read")]
+    CloudKitRead,
 }
 
 #[derive(Debug, Args)]
@@ -1321,6 +1397,8 @@ pub enum CliError {
     FailedAssetsQuarantineGate { message: String },
     #[error("failed-assets-quarantine database commit succeeded but the JSON checkpoint is stale")]
     FailedAssetsQuarantineCheckpointStale,
+    #[error("operation hold was committed but the manifest checkpoint could not be refreshed")]
+    OperationHoldCheckpointStale,
     #[error("legacy-failures-classify gate failed: {message}")]
     LegacyFailuresClassifyGate { message: String },
     #[error("legacy-failures-classify database commit succeeded but the JSON checkpoint is stale")]
@@ -1501,7 +1579,7 @@ fn run_upload_proof_child_protocol<R: Read, W: Write>(
     {
         return Err(CliError::InvalidPrivateChildProtocol);
     }
-    let heic = upload_ready_heic_proof(&manifest, &input.asset_id)?;
+    let heic = crate::workflow::ensure_upload_dispatch_allowed(&manifest, &input.asset_id)?;
     let heic_source = VerifiedUploadSource::from_verified_heic(&heic)?;
     load_upload_session(&input.session_path)?;
     let destination = upload_destination_for_asset(&manifest, &input.asset_id)?;
@@ -1613,6 +1691,10 @@ fn run_workflow<W: Write>(args: WorkflowArgs, writer: &mut W) -> Result<(), CliE
         WorkflowCommand::HeicVerified(args) => workflow_heic_verified(args),
         WorkflowCommand::UploadHeic(args) => workflow_upload_heic(args),
         WorkflowCommand::UploadHeicProof(args) => workflow_upload_heic_proof(args, writer),
+        WorkflowCommand::RemoteReadback(args) => workflow_remote_readback(args),
+        WorkflowCommand::ProviderSessionDiagnose(args) => {
+            workflow_provider_session_diagnose(args, writer)
+        }
         WorkflowCommand::UploadVerified(args) => workflow_upload_verified(args),
         WorkflowCommand::UploadedHeicDeletePlan(args) => {
             workflow_uploaded_heic_delete_plan(args, writer)
@@ -1652,6 +1734,7 @@ fn run_monitor<W: Write>(args: MonitorArgs, writer: &mut W) -> Result<(), CliErr
         MonitorCommand::FailedAssetsQuarantine(args) => {
             monitor_failed_assets_quarantine(args, writer)
         }
+        MonitorCommand::OperationHold(args) => monitor_operation_hold(args, writer),
         MonitorCommand::LegacyFailuresClassify(args) => {
             monitor_legacy_failures_classify(args, writer)
         }
@@ -6711,6 +6794,131 @@ struct FailedAssetsQuarantineReport {
     changed_count: u64,
 }
 
+fn monitor_operation_hold<W: Write>(
+    args: MonitorOperationHoldArgs,
+    writer: &mut W,
+) -> Result<(), CliError> {
+    let destination = validate_cli_library_destination(CloudKitLibraryDestination {
+        database_scope: args.database_scope.into(),
+        zone_name: args.zone_name,
+        owner_record_name: args.owner_record_name,
+    })?;
+    let hold = crate::operation_hold::OperationHold::uncertain(
+        match args.operation {
+            OperationHoldOperationArg::Upload => crate::operation_hold::HeldRemoteOperation::Upload,
+            OperationHoldOperationArg::Move => crate::operation_hold::HeldRemoteOperation::Move,
+        },
+        destination,
+        args.recorded_at_unix_seconds,
+    )
+    .map_err(operation_hold_error)?;
+    let config = MonitorConfig::load(&args.config).map_err(|_| {
+        operation_hold_error(crate::operation_hold::OperationHoldError::InvalidHold {
+            reason: "monitor configuration could not be loaded",
+        })
+    })?;
+    config.validate().map_err(|_| {
+        operation_hold_error(crate::operation_hold::OperationHoldError::InvalidHold {
+            reason: "monitor configuration did not pass validation",
+        })
+    })?;
+    let mut guard = acquire_monitor_run_guard(&config)?;
+    let state_store = guard.state_store(&config.manifest_path)?;
+    let mut manifest = state_store.load()?;
+    let expected = manifest
+        .get(&args.asset_id)
+        .map_err(WorkflowError::Manifest)?
+        .clone();
+    let state_before = expected.state;
+    let changed = match args.action {
+        OperationHoldActionArg::Apply => {
+            crate::operation_hold::apply_operation_hold(&mut manifest, &args.asset_id, hold)
+        }
+        OperationHoldActionArg::Release => {
+            crate::operation_hold::release_operation_hold(&mut manifest, &args.asset_id, &hold)
+        }
+    }
+    .map_err(operation_hold_error)?;
+    if changed {
+        let updated = manifest
+            .get(&args.asset_id)
+            .map_err(WorkflowError::Manifest)?
+            .clone();
+        if updated.state != state_before || updated.failures != expected.failures {
+            return Err(operation_hold_error(
+                crate::operation_hold::OperationHoldError::InvalidHold {
+                    reason: "hold would change historical state",
+                },
+            ));
+        }
+        state_store
+            .persist_records_exact_cas_atomic_trusted([AssetRecordExactCasUpdate {
+                expected: &expected,
+                updated: &updated,
+            }])
+            .map_err(|_| {
+                operation_hold_error(crate::operation_hold::OperationHoldError::InvalidHold {
+                    reason: "current state changed before the hold commit",
+                })
+            })?;
+        state_store
+            .export_json()
+            .map_err(|_| CliError::OperationHoldCheckpointStale)?;
+    }
+    let held = manifest
+        .get(&args.asset_id)
+        .map_err(WorkflowError::Manifest)?
+        .proofs
+        .contains_key(crate::operation_hold::OPERATION_HOLD_PROOF_NAME);
+    let report = serde_json::json!({
+        "action": match args.action {
+            OperationHoldActionArg::Apply => "apply",
+            OperationHoldActionArg::Release => "release",
+        },
+        "changed": changed,
+        "state": state_before.as_str(),
+        "operation_hold": held,
+    });
+    serde_json::to_writer_pretty(&mut *writer, &report)?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn operation_hold_error(error: crate::operation_hold::OperationHoldError) -> CliError {
+    match error {
+        crate::operation_hold::OperationHoldError::Held { asset_id } => {
+            CliError::Workflow(WorkflowError::RemoteOperationHeld { asset_id })
+        }
+        crate::operation_hold::OperationHoldError::Malformed { asset_id } => {
+            CliError::Workflow(WorkflowError::OperationHold {
+                asset_id,
+                reason: "malformed hold remains in force",
+            })
+        }
+        crate::operation_hold::OperationHoldError::Conflict { asset_id } => {
+            CliError::Workflow(WorkflowError::OperationHold {
+                asset_id,
+                reason: "a different hold is already recorded",
+            })
+        }
+        crate::operation_hold::OperationHoldError::UnknownAsset { asset_id } => {
+            CliError::Workflow(WorkflowError::OperationHold {
+                asset_id,
+                reason: "asset was not found",
+            })
+        }
+        crate::operation_hold::OperationHoldError::InvalidHold { reason } => {
+            CliError::Workflow(WorkflowError::OperationHold {
+                asset_id: String::new(),
+                reason,
+            })
+        }
+        crate::operation_hold::OperationHoldError::Manifest(source) => {
+            CliError::Workflow(WorkflowError::Manifest(source))
+        }
+    }
+}
+
 fn monitor_failed_assets_quarantine<W: Write>(
     args: MonitorFailedAssetsQuarantineArgs,
     writer: &mut W,
@@ -8880,6 +9088,9 @@ fn queue_next_stage_for_record(
     record: &AssetRecord,
     config: &MonitorConfig,
 ) -> Option<&'static str> {
+    if crate::operation_hold::blocks_scheduled_remote_mutation(record) {
+        return Some("held_remote_operation");
+    }
     if record.state == State::UploadVerified {
         return match icloudpd_local_mirror_proof_disposition(manifest, &record.asset_id) {
             IcloudpdLocalMirrorProofDisposition::Current if config.auto_delete => {
@@ -10991,7 +11202,7 @@ fn workflow_heic_verified(args: WorkflowHeicVerifiedArgs) -> Result<(), CliError
 
 fn workflow_upload_heic(args: WorkflowUploadHeicArgs) -> Result<(), CliError> {
     let mut manifest = load_operational_manifest_for_asset(&args.manifest, &args.asset_id)?;
-    let heic = upload_ready_heic_proof(&manifest, &args.asset_id)?;
+    let heic = crate::workflow::ensure_upload_dispatch_allowed(&manifest, &args.asset_id)?;
     let heic_source = VerifiedUploadSource::from_verified_heic(&heic)?;
     load_upload_session(&args.session)?;
     let destination = upload_destination_for_asset(&manifest, &args.asset_id)?;
@@ -11010,7 +11221,7 @@ fn workflow_upload_heic_proof<W: Write>(
     writer: &mut W,
 ) -> Result<(), CliError> {
     let manifest = load_operational_manifest_for_asset(&args.manifest, &args.asset_id)?;
-    let heic = upload_ready_heic_proof(&manifest, &args.asset_id)?;
+    let heic = crate::workflow::ensure_upload_dispatch_allowed(&manifest, &args.asset_id)?;
     let heic_source = VerifiedUploadSource::from_verified_heic(&heic)?;
     load_upload_session(&args.session)?;
     let destination = upload_destination_for_asset(&manifest, &args.asset_id)?;
@@ -11049,6 +11260,44 @@ fn upload_destination_for_asset(
         owner_record_name: original.owner_record_name,
     };
     validate_cli_library_destination(destination)
+}
+
+fn workflow_remote_readback(args: WorkflowRemoteReadbackArgs) -> Result<(), CliError> {
+    let mut manifest = load_operational_manifest_for_asset(&args.manifest, &args.asset_id)?;
+    let session = load_cloudkit_delete_session(&args.session)?;
+    let mut transport = ReqwestCloudKitReadTransport::new()?;
+    crate::workflow::verify_remote_readback(
+        &mut manifest,
+        &args.asset_id,
+        &session,
+        &mut transport,
+    )?;
+    save_manifest(&manifest, &args.manifest)
+}
+
+fn workflow_provider_session_diagnose<W: Write>(
+    args: WorkflowProviderSessionDiagnoseArgs,
+    writer: &mut W,
+) -> Result<(), CliError> {
+    let role = match args.role {
+        ProviderSessionRoleArg::Upload => crate::upload::ProviderSessionRole::Upload,
+        ProviderSessionRoleArg::CloudKitRead => crate::upload::ProviderSessionRole::CloudKitRead,
+    };
+    let diagnostic = match fs::read_to_string(&args.session) {
+        Ok(json) => crate::upload::diagnose_provider_session(role, &json),
+        Err(_) => crate::upload::ProviderSessionDiagnostic {
+            role,
+            class: crate::upload::ProviderSessionDiagnosticClass::LocalMisconfiguration,
+            code: "session_unreadable",
+            message: "session file could not be read".to_string(),
+            network_contacted: false,
+            authenticated: false,
+            supported_requirement: crate::upload::PROVIDER_SESSION_SUPPORTED_REQUIREMENT,
+        },
+    };
+    serde_json::to_writer_pretty(&mut *writer, &diagnostic)?;
+    writeln!(writer)?;
+    Ok(())
 }
 
 fn workflow_upload_verified(args: WorkflowUploadVerifiedArgs) -> Result<(), CliError> {
@@ -11091,6 +11340,7 @@ fn workflow_uploaded_heic_delete_plan<W: Write>(
 
 fn workflow_delete_uploaded_heic(args: WorkflowDeleteUploadedHeicArgs) -> Result<(), CliError> {
     let mut manifest = load_operational_manifest_for_asset(&args.manifest, &args.asset_id)?;
+    crate::workflow::ensure_remote_mutation_allowed(&manifest, &args.asset_id)?;
     let request = uploaded_heic_delete_request(&manifest, &args.asset_id)?;
     let session = load_cloudkit_delete_session(&args.session)?;
     let transport = ReqwestCloudKitDeleteTransport::new()?;
@@ -11355,6 +11605,7 @@ fn workflow_delete_plan<W: Write>(args: WorkflowAssetArgs, writer: &mut W) -> Re
 
 fn workflow_delete_execute(args: WorkflowDeleteExecuteArgs) -> Result<(), CliError> {
     let mut manifest = load_operational_manifest_for_asset(&args.manifest, &args.asset_id)?;
+    crate::workflow::ensure_remote_mutation_allowed(&manifest, &args.asset_id)?;
     let request = approved_original_delete_request(&manifest, &args.asset_id)?;
     let session = load_cloudkit_delete_session(&args.session)?;
     let transport = ReqwestCloudKitDeleteTransport::new()?;
@@ -14027,5 +14278,49 @@ mod original_assets_audit_tests {
             CliError::OriginalAssetsReconcileCheckpointStale.to_string(),
             "original-assets-reconcile database commit succeeded but the JSON checkpoint is stale"
         );
+    }
+}
+
+#[cfg(test)]
+mod per_photo_queue_tests {
+    use super::*;
+    use crate::operation_hold::{HeldRemoteOperation, OperationHold, apply_operation_hold};
+    use crate::upload::CloudKitDatabaseScope;
+    use serde_json::json;
+
+    #[test]
+    fn queue_does_not_offer_a_held_asset_for_upload() {
+        let mut record = AssetRecord::new("held", "/raw/held.DNG");
+        record.state = State::ConversionVerified;
+        record
+            .proofs
+            .insert("original_asset".to_string(), json!({"record_name": "CPL"}));
+        let mut manifest = Manifest::new();
+        manifest.upsert_trusted(record);
+        let mut config = MonitorConfig::new("/photos", "/manifest.json", "/heic");
+        config.full_lifecycle = true;
+        config.auto_delete = false;
+        assert_eq!(
+            queue_next_stage(&manifest, manifest.get("held").unwrap(), &config),
+            "upload_verified_heics"
+        );
+        let hold = OperationHold::uncertain(
+            HeldRemoteOperation::Move,
+            CloudKitLibraryDestination {
+                database_scope: CloudKitDatabaseScope::Shared,
+                zone_name: "SharedSync-LIBRARY".to_string(),
+                owner_record_name: Some("_shared-owner".to_string()),
+            },
+            1_700_000_000,
+        )
+        .unwrap();
+        apply_operation_hold(&mut manifest, "held", hold).unwrap();
+        assert_eq!(
+            queue_next_stage(&manifest, manifest.get("held").unwrap(), &config),
+            "held_remote_operation"
+        );
+        let counts = queue_counts(&manifest, &config, &[]);
+        assert_eq!(counts.get("upload_verified_heics"), None);
+        assert_eq!(counts["held_remote_operation"], 1);
     }
 }

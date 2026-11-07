@@ -600,6 +600,26 @@ impl Manifest {
         Ok(record)
     }
 
+    /// Removes one proof without changing lifecycle state, failures, or other proofs.
+    pub(crate) fn remove_proof_preserving_state(
+        &mut self,
+        asset_id: &str,
+        proof_name: &str,
+    ) -> Result<&AssetRecord, ManifestError> {
+        reject_reserved_internal_proof_name(proof_name)?;
+        reject_reserved_internal_proof(self.get(asset_id)?)?;
+        let updated_at = current_timestamp();
+        let record = self
+            .records
+            .get_mut(asset_id)
+            .ok_or_else(|| ManifestError::UnknownAsset {
+                asset_id: asset_id.to_string(),
+            })?;
+        record.proofs.remove(proof_name);
+        record.updated_at = updated_at;
+        Ok(record)
+    }
+
     pub(crate) fn requeue_interrupted_retries_as_failed(
         &mut self,
         mut is_interrupted_retry: impl FnMut(&AssetRecord) -> bool,

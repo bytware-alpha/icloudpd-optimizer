@@ -46,6 +46,7 @@ use crate::manifest_lock::{
     ManifestLockError, ManifestLockGuard, acquire_manifest_lock, manifest_lock_path,
 };
 use crate::metrics::VerifiedMetrics;
+use crate::operation_hold::{blocks_scheduled_remote_mutation, remote_mutation_blocked};
 use crate::proof::{MIN_RAW_AGE_DAYS, NasRawProof, ProofError};
 use crate::reconciliation::{
     OriginalAssetResolutionBatch, OriginalAssetResolutionBatchSummary, OriginalAssetResolutionError,
@@ -73,7 +74,7 @@ use crate::workflow::{
     record_current_heic_verification, record_icloudpd_local_mirror_proof,
     record_prevalidated_delete_execution, record_reconciled_delete_execution,
     record_source_age_proof, record_stage_failure, record_stage_failure_with_kind,
-    record_upload_proof, upload_ready_heic_proof, validated_adjusted_source_for_conversion,
+    record_upload_proof, validated_adjusted_source_for_conversion,
 };
 
 static MONITOR_FAILURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -2754,6 +2755,9 @@ fn rolling_lifecycle_next_worker_step(
     config: &MonitorConfig,
     conversion_capacity_available: bool,
 ) -> Option<RollingAssetStep> {
+    if blocks_scheduled_remote_mutation(record) {
+        return None;
+    }
     match record.state {
         State::Failed
             if config.full_lifecycle
@@ -3824,13 +3828,14 @@ where
     let (heic, destination, record) = {
         let manifest = lock_shared(manifest, "rolling lifecycle manifest")?;
         let record = manifest.get(asset_id)?;
-        if record.state != State::ConversionVerified
-            || !record.proofs.contains_key("original_asset")
+        if remote_mutation_blocked(record)
             || record.proofs.contains_key("upload")
+            || record.state != State::ConversionVerified
+            || !record.proofs.contains_key("original_asset")
         {
             return Ok(RollingAssetStepOutcome::skipped());
         }
-        match upload_ready_heic_proof(&manifest, asset_id) {
+        match crate::workflow::ensure_upload_dispatch_allowed(&manifest, asset_id) {
             Ok(heic) => {
                 let destination = original_asset_destination(record)?;
                 (heic, destination, record.clone())
@@ -4017,7 +4022,8 @@ fn rolling_asset_local_mirror_request(
     asset_id: &str,
 ) -> Result<Option<IcloudpdLocalMirrorRequest>, MonitorError> {
     let record = manifest.get(asset_id)?;
-    if record.state != State::UploadVerified
+    if remote_mutation_blocked(record)
+        || record.state != State::UploadVerified
         || local_mirror_work_disposition(manifest, record) != LocalMirrorWorkDisposition::Repairable
     {
         return Ok(None);
@@ -5019,6 +5025,7 @@ fn upload_verified_heics(
 ) -> Result<(), MonitorError> {
     let asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
         active_lifecycle_allows(Some(active_lifecycle_asset_ids), &record.asset_id)
+            && !remote_mutation_blocked(record)
             && record.state == State::ConversionVerified
             && record.proofs.contains_key("original_asset")
             && !record.proofs.contains_key("upload")
@@ -5027,7 +5034,7 @@ fn upload_verified_heics(
     let mut heic_sizes = BTreeMap::new();
     let mut upload_asset_ids = Vec::new();
     for asset_id in asset_ids {
-        match upload_ready_heic_proof(manifest, &asset_id) {
+        match crate::workflow::ensure_upload_dispatch_allowed(manifest, &asset_id) {
             Ok(heic) => {
                 summary.uploads_attempted = summary.uploads_attempted.saturating_add(1);
                 heic_sizes.insert(asset_id.clone(), heic.size_bytes);
@@ -5412,6 +5419,7 @@ fn record_local_mirrors(
 ) -> Result<(), MonitorError> {
     let asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
         active_lifecycle_allows(Some(active_lifecycle_asset_ids), &record.asset_id)
+            && !remote_mutation_blocked(record)
             && record.state == State::UploadVerified
             && local_mirror_work_disposition(manifest, record)
                 == LocalMirrorWorkDisposition::Repairable
@@ -5732,7 +5740,8 @@ fn delete_original_assets(
 }
 
 fn is_upload_verified_delete_candidate(manifest: &Manifest, record: &AssetRecord) -> bool {
-    record.state == State::UploadVerified
+    !remote_mutation_blocked(record)
+        && record.state == State::UploadVerified
         && local_mirror_work_disposition(manifest, record) == LocalMirrorWorkDisposition::Current
 }
 
@@ -6588,6 +6597,7 @@ fn delete_lifecycle_asset_ids(
             .saturating_sub(asset_ids.len()),
         |record| {
             active_lifecycle_allows(Some(active_lifecycle_asset_ids), &record.asset_id)
+                && !remote_mutation_blocked(record)
                 && matches!(record.state, State::DeleteEligible | State::DeleteApproved)
         },
     ));
@@ -9413,7 +9423,7 @@ fn lifecycle_candidate_has_runnable_stage(
     record: &AssetRecord,
     auto_delete: bool,
 ) -> bool {
-    if !is_lifecycle_candidate(record) {
+    if blocks_scheduled_remote_mutation(record) || !is_lifecycle_candidate(record) {
         return false;
     }
     match record.state {
@@ -9441,6 +9451,9 @@ fn is_lifecycle_continuation_candidate(
     record: &AssetRecord,
     auto_delete: bool,
 ) -> bool {
+    if blocks_scheduled_remote_mutation(record) {
+        return false;
+    }
     (record.state == State::Failed && adjusted_source_required_proof(record).is_ok())
         || matches!(record.state, State::Converted | State::ConversionVerified)
         || (record.state == State::NasVerified && record.proofs.contains_key("original_asset"))
@@ -24901,5 +24914,174 @@ printf '%s\n' "$workspace" >> '{}'
             Err(MonitorError::DownloadRootPreflight { message, .. })
                 if message.contains("timed out after 1 seconds")
         ));
+    }
+}
+
+#[cfg(test)]
+mod per_photo_hold_scheduling_tests {
+    use super::*;
+    use crate::operation_hold::{HeldRemoteOperation, OperationHold, apply_operation_hold};
+    use crate::upload::CloudKitDatabaseScope;
+
+    fn library(scope: CloudKitDatabaseScope) -> CloudKitLibraryDestination {
+        if scope == CloudKitDatabaseScope::Shared {
+            CloudKitLibraryDestination {
+                database_scope: scope,
+                zone_name: "SharedSync-LIBRARY".to_string(),
+                owner_record_name: Some("_shared-owner".to_string()),
+            }
+        } else {
+            CloudKitLibraryDestination::primary_sync()
+        }
+    }
+
+    fn held_upload_candidate(asset_id: &str, size_bytes: u64) -> AssetRecord {
+        let mut record = AssetRecord::new(asset_id, format!("/raw/{asset_id}.DNG"));
+        record.state = State::ConversionVerified;
+        record.proofs.insert(
+            "original_asset".to_string(),
+            json!({"record_name": format!("CPLAsset-{asset_id}")}),
+        );
+        record
+            .proofs
+            .insert("nas".to_string(), json!({"size_bytes": size_bytes}));
+        record
+    }
+
+    #[test]
+    fn held53_style_records_cannot_take_upload_slots_from_an_eligible_asset() {
+        let mut offered = Manifest::new();
+        let mut held_ids = Vec::new();
+        for index in 0..27 {
+            let asset_id = format!("shared-upload-{index:02}");
+            offered.upsert_trusted(held_upload_candidate(&asset_id, 1_000_000 + index));
+            held_ids.push((
+                asset_id,
+                HeldRemoteOperation::Upload,
+                CloudKitDatabaseScope::Shared,
+            ));
+        }
+        for index in 0..21 {
+            let asset_id = format!("shared-move-{index:02}");
+            offered.upsert_trusted(held_upload_candidate(&asset_id, 2_000_000 + index));
+            held_ids.push((
+                asset_id,
+                HeldRemoteOperation::Move,
+                CloudKitDatabaseScope::Shared,
+            ));
+        }
+        for index in 0..5 {
+            let asset_id = format!("primary-upload-{index:02}");
+            offered.upsert_trusted(held_upload_candidate(&asset_id, 3_000_000 + index));
+            held_ids.push((
+                asset_id,
+                HeldRemoteOperation::Upload,
+                CloudKitDatabaseScope::Private,
+            ));
+        }
+        offered.upsert_trusted(held_upload_candidate("eligible-canary", 10));
+        assert_eq!(held_ids.len(), 53);
+
+        let mut config = MonitorConfig::new("/photos", "/manifest.json", "/heic");
+        config.full_lifecycle = true;
+        config.auto_delete = false;
+        config.rolling_lifecycle = false;
+        config.max_lifecycle_per_scan = 1;
+        let before_holds = active_lifecycle_asset_ids_for_config(&config, &offered);
+        assert_eq!(before_holds.len(), 1);
+        assert_ne!(before_holds[0], "eligible-canary");
+
+        for (asset_id, operation, scope) in &held_ids {
+            let hold =
+                OperationHold::uncertain(*operation, library(*scope), 1_700_000_000).unwrap();
+            let state = offered.get(asset_id).unwrap().state;
+            assert!(apply_operation_hold(&mut offered, asset_id, hold).unwrap());
+            assert_eq!(offered.get(asset_id).unwrap().state, state);
+            assert_ne!(offered.get(asset_id).unwrap().state, State::Failed);
+        }
+
+        config.max_lifecycle_per_scan = 1;
+        assert_eq!(
+            active_lifecycle_asset_ids_for_config(&config, &offered),
+            vec!["eligible-canary".to_string()]
+        );
+        config.max_lifecycle_per_scan = 100;
+        assert_eq!(
+            active_lifecycle_asset_ids_for_config(&config, &offered),
+            vec!["eligible-canary".to_string()]
+        );
+        config.rolling_lifecycle = true;
+        config.max_lifecycle_per_scan = 1;
+        assert_eq!(
+            active_lifecycle_asset_ids_for_config(&config, &offered),
+            vec!["eligible-canary".to_string()]
+        );
+
+        let mut delete_ready = AssetRecord::new("held-delete", "/raw/held-delete.DNG");
+        delete_ready.state = State::DeleteApproved;
+        offered.upsert_trusted(delete_ready);
+        let delete_hold = OperationHold::uncertain(
+            HeldRemoteOperation::Move,
+            library(CloudKitDatabaseScope::Private),
+            1_700_000_000,
+        )
+        .unwrap();
+        apply_operation_hold(&mut offered, "held-delete", delete_hold).unwrap();
+        config.auto_delete = true;
+        config.max_lifecycle_per_scan = 10;
+        assert!(
+            delete_lifecycle_asset_ids(&offered, &config, &["held-delete".to_string()]).is_empty()
+        );
+        config.auto_delete = false;
+    }
+
+    #[test]
+    fn rolling_dispatch_skips_a_held_asset_without_calling_upload() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut manifest = Manifest::new();
+        manifest.upsert_trusted(held_upload_candidate("held", 100));
+        let hold = OperationHold::uncertain(
+            HeldRemoteOperation::Upload,
+            library(CloudKitDatabaseScope::Shared),
+            1_700_000_000,
+        )
+        .unwrap();
+        apply_operation_hold(&mut manifest, "held", hold).unwrap();
+        let manifest = Arc::new(Mutex::new(manifest));
+        let summary = Arc::new(Mutex::new(MonitorScanSummary::default()));
+        let path = tempdir.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&path, "hold-dispatch", Duration::from_secs(30)).unwrap();
+        store
+            .persist_manifest_records_trusted(&manifest.lock().unwrap())
+            .unwrap();
+        let mut config = MonitorConfig::new(tempdir.path(), &path, tempdir.path().join("heic"));
+        config.full_lifecycle = true;
+        config.auto_delete = false;
+        config.upload_session_path = Some(tempdir.path().join("upload-session.json"));
+        let called = Arc::new(Mutex::new(false));
+        let called_flag = Arc::clone(&called);
+        let outcome = run_rolling_asset_upload_with_child(
+            &config,
+            &store,
+            "held",
+            &manifest,
+            &summary,
+            move |_, _, _, _, _| {
+                *called_flag.lock().unwrap() = true;
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, RollingAssetStepOutcome::skipped());
+        assert!(!*called.lock().unwrap());
+        assert_eq!(summary.lock().unwrap().uploads_attempted, 0);
+        drop(store);
+        let loaded = AssetStateStore::open_read_only(&path)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert!(!loaded.get("held").unwrap().proofs.contains_key("upload"));
+        assert_eq!(loaded.get("held").unwrap().state, State::ConversionVerified);
     }
 }
