@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -83,8 +83,7 @@ pub(crate) struct ConversionResultProof {
     pub source_binding: ConversionSourceBinding,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum ConversionSourceBinding {
     #[default]
     EmbeddedPreview,
@@ -94,9 +93,120 @@ pub enum ConversionSourceBinding {
         adjusted_jpeg_path: PathBuf,
     },
     /// Historical claim that the conversion consumed the camera-native RAW.
-    /// Decoding keeps that claim. It is not an embedded-preview or adjusted-source
-    /// verification and cannot satisfy the current quality gates.
-    NativeRaw,
+    /// A bare string and a historical object are both preserved. Neither is an
+    /// embedded-preview or adjusted-source verification.
+    NativeRaw(NativeRawSource),
+}
+
+/// Provenance stored with a historical `native_raw` conversion source.
+///
+/// `object_fields` is `None` for the string token `"native_raw"` and `Some`
+/// for the externally tagged object `{"native_raw": { ... }}`. Every field in
+/// that object is retained and none of them grants a current quality pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NativeRawSource {
+    object_fields: Option<serde_json::Map<String, Value>>,
+}
+
+impl NativeRawSource {
+    pub fn token() -> Self {
+        Self {
+            object_fields: None,
+        }
+    }
+
+    pub fn object(fields: serde_json::Map<String, Value>) -> Self {
+        Self {
+            object_fields: Some(fields),
+        }
+    }
+
+    pub fn object_fields(&self) -> Option<&serde_json::Map<String, Value>> {
+        self.object_fields.as_ref()
+    }
+}
+
+impl ConversionSourceBinding {
+    pub fn historical_native_raw_token() -> Self {
+        Self::NativeRaw(NativeRawSource::token())
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct AdjustedSourceWire {
+    adjusted_source_proof_digest: String,
+    adjusted_jpeg_sha256: String,
+    adjusted_jpeg_path: PathBuf,
+}
+
+impl Serialize for ConversionSourceBinding {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::EmbeddedPreview => serializer.serialize_str("embedded_preview"),
+            Self::AdjustedSource {
+                adjusted_source_proof_digest,
+                adjusted_jpeg_sha256,
+                adjusted_jpeg_path,
+            } => {
+                let wire = AdjustedSourceWire {
+                    adjusted_source_proof_digest: adjusted_source_proof_digest.clone(),
+                    adjusted_jpeg_sha256: adjusted_jpeg_sha256.clone(),
+                    adjusted_jpeg_path: adjusted_jpeg_path.clone(),
+                };
+                serde_json::json!({ "adjusted_source": wire }).serialize(serializer)
+            }
+            Self::NativeRaw(source) => match &source.object_fields {
+                None => serializer.serialize_str("native_raw"),
+                Some(fields) => serde_json::json!({ "native_raw": fields }).serialize(serializer),
+            },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ConversionSourceBinding {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        conversion_source_binding_from_value(value).map_err(de::Error::custom)
+    }
+}
+
+fn conversion_source_binding_from_value(value: Value) -> Result<ConversionSourceBinding, String> {
+    match value {
+        Value::String(token) if token == "embedded_preview" => {
+            Ok(ConversionSourceBinding::EmbeddedPreview)
+        }
+        Value::String(token) if token == "native_raw" => {
+            Ok(ConversionSourceBinding::historical_native_raw_token())
+        }
+        Value::String(token) => Err(format!("unknown conversion source binding {token}")),
+        Value::Object(map) if map.len() == 1 && map.contains_key("adjusted_source") => {
+            let wire: AdjustedSourceWire = serde_json::from_value(
+                map.get("adjusted_source").cloned().unwrap_or(Value::Null),
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(ConversionSourceBinding::AdjustedSource {
+                adjusted_source_proof_digest: wire.adjusted_source_proof_digest,
+                adjusted_jpeg_sha256: wire.adjusted_jpeg_sha256,
+                adjusted_jpeg_path: wire.adjusted_jpeg_path,
+            })
+        }
+        Value::Object(map) if map.len() == 1 && map.contains_key("native_raw") => {
+            match map.get("native_raw") {
+                Some(Value::Object(fields)) => Ok(ConversionSourceBinding::NativeRaw(
+                    NativeRawSource::object(fields.clone()),
+                )),
+                _ => Err(
+                    "historical native_raw conversion source must be a string or an object"
+                        .to_string(),
+                ),
+            }
+        }
+        Value::Object(_) => Err(
+            "conversion source binding object is not a supported historical native_raw or adjusted source"
+                .to_string(),
+        ),
+        _ => Err("conversion source binding must be a string or object".to_string()),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1105,7 +1215,10 @@ pub fn decode_historical_conversion_source(
             source,
         })?;
     Ok(HistoricalConversionSource {
-        current_policy_source: !matches!(parsed.source_binding, ConversionSourceBinding::NativeRaw),
+        current_policy_source: !matches!(
+            parsed.source_binding,
+            ConversionSourceBinding::NativeRaw(_)
+        ),
         source_binding: parsed.source_binding,
     })
 }
@@ -2801,7 +2914,7 @@ fn validate_conversion_source_binding(
 ) -> Result<Option<CloudKitAdjustedSourceProof>, WorkflowError> {
     if matches!(
         conversion.source_binding,
-        ConversionSourceBinding::NativeRaw
+        ConversionSourceBinding::NativeRaw(_)
     ) {
         return Err(WorkflowError::HistoricalNativeRawUnverified {
             asset_id: asset_id.to_string(),
@@ -2810,7 +2923,7 @@ fn validate_conversion_source_binding(
     let adjusted_source =
         stored_adjusted_source_for_conversion(manifest, asset_id, &conversion.heic_path)?;
     match (&adjusted_source, &conversion.source_binding) {
-        (_, ConversionSourceBinding::NativeRaw) => {
+        (_, ConversionSourceBinding::NativeRaw(_)) => {
             Err(WorkflowError::HistoricalNativeRawUnverified {
                 asset_id: asset_id.to_string(),
             })
@@ -3838,8 +3951,14 @@ mod per_photo_lifecycle_tests {
 
         let proof = &manifest.get("asset").unwrap().proofs[CONVERSION_PROOF];
         let decoded = decode_historical_conversion_source("asset", proof).unwrap();
-        assert_eq!(decoded.source_binding, ConversionSourceBinding::NativeRaw);
+        assert_eq!(
+            decoded.source_binding,
+            ConversionSourceBinding::historical_native_raw_token()
+        );
         assert!(!decoded.current_policy_source);
+        assert!(
+            decoded.source_binding == ConversionSourceBinding::NativeRaw(NativeRawSource::token())
+        );
         assert_eq!(
             identity_migrate_historical_conversion_proof("asset", proof).unwrap(),
             *proof
@@ -3876,7 +3995,7 @@ mod per_photo_lifecycle_tests {
         let error = record_current_conversion_result(
             &mut fresh,
             "asset",
-            conversion_input(ConversionSourceBinding::NativeRaw),
+            conversion_input(ConversionSourceBinding::historical_native_raw_token()),
         )
         .expect_err("new native_raw proof must not be recorded");
         assert!(matches!(
@@ -3884,6 +4003,104 @@ mod per_photo_lifecycle_tests {
             WorkflowError::HistoricalNativeRawUnverified { .. }
         ));
         assert_eq!(fresh, untouched);
+
+        let mut object_fields = BTreeMap::new();
+        object_fields.insert("raw_sha256".to_string(), serde_json::json!("cd".repeat(32)));
+        object_fields.insert(
+            "raw_path".to_string(),
+            serde_json::json!("/nas/PrimarySync/IMG_0001.DNG"),
+        );
+        object_fields.insert(
+            "converter".to_string(),
+            serde_json::json!("dcraw_emu+magick+heif-enc"),
+        );
+        object_fields.insert("quality_verified".to_string(), serde_json::json!(true));
+        object_fields.insert(
+            "provenance".to_string(),
+            serde_json::json!({
+                "library": "primary",
+                "asset_ref": "raw-122ae80b2d2fb76c"
+            }),
+        );
+        let historical_object = serde_json::json!({ "native_raw": object_fields.clone() });
+        let mut object_record = before.clone();
+        object_record.proofs.get_mut(CONVERSION_PROOF).unwrap()["source_binding"] =
+            historical_object.clone();
+        let mut object_manifest = Manifest::new();
+        object_manifest.upsert_trusted(object_record);
+        let stored = &object_manifest.get("asset").unwrap().proofs[CONVERSION_PROOF];
+        let decoded = decode_historical_conversion_source("asset", stored).unwrap();
+        assert!(!decoded.current_policy_source);
+        assert_eq!(
+            serde_json::to_value(&decoded.source_binding).unwrap(),
+            historical_object
+        );
+        let ConversionSourceBinding::NativeRaw(source) = &decoded.source_binding else {
+            panic!("object native_raw must stay native_raw");
+        };
+        assert_eq!(
+            source
+                .object_fields()
+                .and_then(|fields| fields.get("provenance")),
+            Some(&serde_json::json!({
+                "library": "primary",
+                "asset_ref": "raw-122ae80b2d2fb76c"
+            }))
+        );
+        assert_eq!(
+            source
+                .object_fields()
+                .and_then(|fields| fields.get("quality_verified")),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            identity_migrate_historical_conversion_proof("asset", stored).unwrap()["source_binding"],
+            historical_object
+        );
+        let error = upload_ready_heic_proof(&object_manifest, "asset")
+            .expect_err("object native_raw must not gain a quality pass");
+        assert!(matches!(
+            error,
+            WorkflowError::HistoricalNativeRawUnverified { .. }
+        ));
+        for malformed in [
+            serde_json::json!({"native_raw": "not-an-object"}),
+            serde_json::json!({"sensor_render": {}}),
+            serde_json::json!("not_a_source"),
+            serde_json::json!({"native_raw": {"raw_sha256": "abc"}, "extra": true}),
+        ] {
+            let mut broken = before.clone();
+            broken.proofs.get_mut(CONVERSION_PROOF).unwrap()["source_binding"] = malformed;
+            let mut manifest = Manifest::new();
+            manifest.upsert_trusted(broken);
+            let proof = &manifest.get("asset").unwrap().proofs[CONVERSION_PROOF];
+            assert!(
+                decode_historical_conversion_source("asset", proof).is_err(),
+                "malformed historical source must fail closed"
+            );
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("manifest.json");
+        let store =
+            AssetStateStore::open_writer(&path, "native-raw-object", Duration::from_secs(30))
+                .unwrap();
+        store
+            .persist_manifest_records_trusted(&object_manifest)
+            .unwrap();
+        drop(store);
+        let loaded = AssetStateStore::open_read_only(&path)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(
+            loaded.get("asset").unwrap().proofs[CONVERSION_PROOF]["source_binding"],
+            historical_object
+        );
+        assert!(matches!(
+            upload_ready_heic_proof(&loaded, "asset"),
+            Err(WorkflowError::HistoricalNativeRawUnverified { .. })
+        ));
     }
 
     struct ReadbackTransport {

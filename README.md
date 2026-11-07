@@ -895,7 +895,13 @@ exists, prefer recording upload proof with `workflow upload-verified` after an o
 has independently verified the iCloud asset id and uploaded HEIC identity.
 
 Upload proof is not remote readback. After one asset is upload-verified, download
-its HEIC and record the hash with the same library identity:
+its HEIC and record the hash with the same library identity. The result is
+committed with an exact compare-and-swap against the pre-download record. A
+hold or any other change applied while the download is in progress is kept,
+the readback is not written, and other assets are not rewritten. Historical
+`native_raw` proofs may be the string `native_raw` or an object
+`{"native_raw": { ... }}`. Both decode with their original fields and neither
+passes the current quality gate:
 
 ```sh
 icloudpd-optimizer workflow remote-readback \
