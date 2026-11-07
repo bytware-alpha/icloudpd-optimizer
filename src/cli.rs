@@ -8549,7 +8549,9 @@ fn hash_stable_file_with_before_hash(
         hasher.update(&buffer[..bytes_read]);
     }
     let after = file.metadata()?;
+    let path_after = fs::metadata(path)?;
     if !same_file_handle_metadata(&before, &after)
+        || !same_file_handle_metadata(&before, &path_after)
         || !canonical_path_still_points_to_open_file(path, &after)
     {
         return Err(io::Error::new(
@@ -13543,9 +13545,23 @@ mod original_assets_audit_tests {
         let original_mtime = FileTime::from_last_modification_time(&before);
 
         let error = hash_stable_file_with_before_hash(&replacement, || {
-            fs::write(&replacement, b"after!").expect("replacement mutation should succeed");
-            set_file_mtime(&replacement, original_mtime)
-                .expect("replacement mtime should be restored");
+            let started = fs::metadata(&replacement).expect("replacement metadata should reload");
+            for _ in 0..40 {
+                fs::write(&replacement, b"after!").expect("replacement mutation should succeed");
+                set_file_mtime(&replacement, original_mtime)
+                    .expect("replacement mtime should be restored");
+                let current =
+                    fs::metadata(&replacement).expect("replacement metadata should reload");
+                if (current.ctime(), current.ctime_nsec())
+                    != (started.ctime(), started.ctime_nsec())
+                {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            panic!(
+                "filesystem did not expose a ctime change after a same-size rewrite; the hash check was not given a visible change to reject"
+            );
         })
         .expect_err("same-size rewrite must not produce an exact local candidate");
 

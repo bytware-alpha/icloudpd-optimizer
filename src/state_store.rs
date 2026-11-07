@@ -3424,8 +3424,28 @@ mod tests {
         let db_path_for_hook = db_path.clone();
 
         set_migration_precommit_hook_for_current_thread(move || {
-            fs::rename(&db_path_for_hook, &moved_db_path).expect("move verified database path");
-            fs::rename(&moved_db_path, &db_path_for_hook).expect("restore verified database path");
+            let parent = db_path_for_hook
+                .parent()
+                .expect("database path should have a parent")
+                .to_path_buf();
+            let started = fs::metadata(&parent).expect("database directory metadata");
+            for _ in 0..40 {
+                thread::sleep(Duration::from_millis(25));
+                fs::rename(&db_path_for_hook, &moved_db_path).expect("move verified database path");
+                fs::rename(&moved_db_path, &db_path_for_hook)
+                    .expect("restore verified database path");
+                let current = fs::metadata(&parent).expect("database directory metadata");
+                if current.mtime() != started.mtime()
+                    || current.mtime_nsec() != started.mtime_nsec()
+                    || current.ctime() != started.ctime()
+                    || current.ctime_nsec() != started.ctime_nsec()
+                {
+                    return;
+                }
+            }
+            panic!(
+                "filesystem did not update directory timestamps after renaming the database; the directory witness was not given a visible change to reject"
+            );
         });
         let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
             .expect_err("database path ABA must roll back before commit");
@@ -3455,6 +3475,54 @@ mod tests {
         let summary = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
             .expect("restored verified path should migrate normally");
         assert_eq!(summary.database_id, expected_database_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_only_migration_rejects_a_different_inode_left_at_the_database_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tempdir.path().join("manifest.json");
+        let record = AssetRecord::new("asset-1", "/photos/asset-1.dng");
+        let record_json = create_migratable_v1_database(&manifest_path, &record);
+        let db_path = AssetStateStore::db_path_for_manifest(&manifest_path);
+        let moved_db_path = tempdir.path().join("moved-state.sqlite3");
+        let digest_before = format!("{:x}", Sha256::digest(record_json.as_bytes()));
+        let original_inode = fs::metadata(&db_path).expect("database metadata").ino();
+        let hook_db_path = db_path.clone();
+        let hook_moved_db_path = moved_db_path.clone();
+
+        set_migration_precommit_hook_for_current_thread(move || {
+            fs::rename(&hook_db_path, &hook_moved_db_path).expect("move verified database path");
+            fs::write(&hook_db_path, b"replacement-database-bytes")
+                .expect("leave a different file at the database path");
+        });
+        let error = AssetStateStore::migrate_schema_only(&manifest_path, 1, 2)
+            .expect_err("a different inode at the database path must roll back");
+
+        assert!(matches!(
+            error,
+            AssetStateStoreError::MigrationDatabaseIdentityChanged { .. }
+        ));
+        assert_ne!(
+            fs::metadata(&db_path).expect("replacement metadata").ino(),
+            original_inode
+        );
+        let connection = Connection::open(&moved_db_path).expect("reopen original database inode");
+        let version: i32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read original schema version");
+        assert_eq!(version, 1);
+        let durable_json: String = connection
+            .query_row(
+                "SELECT record_json FROM assets WHERE asset_id = 'asset-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read original asset record");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(durable_json.as_bytes())),
+            digest_before
+        );
     }
 
     #[test]
