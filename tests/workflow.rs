@@ -3940,3 +3940,39 @@ fn delete_approval_requires_non_empty_operator() {
         &before
     );
 }
+
+#[test]
+fn held_asset_refuses_recently_deleted_proof_delete_recording() {
+    use icloudpd_optimizer::operation_hold::{
+        HeldRemoteOperation, OperationHold, apply_operation_hold,
+    };
+    use icloudpd_optimizer::upload::CloudKitLibraryDestination;
+    use icloudpd_optimizer::workflow::record_delete_execution_with_recently_deleted_proof;
+
+    let (_tempdir, mut manifest, _) = real_delete_approved_manifest();
+    let hold = OperationHold::uncertain(
+        HeldRemoteOperation::Upload,
+        CloudKitLibraryDestination::primary_sync(),
+        1_800_000_000,
+    )
+    .expect("valid hold");
+    assert!(apply_operation_hold(&mut manifest, "asset-1", hold).expect("hold applies"));
+
+    let error = record_delete_execution_with_recently_deleted_proof(
+        &mut manifest,
+        "asset-1",
+        delete_outcome(),
+        None,
+    )
+    .expect_err("a held asset must not record a delete");
+    assert!(matches!(error, WorkflowError::RemoteOperationHeld { .. }));
+
+    let error = record_delete_execution(&mut manifest, "asset-1", delete_outcome())
+        .expect_err("the legacy wrapper must also refuse a held asset");
+    assert!(matches!(error, WorkflowError::RemoteOperationHeld { .. }));
+
+    let record = manifest.get("asset-1").expect("record");
+    assert_eq!(record.state, State::DeleteApproved);
+    assert!(!record.proofs.contains_key("delete"));
+    assert!(record.proofs.contains_key("operation_hold"));
+}

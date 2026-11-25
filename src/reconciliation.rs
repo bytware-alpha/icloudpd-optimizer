@@ -198,7 +198,12 @@ impl Manifest {
     ) -> Result<OriginalAssetResolutionBatchApplyResult, OriginalAssetResolutionError> {
         validate_batch_shape(&batch)?;
 
-        let mut seen_remote_records = existing_original_record_names(self)?;
+        let target_ids = batch
+            .targets
+            .iter()
+            .map(|target| target.asset_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut seen_remote_records = existing_original_record_names(self, &target_ids)?;
         let mut updates = Vec::with_capacity(batch.targets.len());
         let mut summary = OriginalAssetResolutionBatchSummary::default();
 
@@ -564,10 +569,24 @@ fn validate_source(
     Ok(nas)
 }
 
+/// Minimum source age in force when early resolution proofs were recorded.
+/// Used only to recognize those historical proofs on records outside the
+/// current batch; never for admission, conversion, upload, or deletion.
+const LEGACY_MIN_RAW_AGE_SECONDS: u64 = 24 * 60 * 60;
+
 fn source_proofs_are_valid(
     record: &AssetRecord,
     nas: &NasRawProof,
     source_age: &SourceAgeProof,
+) -> bool {
+    source_proofs_are_valid_with_min_age(record, nas, source_age, MIN_RAW_AGE_SECONDS)
+}
+
+fn source_proofs_are_valid_with_min_age(
+    record: &AssetRecord,
+    nas: &NasRawProof,
+    source_age: &SourceAgeProof,
+    min_age_floor_seconds: u64,
 ) -> bool {
     let relative_path_is_safe = !nas.relative_path.as_os_str().is_empty()
         && nas
@@ -580,7 +599,7 @@ fn source_proofs_are_valid(
         && nas.size_bytes > 0
         && is_sha256(&nas.sha256)
         && nas.modified_unix_seconds == source_age.source_captured_unix_seconds
-        && source_age.min_age_seconds >= MIN_RAW_AGE_SECONDS
+        && source_age.min_age_seconds >= min_age_floor_seconds
         && nas.age_seconds >= source_age.min_age_seconds
         && source_age
             .verified_at_unix_seconds
@@ -836,8 +855,19 @@ fn evidence_is_coherent(
     }
 }
 
+/// Builds the index of remote CloudKit identities already claimed by manifest
+/// records so a batch can never bind one remote record to two local assets.
+///
+/// Records being updated by this batch keep the full strict validation. A
+/// record outside the batch whose resolution proof was recorded under the
+/// historical one-day minimum source age is re-validated with every other check
+/// unchanged and only that legacy age floor; its remote identities still
+/// participate in duplicate detection. Any other inconsistency still fails
+/// closed. This index never grants delete eligibility; delete paths validate
+/// each record's own proofs against today's minimum age separately.
 fn existing_original_record_names(
     manifest: &Manifest,
+    batch_target_ids: &BTreeSet<&str>,
 ) -> Result<BTreeSet<RemoteRecordIdentity>, OriginalAssetResolutionError> {
     let mut names = BTreeMap::new();
     for record in manifest.records().values() {
@@ -876,8 +906,25 @@ fn existing_original_record_names(
             })
             .transpose()?;
         if let Some(proof) = &resolution {
-            let resolution_identities =
-                validate_existing_resolution_proof(manifest, record, proof, original.as_ref())?;
+            let resolution_identities = match validate_existing_resolution_proof(
+                manifest,
+                record,
+                proof,
+                original.as_ref(),
+            ) {
+                Ok(identities) => identities,
+                Err(error) if !batch_target_ids.contains(record.asset_id.as_str()) => {
+                    validate_existing_resolution_proof_in_mode(
+                        manifest,
+                        record,
+                        proof,
+                        original.as_ref(),
+                        ExistingProofMode::Historical,
+                    )
+                    .map_err(|_| error)?
+                }
+                Err(error) => return Err(error),
+            };
             for identity in resolution_identities {
                 insert_existing_remote_identity(&mut names, record, identity)?;
             }
@@ -956,6 +1003,45 @@ fn validate_existing_resolution_proof(
     proof: &OriginalAssetResolutionProof,
     top_level_original: Option<&OriginalAssetProof>,
 ) -> Result<Vec<RemoteRecordIdentity>, OriginalAssetResolutionError> {
+    validate_existing_resolution_proof_in_mode(
+        manifest,
+        record,
+        proof,
+        top_level_original,
+        ExistingProofMode::Current,
+    )
+}
+
+/// How an existing resolution proof is checked while building the remote
+/// identity index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingProofMode {
+    /// Every check, against today's minimum source age and current lifecycle
+    /// recipes. Always used for records the batch is about to update.
+    Current,
+    /// For records outside the batch only. The proof's own shape, source
+    /// binding (with the historical one-day age floor), evidence coherence and
+    /// remote identities are still fully checked, and an exact original must
+    /// still equal the record's top-level original proof. Lifecycle proofs made
+    /// by older conversion recipes are not re-judged against today's recipes,
+    /// because this index only detects duplicate remote records; it never
+    /// grants or restores any lifecycle state or delete eligibility.
+    Historical,
+}
+
+fn validate_existing_resolution_proof_in_mode(
+    manifest: &Manifest,
+    record: &AssetRecord,
+    proof: &OriginalAssetResolutionProof,
+    top_level_original: Option<&OriginalAssetProof>,
+    mode: ExistingProofMode,
+) -> Result<Vec<RemoteRecordIdentity>, OriginalAssetResolutionError> {
+    let historical = mode == ExistingProofMode::Historical;
+    let min_age_floor_seconds = if historical {
+        LEGACY_MIN_RAW_AGE_SECONDS
+    } else {
+        MIN_RAW_AGE_SECONDS
+    };
     if proof.schema_version != ORIGINAL_ASSET_RESOLUTION_SCHEMA_VERSION
         || validate_inventory(&CloudKitOriginalAssetInventoryFingerprint {
             resolver_version: proof.inventory.resolver_version.clone(),
@@ -973,9 +1059,11 @@ fn validate_existing_resolution_proof(
         return Err(malformed_existing_resolution(record));
     }
 
-    validate_existing_resolution_source(record, proof)?;
-    reconciliation_lifecycle_state(manifest, &record.asset_id, &proof.destination)
-        .map_err(|_| malformed_existing_resolution(record))?;
+    validate_existing_resolution_source(record, proof, min_age_floor_seconds)?;
+    if !historical {
+        reconciliation_lifecycle_state(manifest, &record.asset_id, &proof.destination)
+            .map_err(|_| malformed_existing_resolution(record))?;
+    }
 
     let (evidence, identity) = match &proof.disposition {
         OriginalAssetResolutionDisposition::ExactOriginal { proof: original } => {
@@ -987,12 +1075,13 @@ fn validate_existing_resolution_proof(
                 || original.filename != proof.source.filename
                 || original.size_bytes != proof.source.nas_size_bytes
                 || original.matched_raw_sha256 != proof.source.nas_sha256
-                || !reconciliation_exact_state_is_consistent(
-                    manifest,
-                    &record.asset_id,
-                    &proof.destination,
-                )
-                .map_err(|_| malformed_existing_resolution(record))?
+                || (!historical
+                    && !reconciliation_exact_state_is_consistent(
+                        manifest,
+                        &record.asset_id,
+                        &proof.destination,
+                    )
+                    .map_err(|_| malformed_existing_resolution(record))?)
             {
                 return Err(malformed_existing_resolution(record));
             }
@@ -1093,6 +1182,7 @@ fn validate_existing_resolution_proof(
 fn validate_existing_resolution_source(
     record: &AssetRecord,
     proof: &OriginalAssetResolutionProof,
+    min_age_floor_seconds: u64,
 ) -> Result<(), OriginalAssetResolutionError> {
     let nas = stored_source_proof::<NasRawProof>(record, "nas")
         .map_err(|_| malformed_existing_resolution(record))?;
@@ -1100,7 +1190,7 @@ fn validate_existing_resolution_source(
         .map_err(|_| malformed_existing_resolution(record))?;
     let filename = record.raw_path.file_name().and_then(|name| name.to_str());
 
-    if !source_proofs_are_valid(record, &nas, &source_age)
+    if !source_proofs_are_valid_with_min_age(record, &nas, &source_age, min_age_floor_seconds)
         || proof.source.nas_sha256 != nas.sha256
         || proof.source.nas_size_bytes != nas.size_bytes
         || proof.source.source_captured_unix_seconds != source_age.source_captured_unix_seconds

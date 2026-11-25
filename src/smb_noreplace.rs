@@ -1333,13 +1333,23 @@ fn mount_with_netfs_keychain_credentials(
         )
     };
     if status != 0 || mountpoints.is_null() {
+        eprintln!(
+            "SMB no-replace NetFSMountURLSync failed: status={} mountpoints_null={}",
+            status,
+            mountpoints.is_null()
+        );
         if !mountpoints.is_null() {
             unsafe { CFRelease(mountpoints) };
         }
         return Err(SmbNoReplaceError::MountRecovery);
     }
     let mountpoints = OwnedCf(mountpoints);
-    if unsafe { CFArrayGetCount(mountpoints.0) } != 1 {
+    let mountpoint_count = unsafe { CFArrayGetCount(mountpoints.0) };
+    if mountpoint_count != 1 {
+        eprintln!(
+            "SMB no-replace NetFSMountURLSync returned unexpected mountpoint count={}",
+            mountpoint_count
+        );
         return Err(SmbNoReplaceError::MountRecoveryMismatch);
     }
     let mounted_path = unsafe { CFArrayGetValueAtIndex(mountpoints.0, 0) };

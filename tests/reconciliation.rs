@@ -653,8 +653,31 @@ fn persisted_resolution_proofs_bind_record_source_original_and_state() {
 
         let mut manifest = Manifest::new();
         manifest.upsert(failed_resolver_record("target"));
-        manifest.upsert(historical_record);
+        manifest.upsert(historical_record.clone());
         let before = manifest.clone();
+        if case == "lifecycle-state" {
+            // A lifecycle state the current recipes cannot re-derive on an
+            // unrelated record is historical: it no longer aborts other work,
+            // its remote identity stays claimed, and it gains nothing.
+            assert!(
+                manifest
+                    .apply_original_asset_resolution_batch(batch(
+                        "target",
+                        exact_original_resolution_with_record_name("CPLAsset-historical"),
+                    ))
+                    .is_err()
+            );
+            assert_eq!(manifest, before);
+            manifest
+                .apply_original_asset_resolution_batch(batch(
+                    "target",
+                    exact_original_resolution_with_record_name("CPLAsset-target"),
+                ))
+                .unwrap();
+            assert_eq!(manifest.get("historical").unwrap(), &historical_record);
+            assert!(mark_delete_eligible(&mut manifest, "historical").is_err());
+            continue;
+        }
         assert!(
             manifest
                 .apply_original_asset_resolution_batch(batch(
@@ -668,7 +691,7 @@ fn persisted_resolution_proofs_bind_record_source_original_and_state() {
 }
 
 #[test]
-fn persisted_exact_resolution_rejects_unproven_later_or_failed_state() {
+fn persisted_exact_resolution_with_unproven_later_or_failed_state_is_historical_only() {
     for case in ["delete-eligible", "failed"] {
         let mut historical = Manifest::new();
         historical.upsert(failed_resolver_record_at_strength(
@@ -690,17 +713,32 @@ fn persisted_exact_resolution_rejects_unproven_later_or_failed_state() {
 
         let mut manifest = Manifest::new();
         manifest.upsert(failed_resolver_record("target"));
-        manifest.upsert(historical_record);
+        manifest.upsert(historical_record.clone());
         let before = manifest.clone();
         assert!(
             manifest
                 .apply_original_asset_resolution_batch(batch(
                     "target",
-                    exact_original_resolution_with_record_name("CPLAsset-target"),
+                    exact_original_resolution_with_record_name("CPLAsset-historical"),
                 ))
-                .is_err()
+                .is_err(),
+            "{case}: the historical remote identity must stay claimed"
         );
-        assert_eq!(manifest, before, "{case} must fail closed");
+        assert_eq!(manifest, before);
+        manifest
+            .apply_original_asset_resolution_batch(batch(
+                "target",
+                exact_original_resolution_with_record_name("CPLAsset-target"),
+            ))
+            .unwrap();
+        assert_eq!(
+            manifest.get("historical").unwrap(),
+            &historical_record,
+            "{case}: an unrelated historical record must not change"
+        );
+        if case == "failed" {
+            assert!(mark_delete_eligible(&mut manifest, "historical").is_err());
+        }
     }
 }
 
@@ -1147,4 +1185,148 @@ fn reconciliation_terminal_states_freeze_source_age_proofs() {
         .expect_err("terminal reconciliation classifications must freeze source proof updates");
         assert!(matches!(error, WorkflowError::SourceAgeProofFrozen { .. }));
     }
+}
+
+/// Real shape of a production record (IMG_2995.DNG, raw-00095462d28eec8a)
+/// whose `no_date_candidate` resolution proof was recorded when the minimum
+/// source age was one day. Today's 30-day minimum makes its provenance stale.
+/// The owner record name is a placeholder.
+fn legacy_one_day_no_date_candidate_record() -> AssetRecord {
+    serde_json::from_value(json!({
+        "asset_id": "raw-00095462d28eec8a",
+        "raw_path": "/Volumes/home/Photos/iCloud/PrimarySync/IMG_2995.DNG",
+        "state": "no_action",
+        "proofs": {
+            "nas": {
+                "age_seconds": 92_357_979u64,
+                "canonical_path": "/Volumes/home/Photos/iCloud/PrimarySync/IMG_2995.DNG",
+                "modified_unix_seconds": 1_693_966_820u64,
+                "relative_path": "PrimarySync/IMG_2995.DNG",
+                "sha256": "0903a7ea5eef5b35207d8c710d468930a1c33eaf0e847037f53a06197b761fa8",
+                "size_bytes": 18_513_261u64
+            },
+            "original_asset_resolution": {
+                "destination": {
+                    "database_scope": "private",
+                    "owner_record_name": "_0123456789abcdef0123456789abcdef",
+                    "zone_name": "PrimarySync"
+                },
+                "disposition": "no_date_candidate",
+                "inventory": {
+                    "records_scanned": 1,
+                    "resolver_version": "cloudkit-original-asset-reconcile-v1",
+                    "sha256": "61ec76c0327f500d7387d159b321d08f818469da16dd57c2ebe9a6121e08f2ad"
+                },
+                "observations": {
+                    "ambiguity_evidence": 0,
+                    "date_candidates": 0,
+                    "download_size_mismatches": 0,
+                    "raw_hash_matches": 0,
+                    "raw_resources": 0,
+                    "raw_size_matches": 0,
+                    "replacement_resource_matches": 0
+                },
+                "observed_at_unix_seconds": 1_786_325_066u64,
+                "schema_version": 2,
+                "source": {
+                    "capture_tolerance_seconds": 2,
+                    "filename": "IMG_2995.DNG",
+                    "nas_sha256": "0903a7ea5eef5b35207d8c710d468930a1c33eaf0e847037f53a06197b761fa8",
+                    "nas_size_bytes": 18_513_261u64,
+                    "source_captured_unix_seconds": 1_693_966_820u64
+                }
+            },
+            "source_age": {
+                "min_age_seconds": 86_400u64,
+                "source_captured_unix_seconds": 1_693_966_820u64,
+                "verified_at_unix_seconds": 1_786_324_799u64
+            }
+        },
+        "failures": [],
+        "updated_at": "1786325066.542744000Z"
+    }))
+    .unwrap()
+}
+
+#[test]
+fn legacy_resolution_proof_on_unrelated_record_does_not_abort_the_batch() {
+    let legacy = legacy_one_day_no_date_candidate_record();
+    let mut manifest = Manifest::new();
+    manifest.upsert(failed_resolver_record("target"));
+    manifest.upsert(legacy.clone());
+
+    manifest
+        .apply_original_asset_resolution_batch(batch("target", exact_original_resolution()))
+        .unwrap();
+
+    assert_eq!(manifest.get("raw-00095462d28eec8a").unwrap(), &legacy);
+    let target = manifest.get("target").unwrap();
+    assert!(target.proofs.contains_key("original_asset"));
+    assert!(!target.proofs.contains_key("delete_eligibility"));
+}
+
+#[test]
+fn legacy_resolution_proof_never_grants_delete_eligibility() {
+    let mut manifest = Manifest::new();
+    manifest.upsert(legacy_one_day_no_date_candidate_record());
+    let before = manifest.clone();
+    assert!(mark_delete_eligible(&mut manifest, "raw-00095462d28eec8a").is_err());
+    assert_eq!(manifest, before);
+}
+
+#[test]
+fn legacy_identity_bearing_proof_still_blocks_duplicate_remote_records() {
+    let mut historical = Manifest::new();
+    historical.upsert(failed_resolver_record("historic-exact"));
+    historical
+        .apply_original_asset_resolution_batch(batch("historic-exact", exact_original_resolution()))
+        .unwrap();
+    let mut legacy = historical.get("historic-exact").unwrap().clone();
+    // Make the provenance stale the same way production legacy proofs are.
+    let mut source_age = legacy.proofs["source_age"].clone();
+    source_age["min_age_seconds"] = json!(DAY);
+    legacy.proofs.insert("source_age".to_string(), source_age);
+
+    let mut manifest = Manifest::new();
+    manifest.upsert(failed_resolver_record("target-exact"));
+    manifest.upsert(legacy.clone());
+    let before = manifest.clone();
+    assert!(
+        manifest
+            .apply_original_asset_resolution_batch(batch(
+                "target-exact",
+                exact_original_resolution()
+            ))
+            .is_err(),
+        "a legacy proof's remote identity must still count as claimed"
+    );
+    assert_eq!(manifest, before);
+
+    manifest
+        .apply_original_asset_resolution_batch(batch(
+            "target-exact",
+            exact_original_resolution_with_record_name("CPLAsset-other"),
+        ))
+        .unwrap();
+    assert_eq!(manifest.get("historic-exact").unwrap(), &legacy);
+}
+
+#[test]
+fn legacy_resolution_proof_on_a_batch_target_still_fails_closed() {
+    let mut target = failed_resolver_record("target");
+    let mut proof =
+        legacy_one_day_no_date_candidate_record().proofs["original_asset_resolution"].clone();
+    proof["source"]["filename"] = json!("IMG_0001.dng");
+    target
+        .proofs
+        .insert("original_asset_resolution".to_string(), proof);
+    let mut manifest = Manifest::new();
+    manifest.upsert(target);
+    let before = manifest.clone();
+    assert!(
+        manifest
+            .apply_original_asset_resolution_batch(batch("target", exact_original_resolution()))
+            .is_err()
+    );
+    assert_eq!(manifest, before);
 }
