@@ -2507,6 +2507,7 @@ exit 67
             filename: "IMG_0001.dng".to_string(),
             size_bytes: raw_bytes.len() as u64,
             matched_raw_sha256: format!("{:x}", Sha256::digest(&raw_bytes)),
+            raw_resource_count: None,
         };
         record_original_asset_proof(&mut manifest, "asset-1", original.clone())
             .expect("original asset proof should record");
@@ -2670,6 +2671,7 @@ exit 67
             filename: "IMG_0002.dng".to_string(),
             size_bytes: raw_bytes.len() as u64,
             matched_raw_sha256: format!("{:x}", Sha256::digest(&raw_bytes)),
+            raw_resource_count: None,
         };
         record_original_asset_proof(&mut manifest, "asset-1", original.clone())
             .expect("original asset proof should record");
@@ -4290,6 +4292,7 @@ fi
             filename: "IMG_REAL_HEIF.dng".to_string(),
             size_bytes: raw_bytes.len() as u64,
             matched_raw_sha256: format!("{:x}", Sha256::digest(&raw_bytes)),
+            raw_resource_count: None,
         };
         record_original_asset_proof(&mut manifest, "asset-1", original.clone())
             .expect("original asset proof should record");
@@ -4374,6 +4377,7 @@ exit 67
             filename: "IMG_REAL_SIPS.dng".to_string(),
             size_bytes: raw_bytes.len() as u64,
             matched_raw_sha256: format!("{:x}", Sha256::digest(&raw_bytes)),
+            raw_resource_count: None,
         };
         record_original_asset_proof(&mut manifest, "asset-1", original.clone())
             .expect("original asset proof should record");

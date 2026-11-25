@@ -61,6 +61,7 @@ fn exact_original_resolution_with_record_name(
                 filename: "IMG_0001.dng".to_string(),
                 size_bytes: 42,
                 matched_raw_sha256: RAW_SHA256.to_string(),
+                raw_resource_count: None,
             },
         },
     }
@@ -241,6 +242,7 @@ fn coexistence_resolution() -> CloudKitOriginalAssetResolution {
                 filename: "IMG_0001.dng".to_string(),
                 size_bytes: 42,
                 matched_raw_sha256: RAW_SHA256.to_string(),
+                raw_resource_count: None,
             },
             replacement_proof: CloudKitReplacementResourceProof {
                 record_name: "CPLAsset-coexistence".to_string(),

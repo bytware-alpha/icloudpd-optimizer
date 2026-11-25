@@ -9035,6 +9035,7 @@ mod conversion_failure_tests {
                         filename: "asset.raw".to_string(),
                         size_bytes: 1,
                         matched_raw_sha256: "a".repeat(64),
+                        raw_resource_count: None,
                     },
                 },
                 CloudKitOriginalAssetResolveObservations::default(),
@@ -9582,6 +9583,7 @@ mod legacy_destination_binding_tests {
                     filename: target.filename.clone(),
                     size_bytes: target.raw_size_bytes,
                     matched_raw_sha256: target.matched_raw_sha256.clone(),
+                    raw_resource_count: None,
                 },
                 replacement_proof: CloudKitReplacementResourceProof {
                     record_name: proof.record_name.clone(),

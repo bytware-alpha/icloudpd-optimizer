@@ -62,7 +62,7 @@ use crate::upload::{
     CloudKitOriginalAssetReadTransport, CloudKitOriginalAssetResolveTarget,
     CloudKitRecentlyDeletedProof, CloudKitUploadedHeicReadClient, ReqwestCloudKitDeleteTransport,
     ReqwestCloudKitReadTransport, UploadError, UploadTimings, build_upload_proof,
-    load_cloudkit_delete_session,
+    load_cloudkit_delete_session, read_session_expiry,
 };
 use crate::workflow::{
     ConversionResultProof, DeleteReconciliation, HeicVerificationInput, HeicVerificationProof,
@@ -101,29 +101,64 @@ const DEFAULT_CLOUDKIT_MAX_PAGES: u64 = 2000;
 const DEFAULT_SCAN_ROOT_PREFLIGHT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_LOCAL_MIRROR_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_UPLOAD_TIMEOUT_SECONDS: u64 = 600;
-const MAX_ROLLING_NETWORK_SLOTS: usize = 2;
-static ROLLING_NETWORK_AUTH_PAUSED: AtomicBool = AtomicBool::new(false);
+const DEFAULT_NETWORK_CONCURRENCY: usize = 4;
+const MAX_NETWORK_CONCURRENCY: usize = 8;
+const SEVEN_DAYS_SECONDS: u64 = 7 * 24 * 60 * 60;
+/// Set on 401/403/421, storage full (413), or an expired session. Every
+/// network stage stops for the rest of the scan.
+static ROLLING_NETWORK_PAUSED: AtomicBool = AtomicBool::new(false);
+/// Count of 429/503 responses. Each new one halves network concurrency.
+static NETWORK_THROTTLES: AtomicU64 = AtomicU64::new(0);
 
-fn clear_rolling_network_auth_pause() {
-    ROLLING_NETWORK_AUTH_PAUSED.store(false, Ordering::Relaxed);
+fn clear_rolling_network_pause() {
+    ROLLING_NETWORK_PAUSED.store(false, Ordering::Relaxed);
 }
 
-fn pause_rolling_network_auth() {
-    ROLLING_NETWORK_AUTH_PAUSED.store(true, Ordering::Relaxed);
+fn pause_rolling_network() {
+    ROLLING_NETWORK_PAUSED.store(true, Ordering::Relaxed);
 }
 
-fn rolling_network_auth_paused() -> bool {
-    ROLLING_NETWORK_AUTH_PAUSED.load(Ordering::Relaxed)
+fn rolling_network_paused() -> bool {
+    ROLLING_NETWORK_PAUSED.load(Ordering::Relaxed)
 }
 
 fn note_provider_auth_rejection(message: &str) {
     if provider_auth_rejection_text(message) {
-        pause_rolling_network_auth();
+        pause_rolling_network();
+    }
+    if provider_storage_full_text(message) {
+        pause_rolling_network();
+        log_monitor_event(
+            "icloud_storage_full",
+            current_unix_seconds(),
+            json!({"action": "network_stages_paused"}),
+        );
+    }
+    if provider_throttle_text(message) {
+        NETWORK_THROTTLES.fetch_add(1, Ordering::Relaxed);
     }
 }
 
+/// CloudKit maps QUOTA_EXCEEDED to HTTP 413. Retrying cannot succeed until
+/// the user frees storage, so it is a hard stop, never a record failure.
+pub(crate) fn provider_storage_full_text(message: &str) -> bool {
+    message.contains("returned HTTP 413 ")
+        || message.contains("rejected the upload with status 413:")
+}
+
+pub(crate) fn provider_throttle_text(message: &str) -> bool {
+    ["429", "503"].iter().any(|status| {
+        message.contains(&format!("returned HTTP {status} "))
+            || message.contains(&format!("rejected the upload with status {status}:"))
+    })
+}
+
+/// 401/403 and 421 (stale session or partition) stop the pass. The upload
+/// child reloads the session file on every call, so a refreshed session is
+/// picked up by the next pass.
 pub(crate) fn provider_auth_rejection_text(message: &str) -> bool {
-    message.contains("returned HTTP 401 ")
+    message.contains("returned HTTP 421 ")
+        || message.contains("returned HTTP 401 ")
         || message.contains("returned HTTP 403 ")
         || message.contains("rejected the upload with status 401:")
         || message.contains("rejected the upload with status 403:")
@@ -256,6 +291,20 @@ pub struct MonitorConfig {
     pub upload_session_path: Option<PathBuf>,
     #[serde(default)]
     pub delete_session_path: Option<PathBuf>,
+    /// Library zone this lane reads, uploads to, and deletes from. When set,
+    /// the lane binds the one consolidated account session in
+    /// `delete_session_path` to this zone instead of trusting the zone baked
+    /// into the session file, so Private and Shared lanes share one login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library: Option<CloudKitLibraryDestination>,
+    /// Operator-written approval file (mode 0600) naming the original record
+    /// names that may be deleted, with an expiry. Without it nothing is
+    /// approved, even when `auto_delete` is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_approval_path: Option<PathBuf>,
+    /// Upper bound on concurrent Apple network stages. Defaults to 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_concurrency: Option<usize>,
     #[serde(default)]
     pub mirror_root: Option<PathBuf>,
     #[serde(default = "default_delete_operator")]
@@ -328,6 +377,9 @@ impl MonitorConfig {
             auto_delete: false,
             upload_session_path: None,
             delete_session_path: None,
+            library: None,
+            delete_approval_path: None,
+            network_concurrency: None,
             mirror_root: None,
             delete_operator: default_delete_operator(),
             max_lifecycle_per_scan: default_max_lifecycle_per_scan(),
@@ -459,6 +511,23 @@ impl MonitorConfig {
             return Err(MonitorError::InvalidConfig {
                 message: "rolling_cpu_stage_count must be greater than 0 when set".to_string(),
             });
+        }
+        if self
+            .network_concurrency
+            .is_some_and(|count| count == 0 || count > MAX_NETWORK_CONCURRENCY)
+        {
+            return Err(MonitorError::InvalidConfig {
+                message: format!(
+                    "network_concurrency must be between 1 and {MAX_NETWORK_CONCURRENCY} when set"
+                ),
+            });
+        }
+        if let Some(library) = &self.library {
+            crate::upload::validate_library_destination(library).map_err(|_| {
+                MonitorError::InvalidConfig {
+                    message: "library must be a valid CloudKit library destination".to_string(),
+                }
+            })?;
         }
         if self.rolling_convert_stage_count == Some(0) {
             return Err(MonitorError::InvalidConfig {
@@ -727,9 +796,10 @@ pub fn run_monitor_once(
     config: &MonitorConfig,
     guard: &mut MonitorRunGuard,
 ) -> Result<MonitorScanSummary, MonitorError> {
-    clear_rolling_network_auth_pause();
+    clear_rolling_network_pause();
     clear_pending_monitor_failure_correlation();
     config.validate()?;
+    check_session_expiry(config, current_unix_seconds());
     let preclassified_state =
         if AssetStateStore::db_path_for_manifest(&config.manifest_path).exists() {
             let state_store = Arc::new(guard.state_store(&config.manifest_path)?.clone());
@@ -1982,7 +2052,7 @@ fn run_rolling_lifecycle_delete_batch(
     if !config.auto_delete {
         return Ok(());
     }
-    if rolling_network_auth_paused() {
+    if rolling_network_paused() {
         return Ok(());
     }
     let admitted = admit_rolling_lifecycle_delete_asset_ids(
@@ -2078,8 +2148,7 @@ where
         }
     }
     let base_read_session = if !resolver_asset_ids.is_empty() {
-        let read_session_path = required_path(&config.delete_session_path, "delete_session_path")?;
-        Some(Arc::new(load_cloudkit_delete_session(read_session_path)?))
+        Some(Arc::new(load_lane_cloudkit_session(config)?))
     } else {
         None
     };
@@ -2093,6 +2162,7 @@ where
         cpu_stage_jobs,
         convert_stage_jobs,
         mirror_stage_jobs,
+        network_concurrency(config),
     ));
     let conversion_reservations = Arc::new(RollingConversionReservations::new(resolver_asset_ids));
     let queue = Arc::new(Mutex::new(
@@ -2106,7 +2176,7 @@ where
         summary.started_unix_seconds,
         json!({
             "worker_slots": worker_count,
-            "network_stage_slots": MAX_ROLLING_NETWORK_SLOTS,
+            "network_stage_slots": network_concurrency(config),
             "cpu_stage_slots": cpu_stage_jobs,
             "convert_stage_slots": convert_stage_jobs,
             "mirror_stage_slots": mirror_stage_jobs,
@@ -2348,6 +2418,13 @@ fn rolling_lifecycle_worker_count(config: &MonitorConfig, queued_assets: usize) 
     rolling_lifecycle_configured_worker_count(config).min(queued_assets)
 }
 
+pub(crate) fn network_concurrency(config: &MonitorConfig) -> usize {
+    config
+        .network_concurrency
+        .unwrap_or(DEFAULT_NETWORK_CONCURRENCY)
+        .clamp(1, MAX_NETWORK_CONCURRENCY)
+}
+
 pub(crate) fn rolling_lifecycle_configured_worker_count(config: &MonitorConfig) -> usize {
     config.rolling_worker_count.unwrap_or(config.jobs).max(1)
 }
@@ -2366,7 +2443,7 @@ pub(crate) fn rolling_lifecycle_cpu_stage_jobs(
 ) -> usize {
     config
         .rolling_cpu_stage_count
-        .unwrap_or_else(|| config.jobs.max(1).min(available_parallelism.max(1)))
+        .unwrap_or(available_parallelism)
         .max(1)
 }
 
@@ -2374,10 +2451,9 @@ pub(crate) fn rolling_lifecycle_convert_stage_jobs(
     config: &MonitorConfig,
     cpu_stage_jobs: usize,
 ) -> usize {
-    let default_slots = cpu_stage_jobs.max(1).div_ceil(2).max(1);
     config
         .rolling_convert_stage_count
-        .unwrap_or(default_slots)
+        .unwrap_or(cpu_stage_jobs)
         .max(1)
         .min(cpu_stage_jobs.max(1))
 }
@@ -2423,12 +2499,24 @@ struct RollingStagePermitState {
     available_cpu_stage_slots: usize,
     available_convert_stage_slots: usize,
     available_mirror_stage_slots: usize,
-    available_network_slots: usize,
+    /// Network concurrency: starts at `network_max`, halves on each new
+    /// 429/503, and grows by one after `network_limit` clean releases.
+    network_max: usize,
+    network_limit: usize,
+    network_in_flight: usize,
+    network_throttles_seen: u64,
+    network_clean_releases: usize,
     waiting_cpu_only_slots: usize,
 }
 
 impl RollingStagePermits {
-    fn new(cpu_stage_slots: usize, convert_stage_slots: usize, mirror_stage_slots: usize) -> Self {
+    fn new(
+        cpu_stage_slots: usize,
+        convert_stage_slots: usize,
+        mirror_stage_slots: usize,
+        network_slots: usize,
+    ) -> Self {
+        let network_slots = network_slots.clamp(1, MAX_NETWORK_CONCURRENCY);
         let cpu_stage_slots = cpu_stage_slots.max(1);
         let convert_stage_slots = convert_stage_slots.max(1).min(cpu_stage_slots);
         let mirror_stage_slots = mirror_stage_slots.max(1);
@@ -2440,7 +2528,11 @@ impl RollingStagePermits {
                 available_cpu_stage_slots: cpu_stage_slots,
                 available_convert_stage_slots: convert_stage_slots,
                 available_mirror_stage_slots: mirror_stage_slots,
-                available_network_slots: MAX_ROLLING_NETWORK_SLOTS,
+                network_max: network_slots,
+                network_limit: network_slots,
+                network_in_flight: 0,
+                network_throttles_seen: NETWORK_THROTTLES.load(Ordering::Relaxed),
+                network_clean_releases: 0,
                 waiting_cpu_only_slots: 0,
             }),
             available: Condvar::new(),
@@ -2548,7 +2640,11 @@ impl RollingStagePermits {
             program: "icloudpd-optimizer",
             message: "rolling lifecycle permit lock poisoned".to_string(),
         })?;
-        while state.available_network_slots == 0 {
+        loop {
+            state.observe_network_throttles();
+            if state.network_in_flight < state.network_limit {
+                break;
+            }
             state = self
                 .available
                 .wait(state)
@@ -2557,7 +2653,7 @@ impl RollingStagePermits {
                     message: "rolling lifecycle permit wait failed".to_string(),
                 })?;
         }
-        state.available_network_slots -= 1;
+        state.network_in_flight += 1;
         Ok(())
     }
 
@@ -2583,14 +2679,35 @@ impl RollingStagePermits {
 
     fn release_network_slot(&self) {
         if let Ok(mut state) = self.state.lock() {
-            state.available_network_slots =
-                (state.available_network_slots + 1).min(MAX_ROLLING_NETWORK_SLOTS);
+            state.network_in_flight = state.network_in_flight.saturating_sub(1);
+            if !state.observe_network_throttles() {
+                state.network_clean_releases += 1;
+                if state.network_limit < state.network_max
+                    && state.network_clean_releases >= state.network_limit
+                {
+                    state.network_limit += 1;
+                    state.network_clean_releases = 0;
+                }
+            }
             self.available.notify_all();
         }
     }
 }
 
 impl RollingStagePermitState {
+    /// Halves the network limit (never below one) once per new 429/503.
+    /// Returns true when a new throttle was seen.
+    fn observe_network_throttles(&mut self) -> bool {
+        let throttles = NETWORK_THROTTLES.load(Ordering::Relaxed);
+        if throttles <= self.network_throttles_seen {
+            return false;
+        }
+        self.network_throttles_seen = throttles;
+        self.network_limit = (self.network_limit / 2).max(1);
+        self.network_clean_releases = 0;
+        true
+    }
+
     fn should_wait_for(&self, convert_slot: bool) -> bool {
         self.available_cpu_stage_slots == 0
             || (convert_slot
@@ -2831,12 +2948,6 @@ fn rolling_lifecycle_next_worker_step(
     conversion_capacity_available: bool,
 ) -> Option<RollingAssetStep> {
     if blocks_scheduled_remote_mutation(record) {
-        return None;
-    }
-    if record
-        .proofs
-        .contains_key(crate::photos_import_handoff::PHOTOS_IMPORT_HANDOFF_PROOF)
-    {
         return None;
     }
     match record.state {
@@ -3152,7 +3263,7 @@ fn run_rolling_adjusted_source_resolution<T: CloudKitAdjustedSourceTransport>(
     base_read_session: &CloudKitDeleteSession,
     resolver: &mut CloudKitAdjustedSourceResolver<T>,
 ) -> Result<RollingAssetStepOutcome, MonitorError> {
-    if rolling_network_auth_paused() {
+    if rolling_network_paused() {
         return Ok(RollingAssetStepOutcome::skipped());
     }
     if !execution.config.full_lifecycle || !execution.config.rolling_lifecycle {
@@ -3908,7 +4019,7 @@ fn run_rolling_asset_upload_with_child<F>(
 where
     F: FnOnce(&Path, &str, &AssetRecord, &Path, u64) -> Result<Vec<u8>, MonitorError>,
 {
-    if rolling_network_auth_paused() {
+    if rolling_network_paused() {
         return Ok(RollingAssetStepOutcome::skipped());
     }
     let session_path = required_path(&config.upload_session_path, "upload_session_path")?;
@@ -4749,12 +4860,11 @@ fn resolve_original_asset_batches(
     if target_batches.is_empty() {
         return Ok(());
     }
-    if rolling_network_auth_paused() {
+    if rolling_network_paused() {
         return Ok(());
     }
 
-    let session_path = required_path(&config.delete_session_path, "delete_session_path")?;
-    let session = load_cloudkit_delete_session(session_path)?;
+    let session = load_lane_cloudkit_session(config)?;
     let run_parallel = max_batches.is_some_and(|limit| limit > 1) && target_batches.len() > 1;
     if run_parallel {
         return resolve_original_asset_batches_parallel(
@@ -5117,9 +5227,6 @@ fn upload_verified_heics(
     let asset_ids = asset_ids_matching(manifest, config.max_lifecycle_per_scan, |record| {
         active_lifecycle_allows(Some(active_lifecycle_asset_ids), &record.asset_id)
             && !remote_mutation_blocked(record)
-            && !record
-                .proofs
-                .contains_key(crate::photos_import_handoff::PHOTOS_IMPORT_HANDOFF_PROOF)
             && record.state == State::ConversionVerified
             && record.proofs.contains_key("original_asset")
             && !record.proofs.contains_key("upload")
@@ -5158,9 +5265,9 @@ fn upload_verified_heics(
             }
         }
     }
-    let upload_slots = config.jobs.clamp(1, MAX_ROLLING_NETWORK_SLOTS);
+    let upload_slots = config.jobs.clamp(1, 2);
     for chunk in upload_asset_ids.chunks(upload_slots) {
-        if rolling_network_auth_paused() {
+        if rolling_network_paused() {
             break;
         }
         let manifest_path = config.manifest_path.clone();
@@ -5836,8 +5943,7 @@ fn delete_original_assets(
     active_lifecycle_asset_ids: &[String],
 ) -> Result<(), MonitorError> {
     ensure_delete_nas_mount(config)?;
-    let session_path = required_path(&config.delete_session_path, "delete_session_path")?;
-    let session = load_cloudkit_delete_session(session_path)?;
+    let session = load_lane_cloudkit_session(config)?;
     let transport = ReqwestCloudKitDeleteTransport::new()?;
     let heic_transport = ReqwestCloudKitDeleteTransport::new()?;
     let mut heic_client = CloudKitUploadedHeicReadClient::new(heic_transport);
@@ -7224,12 +7330,14 @@ fn prepare_delete_items(
     if worker_count == 0 {
         return batch;
     }
+    let approved = Arc::new(approved_delete_record_names(config, current_unix_seconds()));
 
     for chunk in asset_ids.chunks(worker_count) {
         let mut handles = Vec::with_capacity(chunk.len());
         for asset_id in chunk {
             let asset_id = asset_id.clone();
             let delete_operator = config.delete_operator.clone();
+            let approved = Arc::clone(&approved);
             let snapshot = match manifest.snapshot_record(&asset_id) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
@@ -7240,7 +7348,7 @@ fn prepare_delete_items(
             handles.push((
                 asset_id.clone(),
                 thread::spawn(move || {
-                    prepare_delete_item_snapshot(&delete_operator, snapshot, &asset_id)
+                    prepare_delete_item_snapshot(&delete_operator, &approved, snapshot, &asset_id)
                 }),
             ));
         }
@@ -7273,10 +7381,12 @@ fn delete_prepare_worker_count(config: &MonitorConfig, queued_assets: usize) -> 
 
 fn prepare_delete_item_snapshot(
     delete_operator: &str,
+    approved: &BTreeSet<String>,
     mut snapshot: Manifest,
     asset_id: &str,
 ) -> Result<DeletePreparationOutcome, MonitorError> {
-    let (prepared, changed) = prepare_delete_item(delete_operator, &mut snapshot, asset_id)?;
+    let (prepared, changed) =
+        prepare_delete_item(delete_operator, approved, &mut snapshot, asset_id)?;
     let checkpoint_record = if changed {
         Some(snapshot.get(asset_id)?.clone())
     } else {
@@ -7288,8 +7398,11 @@ fn prepare_delete_item_snapshot(
     })
 }
 
+/// Approval comes only from the operator's approval file, never from the
+/// monitor: a record is approved here only when that file names it.
 fn prepare_delete_item(
     delete_operator: &str,
+    approved: &BTreeSet<String>,
     manifest: &mut Manifest,
     asset_id: &str,
 ) -> Result<(Option<PreparedDeleteItem>, bool), MonitorError> {
@@ -7298,7 +7411,9 @@ fn prepare_delete_item(
         mark_delete_eligible(manifest, asset_id)?;
         changed = true;
     }
-    if manifest.get(asset_id)?.state == State::DeleteEligible {
+    if manifest.get(asset_id)?.state == State::DeleteEligible
+        && original_record_name(manifest, asset_id).is_some_and(|name| approved.contains(&name))
+    {
         approve_delete(manifest, asset_id, delete_operator)?;
         changed = true;
     }
@@ -7316,6 +7431,11 @@ fn prepare_delete_item(
         }),
         changed,
     ))
+}
+
+fn original_record_name(manifest: &Manifest, asset_id: &str) -> Option<String> {
+    let proof = manifest.get(asset_id).ok()?.proofs.get("original_asset")?;
+    Some(proof.get("record_name")?.as_str()?.to_string())
 }
 
 fn pending_conversion_count(manifest: &Manifest, config: &MonitorConfig) -> usize {
@@ -7568,6 +7688,74 @@ pub fn run_scan_root_preflight_probe(path: &Path) -> Result<(), MonitorError> {
         })?;
     }
     Ok(())
+}
+
+/// Loads the one consolidated account session and binds it to this lane's
+/// library. Lanes never carry their own login snapshot.
+fn load_lane_cloudkit_session(
+    config: &MonitorConfig,
+) -> Result<CloudKitDeleteSession, MonitorError> {
+    let session_path = required_path(&config.delete_session_path, "delete_session_path")?;
+    let session = load_cloudkit_delete_session(session_path)?;
+    match &config.library {
+        Some(library) => Ok(session.bound_to(library)?),
+        None => Ok(session),
+    }
+}
+
+/// Warns within seven days of the session's recorded expiry and stops every
+/// network stage once it has passed.
+fn check_session_expiry(config: &MonitorConfig, now: u64) {
+    let Some(path) = &config.delete_session_path else {
+        return;
+    };
+    let Ok(Some(expires_at)) = read_session_expiry(path) else {
+        return;
+    };
+    let event = if expires_at <= now {
+        pause_rolling_network();
+        "session_expired"
+    } else if expires_at - now <= SEVEN_DAYS_SECONDS {
+        "session_expiring"
+    } else {
+        return;
+    };
+    log_monitor_event(event, now, json!({"expires_at_unix_seconds": expires_at}));
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteApprovalFile {
+    expires_at_unix_seconds: u64,
+    record_names: BTreeSet<String>,
+}
+
+/// Original record names the operator approved for deletion. The file is
+/// written by a person, never by the monitor; it must be mode 0600 and expire
+/// within seven days. Any problem approves nothing.
+fn approved_delete_record_names(config: &MonitorConfig, now: u64) -> BTreeSet<String> {
+    let Some(path) = &config.delete_approval_path else {
+        return BTreeSet::new();
+    };
+    let approval = fs::metadata(path)
+        .ok()
+        .filter(|metadata| {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.is_file() && metadata.permissions().mode() & 0o077 == 0
+        })
+        .and_then(|_| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<DeleteApprovalFile>(&bytes).ok())
+        .filter(|approval| {
+            now < approval.expires_at_unix_seconds
+                && approval.expires_at_unix_seconds - now <= SEVEN_DAYS_SECONDS
+        });
+    match approval {
+        Some(approval) => approval.record_names,
+        None => {
+            log_monitor_event("delete_approval_invalid", now, json!({}));
+            BTreeSet::new()
+        }
+    }
 }
 
 fn log_monitor_event(event: &str, scan_started_unix_seconds: u64, fields: serde_json::Value) {
@@ -12095,30 +12283,171 @@ mod tests {
     use std::io::Write;
     use url::Url;
 
-    #[test]
-    fn service_launchd_plist_renders_stable_associated_bundle_identifier() {
-        let temporary = tempfile::tempdir().expect("temporary service plist directory");
-        let plist_path = temporary
-            .path()
-            .join("com.icloudpd-optimizer.monitor.plist");
-        let hard_stop_path = plist_path.with_extension("hard-stop");
-        let plist = launchd_plist(
-            "com.icloudpd-optimizer.monitor",
-            &temporary.path().join("ICloudPDOptimizerApp"),
-            &temporary.path().join("monitor.json"),
-            &temporary.path().join("monitor.stdout.log"),
-            &temporary.path().join("monitor.stderr.log"),
-            Some("com.icloudpd-optimizer.monitor"),
-            Some(&hard_stop_path),
-        )
-        .expect("stable service plist should render");
+    /// Writes an operator approval covering the fixture originals
+    /// (`CPLAsset-<asset id>`) used by the delete tests.
+    fn approve_test_deletes(config: &mut MonitorConfig) {
+        use std::os::unix::fs::PermissionsExt;
+        let ids = (0..1000)
+            .flat_map(|index| [format!("asset-{index}"), format!("asset-{index:03}")])
+            .chain(('a'..='z').map(|letter| format!("asset-{letter}")))
+            .chain(["asset-ok".to_string(), "asset-bad".to_string()]);
+        let path = config.manifest_path.with_file_name("delete-approval.json");
+        let approval = json!({
+            "expires_at_unix_seconds": current_unix_seconds() + 3600,
+            "record_names": ids.map(|id| format!("CPLAsset-{id}")).collect::<Vec<_>>(),
+        });
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&approval).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        config.delete_approval_path = Some(path);
+    }
 
-        assert!(plist.contains("<key>AssociatedBundleIdentifiers</key>"));
-        assert!(plist.contains("<string>com.icloudpd-optimizer.monitor</string>"));
-        assert!(!plist.contains("io.github.bytware-alpha.icloudpd-optimizer"));
-        assert!(plist.contains("<key>Disabled</key>\n  <true/>"));
-        assert!(plist.contains("--service-hard-stop"));
-        assert!(plist.contains(&hard_stop_path.to_string_lossy().to_string()));
+    /// Prepares a delete as if the operator's approval file named every
+    /// original in the manifest.
+    fn prepare_approved(
+        manifest: &mut Manifest,
+        asset_id: &str,
+    ) -> Result<(Option<PreparedDeleteItem>, bool), MonitorError> {
+        let approved = manifest
+            .records()
+            .keys()
+            .filter_map(|asset_id| original_record_name(manifest, asset_id))
+            .collect();
+        prepare_delete_item("batch-test", &approved, manifest, asset_id)
+    }
+
+    #[test]
+    fn network_limit_halves_on_throttle_and_recovers_additively() {
+        let permits = RollingStagePermits::new(1, 1, 1, 4);
+        let state = || permits.state.lock().unwrap();
+        for _ in 0..4 {
+            permits.acquire_network_slot().unwrap();
+        }
+        NETWORK_THROTTLES.fetch_add(1, Ordering::Relaxed);
+        permits.release_network_slot();
+        assert_eq!(state().network_limit, 2);
+        NETWORK_THROTTLES.fetch_add(1, Ordering::Relaxed);
+        permits.release_network_slot();
+        permits.release_network_slot();
+        permits.release_network_slot();
+        assert_eq!(
+            state().network_limit,
+            2,
+            "two clean releases at limit 1 regrow it to 2"
+        );
+        for _ in 0..2 {
+            permits.acquire_network_slot().unwrap();
+            permits.release_network_slot();
+        }
+        assert_eq!(state().network_limit, 3);
+        for _ in 0..20 {
+            permits.acquire_network_slot().unwrap();
+            permits.release_network_slot();
+        }
+        assert_eq!(
+            state().network_limit,
+            4,
+            "never exceeds the configured maximum"
+        );
+    }
+
+    #[test]
+    fn provider_status_text_classifies_storage_full_and_throttling() {
+        assert!(provider_storage_full_text(
+            "iCloud upload returned HTTP 413 during createUploadUrl"
+        ));
+        assert!(provider_storage_full_text(
+            "iCloud Photos putAsset rejected the upload with status 413: quota"
+        ));
+        for status in ["429", "503"] {
+            assert!(provider_throttle_text(&format!(
+                "iCloud upload returned HTTP {status} during signed upload"
+            )));
+            assert!(provider_throttle_text(&format!(
+                "iCloud Photos putAsset rejected the upload with status {status}: busy"
+            )));
+        }
+        assert!(!provider_throttle_text(
+            "iCloud upload returned HTTP 4290 during x"
+        ));
+        assert!(!provider_storage_full_text("HEIC size mismatch 413"));
+        assert!(!upload_error_should_fail_record(
+            &MonitorError::CommandFailed {
+                program: "icloudpd-optimizer",
+                message: "iCloud upload returned HTTP 413 during createUploadUrl".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn network_concurrency_defaults_to_four_and_is_bounded() {
+        let mut config = MonitorConfig::new("/download", "/manifest.json", "/heic");
+        assert_eq!(network_concurrency(&config), DEFAULT_NETWORK_CONCURRENCY);
+        config.network_concurrency = Some(6);
+        assert_eq!(network_concurrency(&config), 6);
+        config.validate().expect("six upload slots are valid");
+        for invalid in [0, MAX_NETWORK_CONCURRENCY + 1] {
+            config.network_concurrency = Some(invalid);
+            assert!(config.validate().is_err(), "{invalid} must be rejected");
+        }
+    }
+
+    #[test]
+    fn lane_library_must_be_a_valid_destination() {
+        let mut config = MonitorConfig::new("/download", "/manifest.json", "/heic");
+        config.library = Some(CloudKitLibraryDestination {
+            database_scope: CloudKitDatabaseScope::Shared,
+            zone_name: "SharedSync-ABCDEF123456".to_string(),
+            owner_record_name: Some("_owner".to_string()),
+        });
+        config.validate().expect("shared lane library is valid");
+        config.library = Some(CloudKitLibraryDestination {
+            database_scope: CloudKitDatabaseScope::Private,
+            zone_name: "SharedSync-ABCDEF123456".to_string(),
+            owner_record_name: Some("_owner".to_string()),
+        });
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn delete_approval_file_must_be_private_unexpired_and_name_records() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let path = temporary.path().join("delete-approval.json");
+        let mut config = MonitorConfig::new("/download", "/manifest.json", "/heic");
+        let now = 2_000_000_000u64;
+        assert!(approved_delete_record_names(&config, now).is_empty());
+        config.delete_approval_path = Some(path.clone());
+        let write = |value: Value, mode: u32| {
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let valid = json!({"expires_at_unix_seconds": now + 3600, "record_names": ["A", "B"]});
+        write(valid.clone(), 0o600);
+        assert_eq!(
+            approved_delete_record_names(&config, now),
+            BTreeSet::from(["A".to_string(), "B".to_string()])
+        );
+        assert!(
+            approved_delete_record_names(&config, now + 3600).is_empty(),
+            "expired"
+        );
+        write(valid, 0o644);
+        assert!(
+            approved_delete_record_names(&config, now).is_empty(),
+            "readable by others"
+        );
+        for invalid in [
+            json!({"expires_at_unix_seconds": now + SEVEN_DAYS_SECONDS + 1, "record_names": ["A"]}),
+            json!({"expires_at_unix_seconds": now + 60, "record_names": ["A"], "auto_delete": true}),
+            json!({"record_names": ["A"]}),
+        ] {
+            write(invalid.clone(), 0o600);
+            assert!(
+                approved_delete_record_names(&config, now).is_empty(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
@@ -15014,23 +15343,10 @@ printf '%s\n' "$workspace" >> '{}'
     }
 
     #[test]
-    fn rolling_lifecycle_cpu_stage_jobs_cap_cpu_work_without_limiting_slots() {
-        let mut config = MonitorConfig::new("/download", "/manifest.json", "/heic");
-
-        config.jobs = 24;
+    fn rolling_lifecycle_cpu_stage_jobs_default_to_one_per_core() {
+        let config = MonitorConfig::new("/download", "/manifest.json", "/heic");
         assert_eq!(rolling_lifecycle_cpu_stage_jobs(&config, 8), 8);
-
-        config.jobs = 8;
-        assert_eq!(rolling_lifecycle_cpu_stage_jobs(&config, 24), 8);
-
-        config.jobs = 1;
-        assert_eq!(rolling_lifecycle_cpu_stage_jobs(&config, 8), 1);
-
-        config.jobs = 24;
         assert_eq!(rolling_lifecycle_cpu_stage_jobs(&config, 0), 1);
-
-        config.jobs = 0;
-        assert_eq!(rolling_lifecycle_cpu_stage_jobs(&config, 8), 1);
     }
 
     #[test]
@@ -15046,13 +15362,9 @@ printf '%s\n' "$workspace" >> '{}'
     }
 
     #[test]
-    fn rolling_lifecycle_convert_stage_jobs_leave_cpu_room_for_verification() {
+    fn rolling_lifecycle_convert_stage_jobs_default_to_every_cpu_slot() {
         let config = MonitorConfig::new("/download", "/manifest.json", "/heic");
-
-        assert_eq!(rolling_lifecycle_convert_stage_jobs(&config, 8), 4);
-        assert_eq!(rolling_lifecycle_convert_stage_jobs(&config, 7), 4);
-        assert_eq!(rolling_lifecycle_convert_stage_jobs(&config, 2), 1);
-        assert_eq!(rolling_lifecycle_convert_stage_jobs(&config, 1), 1);
+        assert_eq!(rolling_lifecycle_convert_stage_jobs(&config, 8), 8);
         assert_eq!(rolling_lifecycle_convert_stage_jobs(&config, 0), 1);
     }
 
@@ -15111,7 +15423,7 @@ printf '%s\n' "$workspace" >> '{}'
 
     #[test]
     fn rolling_stage_permits_do_not_let_waiting_conversions_consume_cpu_slots() {
-        let permits = Arc::new(RollingStagePermits::new(2, 1, 2));
+        let permits = Arc::new(RollingStagePermits::new(2, 1, 2, 2));
         let first_convert = permits
             .acquire(RollingAssetStep::ConvertHeic)
             .expect("first convert should acquire")
@@ -15151,7 +15463,7 @@ printf '%s\n' "$workspace" >> '{}'
 
     #[test]
     fn rolling_stage_permits_limit_mirrors_without_consuming_cpu_slots() {
-        let permits = Arc::new(RollingStagePermits::new(2, 1, 1));
+        let permits = Arc::new(RollingStagePermits::new(2, 1, 1, 2));
         let first_mirror = permits
             .acquire(RollingAssetStep::RecordLocalMirrors)
             .expect("first mirror should acquire")
@@ -15341,7 +15653,7 @@ printf '%s\n' "$workspace" >> '{}'
         let reservations = Arc::new(RollingConversionReservations::new([
             "resolver-slot".to_string()
         ]));
-        let stage_permits = Arc::new(RollingStagePermits::new(1, 1, 1));
+        let stage_permits = Arc::new(RollingStagePermits::new(1, 1, 1, 2));
         let (lookup_started_sender, lookup_started_receiver) = mpsc::channel();
         let (continue_sender, continue_receiver) = mpsc::channel();
         let worker_config = config.clone();
@@ -15519,7 +15831,7 @@ printf '%s\n' "$workspace" >> '{}'
         fail_next_adjusted_source_resolution_before_cas();
         let error = run_rolling_asset_lifecycle(
             "resolver-error",
-            &Arc::new(RollingStagePermits::new(1, 1, 1)),
+            &Arc::new(RollingStagePermits::new(1, 1, 1, 2)),
             &mut execution,
         )
         .expect_err("injected resolver error should leave the lifecycle");
@@ -15596,7 +15908,7 @@ printf '%s\n' "$workspace" >> '{}'
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_rolling_asset_lifecycle(
                 "resolver-panic",
-                &Arc::new(RollingStagePermits::new(1, 1, 1)),
+                &Arc::new(RollingStagePermits::new(1, 1, 1, 2)),
                 &mut execution,
             )
         }));
@@ -18179,6 +18491,7 @@ printf '%s\n' "$workspace" >> '{}'
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.jobs = 2;
         config.delete_operator = "batch-test".to_string();
+        approve_test_deletes(&mut config);
         config.max_lifecycle_per_scan = 10;
         let mut manifest = Manifest::new();
         for asset_id in ["asset-a", "asset-b"] {
@@ -18270,6 +18583,7 @@ printf '%s\n' "$workspace" >> '{}'
         );
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.delete_operator = "recently-deleted-test".to_string();
+        approve_test_deletes(&mut config);
         let mut manifest = Manifest::new();
         manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-a",
@@ -18331,6 +18645,7 @@ printf '%s\n' "$workspace" >> '{}'
         );
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.delete_operator = "remote-proof-test".to_string();
+        approve_test_deletes(&mut config);
         let mut manifest = Manifest::new();
         manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-a",
@@ -18395,6 +18710,7 @@ printf '%s\n' "$workspace" >> '{}'
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.jobs = 2;
         config.delete_operator = "remote-proof-421-test".to_string();
+        approve_test_deletes(&mut config);
         let mut manifest = Manifest::new();
         for asset_id in ["asset-a", "asset-b"] {
             manifest.upsert_trusted(upload_verified_delete_ready_record(
@@ -18464,6 +18780,7 @@ printf '%s\n' "$workspace" >> '{}'
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.jobs = 2;
         config.delete_operator = "batch-test".to_string();
+        approve_test_deletes(&mut config);
         let mut manifest = Manifest::new();
         let record = upload_verified_delete_ready_record("asset-a", &config.download_root);
         let raw_path = record.raw_path.clone();
@@ -18555,8 +18872,7 @@ printf '%s\n' "$workspace" >> '{}'
         let record = upload_verified_delete_ready_record("asset-a", &config.download_root);
         let raw_path = record.raw_path.clone();
         manifest.upsert_trusted(record);
-        let _ = prepare_delete_item("batch-test", &mut manifest, "asset-a")
-            .expect("approval should succeed");
+        let _ = prepare_approved(&mut manifest, "asset-a").expect("approval should succeed");
         manifest.save_atomic(&config.manifest_path).unwrap();
         let state_store = AssetStateStore::open_writer(
             &config.manifest_path,
@@ -18615,8 +18931,7 @@ printf '%s\n' "$workspace" >> '{}'
             "asset-a",
             &config.download_root,
         ));
-        let _ = prepare_delete_item("batch-test", &mut manifest, "asset-a")
-            .expect("approval should succeed");
+        let _ = prepare_approved(&mut manifest, "asset-a").expect("approval should succeed");
         manifest.save_atomic(&config.manifest_path).unwrap();
         let state_store = AssetStateStore::open_writer(
             &config.manifest_path,
@@ -18677,7 +18992,7 @@ printf '%s\n' "$workspace" >> '{}'
             "asset-a",
             &config.download_root,
         ));
-        let _ = prepare_delete_item("batch-test", &mut manifest, "asset-a").unwrap();
+        let _ = prepare_approved(&mut manifest, "asset-a").unwrap();
         manifest.save_atomic(&config.manifest_path).unwrap();
         let state_store = AssetStateStore::open_writer(
             &config.manifest_path,
@@ -18728,6 +19043,7 @@ printf '%s\n' "$workspace" >> '{}'
         );
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.delete_operator = "batch-test".to_string();
+        approve_test_deletes(&mut config);
         let mut manifest = Manifest::new();
         manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-a",
@@ -18798,11 +19114,11 @@ printf '%s\n' "$workspace" >> '{}'
                 &download_root,
             ));
         }
-        let first = prepare_delete_item("batch-test", &mut manifest, "asset-a")
+        let first = prepare_approved(&mut manifest, "asset-a")
             .unwrap()
             .0
             .unwrap();
-        let second = prepare_delete_item("batch-test", &mut manifest, "asset-b")
+        let second = prepare_approved(&mut manifest, "asset-b")
             .unwrap()
             .0
             .unwrap();
@@ -18853,11 +19169,11 @@ printf '%s\n' "$workspace" >> '{}'
             &download_root,
         ));
         let mut second_manifest = first_manifest.clone();
-        let first = prepare_delete_item("batch-test", &mut first_manifest, "asset-a")
+        let first = prepare_approved(&mut first_manifest, "asset-a")
             .unwrap()
             .0
             .unwrap();
-        let second = prepare_delete_item("batch-test", &mut second_manifest, "asset-a")
+        let second = prepare_approved(&mut second_manifest, "asset-a")
             .unwrap()
             .0
             .unwrap();
@@ -18904,7 +19220,7 @@ printf '%s\n' "$workspace" >> '{}'
             "asset-b",
             &download_root,
         ));
-        let (prepared, _) = prepare_delete_item("batch-test", &mut manifest, "asset-a").unwrap();
+        let (prepared, _) = prepare_approved(&mut manifest, "asset-a").unwrap();
         let unrelated_before = manifest.get("asset-b").unwrap().clone();
         let state_store = AssetStateStore::open_writer(
             tempdir.path().join("manifest.json"),
@@ -18997,8 +19313,8 @@ printf '%s\n' "$workspace" >> '{}'
             let record = upload_verified_delete_ready_record("asset-a", &download_root);
             let raw_path = record.raw_path.clone();
             manifest.upsert_trusted(record);
-            let (prepared, _) = prepare_delete_item("batch-test", &mut manifest, "asset-a")
-                .expect("delete should prevalidate");
+            let (prepared, _) =
+                prepare_approved(&mut manifest, "asset-a").expect("delete should prevalidate");
             let prepared = prepared.expect("approved delete should be prepared");
             let max_age = if expired {
                 thread::sleep(Duration::from_millis(2));
@@ -19052,6 +19368,7 @@ printf '%s\n' "$workspace" >> '{}'
         );
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.delete_operator = "batch-test".to_string();
+        approve_test_deletes(&mut config);
         let mut manifest = Manifest::new();
         manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-a",
@@ -19134,6 +19451,7 @@ printf '%s\n' "$workspace" >> '{}'
             );
             fs::create_dir_all(&config.download_root).expect("download root should be created");
             config.delete_operator = "batch-test".to_string();
+            approve_test_deletes(&mut config);
             let mut manifest = Manifest::new();
             manifest.upsert_trusted(upload_verified_delete_ready_record(
                 "asset-a",
@@ -19196,6 +19514,7 @@ printf '%s\n' "$workspace" >> '{}'
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.jobs = 2;
         config.delete_operator = "batch-test".to_string();
+        approve_test_deletes(&mut config);
         let mut manifest = Manifest::new();
         let first = upload_verified_delete_ready_record("asset-a", &config.download_root);
         let second = upload_verified_delete_ready_record("asset-b", &config.download_root);
@@ -19278,8 +19597,8 @@ printf '%s\n' "$workspace" >> '{}'
             "asset-a",
             &download_root,
         ));
-        let (prepared, changed) = prepare_delete_item("batch-test", &mut manifest, "asset-a")
-            .expect("delete should prevalidate");
+        let (prepared, changed) =
+            prepare_approved(&mut manifest, "asset-a").expect("delete should prevalidate");
         let prepared = prepared.expect("approved delete should be prepared");
         assert!(changed);
         let mut changed_record = manifest.get("asset-a").expect("asset should exist").clone();
@@ -19317,8 +19636,8 @@ printf '%s\n' "$workspace" >> '{}'
             "asset-a",
             &download_root,
         ));
-        let (prepared, _) = prepare_delete_item("batch-test", &mut manifest, "asset-a")
-            .expect("delete should prevalidate");
+        let (prepared, _) =
+            prepare_approved(&mut manifest, "asset-a").expect("delete should prevalidate");
         let prepared = prepared.expect("approved delete should be prepared");
 
         let error = record_prevalidated_delete_execution(
@@ -19356,6 +19675,7 @@ printf '%s\n' "$workspace" >> '{}'
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.jobs = 2;
         config.delete_operator = "batch-test".to_string();
+        approve_test_deletes(&mut config);
         let mut manifest = Manifest::new();
         let active = (0..5)
             .map(|index| format!("asset-{index}"))
@@ -19402,6 +19722,7 @@ printf '%s\n' "$workspace" >> '{}'
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.jobs = 2;
         config.delete_operator = "batch-test".to_string();
+        approve_test_deletes(&mut config);
         let mut manifest = Manifest::new();
         manifest.upsert_trusted(upload_verified_delete_ready_record(
             "asset-ok",
@@ -19445,6 +19766,7 @@ printf '%s\n' "$workspace" >> '{}'
         );
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.delete_operator = "batch-test".to_string();
+        approve_test_deletes(&mut config);
         config.jobs = 500;
         config.max_lifecycle_per_scan = 201;
         let mut manifest = Manifest::new();
@@ -19538,6 +19860,7 @@ printf '%s\n' "$workspace" >> '{}'
         );
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.delete_operator = "batch-test".to_string();
+        approve_test_deletes(&mut config);
         config.max_lifecycle_per_scan = 10;
         let mut manifest = Manifest::new();
         let private_record = upload_verified_delete_ready_record("asset-a", &config.download_root);
@@ -19627,6 +19950,7 @@ printf '%s\n' "$workspace" >> '{}'
         fs::create_dir_all(&config.download_root).expect("download root should be created");
         config.jobs = 2;
         config.delete_operator = "batch-test".to_string();
+        approve_test_deletes(&mut config);
         let mut manifest = Manifest::new();
         for asset_id in ["asset-a", "asset-b"] {
             manifest.upsert_trusted(upload_verified_delete_ready_record(
@@ -20194,7 +20518,7 @@ printf '%s\n' "$workspace" >> '{}'
     }
 
     fn set_library_destination(record: &mut AssetRecord, database_scope: &str, zone_name: &str) {
-        for proof_key in ["original_asset", "upload"] {
+        for proof_key in ["original_asset", "upload", "remote_readback"] {
             record
                 .proofs
                 .get_mut(proof_key)
@@ -20320,6 +20644,20 @@ printf '%s\n' "$workspace" >> '{}'
                 "filename": format!("{asset_id}.DNG"),
                 "size_bytes": 100u64,
                 "matched_raw_sha256": raw_sha,
+                "raw_resource_count": 1,
+            }),
+        );
+        record.proofs.insert(
+            "remote_readback".to_string(),
+            json!({
+                "schema_version": 1,
+                "uploaded_heic_asset_id": format!("uploaded-{asset_id}"),
+                "matched_heic_sha256": heic_sha,
+                "size_bytes": 10u64,
+                "database_scope": "private",
+                "zone_name": "PrimarySync",
+                "record_change_tag": "readback-tag",
+                "master_record_name": format!("master-{asset_id}"),
             }),
         );
         record
@@ -20444,6 +20782,7 @@ printf '%s\n' "$workspace" >> '{}'
                     filename: format!("{asset_id}.DNG"),
                     size_bytes: 9,
                     matched_raw_sha256: "ab".repeat(32),
+                    raw_resource_count: None,
                 },
             },
         }
@@ -25362,7 +25701,7 @@ printf '%s\n' "$workspace" >> '{}'
 
     #[test]
     fn rolling_stage_permits_consume_one_cpu_slot_per_cpu_stage() {
-        let permits = Arc::new(RollingStagePermits::new(4, 2, 4));
+        let permits = Arc::new(RollingStagePermits::new(4, 2, 4, 2));
         let _first = permits
             .acquire(RollingAssetStep::VerifyConvertedHeics)
             .expect("permit acquire should succeed")
@@ -25388,7 +25727,11 @@ printf '%s\n' "$workspace" >> '{}'
             available_cpu_stage_slots: 1,
             available_convert_stage_slots: 1,
             available_mirror_stage_slots: 1,
-            available_network_slots: 2,
+            network_max: 2,
+            network_limit: 2,
+            network_in_flight: 0,
+            network_throttles_seen: 0,
+            network_clean_releases: 0,
             waiting_cpu_only_slots: 1,
         };
 
@@ -26098,8 +26441,8 @@ mod per_photo_hold_scheduling_tests {
 
     #[test]
     fn auth_pause_skips_the_next_upload_without_opening_another_request() {
-        clear_rolling_network_auth_pause();
-        pause_rolling_network_auth();
+        clear_rolling_network_pause();
+        pause_rolling_network();
         let tempdir = tempfile::tempdir().unwrap();
         let mut manifest = Manifest::new();
         manifest.upsert_trusted(held_upload_candidate("eligible", 10));
@@ -26132,13 +26475,13 @@ mod per_photo_hold_scheduling_tests {
         assert_eq!(outcome, RollingAssetStepOutcome::skipped());
         assert!(!*called.lock().unwrap());
         assert_eq!(summary.lock().unwrap().uploads_attempted, 0);
-        clear_rolling_network_auth_pause();
+        clear_rolling_network_pause();
     }
 
     #[test]
     fn auth_pause_skips_later_original_asset_resolution_without_a_session() {
-        clear_rolling_network_auth_pause();
-        pause_rolling_network_auth();
+        clear_rolling_network_pause();
+        pause_rolling_network();
         let tempdir = tempfile::tempdir().unwrap();
         let mut manifest = Manifest::new();
         let mut record = AssetRecord::new("needs-resolve", "/raw/needs-resolve.DNG");
@@ -26186,7 +26529,7 @@ mod per_photo_hold_scheduling_tests {
                 .proofs
                 .contains_key("original_asset")
         );
-        clear_rolling_network_auth_pause();
+        clear_rolling_network_pause();
     }
 
     #[test]
@@ -26206,25 +26549,8 @@ mod per_photo_hold_scheduling_tests {
     }
 
     #[test]
-    fn photos_import_handoff_is_not_scheduled_for_upload() {
-        let mut manifest = Manifest::new();
-        let mut record = held_upload_candidate("canary", 10);
-        record.proofs.insert(
-            crate::photos_import_handoff::PHOTOS_IMPORT_HANDOFF_PROOF.to_string(),
-            json!({"schema_version": 1}),
-        );
-        manifest.upsert_trusted(record);
-        let mut config = MonitorConfig::new("/photos", "/manifest.json", "/heic");
-        config.full_lifecycle = true;
-        config.rolling_lifecycle = true;
-        config.auto_delete = false;
-        let record = manifest.get("canary").unwrap();
-        assert!(rolling_lifecycle_next_worker_step(&manifest, record, &config, true).is_none());
-    }
-
-    #[test]
     fn network_permits_keep_a_third_remote_step_waiting() {
-        let permits = Arc::new(RollingStagePermits::new(4, 2, 4));
+        let permits = Arc::new(RollingStagePermits::new(4, 2, 4, 2));
         let first = permits
             .acquire(RollingAssetStep::UploadVerifiedHeics)
             .unwrap()
@@ -26251,6 +26577,6 @@ mod per_photo_hold_scheduling_tests {
         drop(first);
         handle.join().unwrap();
         drop(second);
-        clear_rolling_network_auth_pause();
+        clear_rolling_network_pause();
     }
 }

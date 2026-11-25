@@ -30,8 +30,7 @@ DEFAULT_COOKIE_DIRECTORY = Path.home() / "icloudpd-optimizer" / "cloudkit-auth-v
 DEFAULT_SESSION_DIRECTORY = Path.home() / "icloudpd-optimizer" / "service" / "private-runtime"
 UPLOAD_FILE = "upload-session-production.json"
 DELETE_PRODUCTION_FILE = "delete-session-production.json"
-DELETE_SHARED_FILE = "delete-session-shared-production.json"
-SESSION_FILES = (UPLOAD_FILE, DELETE_PRODUCTION_FILE, DELETE_SHARED_FILE)
+SESSION_FILES = (UPLOAD_FILE, DELETE_PRODUCTION_FILE)
 SAFE_QUERY_NAMES = frozenset(
     {"clientBuildNumber", "clientMasteringNumber", "clientId", "dsid", "remapEnums", "getCurrentSyncToken"}
 )
@@ -94,7 +93,7 @@ def _normalize_dsid(value: Any) -> str:
 
 def _validate_existing_session(value: dict[str, Any], kind: str) -> None:
     if kind == "upload":
-        required = {"cookies", "dsid", "photosupload_url", "sharedlibrary_url", "time_zone_offset_minutes", "local_time_zone_id"}
+        required = {"cookies", "dsid", "photosupload_url", "time_zone_offset_minutes", "local_time_zone_id"}
     else:
         required = {"cookies", "dsid", "ckdatabasews_url", "cloudkit_query_params", "database_scope", "zone_name", "owner_record_name"}
     missing = sorted(key for key in required if key not in value)
@@ -161,6 +160,17 @@ def _fresh_cookies(service: Any) -> list[dict[str, str]]:
     return result
 
 
+def _session_expiry(service: Any) -> int | None:
+    """Earliest expiry of the X-APPLE-WEBAUTH cookies, the ones Apple checks."""
+    expiries = [
+        cookie.expires
+        for cookie in getattr(getattr(service, "session", None), "cookies", None) or []
+        if str(getattr(cookie, "name", "")).startswith("X-APPLE-WEBAUTH")
+        and isinstance(getattr(cookie, "expires", None), int)
+    ]
+    return min(expiries) if expiries else None
+
+
 def _fresh_auth(service: Any) -> tuple[str, dict[str, Any], list[dict[str, str]]]:
     data = getattr(service, "data", None)
     if not isinstance(data, dict) or not isinstance(data.get("dsInfo"), dict):
@@ -176,7 +186,6 @@ def _fresh_auth(service: Any) -> tuple[str, dict[str, Any], list[dict[str, str]]
     webservices = data.get("webservices")
     urls = {
         "photosupload_url": _fresh_url(webservices, "photosupload"),
-        "sharedlibrary_url": _fresh_url(webservices, "sharedlibrary"),
         "ckdatabasews_url": _fresh_url(webservices, "ckdatabasews"),
     }
     return dsid, urls, _fresh_cookies(service)
@@ -201,12 +210,17 @@ def _safe_query(existing: dict[str, Any], fresh_dsid: str) -> list[dict[str, str
 
 
 def prepare_export(existing: dict[str, dict[str, Any]], service: Any) -> dict[str, dict[str, Any]]:
-    """Validate all inputs and build all three output objects without writing."""
+    """Validate all inputs and build both output objects without writing.
 
-    for kind, key in (("upload", UPLOAD_FILE), ("delete", DELETE_PRODUCTION_FILE), ("delete", DELETE_SHARED_FILE)):
+    One account session serves every library; each monitor lane binds it to
+    its own zone, so there is no per-library session file.
+    """
+
+    for kind, key in (("upload", UPLOAD_FILE), ("delete", DELETE_PRODUCTION_FILE)):
         _validate_existing_session(existing[key], kind)
     fresh_dsid, urls, cookies = _fresh_auth(service)
-    for key in (UPLOAD_FILE, DELETE_PRODUCTION_FILE, DELETE_SHARED_FILE):
+    expires_at = _session_expiry(service)
+    for key in SESSION_FILES:
         if _normalize_dsid(existing[key]["dsid"]) != fresh_dsid:
             raise SessionRefreshError("authenticated account DSID does not match an existing optimizer session")
 
@@ -216,27 +230,25 @@ def prepare_export(existing: dict[str, dict[str, Any]], service: Any) -> dict[st
         "dsid": fresh_dsid,
         "local_time_zone_id": upload_old["local_time_zone_id"],
         "photosupload_url": urls["photosupload_url"],
-        "sharedlibrary_url": urls["sharedlibrary_url"],
         "time_zone_offset_minutes": upload_old["time_zone_offset_minutes"],
     }
-
-    deletes: dict[str, Any] = {}
-    for key in (DELETE_PRODUCTION_FILE, DELETE_SHARED_FILE):
-        old = existing[key]
-        output: dict[str, Any] = {
-            "ckdatabasews_url": urls["ckdatabasews_url"],
-            "cloudkit_query_params": _safe_query(old, fresh_dsid),
-            "cookies": cookies,
-            "database_scope": old["database_scope"],
-            "dsid": fresh_dsid,
-            "owner_record_name": old["owner_record_name"],
-            "zone_name": old["zone_name"],
-        }
-        for field in ("local_time_zone_id", "time_zone_offset_minutes"):
-            if field in old:
-                output[field] = old[field]
-        deletes[key] = output
-    return {UPLOAD_FILE: upload, **deletes}
+    old = existing[DELETE_PRODUCTION_FILE]
+    delete: dict[str, Any] = {
+        "ckdatabasews_url": urls["ckdatabasews_url"],
+        "cloudkit_query_params": _safe_query(old, fresh_dsid),
+        "cookies": cookies,
+        "database_scope": old["database_scope"],
+        "dsid": fresh_dsid,
+        "owner_record_name": old["owner_record_name"],
+        "zone_name": old["zone_name"],
+    }
+    for field in ("local_time_zone_id", "time_zone_offset_minutes"):
+        if field in old:
+            delete[field] = old[field]
+    if expires_at is not None:
+        upload["expires_at_unix_seconds"] = expires_at
+        delete["expires_at_unix_seconds"] = expires_at
+    return {UPLOAD_FILE: upload, DELETE_PRODUCTION_FILE: delete}
 
 
 def _json_bytes(value: dict[str, Any]) -> bytes:

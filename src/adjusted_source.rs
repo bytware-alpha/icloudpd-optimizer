@@ -3124,6 +3124,7 @@ mod tests {
             filename: "unrelated.dng".to_string(),
             size_bytes: 1,
             matched_raw_sha256: "0".repeat(64),
+            raw_resource_count: None,
         };
         let proof = CloudKitAdjustedSourceProof {
             schema_version: ADJUSTED_SOURCE_PROOF_SCHEMA_VERSION.to_string(),

@@ -367,6 +367,11 @@ pub struct OriginalAssetProof {
     pub filename: String,
     pub size_bytes: u64,
     pub matched_raw_sha256: String,
+    /// RAW-typed resources on the original asset and master (`resOriginal`,
+    /// `resOriginalAlt`, ...). Deleting the asset deletes all of them, so a
+    /// delete needs every one hashed locally; unknown means no delete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_resource_count: Option<u32>,
 }
 
 fn primary_sync_zone_name() -> String {
@@ -1191,20 +1196,20 @@ pub fn ensure_upload_dispatch_allowed(
 ) -> Result<VerifiedHeic, WorkflowError> {
     let record = manifest.get(asset_id)?;
     ensure_remote_mutation_allowed_record(record)?;
-    if record
-        .proofs
-        .contains_key(crate::photos_import_handoff::PHOTOS_IMPORT_HANDOFF_PROOF)
-    {
-        return Err(WorkflowError::PhotosImportHandoffPending {
-            asset_id: asset_id.to_string(),
-        });
-    }
     if record.proofs.contains_key(UPLOAD_PROOF) {
         return Err(WorkflowError::UploadAlreadyRecorded {
             asset_id: asset_id.to_string(),
         });
     }
     upload_ready_heic_proof(manifest, asset_id)
+}
+
+/// The original's capture time: the NAS mtime icloudpd set from the
+/// record's `assetDate`, matched against it when the original was resolved.
+pub fn source_capture_unix_seconds(manifest: &Manifest, asset_id: &str) -> Option<u64> {
+    stored_proof::<SourceAgeProof>(manifest, asset_id, SOURCE_AGE_PROOF)
+        .ok()
+        .map(|proof| proof.source_captured_unix_seconds)
 }
 
 pub fn upload_ready_heic_proof(
@@ -1503,6 +1508,25 @@ pub fn mark_delete_eligible<'a>(
         .map_err(WorkflowError::Manifest)
 }
 
+/// Deleting the original asset deletes every resource on it. Refuse unless
+/// the uploaded HEIC was read back from iCloud and the original carries
+/// exactly one RAW resource, the one hashed locally. A paired RAW on
+/// `resOriginalAlt`, or an unknown count, blocks the delete.
+fn require_delete_safe_original(manifest: &Manifest, asset_id: &str) -> Result<(), WorkflowError> {
+    let original = stored_proof::<OriginalAssetProof>(manifest, asset_id, ORIGINAL_ASSET_PROOF)?;
+    let reason = if !remote_readback_is_verified(manifest, asset_id)? {
+        "the uploaded HEIC has no matching remote readback"
+    } else if original.raw_resource_count != Some(1) {
+        "the original has RAW resources that are not all hashed locally"
+    } else {
+        return Ok(());
+    };
+    Err(WorkflowError::DeleteNotSafe {
+        asset_id: asset_id.to_string(),
+        reason,
+    })
+}
+
 pub fn approve_delete<'a>(
     manifest: &'a mut Manifest,
     asset_id: &str,
@@ -1527,6 +1551,7 @@ pub fn approve_delete<'a>(
 
     let facts = validate_pre_delete_facts(manifest, asset_id)?;
     validate_delete_eligibility_chain(manifest, asset_id, &facts)?;
+    require_delete_safe_original(manifest, asset_id)?;
 
     let proof = delete_approval_proof(operator, &facts);
     transition_with_proof(
@@ -1708,6 +1733,7 @@ pub fn prevalidate_approved_original_delete(
     }
 
     let facts = revalidate_delete_plan_proofs(manifest, asset_id)?;
+    require_delete_safe_original(manifest, asset_id)?;
     let original = stored_proof::<OriginalAssetProof>(manifest, asset_id, ORIGINAL_ASSET_PROOF)?;
     let upload = stored_proof::<UploadProof>(manifest, asset_id, UPLOAD_PROOF)?;
     let record = manifest.get(asset_id)?;
@@ -4060,6 +4086,11 @@ pub enum WorkflowError {
     },
     #[error("delete approval operator is required")]
     EmptyOperator,
+    #[error("asset {asset_id} cannot be deleted: {reason}")]
+    DeleteNotSafe {
+        asset_id: String,
+        reason: &'static str,
+    },
     #[error("workflow proof field {field} is required")]
     EmptyProofField { field: &'static str },
     #[error("proof {proof_key} field {field} is invalid: {reason}")]
@@ -4084,10 +4115,6 @@ pub enum WorkflowError {
     RemoteOperationHeld { asset_id: String },
     #[error("upload for {asset_id} is already recorded; refusing a duplicate upload")]
     UploadAlreadyRecorded { asset_id: String },
-    #[error(
-        "asset {asset_id} has a Photos import handoff pending; automatic upload stays blocked until that handoff is rolled back"
-    )]
-    PhotosImportHandoffPending { asset_id: String },
     #[error("operation hold for {asset_id} could not be changed: {reason}")]
     OperationHold {
         asset_id: String,
@@ -4212,6 +4239,7 @@ mod per_photo_lifecycle_tests {
             filename: "IMG_0001.dng".to_string(),
             size_bytes: 42,
             matched_raw_sha256: raw_sha(),
+            raw_resource_count: None,
         }
     }
 
