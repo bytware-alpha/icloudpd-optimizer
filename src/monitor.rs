@@ -51,30 +51,36 @@ use crate::proof::{MIN_RAW_AGE_DAYS, NasRawProof, ProofError};
 use crate::reconciliation::{
     OriginalAssetResolutionBatch, OriginalAssetResolutionBatchSummary, OriginalAssetResolutionError,
 };
+#[cfg(target_os = "macos")]
+use crate::smb_noreplace::SmbMountBinding;
 use crate::state_store::{AssetRecordExactCasUpdate, AssetStateStore, AssetStateStoreError};
 use crate::upload::{
     CLOUDKIT_RECORDS_MODIFY_MAX_OPERATIONS, CloudKitDatabaseScope, CloudKitDeleteBatchRequest,
     CloudKitDeleteBatchSendError, CloudKitDeleteClient, CloudKitDeleteOutcome,
     CloudKitDeleteSession, CloudKitDeleteTransport, CloudKitLibraryDestination,
     CloudKitOriginalAssetBatchResolveOutcome, CloudKitOriginalAssetBatchResolveRequest,
-    CloudKitOriginalAssetResolveTarget, ReqwestCloudKitDeleteTransport,
+    CloudKitOriginalAssetReadTransport, CloudKitOriginalAssetResolveTarget,
+    CloudKitRecentlyDeletedProof, CloudKitUploadedHeicReadClient, ReqwestCloudKitDeleteTransport,
     ReqwestCloudKitReadTransport, UploadError, UploadTimings, build_upload_proof,
     load_cloudkit_delete_session,
 };
-#[cfg(test)]
-use crate::workflow::validate_current_icloudpd_local_mirror_proof;
 use crate::workflow::{
     ConversionResultProof, DeleteReconciliation, HeicVerificationInput, HeicVerificationProof,
     IcloudpdLocalMirrorProof, IcloudpdLocalMirrorProofDisposition, OriginalAssetProof,
     PrevalidatedDelete, SourceAgeProof, UploadProof, VerifiedHeic as UploadVerifiedHeic,
-    WorkflowError, approve_delete, icloudpd_local_mirror_proof_disposition,
+    WorkflowError, approve_delete, hold_delete_for_review, icloudpd_local_mirror_proof_disposition,
     icloudpd_local_mirror_ready_proofs, mark_delete_eligible, prepare_delete_reconciliation,
     prevalidate_approved_original_delete, prove_and_record_nas,
     reconciliation_exact_state_is_consistent, record_adjusted_source_proof,
     record_current_heic_verification, record_icloudpd_local_mirror_proof,
-    record_prevalidated_delete_execution, record_reconciled_delete_execution,
-    record_source_age_proof, record_stage_failure, record_stage_failure_with_kind,
-    record_upload_proof, validated_adjusted_source_for_conversion,
+    record_prevalidated_delete_execution_with_recently_deleted_proof,
+    record_reconciled_delete_execution_with_recently_deleted_proof, record_source_age_proof,
+    record_stage_failure, record_stage_failure_with_kind, record_upload_proof,
+    uploaded_heic_delete_request, validated_adjusted_source_for_conversion,
+};
+#[cfg(test)]
+use crate::workflow::{
+    record_prevalidated_delete_execution, validate_current_icloudpd_local_mirror_proof,
 };
 
 static MONITOR_FAILURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -5207,7 +5213,8 @@ fn upload_verified_heics(
                     if provider_auth_rejection_text(&message) {
                         should_stop = true;
                     }
-                    if upload_error_should_fail_record(&error) {
+                    let reauthentication_required = upload_error_requires_operator_action(&error);
+                    if upload_error_should_fail_record(&error) || reauthentication_required {
                         record_stage_failure(manifest, &outcome.asset_id, "upload", &message)?;
                         manifest_changed = true;
                     }
@@ -5220,7 +5227,8 @@ fn upload_verified_heics(
                             "error": message,
                         }),
                     );
-                    should_stop |= matches!(error, MonitorError::UploadWorkflowTimeout { .. });
+                    should_stop |= reauthentication_required
+                        || matches!(error, MonitorError::UploadWorkflowTimeout { .. });
                     record_monitor_failure(summary, error);
                 }
             }
@@ -5290,6 +5298,14 @@ fn upload_error_should_fail_record(error: &MonitorError) -> bool {
         ]
         .iter()
         .any(|needle| message.contains(needle)),
+        _ => false,
+    }
+}
+
+fn upload_error_requires_operator_action(error: &MonitorError) -> bool {
+    match error {
+        MonitorError::Upload(upload_error) => upload_error.is_reauthentication_required(),
+        MonitorError::CommandFailed { message, .. } => message.contains("HTTP 421"),
         _ => false,
     }
 }
@@ -5819,11 +5835,14 @@ fn delete_original_assets(
     summary: &mut MonitorScanSummary,
     active_lifecycle_asset_ids: &[String],
 ) -> Result<(), MonitorError> {
+    ensure_delete_nas_mount(config)?;
     let session_path = required_path(&config.delete_session_path, "delete_session_path")?;
     let session = load_cloudkit_delete_session(session_path)?;
     let transport = ReqwestCloudKitDeleteTransport::new()?;
+    let heic_transport = ReqwestCloudKitDeleteTransport::new()?;
+    let mut heic_client = CloudKitUploadedHeicReadClient::new(heic_transport);
     let mut client = CloudKitDeleteClient::new(transport);
-    delete_original_assets_with_client(
+    delete_original_assets_with_client_and_remote_heic_verifier(
         config,
         state_store,
         manifest,
@@ -5831,7 +5850,49 @@ fn delete_original_assets(
         active_lifecycle_asset_ids,
         &session,
         &mut client,
+        |manifest, asset_id, destination| {
+            let request =
+                uploaded_heic_delete_request(manifest, asset_id).map_err(MonitorError::Workflow)?;
+            let mut destination_session = session.clone();
+            destination_session.database_scope = destination.database_scope;
+            destination_session.zone = destination.clone();
+            heic_client
+                .resolve_uploaded_heic_asset(&destination_session, &request)
+                .map(|_| ())
+                .map_err(MonitorError::Upload)
+        },
     )?;
+    Ok(())
+}
+
+/// Reconfirm the configured NAS path is still on the exact SMB mount that was
+/// admitted by configuration before any remote delete is attempted.  When no
+/// mount authority is configured, the ordinary NAS proof and final byte hash
+/// gates remain the source of truth (local test fixtures use this mode).
+fn ensure_delete_nas_mount(config: &MonitorConfig) -> Result<(), MonitorError> {
+    #[cfg(target_os = "macos")]
+    if let Some(expected_mount_root) = &config.smb_expected_mount_root {
+        let binding =
+            SmbMountBinding::discover_mount_root(expected_mount_root).map_err(|error| {
+                MonitorError::InvalidConfig {
+                    message: format!(
+                        "NAS delete root is not the configured SMB mount {}: {error}",
+                        expected_mount_root.display()
+                    ),
+                }
+            })?;
+        if config.nas_root != *expected_mount_root {
+            binding
+                .validate_existing_path(&config.nas_root)
+                .map_err(|error| MonitorError::InvalidConfig {
+                    message: format!(
+                        "NAS delete root {} is not on the configured SMB mount {}: {error}",
+                        config.nas_root.display(),
+                        expected_mount_root.display()
+                    ),
+                })?;
+        }
+    }
     Ok(())
 }
 
@@ -5850,6 +5911,7 @@ struct PreparedDeleteItem {
 struct ConfirmedDeleteItem {
     prepared: PreparedDeleteItem,
     outcome: CloudKitDeleteOutcome,
+    recently_deleted_proof: Option<CloudKitRecentlyDeletedProof>,
 }
 
 struct DeletePreflightFailure {
@@ -5867,14 +5929,19 @@ struct ReconciliationDeleteItem {
 struct ConfirmedReconciliationItem {
     item: ReconciliationDeleteItem,
     outcome: CloudKitDeleteOutcome,
+    recently_deleted_proof: CloudKitRecentlyDeletedProof,
 }
 
 #[derive(Default)]
 struct DeleteSubmissionResult {
     confirmed: Vec<ConfirmedDeleteItem>,
+    review_asset_ids: Vec<String>,
+    review_reason: Option<String>,
     attempted_deletes: usize,
     cloudkit_lookup_wall_time_millis: u64,
     cloudkit_modify_wall_time_millis: u64,
+    effect_unknown_asset_ids: Vec<String>,
+    operator_action_required: bool,
 }
 
 #[derive(Default)]
@@ -5924,7 +5991,10 @@ struct DeletePreparationOutcome {
     checkpoint_record: Option<AssetRecord>,
 }
 
-fn delete_original_assets_with_client<T: CloudKitDeleteTransport>(
+#[cfg(test)]
+fn delete_original_assets_with_client<
+    T: CloudKitDeleteTransport + CloudKitOriginalAssetReadTransport,
+>(
     config: &MonitorConfig,
     state_store: &AssetStateStore,
     manifest: &mut Manifest,
@@ -5933,6 +6003,33 @@ fn delete_original_assets_with_client<T: CloudKitDeleteTransport>(
     session: &CloudKitDeleteSession,
     client: &mut CloudKitDeleteClient<T>,
 ) -> Result<(), MonitorError> {
+    delete_original_assets_with_client_and_remote_heic_verifier(
+        config,
+        state_store,
+        manifest,
+        summary,
+        active_lifecycle_asset_ids,
+        session,
+        client,
+        |_manifest, _asset_id, _destination| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn delete_original_assets_with_client_and_remote_heic_verifier<T, F>(
+    config: &MonitorConfig,
+    state_store: &AssetStateStore,
+    manifest: &mut Manifest,
+    summary: &mut MonitorScanSummary,
+    active_lifecycle_asset_ids: &[String],
+    session: &CloudKitDeleteSession,
+    client: &mut CloudKitDeleteClient<T>,
+    mut verify_remote_heic: F,
+) -> Result<(), MonitorError>
+where
+    T: CloudKitDeleteTransport + CloudKitOriginalAssetReadTransport,
+    F: FnMut(&Manifest, &str, &CloudKitLibraryDestination) -> Result<(), MonitorError>,
+{
     let total_started = Instant::now();
     let asset_ids = delete_lifecycle_asset_ids(manifest, config, active_lifecycle_asset_ids);
     if asset_ids.is_empty() {
@@ -5962,6 +6059,9 @@ fn delete_original_assets_with_client<T: CloudKitDeleteTransport>(
             window_asset_ids,
             session,
             client,
+            0,
+            config.cloudkit_page_size,
+            config.cloudkit_max_pages,
         )?;
         timings.cloudkit_lookup_wall_time_millis = timings
             .cloudkit_lookup_wall_time_millis
@@ -6001,13 +6101,80 @@ fn delete_original_assets_with_client<T: CloudKitDeleteTransport>(
                 .push(item);
         }
 
+        let mut stop_after_window = false;
         for items in grouped.into_values() {
+            let mut verified_items = Vec::with_capacity(items.len());
+            let mut remote_verification_changed_manifest = false;
+            let mut remote_verification_requires_operator = false;
+            for item in items {
+                let asset_id = item.prevalidated.asset_id().to_string();
+                let request = item.prevalidated.request();
+                let destination = CloudKitLibraryDestination {
+                    database_scope: request.database_scope,
+                    zone_name: request.zone_name.clone(),
+                    owner_record_name: request.owner_record_name.clone(),
+                };
+                match verify_remote_heic(manifest, &asset_id, &destination) {
+                    Ok(()) => verified_items.push(item),
+                    Err(error) => {
+                        let message = error.to_string();
+                        log_monitor_event(
+                            "delete_remote_heic_verification_failed",
+                            summary.started_unix_seconds,
+                            json!({
+                                "asset_id": asset_id,
+                                "error": message,
+                            }),
+                        );
+                        let reauthentication_required = matches!(
+                            &error,
+                            MonitorError::Upload(upload_error)
+                                if upload_error.is_reauthentication_required()
+                        );
+                        record_monitor_failure(summary, error);
+                        if reauthentication_required {
+                            remote_verification_requires_operator = true;
+                            if let Err(failure_error) =
+                                record_stage_failure(manifest, &asset_id, "delete", &message)
+                            {
+                                record_monitor_failure(
+                                    summary,
+                                    MonitorError::Workflow(failure_error),
+                                );
+                            } else {
+                                remote_verification_changed_manifest = true;
+                            }
+                        }
+                        if remote_verification_requires_operator {
+                            break;
+                        }
+                    }
+                }
+            }
+            if remote_verification_changed_manifest {
+                checkpoint_manifest_state(state_store, manifest)?;
+            }
+            if remote_verification_requires_operator {
+                // A 421/expired-session response is terminal for this pass.
+                // Do not submit any previously verified item with the same
+                // session, and do not continue to another destination group.
+                stop_after_window = true;
+                break;
+            }
+            if verified_items.is_empty() {
+                stop_after_window |= remote_verification_requires_operator;
+                continue;
+            }
+            ensure_delete_nas_mount(config)?;
             let submission = submit_prepared_delete_group(
-                items,
+                verified_items,
                 session,
                 client,
                 summary,
                 DELETE_LIVE_RAW_MAX_AGE,
+                0,
+                config.cloudkit_page_size,
+                config.cloudkit_max_pages,
             );
             attempted_deletes =
                 attempted_deletes.saturating_add(submission.attempted_deletes as u64);
@@ -6017,7 +6184,54 @@ fn delete_original_assets_with_client<T: CloudKitDeleteTransport>(
             timings.cloudkit_modify_wall_time_millis = timings
                 .cloudkit_modify_wall_time_millis
                 .saturating_add(submission.cloudkit_modify_wall_time_millis);
+            if !submission.effect_unknown_asset_ids.is_empty() {
+                for asset_id in &submission.effect_unknown_asset_ids {
+                    let message = if submission.operator_action_required {
+                        "CloudKit delete effect is unknown; obtain a fresh authenticated session before retrying"
+                    } else {
+                        "CloudKit delete effect is unknown; refusing an automatic retry"
+                    };
+                    if let Err(error) = record_stage_failure(manifest, asset_id, "delete", message)
+                    {
+                        record_monitor_failure(summary, MonitorError::Workflow(error));
+                    } else {
+                        remote_verification_changed_manifest = true;
+                    }
+                }
+                if remote_verification_changed_manifest {
+                    checkpoint_manifest_state(state_store, manifest)?;
+                }
+            }
+            if !submission.review_asset_ids.is_empty() {
+                let message = submission.review_reason.as_deref().unwrap_or(
+                    "CloudKit delete effect could not be independently proven in Recently Deleted",
+                );
+                if let Err(error) = hold_delete_review_asset_ids(
+                    state_store,
+                    manifest,
+                    summary,
+                    &submission.review_asset_ids,
+                    message,
+                    json!({
+                        "disposition": "needs_review",
+                        "reason": message,
+                    }),
+                ) {
+                    record_monitor_failure(summary, error);
+                } else {
+                    remote_verification_changed_manifest = true;
+                }
+                if remote_verification_changed_manifest {
+                    checkpoint_manifest_state(state_store, manifest)?;
+                }
+            }
+            stop_after_window |= submission.operator_action_required
+                || !submission.effect_unknown_asset_ids.is_empty()
+                || !submission.review_asset_ids.is_empty();
             if submission.confirmed.is_empty() {
+                if stop_after_window {
+                    break;
+                }
                 continue;
             }
             let commit = match stage_and_commit_confirmed_deletes(
@@ -6050,6 +6264,12 @@ fn delete_original_assets_with_client<T: CloudKitDeleteTransport>(
             timings.atomic_batch_commit_wall_time_micros = timings
                 .atomic_batch_commit_wall_time_micros
                 .saturating_add(commit.atomic_batch_commit_wall_time_micros);
+            if stop_after_window {
+                break;
+            }
+        }
+        if stop_after_window {
+            break;
         }
     }
 
@@ -6104,13 +6324,17 @@ fn delete_submission_window_size(config: &MonitorConfig, queued_assets: usize) -
         .min(queued_assets)
 }
 
-fn reconcile_delete_window<T: CloudKitDeleteTransport>(
+#[allow(clippy::too_many_arguments)]
+fn reconcile_delete_window<T: CloudKitDeleteTransport + CloudKitOriginalAssetReadTransport>(
     state_store: &AssetStateStore,
     manifest: &mut Manifest,
     summary: &mut MonitorScanSummary,
     asset_ids: &[String],
     session: &CloudKitDeleteSession,
     client: &mut CloudKitDeleteClient<T>,
+    recently_deleted_start_rank: u64,
+    recently_deleted_page_size: u64,
+    recently_deleted_max_pages: u64,
 ) -> Result<DeleteReconciliationResult, MonitorError> {
     let mut result = DeleteReconciliationResult::default();
     let mut grouped = BTreeMap::<CloudKitLibraryDestination, Vec<ReconciliationDeleteItem>>::new();
@@ -6160,11 +6384,14 @@ fn reconcile_delete_window<T: CloudKitDeleteTransport>(
                     .cloudkit_lookup_wall_time_millis
                     .saturating_add(lookup_started.elapsed().as_millis() as u64);
                 record_monitor_failure(summary, MonitorError::Upload(error));
-                result.remaining_asset_ids.extend(
-                    items
-                        .iter()
-                        .map(|item| item.reconciliation.asset_id().to_string()),
-                );
+                hold_delete_review_items(
+                    state_store,
+                    manifest,
+                    summary,
+                    items.iter().collect(),
+                    "CloudKit delete reconciliation lookup failed after a possible dispatch",
+                    json!({"disposition":"lookup_error"}),
+                )?;
                 continue;
             }
         };
@@ -6172,9 +6399,10 @@ fn reconcile_delete_window<T: CloudKitDeleteTransport>(
             .cloudkit_lookup_wall_time_millis
             .saturating_add(lookup_started.elapsed().as_millis() as u64);
 
-        let mut outcomes = lookup
-            .confirmed_deleted
-            .into_iter()
+        let lookup_confirmed = lookup.confirmed_deleted;
+        let mut outcomes = lookup_confirmed
+            .iter()
+            .cloned()
             .map(|outcome| (outcome.record_name.clone(), outcome))
             .collect::<BTreeMap<_, _>>();
         let unconfirmed = lookup
@@ -6182,14 +6410,91 @@ fn reconcile_delete_window<T: CloudKitDeleteTransport>(
             .into_iter()
             .map(|request| request.record_name)
             .collect::<BTreeSet<_>>();
+
+        let recently_deleted_request = CloudKitDeleteBatchRequest {
+            requests: items
+                .iter()
+                .filter(|item| {
+                    lookup_confirmed.iter().any(|outcome| {
+                        outcome.record_name == item.reconciliation.request().record_name
+                    })
+                })
+                .map(|item| item.reconciliation.request().clone())
+                .collect(),
+        };
+        if recently_deleted_request.requests.is_empty() {
+            hold_delete_review_items(
+                state_store,
+                manifest,
+                summary,
+                items.iter().collect(),
+                "CloudKit delete lookup returned no confirmed asset for independent Recently Deleted proof",
+                json!({"disposition":"lookup_unconfirmed"}),
+            )?;
+            continue;
+        }
+        let recently_started = Instant::now();
+        let recently_deleted = client.lookup_recently_deleted(
+            &destination_session,
+            &recently_deleted_request,
+            recently_deleted_start_rank,
+            recently_deleted_page_size,
+            recently_deleted_max_pages,
+        );
+        result.cloudkit_lookup_wall_time_millis = result
+            .cloudkit_lookup_wall_time_millis
+            .saturating_add(recently_started.elapsed().as_millis() as u64);
+        let recently_deleted = match recently_deleted {
+            Ok(value) => value,
+            Err(error) => {
+                let message =
+                    format!("Recently Deleted proof query failed during reconciliation: {error}");
+                let review_items = items.iter().collect::<Vec<_>>();
+                hold_delete_review_items(
+                    state_store,
+                    manifest,
+                    summary,
+                    review_items,
+                    &message,
+                    json!({"disposition":"query_error"}),
+                )?;
+                record_monitor_failure(summary, MonitorError::Upload(error));
+                continue;
+            }
+        };
+        let recently_by_record = recently_deleted
+            .confirmed
+            .into_iter()
+            .map(|proof| (proof.record_name.clone(), proof))
+            .collect::<BTreeMap<_, _>>();
         for item in items {
             let record_name = item.reconciliation.request().record_name.clone();
             if let Some(outcome) = outcomes.remove(&record_name) {
-                confirmed.push(ConfirmedReconciliationItem { item, outcome });
+                if let Some(recently_deleted_proof) = recently_by_record.get(&record_name) {
+                    confirmed.push(ConfirmedReconciliationItem {
+                        item,
+                        outcome,
+                        recently_deleted_proof: recently_deleted_proof.clone(),
+                    });
+                } else {
+                    hold_delete_review_items(
+                        state_store,
+                        manifest,
+                        summary,
+                        vec![&item],
+                        "Recently Deleted query did not prove the reconciled asset",
+                        json!({"disposition":"missing_or_unconfirmed"}),
+                    )?;
+                }
             } else if unconfirmed.contains(&record_name) {
-                result
-                    .remaining_asset_ids
-                    .push(item.reconciliation.asset_id().to_string());
+                hold_delete_review_items(
+                    state_store,
+                    manifest,
+                    summary,
+                    vec![&item],
+                    "CloudKit delete lookup did not confirm the asset and a safe Recently Deleted proof is unavailable",
+                    json!({"disposition":"lookup_unconfirmed"}),
+                )?;
             } else {
                 return Err(MonitorError::CommandFailed {
                     program: "icloudpd-optimizer",
@@ -6218,6 +6523,73 @@ fn reconcile_delete_window<T: CloudKitDeleteTransport>(
     Ok(result)
 }
 
+fn hold_delete_review_items(
+    state_store: &AssetStateStore,
+    manifest: &mut Manifest,
+    summary: &mut MonitorScanSummary,
+    items: Vec<&ReconciliationDeleteItem>,
+    message: &str,
+    proof: Value,
+) -> Result<(), MonitorError> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut changed_records = Vec::with_capacity(items.len());
+    for item in items {
+        let asset_id = item.reconciliation.asset_id().to_string();
+        let record = hold_delete_for_review(manifest, &asset_id, message, proof.clone())?;
+        changed_records.push(record.clone());
+    }
+    let elapsed = state_store.persist_records_atomic_trusted(changed_records.iter())?;
+    for record in &changed_records {
+        manifest.upsert_trusted(record.clone());
+    }
+    log_monitor_event(
+        "asset_state_batch_committed",
+        summary.started_unix_seconds,
+        json!({
+            "proof_stage": "delete_recently_deleted_review",
+            "state": State::NeedsReview.as_str(),
+            "atomic_batch_records": changed_records.len(),
+            "atomic_batch_commit_wall_time_micros": elapsed.as_micros() as u64,
+        }),
+    );
+    Ok(())
+}
+
+fn hold_delete_review_asset_ids(
+    state_store: &AssetStateStore,
+    manifest: &mut Manifest,
+    summary: &mut MonitorScanSummary,
+    asset_ids: &[String],
+    message: &str,
+    proof: Value,
+) -> Result<(), MonitorError> {
+    if asset_ids.is_empty() {
+        return Ok(());
+    }
+    let mut changed_records = Vec::with_capacity(asset_ids.len());
+    for asset_id in asset_ids {
+        let record = hold_delete_for_review(manifest, asset_id, message, proof.clone())?;
+        changed_records.push(record.clone());
+    }
+    let elapsed = state_store.persist_records_atomic_trusted(changed_records.iter())?;
+    for record in &changed_records {
+        manifest.upsert_trusted(record.clone());
+    }
+    log_monitor_event(
+        "asset_state_batch_committed",
+        summary.started_unix_seconds,
+        json!({
+            "proof_stage": "delete_recently_deleted_review",
+            "state": State::NeedsReview.as_str(),
+            "atomic_batch_records": changed_records.len(),
+            "atomic_batch_commit_wall_time_micros": elapsed.as_micros() as u64,
+        }),
+    );
+    Ok(())
+}
+
 fn stage_and_commit_reconciled_deletes(
     state_store: &AssetStateStore,
     manifest: &mut Manifest,
@@ -6235,10 +6607,11 @@ fn stage_and_commit_reconciled_deletes(
     let mut changed_records = Vec::with_capacity(confirmed.len());
     let mut totals = DeleteCommitTotals::default();
     for confirmed_item in confirmed {
-        let record = record_reconciled_delete_execution(
+        let record = record_reconciled_delete_execution_with_recently_deleted_proof(
             &mut staged,
             confirmed_item.item.reconciliation,
             confirmed_item.outcome,
+            Some(confirmed_item.recently_deleted_proof),
         )?;
         changed_records.push(record.clone());
         totals.recorded = totals.recorded.saturating_add(1);
@@ -6323,12 +6696,16 @@ fn process_delete_preparation_window(
     })
 }
 
-fn submit_prepared_delete_group<T: CloudKitDeleteTransport>(
+#[allow(clippy::too_many_arguments)]
+fn submit_prepared_delete_group<T: CloudKitDeleteTransport + CloudKitOriginalAssetReadTransport>(
     items: Vec<PreparedDeleteItem>,
     session: &CloudKitDeleteSession,
     client: &mut CloudKitDeleteClient<T>,
     summary: &mut MonitorScanSummary,
     max_live_raw_age: Duration,
+    recently_deleted_start_rank: u64,
+    recently_deleted_page_size: u64,
+    recently_deleted_max_pages: u64,
 ) -> DeleteSubmissionResult {
     submit_prepared_delete_group_with_clock(
         items,
@@ -6336,25 +6713,37 @@ fn submit_prepared_delete_group<T: CloudKitDeleteTransport>(
         client,
         summary,
         max_live_raw_age,
+        recently_deleted_start_rank,
+        recently_deleted_page_size,
+        recently_deleted_max_pages,
         SystemTime::now,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn submit_prepared_delete_group_with_clock<T, F>(
     items: Vec<PreparedDeleteItem>,
     session: &CloudKitDeleteSession,
     client: &mut CloudKitDeleteClient<T>,
     summary: &mut MonitorScanSummary,
     max_live_raw_age: Duration,
+    recently_deleted_start_rank: u64,
+    recently_deleted_page_size: u64,
+    recently_deleted_max_pages: u64,
     mut now: F,
 ) -> DeleteSubmissionResult
 where
-    T: CloudKitDeleteTransport,
+    T: CloudKitDeleteTransport + CloudKitOriginalAssetReadTransport,
     F: FnMut() -> SystemTime,
 {
     if items.is_empty() {
         return DeleteSubmissionResult::default();
     }
+
+    let all_asset_ids = items
+        .iter()
+        .map(|item| item.prevalidated.asset_id().to_string())
+        .collect::<Vec<_>>();
 
     let first_request = items[0].prevalidated.request();
     let database_scope = first_request.database_scope;
@@ -6406,7 +6795,7 @@ where
                 .iter()
                 .filter_map(|item| {
                     item.prevalidated
-                        .validate_freshness_at(max_live_raw_age, request_time)
+                        .validate_live_raw_at(max_live_raw_age, request_time)
                         .err()
                         .map(|error| DeletePreflightFailure {
                             asset_id: item.prevalidated.asset_id().to_string(),
@@ -6454,6 +6843,7 @@ where
         }
         Err(CloudKitDeleteBatchSendError::Remote(modify_error)) => {
             let cloudkit_modify_wall_time_millis = modify_started.elapsed().as_millis() as u64;
+            let modify_reauthentication_required = modify_error.is_reauthentication_required();
             let modify_error_message = modify_error.to_string();
             log_monitor_event(
                 "delete_batch_cloudkit_ambiguous",
@@ -6503,14 +6893,40 @@ where
                             ),
                         );
                     }
-                    return finish_delete_submission(
+                    let review_asset_ids = reconciliation
+                        .unconfirmed
+                        .iter()
+                        .filter_map(|request| {
+                            items
+                                .iter()
+                                .find(|item| {
+                                    item.prevalidated.request().record_name == request.record_name
+                                })
+                                .map(|item| item.prevalidated.asset_id().to_string())
+                        })
+                        .collect::<Vec<_>>();
+                    let mut result = finish_delete_submission_with_recently_deleted(
                         items,
                         reconciliation.confirmed_deleted,
+                        review_asset_ids,
+                        &all_asset_ids,
                         attempted_deletes,
                         cloudkit_lookup_wall_time_millis,
                         cloudkit_modify_wall_time_millis,
                         summary,
+                        client,
+                        &destination_session,
+                        recently_deleted_start_rank,
+                        recently_deleted_page_size,
+                        recently_deleted_max_pages,
                     );
+                    // A 421/expired-session response is terminal for this
+                    // monitor pass.  The Recently Deleted proof gate still
+                    // decides which records may be committed; this flag only
+                    // prevents the next batch from blindly retrying with the
+                    // same session.
+                    result.operator_action_required = modify_reauthentication_required;
+                    return result;
                 }
                 Err(lookup_error) => {
                     let cloudkit_lookup_wall_time_millis =
@@ -6533,9 +6949,16 @@ where
                         ),
                     );
                     return DeleteSubmissionResult {
+                        review_asset_ids: all_asset_ids.to_vec(),
+                        review_reason: Some(
+                            "CloudKit delete reconciliation failed after a possible dispatch"
+                                .to_string(),
+                        ),
                         attempted_deletes,
                         cloudkit_lookup_wall_time_millis,
                         cloudkit_modify_wall_time_millis,
+                        operator_action_required: modify_reauthentication_required
+                            || lookup_error.is_reauthentication_required(),
                         ..DeleteSubmissionResult::default()
                     };
                 }
@@ -6543,25 +6966,42 @@ where
         }
     };
 
-    finish_delete_submission(
+    finish_delete_submission_with_recently_deleted(
         items,
         outcomes,
+        Vec::new(),
+        &all_asset_ids,
         attempted_deletes,
         0,
         modify_started.elapsed().as_millis() as u64,
         summary,
+        client,
+        &destination_session,
+        recently_deleted_start_rank,
+        recently_deleted_page_size,
+        recently_deleted_max_pages,
     )
 }
 
-fn finish_delete_submission(
+#[allow(clippy::too_many_arguments)]
+fn finish_delete_submission_with_recently_deleted<
+    T: CloudKitDeleteTransport + CloudKitOriginalAssetReadTransport,
+>(
     items: Vec<PreparedDeleteItem>,
     outcomes: Vec<CloudKitDeleteOutcome>,
+    mut review_asset_ids: Vec<String>,
+    all_asset_ids: &[String],
     attempted_deletes: usize,
     cloudkit_lookup_wall_time_millis: u64,
     cloudkit_modify_wall_time_millis: u64,
     summary: &mut MonitorScanSummary,
+    client: &mut CloudKitDeleteClient<T>,
+    session: &CloudKitDeleteSession,
+    recently_deleted_start_rank: u64,
+    recently_deleted_page_size: u64,
+    recently_deleted_max_pages: u64,
 ) -> DeleteSubmissionResult {
-    let confirmed = match pair_confirmed_delete_outcomes(items, outcomes) {
+    let mut confirmed = match pair_confirmed_delete_outcomes(items, outcomes) {
         Ok(confirmed) => confirmed,
         Err(error) => {
             log_monitor_event(
@@ -6575,10 +7015,68 @@ fn finish_delete_submission(
             Vec::new()
         }
     };
+    if confirmed.is_empty() && review_asset_ids.is_empty() && !all_asset_ids.is_empty() {
+        review_asset_ids.extend(all_asset_ids.iter().cloned());
+    }
+    let request = CloudKitDeleteBatchRequest {
+        requests: confirmed
+            .iter()
+            .map(|item| item.prepared.prevalidated.request().clone())
+            .collect(),
+    };
+    let mut lookup_wall_time_millis = cloudkit_lookup_wall_time_millis;
+    let mut operator_action_required = false;
+    if !request.requests.is_empty() {
+        let started = Instant::now();
+        let recently_deleted = client.lookup_recently_deleted(
+            session,
+            &request,
+            recently_deleted_start_rank,
+            recently_deleted_page_size,
+            recently_deleted_max_pages,
+        );
+        lookup_wall_time_millis =
+            lookup_wall_time_millis.saturating_add(started.elapsed().as_millis() as u64);
+        match recently_deleted {
+            Ok(recently_deleted) => {
+                let proofs = recently_deleted
+                    .confirmed
+                    .into_iter()
+                    .map(|proof| (proof.record_name.clone(), proof))
+                    .collect::<BTreeMap<_, _>>();
+                confirmed.retain_mut(|item| {
+                    let record_name = item.prepared.prevalidated.request().record_name.as_str();
+                    if let Some(proof) = proofs.get(record_name) {
+                        item.recently_deleted_proof = Some(proof.clone());
+                        true
+                    } else {
+                        review_asset_ids.push(item.prepared.prevalidated.asset_id().to_string());
+                        false
+                    }
+                });
+            }
+            Err(error) => {
+                operator_action_required = error.is_reauthentication_required();
+                record_monitor_failure(summary, MonitorError::Upload(error));
+                review_asset_ids.extend(all_asset_ids.iter().cloned());
+                confirmed.clear();
+            }
+        }
+    }
+    review_asset_ids.sort();
+    review_asset_ids.dedup();
+    let review_reason = (!review_asset_ids.is_empty()).then(|| {
+        "Recently Deleted proof was missing, false, or ambiguous after a possible CloudKit dispatch"
+            .to_string()
+    });
     DeleteSubmissionResult {
         confirmed,
+        effect_unknown_asset_ids: Vec::new(),
+        operator_action_required,
+        review_asset_ids,
+        review_reason,
         attempted_deletes,
-        cloudkit_lookup_wall_time_millis,
+        cloudkit_lookup_wall_time_millis: lookup_wall_time_millis,
         cloudkit_modify_wall_time_millis,
     }
 }
@@ -6605,7 +7103,11 @@ fn pair_confirmed_delete_outcomes(
     for prepared in items {
         let record_name = prepared.prevalidated.request().record_name.clone();
         if let Some(outcome) = outcomes_by_record_name.remove(&record_name) {
-            confirmed.push(ConfirmedDeleteItem { prepared, outcome });
+            confirmed.push(ConfirmedDeleteItem {
+                prepared,
+                outcome,
+                recently_deleted_proof: None,
+            });
         }
     }
     if let Some(record_name) = outcomes_by_record_name.into_keys().next() {
@@ -6635,10 +7137,18 @@ fn stage_and_commit_confirmed_deletes(
     let mut totals = DeleteCommitTotals::default();
     for confirmed_item in confirmed {
         let asset_id = confirmed_item.prepared.prevalidated.asset_id().to_string();
-        let record = record_prevalidated_delete_execution(
+        let recently_deleted_proof =
+            confirmed_item
+                .recently_deleted_proof
+                .ok_or(MonitorError::CommandFailed {
+                    program: "icloudpd-optimizer",
+                    message: "delete commit missing independent Recently Deleted proof".to_string(),
+                })?;
+        let record = record_prevalidated_delete_execution_with_recently_deleted_proof(
             &mut staged,
             confirmed_item.prepared.prevalidated,
             confirmed_item.outcome,
+            Some(recently_deleted_proof),
         )?;
         if record.state != State::Deleted {
             return Err(MonitorError::CommandFailed {
@@ -13200,6 +13710,40 @@ printf '%s\n' "$workspace" >> '{}'
         image.save(path).expect("RGB preview PNG should be written");
     }
 
+    fn recently_deleted_response_from_records(payload: &Value, source: &Value) -> Value {
+        let zone = payload
+            .get("zoneID")
+            .cloned()
+            .unwrap_or_else(|| json!({"zoneName": "PrimarySync"}));
+        let records = source
+            .get("records")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|record| {
+                let record_name = record.get("recordName")?.as_str()?;
+                let record_change_tag = record.get("recordChangeTag")?.as_str()?;
+                Some(json!({
+                    "recordName": record_name,
+                    "recordType": "CPLAsset",
+                    "recordChangeTag": record_change_tag,
+                    "zoneID": zone,
+                    "fields": {"isDeleted": {"value": 1}}
+                }))
+            })
+            .collect::<Vec<_>>();
+        json!({"records": records})
+    }
+
+    fn no_test_resource_download(
+        _download_url: &url::Url,
+        _expected_size_bytes: u64,
+    ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
+        Err(UploadError::InvalidCloudKitRecentlyDeletedResponse(
+            "test Recently Deleted transport does not download resources",
+        ))
+    }
+
     struct FakeDeleteTransport {
         payloads: Vec<Value>,
         responses: Vec<Value>,
@@ -13216,7 +13760,9 @@ printf '%s\n' "$workspace" >> '{}'
             if self.responses.is_empty() {
                 Ok(self.response.clone())
             } else {
-                Ok(self.responses.remove(0))
+                let response = self.responses.remove(0);
+                self.response = response.clone();
+                Ok(response)
             }
         }
 
@@ -13226,6 +13772,73 @@ printf '%s\n' "$workspace" >> '{}'
             _payload: Value,
         ) -> Result<Value, UploadError> {
             unreachable!("delete batch tests should not lookup records")
+        }
+    }
+
+    impl CloudKitOriginalAssetReadTransport for FakeDeleteTransport {
+        fn post_records_query(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            payload: Value,
+        ) -> Result<Value, UploadError> {
+            Ok(recently_deleted_response_from_records(
+                &payload,
+                &self.response,
+            ))
+        }
+
+        fn download_resource(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            download_url: &url::Url,
+            expected_size_bytes: u64,
+        ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
+            no_test_resource_download(download_url, expected_size_bytes)
+        }
+    }
+
+    struct ModifyConfirmedRecentlyDeletedMissingTransport {
+        payloads: Vec<Value>,
+        query_payloads: Vec<Value>,
+        response: Value,
+    }
+
+    impl CloudKitDeleteTransport for ModifyConfirmedRecentlyDeletedMissingTransport {
+        fn post_records_modify(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            payload: Value,
+        ) -> Result<Value, UploadError> {
+            self.payloads.push(payload);
+            Ok(self.response.clone())
+        }
+
+        fn post_records_lookup(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            _payload: Value,
+        ) -> Result<Value, UploadError> {
+            unreachable!("successful modify should not lookup records")
+        }
+    }
+
+    impl CloudKitOriginalAssetReadTransport for ModifyConfirmedRecentlyDeletedMissingTransport {
+        fn post_records_query(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            payload: Value,
+        ) -> Result<Value, UploadError> {
+            self.query_payloads.push(payload);
+            Ok(json!({"records": []}))
+        }
+
+        fn download_resource(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            download_url: &url::Url,
+            expected_size_bytes: u64,
+        ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
+            no_test_resource_download(download_url, expected_size_bytes)
         }
     }
 
@@ -13253,6 +13866,28 @@ printf '%s\n' "$workspace" >> '{}'
             _payload: Value,
         ) -> Result<Value, UploadError> {
             unreachable!("delete batch tests should not lookup records")
+        }
+    }
+
+    impl CloudKitOriginalAssetReadTransport for RemoveRawBeforeDeleteResponseTransport {
+        fn post_records_query(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            payload: Value,
+        ) -> Result<Value, UploadError> {
+            Ok(recently_deleted_response_from_records(
+                &payload,
+                &self.response,
+            ))
+        }
+
+        fn download_resource(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            download_url: &url::Url,
+            expected_size_bytes: u64,
+        ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
+            no_test_resource_download(download_url, expected_size_bytes)
         }
     }
 
@@ -13284,6 +13919,28 @@ printf '%s\n' "$workspace" >> '{}'
         }
     }
 
+    impl CloudKitOriginalAssetReadTransport for AmbiguousDeleteTransport {
+        fn post_records_query(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            payload: Value,
+        ) -> Result<Value, UploadError> {
+            Ok(recently_deleted_response_from_records(
+                &payload,
+                &self.lookup_response,
+            ))
+        }
+
+        fn download_resource(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            download_url: &url::Url,
+            expected_size_bytes: u64,
+        ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
+            no_test_resource_download(download_url, expected_size_bytes)
+        }
+    }
+
     struct LookupThenModifyTransport {
         modify_payloads: Vec<Value>,
         lookup_payloads: Vec<Value>,
@@ -13308,6 +13965,35 @@ printf '%s\n' "$workspace" >> '{}'
         ) -> Result<Value, UploadError> {
             self.lookup_payloads.push(payload);
             Ok(self.lookup_response.clone())
+        }
+    }
+
+    impl CloudKitOriginalAssetReadTransport for LookupThenModifyTransport {
+        fn post_records_query(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            payload: Value,
+        ) -> Result<Value, UploadError> {
+            let source = if self
+                .modify_response
+                .get("records")
+                .and_then(Value::as_array)
+                .is_some_and(|records| !records.is_empty())
+            {
+                &self.modify_response
+            } else {
+                &self.lookup_response
+            };
+            Ok(recently_deleted_response_from_records(&payload, source))
+        }
+
+        fn download_resource(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            download_url: &url::Url,
+            expected_size_bytes: u64,
+        ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
+            no_test_resource_download(download_url, expected_size_bytes)
         }
     }
 
@@ -13342,6 +14028,28 @@ printf '%s\n' "$workspace" >> '{}'
             _payload: Value,
         ) -> Result<Value, UploadError> {
             unreachable!("successful modify should not require lookup")
+        }
+    }
+
+    impl CloudKitOriginalAssetReadTransport for PersistConflictAfterModifyTransport {
+        fn post_records_query(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            payload: Value,
+        ) -> Result<Value, UploadError> {
+            Ok(recently_deleted_response_from_records(
+                &payload,
+                &self.response,
+            ))
+        }
+
+        fn download_resource(
+            &mut self,
+            _session: &CloudKitDeleteSession,
+            download_url: &url::Url,
+            expected_size_bytes: u64,
+        ) -> Result<crate::upload::CloudKitResourceDownload, UploadError> {
+            no_test_resource_download(download_url, expected_size_bytes)
         }
     }
 
@@ -17553,6 +18261,199 @@ printf '%s\n' "$workspace" >> '{}'
     }
 
     #[test]
+    fn confirmed_modify_without_recently_deleted_proof_holds_for_review() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        fs::create_dir_all(&config.download_root).expect("download root should be created");
+        config.delete_operator = "recently-deleted-test".to_string();
+        let mut manifest = Manifest::new();
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
+            "asset-a",
+            &config.download_root,
+        ));
+        manifest
+            .save_atomic(&config.manifest_path)
+            .expect("manifest should save");
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store");
+        state_store.load_or_import().expect("import initial state");
+        let mut transport = ModifyConfirmedRecentlyDeletedMissingTransport {
+            payloads: Vec::new(),
+            query_payloads: Vec::new(),
+            response: json!({
+                "records": [{
+                    "recordName": "CPLAsset-asset-a",
+                    "recordChangeTag": "deleted-tag-a",
+                    "fields": {"isDeleted": {"value": true}}
+                }]
+            }),
+        };
+        let mut client = CloudKitDeleteClient::new(&mut transport);
+        let mut summary = MonitorScanSummary {
+            started_unix_seconds: 1,
+            ..MonitorScanSummary::default()
+        };
+
+        delete_original_assets_with_client(
+            &config,
+            &state_store,
+            &mut manifest,
+            &mut summary,
+            &["asset-a".to_string()],
+            &test_delete_session(),
+            &mut client,
+        )
+        .expect("missing independent proof should be recorded for review");
+
+        assert_eq!(transport.payloads.len(), 1);
+        assert_eq!(transport.query_payloads.len(), 1);
+        assert_eq!(summary.originals_deleted, 0);
+        assert_eq!(manifest.get("asset-a").unwrap().state, State::NeedsReview);
+        let saved = Manifest::load(&config.manifest_path).expect("manifest should reload");
+        assert_eq!(saved.get("asset-a").unwrap().state, State::NeedsReview);
+    }
+
+    #[test]
+    fn remote_heic_hash_mismatch_skips_cloudkit_original_delete() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        fs::create_dir_all(&config.download_root).expect("download root should be created");
+        config.delete_operator = "remote-proof-test".to_string();
+        let mut manifest = Manifest::new();
+        manifest.upsert_trusted(upload_verified_delete_ready_record(
+            "asset-a",
+            &config.download_root,
+        ));
+        manifest
+            .save_atomic(&config.manifest_path)
+            .expect("manifest should save");
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store");
+        state_store.load_or_import().expect("import initial state");
+        let mut transport = FakeDeleteTransport {
+            payloads: Vec::new(),
+            responses: Vec::new(),
+            response: json!({"records": []}),
+        };
+        let mut client = CloudKitDeleteClient::new(&mut transport);
+        let mut summary = MonitorScanSummary {
+            started_unix_seconds: 1,
+            ..MonitorScanSummary::default()
+        };
+
+        delete_original_assets_with_client_and_remote_heic_verifier(
+            &config,
+            &state_store,
+            &mut manifest,
+            &mut summary,
+            &["asset-a".to_string()],
+            &test_delete_session(),
+            &mut client,
+            |_manifest, _asset_id, _destination| {
+                Err(MonitorError::Upload(
+                    UploadError::CloudKitUploadedHeicDownloadHashMismatch {
+                        expected: "expected".to_string(),
+                        actual: "actual".to_string(),
+                    },
+                ))
+            },
+        )
+        .expect("remote proof failure should be recorded and stop the item");
+
+        assert!(transport.payloads.is_empty());
+        assert_eq!(summary.originals_deleted, 0);
+        assert_eq!(
+            manifest.get("asset-a").unwrap().state,
+            State::DeleteApproved
+        );
+    }
+
+    #[test]
+    fn remote_heic_421_stops_before_submitting_other_verified_assets() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut config = MonitorConfig::new(
+            tempdir.path().join("download"),
+            tempdir.path().join("manifest.json"),
+            tempdir.path().join("heic"),
+        );
+        fs::create_dir_all(&config.download_root).expect("download root should be created");
+        config.jobs = 2;
+        config.delete_operator = "remote-proof-421-test".to_string();
+        let mut manifest = Manifest::new();
+        for asset_id in ["asset-a", "asset-b"] {
+            manifest.upsert_trusted(upload_verified_delete_ready_record(
+                asset_id,
+                &config.download_root,
+            ));
+        }
+        manifest
+            .save_atomic(&config.manifest_path)
+            .expect("manifest should save");
+        let state_store = AssetStateStore::open_writer(
+            &config.manifest_path,
+            "test-writer",
+            Duration::from_secs(60),
+        )
+        .expect("state store");
+        state_store.load_or_import().expect("import initial state");
+        let mut transport = FakeDeleteTransport {
+            payloads: Vec::new(),
+            responses: Vec::new(),
+            response: json!({"records": []}),
+        };
+        let mut client = CloudKitDeleteClient::new(&mut transport);
+        let mut summary = MonitorScanSummary {
+            started_unix_seconds: 1,
+            ..MonitorScanSummary::default()
+        };
+
+        delete_original_assets_with_client_and_remote_heic_verifier(
+            &config,
+            &state_store,
+            &mut manifest,
+            &mut summary,
+            &["asset-a".to_string(), "asset-b".to_string()],
+            &test_delete_session(),
+            &mut client,
+            |_manifest, asset_id, _destination| {
+                if asset_id == "asset-b" {
+                    Err(MonitorError::Upload(UploadError::UploadHttpStatus {
+                        operation: "test",
+                        status: 421,
+                    }))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect("421 should stop the pass without issuing another mutation");
+
+        assert!(transport.payloads.is_empty());
+        assert_eq!(summary.originals_deleted, 0);
+        assert_eq!(
+            manifest.get("asset-a").unwrap().state,
+            State::DeleteApproved
+        );
+        assert_eq!(manifest.get("asset-b").unwrap().state, State::Failed);
+    }
+
+    #[test]
     fn batched_delete_consumes_prevalidated_token_without_post_cloudkit_nas_access() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let mut config = MonitorConfig::new(
@@ -17700,7 +18601,7 @@ printf '%s\n' "$workspace" >> '{}'
     }
 
     #[test]
-    fn unconfirmed_approved_lookup_runs_full_prevalidation_and_modify() {
+    fn unconfirmed_approved_lookup_holds_for_review_without_modify() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let mut config = MonitorConfig::new(
             tempdir.path().join("download"),
@@ -17754,15 +18655,15 @@ printf '%s\n' "$workspace" >> '{}'
             &test_delete_session(),
             &mut client,
         )
-        .expect("unconfirmed delete should proceed through live validation");
+        .expect("unconfirmed delete should hold for review");
 
         assert_eq!(transport.lookup_payloads.len(), 1);
-        assert_eq!(transport.modify_payloads.len(), 1);
-        assert_eq!(manifest.get("asset-a").unwrap().state, State::Deleted);
+        assert!(transport.modify_payloads.is_empty());
+        assert_eq!(manifest.get("asset-a").unwrap().state, State::NeedsReview);
     }
 
     #[test]
-    fn lookup_error_still_runs_full_prevalidation_and_modify() {
+    fn lookup_without_confirmed_assets_holds_for_review_without_modify() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let mut config = MonitorConfig::new(
             tempdir.path().join("download"),
@@ -17810,11 +18711,11 @@ printf '%s\n' "$workspace" >> '{}'
             &test_delete_session(),
             &mut client,
         )
-        .expect("lookup failure should fall through to live validation and modify");
+        .expect("unconfirmed lookup should hold the asset for review");
 
         assert_eq!(transport.lookup_payloads.len(), 1);
-        assert_eq!(transport.modify_payloads.len(), 1);
-        assert_eq!(manifest.get("asset-a").unwrap().state, State::Deleted);
+        assert!(transport.modify_payloads.is_empty());
+        assert_eq!(manifest.get("asset-a").unwrap().state, State::NeedsReview);
     }
 
     #[test]
@@ -17926,6 +18827,9 @@ printf '%s\n' "$workspace" >> '{}'
             &mut client,
             &mut summary,
             Duration::from_secs(30),
+            0,
+            DEFAULT_CLOUDKIT_PAGE_SIZE,
+            DEFAULT_CLOUDKIT_MAX_PAGES,
             || {
                 times
                     .pop_front()
@@ -17975,6 +18879,9 @@ printf '%s\n' "$workspace" >> '{}'
             &mut client,
             &mut summary,
             Duration::from_secs(30),
+            0,
+            DEFAULT_CLOUDKIT_PAGE_SIZE,
+            DEFAULT_CLOUDKIT_MAX_PAGES,
         );
 
         assert_eq!(submission.attempted_deletes, 0);
@@ -18017,6 +18924,14 @@ printf '%s\n' "$workspace" >> '{}'
                     record_name: "CPLAsset-asset-a".to_string(),
                     record_change_tag: "deleted-tag-a".to_string(),
                 },
+                recently_deleted_proof: Some(CloudKitRecentlyDeletedProof {
+                    record_name: "CPLAsset-asset-a".to_string(),
+                    record_change_tag: "deleted-tag-a".to_string(),
+                    database_scope: CloudKitDatabaseScope::Private,
+                    zone_name: "PrimarySync".to_string(),
+                    owner_record_name: None,
+                    query_record_type: "CPLAssetAndMasterDeletedByExpungedDate".to_string(),
+                }),
             }],
         )
         .expect("small staging commit should succeed");
@@ -18111,6 +19026,9 @@ printf '%s\n' "$workspace" >> '{}'
                 &mut client,
                 &mut summary,
                 max_age,
+                0,
+                DEFAULT_CLOUDKIT_PAGE_SIZE,
+                DEFAULT_CLOUDKIT_MAX_PAGES,
             );
 
             assert_eq!(submission.attempted_deletes, 0);
@@ -18192,7 +19110,7 @@ printf '%s\n' "$workspace" >> '{}'
     }
 
     #[test]
-    fn unconfirmed_or_malformed_lookup_leaves_delete_approved() {
+    fn unconfirmed_or_malformed_lookup_quarantines_effect_unknown_assets() {
         let cases = [
             (
                 "unconfirmed",
@@ -18258,13 +19176,11 @@ printf '%s\n' "$workspace" >> '{}'
             assert_eq!(transport.payloads.len(), 1);
             assert_eq!(transport.lookup_payloads.len(), 1);
             assert_eq!(summary.failures, 1);
-            assert_eq!(
-                manifest.get("asset-a").unwrap().state,
-                State::DeleteApproved
-            );
+            let expected_state = State::NeedsReview;
+            assert_eq!(manifest.get("asset-a").unwrap().state, expected_state);
             assert_eq!(
                 state_store.load().unwrap().get("asset-a").unwrap().state,
-                State::DeleteApproved
+                expected_state
             );
         }
     }
@@ -18701,7 +19617,7 @@ printf '%s\n' "$workspace" >> '{}'
     }
 
     #[test]
-    fn batched_delete_lifecycle_preserves_approved_checkpoint_on_cloudkit_failure() {
+    fn batched_delete_lifecycle_quarantines_effect_unknown_assets_on_cloudkit_failure() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let mut config = MonitorConfig::new(
             tempdir.path().join("download"),
@@ -18756,18 +19672,12 @@ printf '%s\n' "$workspace" >> '{}'
         assert_eq!(summary.failures, 1);
         assert_eq!(transport.payloads.len(), 1);
         assert_eq!(transport.lookup_payloads.len(), 1);
-        assert_eq!(
-            manifest.get("asset-a").unwrap().state,
-            State::DeleteApproved
-        );
-        assert_eq!(
-            manifest.get("asset-b").unwrap().state,
-            State::DeleteApproved
-        );
+        assert_eq!(manifest.get("asset-a").unwrap().state, State::NeedsReview);
+        assert_eq!(manifest.get("asset-b").unwrap().state, State::NeedsReview);
 
         let saved = Manifest::load(&config.manifest_path).expect("manifest should reload");
-        assert_eq!(saved.get("asset-a").unwrap().state, State::DeleteApproved);
-        assert_eq!(saved.get("asset-b").unwrap().state, State::DeleteApproved);
+        assert_eq!(saved.get("asset-a").unwrap().state, State::NeedsReview);
+        assert_eq!(saved.get("asset-b").unwrap().state, State::NeedsReview);
     }
 
     #[test]

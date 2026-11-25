@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.icloudpd-optimizer.health-alert</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/michelle/icloudpd-optimizer/recovery-20261103/health_alert.py</string>
+        <string>--docker-bin</string>
+        <string>/usr/local/bin/docker</string>
+        <string>--docker-context</string>
+        <string>desktop-linux</string>
+        <string>--container-name</string>
+        <string>icloudpd</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>900</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/Users/michelle/icloudpd-optimizer/service/recovery-20261103/health-alert.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/michelle/icloudpd-optimizer/service/recovery-20261103/health-alert.stderr.log</string>
+</dict>
+</plist>

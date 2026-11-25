@@ -1,10 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, Metadata};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(not(unix))]
+use std::time::UNIX_EPOCH;
 
 use serde::de::{self, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::adjusted_source::{
@@ -20,8 +28,9 @@ use crate::proof::{
     prove_nas_raw_with_min_age_seconds_and_fingerprint,
 };
 use crate::upload::{
-    CloudKitDatabaseScope, CloudKitDeleteOutcome, CloudKitDeleteRequest, CloudKitDeleteSession,
-    CloudKitLibraryDestination, CloudKitUploadedHeicAsset, CloudKitUploadedHeicReadClient,
+    CLOUDKIT_RECENTLY_DELETED_QUERY_RECORD_TYPE, CloudKitDatabaseScope, CloudKitDeleteOutcome,
+    CloudKitDeleteRequest, CloudKitDeleteSession, CloudKitLibraryDestination,
+    CloudKitRecentlyDeletedProof, CloudKitUploadedHeicAsset, CloudKitUploadedHeicReadClient,
     CloudKitUploadedHeicReadTransport, CloudKitUploadedHeicResolveRequest, UploadError,
     validate_library_destination,
 };
@@ -436,6 +445,7 @@ struct PreDeleteFacts {
 
 struct LiveDeleteFacts {
     raw_fingerprint: RawFileFingerprint,
+    raw_sha256: String,
 }
 
 struct DeleteEligibilityValidationFacts<'a> {
@@ -455,6 +465,8 @@ pub struct DeleteExecutionProof {
     pub deleted_record_name: String,
     pub confirmed_deleted_change_tag: String,
     pub uploaded_heic_asset_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recently_deleted_proof: Option<CloudKitRecentlyDeletedProof>,
 }
 
 #[must_use = "a prevalidated delete must be consumed when recording the CloudKit outcome"]
@@ -466,6 +478,7 @@ pub struct PrevalidatedDelete {
     uploaded_heic_asset_id: String,
     proofs: BTreeMap<String, Value>,
     raw_fingerprint: RawFileFingerprint,
+    raw_sha256: String,
     validated_at: SystemTime,
 }
 
@@ -496,12 +509,14 @@ impl PrevalidatedDelete {
         validate_prevalidated_delete_freshness(&self.asset_id, self.validated_at, max_age, now)
     }
 
-    /// Rechecks the RAW path fingerprint immediately before issuing the CloudKit delete.
+    /// Rechecks the RAW path fingerprint and bytes immediately before issuing
+    /// the CloudKit delete.
     pub fn validate_live_raw(&self, max_age: Duration) -> Result<(), WorkflowError> {
         self.validate_live_raw_at(max_age, SystemTime::now())
     }
 
-    /// Rechecks the RAW path fingerprint at a supplied time for deterministic tests.
+    /// Rechecks the RAW path fingerprint and bytes at a supplied time for
+    /// deterministic tests.
     pub fn validate_live_raw_at(
         &self,
         max_age: Duration,
@@ -514,6 +529,13 @@ impl PrevalidatedDelete {
             return Err(WorkflowError::PrevalidatedDeleteStale {
                 asset_id: self.asset_id.clone(),
                 field: "raw_fingerprint".to_string(),
+            });
+        }
+        let actual_sha256 = hash_live_raw_stably(&self.raw_path, &self.raw_fingerprint)?;
+        if actual_sha256 != self.raw_sha256 {
+            return Err(WorkflowError::PrevalidatedDeleteStale {
+                asset_id: self.asset_id.clone(),
+                field: "raw_sha256".to_string(),
             });
         }
         Ok(())
@@ -1521,6 +1543,15 @@ pub fn record_delete_execution<'a>(
     asset_id: &str,
     outcome: CloudKitDeleteOutcome,
 ) -> Result<&'a AssetRecord, WorkflowError> {
+    record_delete_execution_with_recently_deleted_proof(manifest, asset_id, outcome, None)
+}
+
+pub fn record_delete_execution_with_recently_deleted_proof<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    outcome: CloudKitDeleteOutcome,
+    recently_deleted_proof: Option<CloudKitRecentlyDeletedProof>,
+) -> Result<&'a AssetRecord, WorkflowError> {
     ensure_remote_mutation_allowed(manifest, asset_id)?;
     let record = manifest.get(asset_id)?;
     if record.state != State::DeleteApproved {
@@ -1537,8 +1568,14 @@ pub fn record_delete_execution<'a>(
     let proof = delete_execution_proof(
         &original.record_name,
         &original.record_change_tag,
+        &CloudKitLibraryDestination {
+            database_scope: original.database_scope,
+            zone_name: original.zone_name.clone(),
+            owner_record_name: original.owner_record_name.clone(),
+        },
         &upload.uploaded_heic_asset_id,
         outcome,
+        recently_deleted_proof,
     )?;
     transition_with_proof(
         manifest,
@@ -1554,6 +1591,20 @@ pub fn record_prevalidated_delete_execution(
     prevalidated: PrevalidatedDelete,
     outcome: CloudKitDeleteOutcome,
 ) -> Result<&AssetRecord, WorkflowError> {
+    record_prevalidated_delete_execution_with_recently_deleted_proof(
+        manifest,
+        prevalidated,
+        outcome,
+        None,
+    )
+}
+
+pub fn record_prevalidated_delete_execution_with_recently_deleted_proof(
+    manifest: &mut Manifest,
+    prevalidated: PrevalidatedDelete,
+    outcome: CloudKitDeleteOutcome,
+    recently_deleted_proof: Option<CloudKitRecentlyDeletedProof>,
+) -> Result<&AssetRecord, WorkflowError> {
     ensure_remote_mutation_allowed(manifest, prevalidated.asset_id())?;
     let record = manifest.get(prevalidated.asset_id())?;
     if record.state != State::DeleteApproved {
@@ -1568,8 +1619,14 @@ pub fn record_prevalidated_delete_execution(
     let proof = delete_execution_proof(
         &prevalidated.request.record_name,
         &prevalidated.request.record_change_tag,
+        &CloudKitLibraryDestination {
+            database_scope: prevalidated.request.database_scope,
+            zone_name: prevalidated.request.zone_name.clone(),
+            owner_record_name: prevalidated.request.owner_record_name.clone(),
+        },
         &prevalidated.uploaded_heic_asset_id,
         outcome,
+        recently_deleted_proof,
     )?;
     transition_with_proof(
         manifest,
@@ -1584,6 +1641,20 @@ pub fn record_reconciled_delete_execution(
     manifest: &mut Manifest,
     reconciliation: DeleteReconciliation,
     outcome: CloudKitDeleteOutcome,
+) -> Result<&AssetRecord, WorkflowError> {
+    record_reconciled_delete_execution_with_recently_deleted_proof(
+        manifest,
+        reconciliation,
+        outcome,
+        None,
+    )
+}
+
+pub fn record_reconciled_delete_execution_with_recently_deleted_proof(
+    manifest: &mut Manifest,
+    reconciliation: DeleteReconciliation,
+    outcome: CloudKitDeleteOutcome,
+    recently_deleted_proof: Option<CloudKitRecentlyDeletedProof>,
 ) -> Result<&AssetRecord, WorkflowError> {
     ensure_remote_mutation_allowed(manifest, reconciliation.asset_id())?;
     let record = manifest.get(reconciliation.asset_id())?;
@@ -1605,8 +1676,14 @@ pub fn record_reconciled_delete_execution(
     let proof = delete_execution_proof(
         &reconciliation.request.record_name,
         &reconciliation.request.record_change_tag,
+        &CloudKitLibraryDestination {
+            database_scope: reconciliation.request.database_scope,
+            zone_name: reconciliation.request.zone_name.clone(),
+            owner_record_name: reconciliation.request.owner_record_name.clone(),
+        },
         &reconciliation.uploaded_heic_asset_id,
         outcome,
+        recently_deleted_proof,
     )?;
     transition_with_proof(
         manifest,
@@ -1648,6 +1725,7 @@ pub fn prevalidate_approved_original_delete(
         uploaded_heic_asset_id: upload.uploaded_heic_asset_id,
         proofs: delete_plan_proof_snapshot(record)?,
         raw_fingerprint: facts.raw_fingerprint,
+        raw_sha256: facts.raw_sha256,
         validated_at: SystemTime::now(),
     })
 }
@@ -1714,8 +1792,10 @@ pub fn build_delete_plan(manifest: &Manifest, asset_id: &str) -> Result<DeletePl
 fn delete_execution_proof(
     original_record_name: &str,
     original_record_change_tag: &str,
+    destination: &CloudKitLibraryDestination,
     uploaded_heic_asset_id: &str,
     outcome: CloudKitDeleteOutcome,
+    recently_deleted_proof: Option<CloudKitRecentlyDeletedProof>,
 ) -> Result<DeleteExecutionProof, WorkflowError> {
     require_matching_str(
         ORIGINAL_ASSET_PROOF,
@@ -1732,12 +1812,66 @@ fn delete_execution_proof(
             actual: outcome.record_change_tag,
         });
     }
+    if let Some(proof) = &recently_deleted_proof {
+        require_matching_str(
+            DELETE_EXECUTION_PROOF,
+            "recently_deleted_record_name",
+            &outcome.record_name,
+            &proof.record_name,
+        )?;
+        require_non_empty(
+            "recently_deleted_record_change_tag",
+            &proof.record_change_tag,
+        )?;
+        require_non_empty(
+            "recently_deleted_query_record_type",
+            &proof.query_record_type,
+        )?;
+        if proof.zone_name.trim().is_empty() {
+            return Err(WorkflowError::EmptyProofField {
+                field: "recently_deleted_zone_name",
+            });
+        }
+        if proof.database_scope != destination.database_scope {
+            return Err(WorkflowError::ProofMismatch {
+                proof_key: DELETE_EXECUTION_PROOF,
+                field: "recently_deleted_database_scope",
+                expected: destination.database_scope.as_str().to_string(),
+                actual: proof.database_scope.as_str().to_string(),
+            });
+        }
+        if proof.zone_name != destination.zone_name {
+            return Err(WorkflowError::ProofMismatch {
+                proof_key: DELETE_EXECUTION_PROOF,
+                field: "recently_deleted_zone_name",
+                expected: destination.zone_name.clone(),
+                actual: proof.zone_name.clone(),
+            });
+        }
+        if proof.owner_record_name != destination.owner_record_name {
+            return Err(WorkflowError::ProofMismatch {
+                proof_key: DELETE_EXECUTION_PROOF,
+                field: "recently_deleted_owner_record_name",
+                expected: destination.owner_record_name.clone().unwrap_or_default(),
+                actual: proof.owner_record_name.clone().unwrap_or_default(),
+            });
+        }
+        if proof.query_record_type != CLOUDKIT_RECENTLY_DELETED_QUERY_RECORD_TYPE {
+            return Err(WorkflowError::ProofMismatch {
+                proof_key: DELETE_EXECUTION_PROOF,
+                field: "recently_deleted_query_record_type",
+                expected: CLOUDKIT_RECENTLY_DELETED_QUERY_RECORD_TYPE.to_string(),
+                actual: proof.query_record_type.clone(),
+            });
+        }
+    }
 
     Ok(DeleteExecutionProof {
         old_record_change_tag: original_record_change_tag.to_string(),
         deleted_record_name: outcome.record_name,
         confirmed_deleted_change_tag: outcome.record_change_tag,
         uploaded_heic_asset_id: uploaded_heic_asset_id.to_string(),
+        recently_deleted_proof,
     })
 }
 
@@ -1877,6 +2011,37 @@ pub fn record_stage_failure_with_kind<'a>(
         .map_err(WorkflowError::Manifest)
 }
 
+/// Terminally hold a remotely-affected delete for operator review.  This is
+/// intentionally separate from retryable stage failures: once a delete may
+/// have been dispatched but the independent Recently Deleted proof is
+/// missing or contradictory, the monitor must not blindly resend it.
+pub fn hold_delete_for_review<'a>(
+    manifest: &'a mut Manifest,
+    asset_id: &str,
+    message: &str,
+    proof: Value,
+) -> Result<&'a AssetRecord, WorkflowError> {
+    let state = manifest.get(asset_id)?.state;
+    if state == State::NeedsReview {
+        return manifest.get(asset_id).map_err(WorkflowError::Manifest);
+    }
+    if state != State::DeleteApproved && state != State::Failed {
+        return Err(WorkflowError::Manifest(ManifestError::InvalidTransition {
+            asset_id: asset_id.to_string(),
+            from: state,
+            to: State::NeedsReview,
+        }));
+    }
+    if state == State::DeleteApproved {
+        manifest
+            .record_failure(asset_id, "delete_recently_deleted", message)
+            .map_err(WorkflowError::Manifest)?;
+    }
+    manifest
+        .terminalize_failed_with_proof(asset_id, "delete_recently_deleted_review", proof)
+        .map_err(WorkflowError::Manifest)
+}
+
 fn revalidate_delete_plan_proofs(
     manifest: &Manifest,
     asset_id: &str,
@@ -1886,7 +2051,10 @@ fn revalidate_delete_plan_proofs(
     let nas = stored_proof::<NasRawProof>(manifest, asset_id, NAS_PROOF)?;
     let raw_fingerprint = reprove_nas_proof(record, &nas, facts.source_age.min_age_seconds)?;
 
-    Ok(LiveDeleteFacts { raw_fingerprint })
+    Ok(LiveDeleteFacts {
+        raw_fingerprint,
+        raw_sha256: nas.sha256,
+    })
 }
 
 fn validate_stored_delete_plan_proofs(
@@ -2208,6 +2376,102 @@ fn reprove_nas_proof(
     require_matching_str(NAS_PROOF, "sha256", &proof.sha256, &live_proof.sha256)?;
 
     Ok(live.raw_fingerprint)
+}
+
+/// Hashes the NAS RAW again while checking both path and opened-file metadata
+/// around the read. The caller invokes this from the final CloudKit delete
+/// preflight, after all remote replacement checks have completed.
+fn hash_live_raw_stably(
+    path: &Path,
+    expected_fingerprint: &RawFileFingerprint,
+) -> Result<String, WorkflowError> {
+    let before = RawFileFingerprint::capture(path)?;
+    if &before != expected_fingerprint {
+        return Err(WorkflowError::ProofMismatch {
+            proof_key: NAS_PROOF,
+            field: "raw_fingerprint",
+            expected: format!("{:?}", expected_fingerprint),
+            actual: format!("{:?}", before),
+        });
+    }
+
+    let mut file = File::open(path).map_err(|source| {
+        WorkflowError::Proof(ProofError::OpenRaw {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
+    let descriptor_metadata = file.metadata().map_err(|source| {
+        WorkflowError::Proof(ProofError::ReadMetadata {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
+    if !descriptor_metadata.is_file()
+        || !descriptor_matches_fingerprint(path, &descriptor_metadata, expected_fingerprint)
+    {
+        return Err(WorkflowError::ProofMismatch {
+            proof_key: NAS_PROOF,
+            field: "raw_fingerprint",
+            expected: format!("{:?}", expected_fingerprint),
+            actual: "opened file metadata differs".to_string(),
+        });
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let bytes_read = file.read(&mut buffer).map_err(|source| {
+            WorkflowError::Proof(ProofError::ReadRaw {
+                path: path.to_path_buf(),
+                source,
+            })
+        })?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    let after = RawFileFingerprint::capture(path)?;
+    if before != after {
+        return Err(WorkflowError::Proof(ProofError::RawChangedDuringProof {
+            path: path.to_path_buf(),
+        }));
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn descriptor_matches_fingerprint(
+    path: &Path,
+    metadata: &Metadata,
+    expected: &RawFileFingerprint,
+) -> bool {
+    let canonical_path = fs::canonicalize(path).ok();
+    if canonical_path.as_ref() != Some(&expected.canonical_path) || metadata.len() != expected.len {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        metadata.mtime() == expected.modified_unix_seconds
+            && metadata.mtime_nsec() == expected.modified_unix_nanos
+            && metadata.dev() == expected.dev
+            && metadata.ino() == expected.ino
+            && metadata.ctime() == expected.ctime
+            && metadata.ctime_nsec() == expected.ctime_nsec
+    }
+
+    #[cfg(not(unix))]
+    {
+        let Ok(modified) = metadata.modified() else {
+            return false;
+        };
+        let Ok(modified) = modified.duration_since(UNIX_EPOCH) else {
+            return false;
+        };
+        modified.as_secs() as i64 == expected.modified_unix_seconds
+            && modified.subsec_nanos() as i64 == expected.modified_unix_nanos
+    }
 }
 
 fn derive_nas_root_from_proof(proof: &NasRawProof) -> Result<PathBuf, WorkflowError> {
@@ -3145,11 +3409,17 @@ fn validate_stored_delete_execution_proof(
     let expected = delete_execution_proof(
         &original.record_name,
         &original.record_change_tag,
+        &CloudKitLibraryDestination {
+            database_scope: original.database_scope,
+            zone_name: original.zone_name.clone(),
+            owner_record_name: original.owner_record_name.clone(),
+        },
         &upload.uploaded_heic_asset_id,
         CloudKitDeleteOutcome {
             record_name: delete.deleted_record_name.clone(),
             record_change_tag: delete.confirmed_deleted_change_tag.clone(),
         },
+        delete.recently_deleted_proof.clone(),
     )?;
     if delete != expected {
         return Err(WorkflowError::ProofMismatch {
@@ -3339,6 +3609,40 @@ fn require_positive_u64(
 mod provenance_tests {
     use super::*;
     use crate::state_store::AssetStateStore;
+
+    #[test]
+    fn live_delete_validation_rejects_a_hash_mismatch_before_transport() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let raw_path = tempdir.path().join("IMG_0001.dng");
+        std::fs::write(&raw_path, b"raw-bytes").expect("raw should be written");
+        let raw_fingerprint =
+            RawFileFingerprint::capture(&raw_path).expect("raw fingerprint should be captured");
+        let prevalidated = PrevalidatedDelete {
+            asset_id: "asset-1".to_string(),
+            raw_path,
+            request: CloudKitDeleteRequest {
+                record_name: "original-record-1".to_string(),
+                record_change_tag: "tag-1".to_string(),
+                database_scope: CloudKitDatabaseScope::Private,
+                zone_name: "PrimarySync".to_string(),
+                owner_record_name: None,
+            },
+            uploaded_heic_asset_id: "heic-asset-1".to_string(),
+            proofs: BTreeMap::new(),
+            raw_fingerprint,
+            raw_sha256: "0".repeat(64),
+            validated_at: SystemTime::now(),
+        };
+
+        let error = prevalidated
+            .validate_live_raw(Duration::from_secs(30))
+            .expect_err("a changed NAS hash must block the final delete preflight");
+
+        assert!(matches!(
+            error,
+            WorkflowError::PrevalidatedDeleteStale { field, .. } if field == "raw_sha256"
+        ));
+    }
 
     #[test]
     fn reverify_owned_proofs_exactly_identifies_current_record() {

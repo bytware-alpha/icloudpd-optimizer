@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.icloudpd-optimizer.dashboard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__DASHBOARD_SCRIPT__</string>
+    <string>--bind</string>
+    <string>__TAILSCALE_IP__</string>
+    <string>--port</string>
+    <string>__PORT__</string>
+    <string>--config</string>
+    <string>__PRIMARY_CONFIG__</string>
+    <string>--shared-config</string>
+    <string>__SHARED_CONFIG__</string>
+    <string>--audit</string>
+    <string>__AUDIT_PATH__</string>
+    <string>--days-remaining</string>
+    <string>__DAYS_REMAINING__</string>
+    <string>--docker-bin</string>
+    <string>__DOCKER_BIN__</string>
+    <string>--docker-context</string>
+    <string>__DOCKER_CONTEXT__</string>
+    <string>--container-name</string>
+    <string>__CONTAINER_NAME__</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__DASHBOARD_DIR__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>__DASHBOARD_DIR__/dashboard.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__DASHBOARD_DIR__/dashboard.stderr.log</string>
+</dict>
+</plist>
