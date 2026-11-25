@@ -908,6 +908,33 @@ fn add_original_asset_proofs(path: &std::path::Path, asset_ids: &[&str]) {
     manifest.save_atomic(path).expect("manifest should save");
 }
 
+/// Stands in for a remote readback and a single-RAW original, both of which
+/// a delete requires.
+fn record_delete_safety_proofs(path: &std::path::Path, heic_sha256: &str) {
+    let mut manifest = Manifest::load(path).expect("manifest should load");
+    let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+    record
+        .proofs
+        .get_mut("original_asset")
+        .expect("original proof")["raw_resource_count"] = json!(1);
+    record.proofs.insert(
+        "remote_readback".to_string(),
+        json!({
+            "schema_version": 1,
+            "uploaded_heic_asset_id": "icloud-heic-asset-1",
+            "matched_heic_sha256": heic_sha256,
+            "size_bytes": 10,
+            "database_scope": "private",
+            "zone_name": "PrimarySync",
+            "record_change_tag": "readback-tag",
+            "master_record_name": "readback-master",
+        }),
+    );
+    manifest.upsert(record);
+    manifest.save_atomic(path).expect("manifest should save");
+    persist_current_conversion_recipe_fixture(path);
+}
+
 fn manifest_with_source_age_verified(path: &std::path::Path) {
     let mut manifest = Manifest::load(path).expect("manifest should load");
     record_source_age_proof(&mut manifest, "asset-1", old_source_age_proof())
@@ -1161,6 +1188,7 @@ fn manifest_with_real_delete_approval(tempdir: &std::path::Path) -> (PathBuf, Pa
         ])
         .assert()
         .success();
+    record_delete_safety_proofs(&manifest_path, &heic_sha256);
     binary()
         .args([
             "workflow",

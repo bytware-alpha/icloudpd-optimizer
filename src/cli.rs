@@ -979,16 +979,6 @@ enum WorkflowCommand {
         about = "Classify a local provider session file without contacting Apple"
     )]
     ProviderSessionDiagnose(WorkflowProviderSessionDiagnoseArgs),
-    #[command(
-        name = "photos-import-handoff",
-        about = "Copy one verified HEIC for a manual Photos Shared Library import"
-    )]
-    PhotosImportHandoff(WorkflowPhotosImportHandoffArgs),
-    #[command(
-        name = "photos-import-handoff-rollback",
-        about = "Remove a local Photos import handoff without deleting originals"
-    )]
-    PhotosImportHandoffRollback(WorkflowAssetArgs),
     #[command(name = "upload-heic-proof", hide = true)]
     UploadHeicProof(WorkflowUploadHeicArgs),
     UploadVerified(WorkflowUploadVerifiedArgs),
@@ -1377,8 +1367,6 @@ pub enum CliError {
     Conversion(#[from] ConversionExecutionError),
     #[error("upload failed: {0}")]
     Upload(#[from] UploadError),
-    #[error("photos import handoff failed: {0}")]
-    PhotosImportHandoff(#[from] crate::photos_import_handoff::PhotosImportHandoffError),
     #[error("local mirror failed: {0}")]
     LocalMirror(#[from] LocalMirrorError),
     #[error("monitor failed: {0}")]
@@ -1603,7 +1591,9 @@ fn run_upload_proof_child_protocol<R: Read, W: Write>(
         return Err(CliError::InvalidPrivateChildProtocol);
     }
     let heic = crate::workflow::ensure_upload_dispatch_allowed(&manifest, &input.asset_id)?;
-    let heic_source = VerifiedUploadSource::from_verified_heic(&heic)?;
+    let heic_source = VerifiedUploadSource::from_verified_heic(&heic)?.with_capture_time(
+        crate::workflow::source_capture_unix_seconds(&manifest, &input.asset_id),
+    );
     load_upload_session(&input.session_path)?;
     let destination = upload_destination_for_asset(&manifest, &input.asset_id)?;
     let response = run_icloud_upload(&IcloudUploadRequest {
@@ -1717,10 +1707,6 @@ fn run_workflow<W: Write>(args: WorkflowArgs, writer: &mut W) -> Result<(), CliE
         WorkflowCommand::RemoteReadback(args) => workflow_remote_readback(args),
         WorkflowCommand::ProviderSessionDiagnose(args) => {
             workflow_provider_session_diagnose(args, writer)
-        }
-        WorkflowCommand::PhotosImportHandoff(args) => workflow_photos_import_handoff(args, writer),
-        WorkflowCommand::PhotosImportHandoffRollback(args) => {
-            workflow_photos_import_handoff_rollback(args, writer)
         }
         WorkflowCommand::UploadVerified(args) => workflow_upload_verified(args),
         WorkflowCommand::UploadedHeicDeletePlan(args) => {
@@ -4625,6 +4611,7 @@ mod upload_verified_reverify_tests {
                 filename: format!("{asset_id}.dng"),
                 size_bytes: raw_bytes.len() as u64,
                 matched_raw_sha256: raw_sha256,
+                raw_resource_count: None,
             },
         )
         .expect("original proof");
@@ -9120,12 +9107,6 @@ fn queue_next_stage_for_record(
     if crate::operation_hold::blocks_scheduled_remote_mutation(record) {
         return Some("held_remote_operation");
     }
-    if record
-        .proofs
-        .contains_key(crate::photos_import_handoff::PHOTOS_IMPORT_HANDOFF_PROOF)
-    {
-        return Some("photos_import_handoff");
-    }
     if record.state == State::UploadVerified {
         return match icloudpd_local_mirror_proof_disposition(manifest, &record.asset_id) {
             IcloudpdLocalMirrorProofDisposition::Current if config.auto_delete => {
@@ -11243,7 +11224,9 @@ fn workflow_upload_heic(args: WorkflowUploadHeicArgs) -> Result<(), CliError> {
     let mut manifest = load_operational_manifest_for_asset(&args.manifest, &args.asset_id)?;
     let baseline = manifest.clone();
     let heic = crate::workflow::ensure_upload_dispatch_allowed(&manifest, &args.asset_id)?;
-    let heic_source = VerifiedUploadSource::from_verified_heic(&heic)?;
+    let heic_source = VerifiedUploadSource::from_verified_heic(&heic)?.with_capture_time(
+        crate::workflow::source_capture_unix_seconds(&manifest, &args.asset_id),
+    );
     load_upload_session(&args.session)?;
     let destination = upload_destination_for_asset(&manifest, &args.asset_id)?;
     let response = run_icloud_upload(&IcloudUploadRequest {
@@ -11262,7 +11245,9 @@ fn workflow_upload_heic_proof<W: Write>(
 ) -> Result<(), CliError> {
     let manifest = load_operational_manifest_for_asset(&args.manifest, &args.asset_id)?;
     let heic = crate::workflow::ensure_upload_dispatch_allowed(&manifest, &args.asset_id)?;
-    let heic_source = VerifiedUploadSource::from_verified_heic(&heic)?;
+    let heic_source = VerifiedUploadSource::from_verified_heic(&heic)?.with_capture_time(
+        crate::workflow::source_capture_unix_seconds(&manifest, &args.asset_id),
+    );
     load_upload_session(&args.session)?;
     let destination = upload_destination_for_asset(&manifest, &args.asset_id)?;
     let response = run_icloud_upload(&IcloudUploadRequest {
@@ -11334,49 +11319,6 @@ fn workflow_provider_session_diagnose<W: Write>(
         ),
     };
     serde_json::to_writer_pretty(&mut *writer, &diagnostic)?;
-    writeln!(writer)?;
-    Ok(())
-}
-
-#[derive(Debug, Args)]
-struct WorkflowPhotosImportHandoffArgs {
-    #[arg(long, value_name = "PATH")]
-    manifest: PathBuf,
-    #[arg(long)]
-    asset_id: String,
-    #[arg(long, value_name = "DIR")]
-    handoff_dir: PathBuf,
-}
-
-fn workflow_photos_import_handoff<W: Write>(
-    args: WorkflowPhotosImportHandoffArgs,
-    writer: &mut W,
-) -> Result<(), CliError> {
-    let mut manifest = load_operational_manifest_for_asset(&args.manifest, &args.asset_id)?;
-    let baseline = manifest.clone();
-    let report = crate::photos_import_handoff::stage_verified_heic_for_photos_import(
-        &mut manifest,
-        &args.asset_id,
-        &args.handoff_dir,
-    )?;
-    save_manifest_changes(&baseline, &manifest, &args.manifest)?;
-    serde_json::to_writer_pretty(&mut *writer, &report)?;
-    writeln!(writer)?;
-    Ok(())
-}
-
-fn workflow_photos_import_handoff_rollback<W: Write>(
-    args: WorkflowAssetArgs,
-    writer: &mut W,
-) -> Result<(), CliError> {
-    let mut manifest = load_operational_manifest_for_asset(&args.manifest, &args.asset_id)?;
-    let baseline = manifest.clone();
-    let report = crate::photos_import_handoff::rollback_photos_import_handoff(
-        &mut manifest,
-        &args.asset_id,
-    )?;
-    save_manifest_changes(&baseline, &manifest, &args.manifest)?;
-    serde_json::to_writer_pretty(&mut *writer, &report)?;
     writeln!(writer)?;
     Ok(())
 }
@@ -11505,6 +11447,7 @@ fn workflow_original_asset_verified(
             filename: args.filename,
             size_bytes: args.size_bytes,
             matched_raw_sha256: args.matched_raw_sha256,
+            raw_resource_count: None,
         },
     )?;
     save_manifest_changes(&baseline, &manifest, &args.manifest)
@@ -13352,6 +13295,7 @@ mod original_assets_audit_tests {
                             filename: target.filename,
                             size_bytes: target.raw_size_bytes,
                             matched_raw_sha256: target.matched_raw_sha256,
+                            raw_resource_count: None,
                         },
                     },
                 },
@@ -13726,6 +13670,7 @@ mod original_assets_audit_tests {
                                     filename: "asset.DNG".to_string(),
                                     size_bytes: 1,
                                     matched_raw_sha256: "sha".to_string(),
+                                    raw_resource_count: None,
                                 },
                             },
                         },
@@ -14074,6 +14019,7 @@ mod original_assets_audit_tests {
                     filename: target.filename.clone(),
                     size_bytes: target.raw_size_bytes,
                     matched_raw_sha256: target.matched_raw_sha256.clone(),
+                    raw_resource_count: None,
                 },
             },
         }
@@ -14857,6 +14803,7 @@ mod per_photo_persistence_tests {
                     filename: format!("{asset_id}.dng"),
                     size_bytes: 42,
                     matched_raw_sha256: raw_sha(),
+                    raw_resource_count: None,
                 },
             )
             .unwrap();

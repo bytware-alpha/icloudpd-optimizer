@@ -19,9 +19,10 @@ SPEC.loader.exec_module(EXPORTER)
 
 
 class Cookie:
-    def __init__(self, name, value):
+    def __init__(self, name, value, expires=None):
         self.name = name
         self.value = value
+        self.expires = expires
 
 
 class FakeService:
@@ -33,11 +34,15 @@ class FakeService:
             "dsInfo": {"dsid": dsid},
             "webservices": {
                 "photosupload": {"url": "https://fresh-photosupload.icloud.com"},
-                "sharedlibrary": {"url": "https://fresh-sharedlibrary.icloud.com/"},
                 "ckdatabasews": {"url": "https://fresh-ckdatabasews.icloud.com"},
             },
         }
-        self.session = type("Session", (), {"cookies": [Cookie("session", "fresh-cookie"), Cookie("scnt", "fresh-scnt")]})()
+        cookies = [
+            Cookie("session", "fresh-cookie", 1900000000),
+            Cookie("X-APPLE-WEBAUTH-TOKEN", "fresh-token", 1800000000),
+            Cookie("X-APPLE-WEBAUTH-USER", "fresh-user", 1810000000),
+        ]
+        self.session = type("Session", (), {"cookies": cookies})()
 
 
 def service_factory_for(service):
@@ -67,7 +72,6 @@ class RefreshOptimizerSessionsTests(unittest.TestCase):
             "dsid": dsid,
             "local_time_zone_id": "America/Los_Angeles",
             "photosupload_url": "https://old-photosupload.icloud.com",
-            "sharedlibrary_url": "https://old-sharedlibrary.icloud.com",
             "time_zone_offset_minutes": -420,
         }
         query = [
@@ -87,9 +91,7 @@ class RefreshOptimizerSessionsTests(unittest.TestCase):
             "owner_record_name": "_owner123",
             "zone_name": "PrimarySync",
         }
-        shared = dict(delete)
-        shared["database_scope"] = "shared"
-        for name, value in ((EXPORTER.UPLOAD_FILE, upload), (EXPORTER.DELETE_PRODUCTION_FILE, delete), (EXPORTER.DELETE_SHARED_FILE, shared)):
+        for name, value in ((EXPORTER.UPLOAD_FILE, upload), (EXPORTER.DELETE_PRODUCTION_FILE, delete)):
             (self.session_dir / name).write_text(json.dumps(value, indent=2) + "\n")
             os.chmod(self.session_dir / name, 0o600)
 
@@ -112,14 +114,14 @@ class RefreshOptimizerSessionsTests(unittest.TestCase):
         self.assertNotEqual(before, self._hashes())
         upload = json.loads((self.session_dir / EXPORTER.UPLOAD_FILE).read_text())
         delete = json.loads((self.session_dir / EXPORTER.DELETE_PRODUCTION_FILE).read_text())
-        shared = json.loads((self.session_dir / EXPORTER.DELETE_SHARED_FILE).read_text())
         self.assertEqual(upload["photosupload_url"], "https://fresh-photosupload.icloud.com")
-        self.assertEqual(upload["sharedlibrary_url"], "https://fresh-sharedlibrary.icloud.com")
         self.assertEqual(upload["cookies"][0]["value"], "fresh-cookie")
         self.assertEqual(delete["ckdatabasews_url"], "https://fresh-ckdatabasews.icloud.com")
         self.assertEqual(delete["owner_record_name"], "_owner123")
         self.assertEqual(delete["zone_name"], "PrimarySync")
-        self.assertEqual(shared["database_scope"], "shared")
+        self.assertEqual(delete["expires_at_unix_seconds"], 1800000000)
+        self.assertEqual(upload["expires_at_unix_seconds"], 1800000000)
+        self.assertFalse((self.session_dir / "delete-session-shared-production.json").exists())
         for name in EXPORTER.SESSION_FILES:
             self.assertEqual(stat.S_IMODE((self.session_dir / name).stat().st_mode), 0o600)
         result = json.loads(stdout.getvalue())
@@ -138,7 +140,7 @@ class RefreshOptimizerSessionsTests(unittest.TestCase):
 
     def test_missing_service_is_blocked_without_mutation(self):
         service = FakeService()
-        del service.data["webservices"]["sharedlibrary"]
+        del service.data["webservices"]["photosupload"]
         self.assert_blocked_without_mutation(service, "blocked")
 
     def test_account_mismatch_is_blocked_without_mutation(self):

@@ -230,6 +230,7 @@ fn original_asset_proof() -> OriginalAssetProof {
         filename: "IMG_0001.dng".to_string(),
         size_bytes: 42,
         matched_raw_sha256: "raw-sha256".to_string(),
+        raw_resource_count: Some(1),
     }
 }
 
@@ -352,10 +353,35 @@ fn source_age_verified_manifest() -> Manifest {
     manifest
 }
 
+/// Records the remote readback that a delete requires, matching the stored
+/// upload and HEIC proofs.
+fn record_test_readback(manifest: &mut Manifest, asset_id: &str) {
+    let mut record = manifest.get(asset_id).expect("asset should exist").clone();
+    let upload = record.proofs["upload"].clone();
+    let heic = record.proofs["heic"].clone();
+    record.proofs.insert(
+        "remote_readback".to_string(),
+        json!({
+            "schema_version": 1,
+            "uploaded_heic_asset_id": upload["uploaded_heic_asset_id"],
+            "matched_heic_sha256": upload["uploaded_heic_sha256"],
+            "size_bytes": heic["size_bytes"],
+            "database_scope": upload["database_scope"],
+            "zone_name": upload["zone_name"],
+            "owner_record_name": upload.get("owner_record_name"),
+            "record_change_tag": "readback-tag",
+            "master_record_name": "readback-master",
+        }),
+    );
+    let current = std::mem::replace(manifest, Manifest::new());
+    *manifest = replace_trusted_record(current, record);
+}
+
 fn upload_verified_manifest() -> Manifest {
     let mut manifest = source_age_verified_manifest();
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
+    record_test_readback(&mut manifest, "asset-1");
     record_icloudpd_local_mirror_proof(&mut manifest, "asset-1", local_mirror_proof())
         .expect("local mirror proof should record");
     record_original_asset_proof(&mut manifest, "asset-1", original_asset_proof())
@@ -427,6 +453,7 @@ fn real_upload_verified_manifest() -> (tempfile::TempDir, Manifest, PathBuf) {
         .expect("source age proof should record");
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
+    record_test_readback(&mut manifest, "asset-1");
     record_icloudpd_local_mirror_proof(&mut manifest, "asset-1", local_mirror_proof())
         .expect("local mirror proof should record");
     let nas = manifest.get("asset-1").expect("asset should exist").proofs["nas"].clone();
@@ -616,6 +643,7 @@ fn two_asset_upload_verified_manifest() -> Manifest {
             },
         )
         .expect("upload proof should record");
+        record_test_readback(&mut manifest, asset_id);
         record_icloudpd_local_mirror_proof(
             &mut manifest,
             asset_id,
@@ -663,6 +691,7 @@ fn record_original_asset_batch_proofs_rejects_missing_result_without_partial_mut
             filename: "IMG_0001.dng".to_string(),
             size_bytes: RAW_BYTES_ASSET_1.len() as u64,
             matched_raw_sha256: "raw-sha256-1".to_string(),
+            raw_resource_count: Some(1),
         },
     );
 
@@ -696,6 +725,7 @@ fn record_original_asset_batch_proofs_keeps_records_upload_verified_without_dele
             filename: "IMG_0001.dng".to_string(),
             size_bytes: RAW_BYTES_ASSET_1.len() as u64,
             matched_raw_sha256: "raw-sha256-1".to_string(),
+            raw_resource_count: Some(1),
         },
     );
     proofs.insert(
@@ -710,6 +740,7 @@ fn record_original_asset_batch_proofs_keeps_records_upload_verified_without_dele
             filename: "IMG_0002.dng".to_string(),
             size_bytes: RAW_BYTES_ASSET_2.len() as u64,
             matched_raw_sha256: "raw-sha256-2".to_string(),
+            raw_resource_count: Some(1),
         },
     );
 
@@ -747,6 +778,7 @@ fn record_original_asset_batch_proofs_rejects_extra_result_without_mutating() {
             filename: "IMG_0001.dng".to_string(),
             size_bytes: RAW_BYTES_ASSET_1.len() as u64,
             matched_raw_sha256: "raw-sha256-1".to_string(),
+            raw_resource_count: Some(1),
         },
     );
     proofs.insert(
@@ -761,6 +793,7 @@ fn record_original_asset_batch_proofs_rejects_extra_result_without_mutating() {
             filename: "IMG_0003.dng".to_string(),
             size_bytes: 12,
             matched_raw_sha256: "raw-sha256-3".to_string(),
+            raw_resource_count: Some(1),
         },
     );
 
@@ -791,6 +824,7 @@ fn record_original_asset_batch_proofs_rejects_duplicate_original_identity_withou
             filename: "IMG_0001.dng".to_string(),
             size_bytes: RAW_BYTES_ASSET_1.len() as u64,
             matched_raw_sha256: "raw-sha256-1".to_string(),
+            raw_resource_count: Some(1),
         },
     );
     proofs.insert(
@@ -805,6 +839,7 @@ fn record_original_asset_batch_proofs_rejects_duplicate_original_identity_withou
             filename: "IMG_0002.dng".to_string(),
             size_bytes: RAW_BYTES_ASSET_2.len() as u64,
             matched_raw_sha256: "raw-sha256-2".to_string(),
+            raw_resource_count: Some(1),
         },
     );
 
@@ -885,6 +920,7 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
         filename: "IMG_0001.dng".to_string(),
         size_bytes: nas.size_bytes,
         matched_raw_sha256: nas.sha256.clone(),
+        raw_resource_count: Some(1),
     };
     record_original_asset_proof(&mut manifest, "asset-1", original.clone())
         .expect("original asset proof should record");
@@ -1015,6 +1051,7 @@ fn adjusted_conversion_requires_exact_proof_binding_and_carries_it_into_delete_l
         },
     )
     .expect("upload proof should record");
+    record_test_readback(&mut manifest, "asset-1");
     record_icloudpd_local_mirror_proof(
         &mut manifest,
         "asset-1",
@@ -2489,6 +2526,7 @@ fn upload_proof_records_heic_identity_for_future_skip() {
 
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
+    record_test_readback(&mut manifest, "asset-1");
 
     let record = manifest.get("asset-1").expect("asset should exist");
     assert_eq!(record.state, State::UploadVerified);
@@ -3072,6 +3110,7 @@ fn icloudpd_local_mirror_proof_records_uploaded_heic_download_identity() {
     let mut manifest = source_age_verified_manifest();
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
+    record_test_readback(&mut manifest, "asset-1");
 
     let record = record_icloudpd_local_mirror_proof(&mut manifest, "asset-1", local_mirror_proof())
         .expect("local mirror proof should record");
@@ -3133,6 +3172,7 @@ fn icloudpd_local_mirror_proof_validates_upload_and_heic_binding_without_mutatio
         let mut manifest = source_age_verified_manifest();
         record_upload_proof(&mut manifest, "asset-1", upload_proof())
             .expect("upload proof should record");
+        record_test_readback(&mut manifest, "asset-1");
         let before = manifest.get("asset-1").expect("asset should exist").clone();
 
         let error = record_icloudpd_local_mirror_proof(&mut manifest, "asset-1", proof)
@@ -3159,6 +3199,7 @@ fn icloudpd_local_mirror_proof_rejects_empty_download_path_without_mutation() {
     let mut manifest = source_age_verified_manifest();
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
+    record_test_readback(&mut manifest, "asset-1");
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = record_icloudpd_local_mirror_proof(
@@ -3761,6 +3802,7 @@ fn delete_eligibility_requires_source_age_proof_without_mutation() {
     let mut manifest = conversion_verified_manifest();
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
+    record_test_readback(&mut manifest, "asset-1");
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = mark_delete_eligible(&mut manifest, "asset-1")
@@ -3787,6 +3829,7 @@ fn delete_eligibility_rejects_too_new_source_age_without_mutation() {
         .expect("source age evidence should record even when too new");
     record_upload_proof(&mut manifest, "asset-1", upload_proof())
         .expect("upload proof should record");
+    record_test_readback(&mut manifest, "asset-1");
     let before = manifest.get("asset-1").expect("asset should exist").clone();
 
     let error = mark_delete_eligible(&mut manifest, "asset-1")
@@ -3924,6 +3967,38 @@ fn delete_plan_is_unavailable_before_explicit_approval() {
         manifest.get("asset-1").expect("asset should exist"),
         &before
     );
+}
+
+#[test]
+fn delete_approval_requires_readback_and_every_raw_resource_hashed() {
+    for (drop_readback, raw_resource_count) in
+        [(true, json!(1)), (false, json!(2)), (false, json!(null))]
+    {
+        let (_tempdir, mut manifest, _) = real_upload_verified_manifest();
+        mark_delete_eligible(&mut manifest, "asset-1").expect("delete eligibility should record");
+        let mut record = manifest.get("asset-1").expect("asset should exist").clone();
+        if drop_readback {
+            record.proofs.remove("remote_readback");
+        }
+        record
+            .proofs
+            .get_mut("original_asset")
+            .expect("original proof")["raw_resource_count"] = raw_resource_count;
+        let mut manifest = replace_trusted_record(manifest, record);
+        let before = manifest.get("asset-1").expect("asset should exist").clone();
+
+        let error = approve_delete(&mut manifest, "asset-1", "operator")
+            .expect_err("unsafe delete must not be approved");
+
+        assert!(
+            matches!(error, WorkflowError::DeleteNotSafe { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            manifest.get("asset-1").expect("asset should exist"),
+            &before
+        );
+    }
 }
 
 #[test]

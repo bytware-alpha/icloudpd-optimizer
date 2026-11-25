@@ -160,6 +160,7 @@ fn original_proof() -> OriginalAssetProof {
         filename: "source.dng".to_string(),
         size_bytes: 42,
         matched_raw_sha256: "raw-sha256".to_string(),
+        raw_resource_count: None,
     }
 }
 

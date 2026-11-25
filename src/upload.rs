@@ -151,6 +151,15 @@ impl VerifiedUploadSource {
         })
     }
 
+    /// Photos dates the new asset from `lastModDate`. Send the original's
+    /// capture time instead of the HEIC's encode time.
+    pub fn with_capture_time(mut self, capture_unix_seconds: Option<u64>) -> Self {
+        if let Some(seconds) = capture_unix_seconds {
+            self.last_modified_millis = seconds.saturating_mul(1000);
+        }
+        self
+    }
+
     pub(crate) fn held_file(&self) -> Result<File, UploadError> {
         let mut file = self
             .file
@@ -259,6 +268,21 @@ impl CloudKitDeleteSession {
         let raw: RawCloudKitDeleteSession = serde_json::from_str(json)
             .map_err(|source| UploadError::DecodeSession { path: None, source })?;
         raw.validate()
+    }
+
+    /// Returns this account session addressed to `destination`.
+    ///
+    /// Authentication (cookies, DSID, service URL, query params) is
+    /// account-wide; the library zone is per request. Every lane derives its
+    /// zone-bound session from the one consolidated account session instead
+    /// of keeping its own snapshot file.
+    pub fn bound_to(&self, destination: &CloudKitLibraryDestination) -> Result<Self, UploadError> {
+        validate_library_destination(destination)?;
+        let mut bound = self.clone();
+        bound.database_scope = destination.database_scope;
+        bound.zone = destination.clone();
+        bound.validate()?;
+        Ok(bound)
     }
 
     fn validate(&self) -> Result<(), UploadError> {
@@ -748,6 +772,29 @@ fn local_session_diagnostic_message(error: &UploadError) -> String {
         UploadError::InvalidSession(message) => message.clone(),
         _ => "session file is not locally valid".to_string(),
     }
+}
+
+/// Reads only the optional `expires_at_unix_seconds` field of a session file.
+///
+/// The refresh tooling records the earliest Apple auth-cookie expiry there so
+/// the monitor can warn ahead of time and stop network stages once it lapses.
+/// No credential value is decoded or returned.
+pub fn read_session_expiry(path: &Path) -> Result<Option<u64>, UploadError> {
+    #[derive(Deserialize)]
+    struct ExpiryOnly {
+        #[serde(default)]
+        expires_at_unix_seconds: Option<u64>,
+    }
+    let json = std::fs::read_to_string(path).map_err(|source| UploadError::ReadSession {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let expiry: ExpiryOnly =
+        serde_json::from_str(&json).map_err(|source| UploadError::DecodeSession {
+            path: Some(path.to_path_buf()),
+            source,
+        })?;
+    Ok(expiry.expires_at_unix_seconds)
 }
 
 pub fn load_cloudkit_delete_session(path: &Path) -> Result<CloudKitDeleteSession, UploadError> {
@@ -2158,6 +2205,7 @@ fn build_batch_resolve_outcome(
                         filename: target.filename.clone(),
                         size_bytes: target.raw_size_bytes,
                         matched_raw_sha256: target.matched_raw_sha256.clone(),
+                        raw_resource_count: Some(raw_candidate.asset.raw_resource_count),
                     },
                     replacement_proof: CloudKitReplacementResourceProof {
                         record_name: replacement_candidate.asset.record_name.clone(),
@@ -2183,6 +2231,7 @@ fn build_batch_resolve_outcome(
                         filename: target.filename.clone(),
                         size_bytes: target.raw_size_bytes,
                         matched_raw_sha256: target.matched_raw_sha256.clone(),
+                        raw_resource_count: Some(candidate.asset.raw_resource_count),
                     },
                 }
             } else if let Some(candidate) = unique_replacement_match {
@@ -3705,6 +3754,7 @@ struct OriginalAssetBatchCandidate {
 struct OriginalAssetRemoteAsset {
     record_name: String,
     record_change_tag: String,
+    raw_resource_count: u32,
 }
 
 #[derive(Clone)]
@@ -3964,6 +4014,10 @@ fn parse_original_asset_query_response(
         }
         let mut target_sizes = BTreeSet::new();
         target_sizes.insert(request.raw_size_bytes);
+        let raw_resources = raw_resource_count(&record_pair_original_asset_resources(
+            &asset.record,
+            master,
+        )?);
         for (_, download_url) in
             record_pair_matching_raw_resource_urls(&asset.record, master, &target_sizes)?
         {
@@ -3978,6 +4032,7 @@ fn parse_original_asset_query_response(
                     filename: request.filename.clone(),
                     size_bytes: request.raw_size_bytes,
                     matched_raw_sha256: request.matched_raw_sha256.clone(),
+                    raw_resource_count: Some(raw_resources),
                 },
                 download_url,
             });
@@ -4085,6 +4140,7 @@ fn parse_original_asset_batch_query_response(
         let asset = OriginalAssetRemoteAsset {
             record_name: asset.record_name,
             record_change_tag: asset.record_change_tag,
+            raw_resource_count: raw_resource_count(&resources),
         };
         matches.extend(resources.into_iter().filter_map(|resource| {
             let relevant = matching_cohort_indexes.iter().any(|cohort_index| {
@@ -5050,6 +5106,14 @@ fn cloudkit_unix_seconds(value: &Value) -> Option<u64> {
         numeric
     };
     Some(seconds.round() as u64)
+}
+
+fn raw_resource_count(resources: &[OriginalAssetRemoteResource]) -> u32 {
+    resources
+        .iter()
+        .filter(|resource| resource.kind == CloudKitOriginalAssetCandidateKind::Raw)
+        .count()
+        .min(u32::MAX as usize) as u32
 }
 
 fn asset_date_matches(asset_date: u64, source_captured: u64, tolerance: u64) -> bool {
@@ -6463,6 +6527,113 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
+    fn shared_test_destination() -> CloudKitLibraryDestination {
+        CloudKitLibraryDestination {
+            database_scope: CloudKitDatabaseScope::Shared,
+            zone_name: "SharedSync-ABCDEF123456".to_string(),
+            owner_record_name: Some("_shared-owner".to_string()),
+        }
+    }
+
+    #[test]
+    fn upload_payloads_target_the_originals_library_zone_and_owner() {
+        let shared = shared_test_destination();
+        let create = create_upload_url_payload(42, &shared);
+        assert_eq!(create["zoneName"], json!("SharedSync-ABCDEF123456"));
+        assert_eq!(create["ownerRecordName"], json!("_shared-owner"));
+        let single_file = SingleFileUploadRequest {
+            file_checksum: "checksum".to_string(),
+            size_bytes: 42,
+            wrapping_key: None,
+            reference_checksum: "reference".to_string(),
+            receipt: "receipt".to_string(),
+        };
+        let put = put_asset_payload(
+            "IMG_0001.heic",
+            1_700_000_000_000,
+            -480,
+            "America/Los_Angeles",
+            &single_file,
+            &shared,
+        );
+        assert_eq!(put["zoneName"], json!("SharedSync-ABCDEF123456"));
+        assert_eq!(put["ownerRecordName"], json!("_shared-owner"));
+        assert_eq!(put["files"][0]["lastModDate"], json!(1_700_000_000_000u64));
+
+        let primary = CloudKitLibraryDestination::primary_sync();
+        let create = create_upload_url_payload(42, &primary);
+        assert_eq!(create["zoneName"], json!(PRIMARY_SYNC_ZONE));
+        assert!(create.get("ownerRecordName").is_none());
+        let put = put_asset_payload("a.heic", 1, 0, "UTC", &single_file, &primary);
+        assert_eq!(put["zoneName"], json!(PRIMARY_SYNC_ZONE));
+        assert!(put.get("ownerRecordName").is_none());
+    }
+
+    #[test]
+    fn upload_is_dated_from_the_original_capture_time() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let heic_path = tempdir.path().join("IMG_0001.heic");
+        std::fs::write(&heic_path, b"heic").expect("write");
+        let source = VerifiedUploadSource::open_candidate(&heic_path).expect("open");
+        let encoded_at = source.last_modified_millis;
+        assert_eq!(
+            source.with_capture_time(None).last_modified_millis,
+            encoded_at
+        );
+        let source = VerifiedUploadSource::open_candidate(&heic_path).expect("open");
+        assert_eq!(
+            source
+                .with_capture_time(Some(1_792_828_515))
+                .last_modified_millis,
+            1_792_828_515_000
+        );
+    }
+
+    #[test]
+    fn one_account_session_binds_to_either_library() {
+        let session = valid_delete_session();
+        let shared = shared_test_destination();
+        let bound = session.bound_to(&shared).expect("bind to shared library");
+        assert_eq!(bound.zone, shared);
+        assert_eq!(bound.database_scope, CloudKitDatabaseScope::Shared);
+        assert_eq!(bound.dsid, session.dsid);
+        validate_session_destination(&bound, &shared).expect("bound session serves shared");
+        assert!(
+            validate_session_destination(&bound, &CloudKitLibraryDestination::primary_sync())
+                .is_err()
+        );
+
+        let rebound = bound
+            .bound_to(&CloudKitLibraryDestination::primary_sync())
+            .expect("bind back to primary");
+        assert_eq!(rebound.zone, CloudKitLibraryDestination::primary_sync());
+
+        let misconfigured = CloudKitLibraryDestination {
+            database_scope: CloudKitDatabaseScope::Private,
+            ..shared_test_destination()
+        };
+        assert!(session.bound_to(&misconfigured).is_err());
+    }
+
+    #[test]
+    fn session_expiry_is_read_without_decoding_credentials() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let with_expiry = tempdir.path().join("with.json");
+        std::fs::write(
+            &with_expiry,
+            r#"{"cookies":"opaque","expires_at_unix_seconds":1796700000}"#,
+        )
+        .expect("write");
+        assert_eq!(
+            read_session_expiry(&with_expiry).expect("read"),
+            Some(1_796_700_000)
+        );
+        let without = tempdir.path().join("without.json");
+        std::fs::write(&without, r#"{"cookies":"opaque"}"#).expect("write");
+        assert_eq!(read_session_expiry(&without).expect("read"), None);
+        assert!(read_session_expiry(&tempdir.path().join("missing.json")).is_err());
+    }
+
     #[test]
     fn hashing_file_hashes_exact_streamed_bytes_with_small_reads() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
@@ -7269,6 +7440,7 @@ mod tests {
                 filename: "source.dng".to_string(),
                 size_bytes: 1,
                 matched_raw_sha256: "raw-sha256".to_string(),
+                raw_resource_count: None,
             },
             output_path: output_path.clone(),
         };

@@ -25,10 +25,14 @@ an original from iCloud, you want proof that:
 - the HEIC was created from that RAW;
 - the conversion performance for the actual run was recorded;
 - the HEIC was verified and metadata was copied;
-- the uploaded HEIC matches what was verified;
+- the uploaded HEIC matches what was verified and was read back from iCloud;
+- the original has exactly one RAW resource, the one hashed on the NAS (a paired
+  RAW on `resOriginalAlt` blocks the delete, because deleting the asset deletes it);
 - the original is old enough to be eligible;
-- an explicit delete approval was recorded, either manually or by the configured
-  auto-delete operator.
+- an explicit delete approval was recorded. The monitor never approves on its own:
+  it approves only original record names listed in the operator's
+  `delete_approval_path` file (mode 0600,
+  `{"expires_at_unix_seconds": ..., "record_names": [...]}`, at most seven days).
 
 `icloudpd-optimizer` records those checks in a manifest so each asset has an audit trail.
 
@@ -365,12 +369,9 @@ Rolling mode keeps conversion quality and delete safety separate from queue tuni
 `rolling_worker_count` (`--rolling-worker-count`) controls queue and coordination
 slots across lifecycle stages. For example, 64 lifecycle workers let up to 64 queued
 assets make progress; they do not permit 64 simultaneous encoders. CPU-bound stages
-default to the smaller of `jobs` (`--jobs`) and the host's available CPU
-parallelism. `rolling_cpu_stage_count` can explicitly override that default and
-may exceed both values. The encoder lane defaults to half the resolved CPU lane,
-rounded up, and can be set with
-`rolling_convert_stage_count` (`--rolling-convert-stage-count`), which is clamped
-to the resolved CPU-stage limit. These controls do not change HEIC quality or any
+and the encoder lane default to one per core. `rolling_cpu_stage_count` and
+`rolling_convert_stage_count` (`--rolling-convert-stage-count`), clamped to
+the CPU-stage limit, override that. These controls do not change HEIC quality or any
 verification gate.
 
 `max_lifecycle_per_scan` (`--max-lifecycle-per-scan`) controls the normal active
@@ -850,65 +851,24 @@ supported command creates the file. The schema below is the shape this
 repository can read. It is not a setup procedure, and `workflow upload-heic`
 cannot restore the upload pipeline.
 
-The documented placement path is two user steps in Photos on the Mac, not a
-session file and not an unattended job. Published Photos import adds the file
-to the personal library. Apple's Shared Library guide then says to choose
-View > Personal Library, select the exact items, and choose Image > Move
-[n] Photos to Shared Library
-(https://support.apple.com/guide/photos/add-photos-to-a-shared-library-pht9a3599aac/mac).
-That menu is documented UI. Apple's Shortcuts guide documents Save to Photo
-Album and does not document a per-item Shared Library move. This repository
-does not script that menu, does not query the Photos library database, and
-does not check the signed-in account, system library, or participant role.
+Each HEIC is uploaded into the library its original lives in: `PrimarySync`
+for the personal library, the `SharedSync-*` zone and owner for the Shared
+Library. The destination comes from the `original_asset` proof, and the
+read-back rejects an asset found in any other zone.
 
-Only the new HEIC replacement is staged. The NAS original is not the import
-file. A personal-library import is not recorded as Shared placement. Shared
-placement stays unrecorded until an independent cloud readback of that HEIC.
-The handoff command does not perform the readback.
-
-Stage one verified HEIC for that sequence. The command copies the file, leaves
-the NAS original and the verified HEIC in place, and records
-`photos_import_handoff`. That proof is not an upload and not a remote
-readback. Automatic upload stays blocked until the handoff is rolled back.
-Deletion stays blocked because there is still no upload proof.
-
-```sh
-icloudpd-optimizer workflow photos-import-handoff \
-  --manifest manifest.json \
-  --asset-id IMG_0001 \
-  --handoff-dir /path/to/empty-canary-dir
-```
-
-On the Mac, after the signed-in account, system photo library, and Shared
-Library role are confirmed there: keep Photos > Settings > General > Copy
-items to the Photos library selected, and import only the staged HEIC.
-Published import lands in the personal library. Then choose View > Personal
-Library, select that imported HEIC, and choose Image > Move [n] Photos to
-Shared Library. Do not select the NAS original. Leave both the staged file
-and the NAS original in place. This command cannot confirm that Photos
-imported the file or moved it.
-
-Roll the local stage back without deleting the verified HEIC, the RAW, or any
-iCloud item:
-
-```sh
-icloudpd-optimizer workflow photos-import-handoff-rollback \
-  --manifest manifest.json \
-  --asset-id IMG_0001
-```
-
-Removing the staged file does not remove an item already imported into Photos.
-That removal is a separate action in Photos and is not performed here.
-
-Do not roll back by running a binary from before `operation_hold`. That binary
-ignores holds and can schedule a held asset. Roll back with this build, or
-with a later build that still enforces `operation_hold`.
+One account session serves both libraries. A lane sets `library`
+(`database_scope`, `zone_name`, `owner_record_name`) and binds the session in
+`delete_session_path` to that zone; there is no per-library session file. When
+the session file carries `expires_at_unix_seconds`, each scan warns within seven
+days of it and stops network stages once it has passed.
 
 The HTTP client used by an externally supplied session keeps one verified
 rustls pool per process, reuses HTTP/1.1 keep-alive connections, and allows at
-most two idle connections per host. Upload and adjusted-source work share two
-network slots. An HTTP 401 or 403 pauses further authenticated calls for the
-rest of that monitor scan. The next scan can try again after the scan interval.
+most two idle connections per host. Upload and adjusted-source work share
+`network_concurrency` slots (default 4, at most 8). Each new HTTP 429 or 503
+halves them and clean completions add one back. An HTTP 401, 403, or 421, or a
+413 (iCloud storage full), pauses further authenticated calls for the rest of
+that monitor scan. The next scan can try again after the scan interval.
 Certificate checks stay enabled. Those limits were checked with local synthetic
 tests. They are not a reading of a live download or of the home network.
 
