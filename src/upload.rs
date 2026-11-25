@@ -4156,20 +4156,46 @@ fn parse_uploaded_heic_asset_lookup_response(
     let fields = record_fields(record)?;
     let initial_remote_state = match mode {
         UploadedHeicInitialStateMode::RequireActive => {
-            match field_value(fields, "isDeleted") {
-                Some(value) if value.as_bool() == Some(false) || value.as_i64() == Some(0) => {}
-                Some(value) if cloudkit_truthy(value) => {
-                    return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
-                        "uploaded HEIC asset is already deleted",
-                    ));
+            // A top-level tombstone always wins and fails closed. Apple omits
+            // the `isDeleted` field on freshly uploaded assets even when it
+            // was requested, so an omitted marker is accepted only together
+            // with an explicit top-level `deleted: false`, exactly as the
+            // full-fields inspector does, and is reported as unmarked.
+            let top_level_deleted = record.get("deleted");
+            if top_level_deleted.is_some_and(|value| value.as_bool() != Some(false)) {
+                return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+                    if top_level_deleted.and_then(Value::as_bool) == Some(true) {
+                        "uploaded HEIC asset is already deleted"
+                    } else {
+                        "uploaded HEIC top-level delete state is malformed"
+                    },
+                ));
+            }
+            match fields.get("isDeleted") {
+                None if top_level_deleted.and_then(Value::as_bool) == Some(false) => {
+                    CloudKitUploadedHeicInitialState::ActiveUnmarked
                 }
-                _ => {
+                None => {
                     return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
                         "uploaded HEIC active delete state is malformed",
                     ));
                 }
+                Some(_) => match field_value(fields, "isDeleted") {
+                    Some(value) if value.as_bool() == Some(false) || value.as_i64() == Some(0) => {
+                        CloudKitUploadedHeicInitialState::Active
+                    }
+                    Some(value) if cloudkit_truthy(value) => {
+                        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+                            "uploaded HEIC asset is already deleted",
+                        ));
+                    }
+                    _ => {
+                        return Err(UploadError::InvalidCloudKitUploadedHeicResponse(
+                            "uploaded HEIC active delete state is malformed",
+                        ));
+                    }
+                },
             }
-            CloudKitUploadedHeicInitialState::Active
         }
         UploadedHeicInitialStateMode::ObserveExact => match field_value(fields, "isDeleted") {
             Some(value) if value.as_bool() == Some(false) || value.as_i64() == Some(0) => {

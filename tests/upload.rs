@@ -5663,3 +5663,220 @@ impl CloudKitOriginalAssetReadTransport for FakeCloudKitDeleteTransport {
         })
     }
 }
+
+/// Shape of the real CPLAsset lookup Apple returned for the IMG_0945 canary
+/// upload on 2026-11-25, with identifiers, owner, and sync token redacted.
+/// Apple omits `isDeleted` from `fields` on a fresh, undeleted upload even
+/// when it is requested, and carries the state only as top-level `deleted`.
+fn img_0945_redacted_uploaded_asset_response() -> Value {
+    json!({
+        "records": [{
+            "recordName": "CPLAsset-img-0945-redacted",
+            "recordType": "CPLAsset",
+            "fields": {
+                "masterRef": {
+                    "value": {
+                        "recordName": "CPLMaster-img-0945-redacted",
+                        "action": "DELETE_SELF",
+                        "zoneID": {
+                            "zoneName": "PrimarySync",
+                            "ownerRecordName": "_redacted-owner",
+                            "zoneType": "REGULAR_CUSTOM_ZONE"
+                        }
+                    },
+                    "type": "REFERENCE"
+                }
+            },
+            "pluginFields": {},
+            "recordChangeTag": "100cz",
+            "created": {"timestamp": 1795580652582_u64, "userRecordName": "_redacted-owner", "deviceID": "6"},
+            "modified": {"timestamp": 1795580652582_u64, "userRecordName": "_redacted-owner", "deviceID": "6"},
+            "deleted": false
+        }],
+        "syncToken": "redacted-sync-token"
+    })
+}
+
+fn img_0945_redacted_uploaded_master_response(size_bytes: u64, download_url: &str) -> Value {
+    json!({
+        "records": [{
+            "recordName": "CPLMaster-img-0945-redacted",
+            "recordType": "CPLMaster",
+            "fields": {
+                "resOriginalFileType": {"value": "public.heic", "type": "STRING"},
+                "resOriginalRes": {
+                    "value": {
+                        "fileChecksum": "redacted-file-checksum",
+                        "size": size_bytes,
+                        "wrappingKey": "redacted-wrapping-key",
+                        "referenceChecksum": "redacted-reference-checksum",
+                        "downloadURL": download_url
+                    },
+                    "type": "ASSETID",
+                    "appliedCryptoFeatures": {"assetKeyEncryptionType": 1}
+                }
+            },
+            "pluginFields": {},
+            "recordChangeTag": "100cy",
+            "created": {"timestamp": 1795580652579_u64, "userRecordName": "_redacted-owner", "deviceID": "6"},
+            "modified": {"timestamp": 1795580652579_u64, "userRecordName": "_redacted-owner", "deviceID": "6"},
+            "deleted": false
+        }],
+        "syncToken": "redacted-sync-token"
+    })
+}
+
+#[test]
+fn active_uploaded_heic_resolver_accepts_real_img_0945_unmarked_response() {
+    let session =
+        CloudKitDeleteSession::from_json(&valid_delete_session_json()).expect("session loads");
+    let bytes = b"img-0945-uploaded-heic-bytes";
+    let mut transport = FakeCloudKitDeleteTransport::lookup_responses_with_downloads(
+        vec![
+            img_0945_redacted_uploaded_asset_response(),
+            img_0945_redacted_uploaded_master_response(
+                bytes.len() as u64,
+                "https://p140-icloud-content.icloud.com/img-0945",
+            ),
+        ],
+        vec![bytes.to_vec()],
+    );
+
+    let resolved = CloudKitDeleteClient::new(&mut transport)
+        .resolve_uploaded_heic_asset(
+            &session,
+            &primary_uploaded_heic_resolve_request(
+                "CPLAsset-img-0945-redacted",
+                sha256_hex(bytes),
+                bytes.len() as u64,
+            ),
+        )
+        .expect("a fresh upload with no isDeleted and deleted:false is active");
+
+    assert_eq!(resolved.record_name, "CPLAsset-img-0945-redacted");
+    assert_eq!(resolved.record_change_tag, "100cz");
+    assert_eq!(resolved.master_record_name, "CPLMaster-img-0945-redacted");
+    assert_eq!(resolved.size_bytes, bytes.len() as u64);
+    assert_eq!(
+        resolved.initial_remote_state,
+        CloudKitUploadedHeicInitialState::ActiveUnmarked
+    );
+    assert_eq!(transport.lookup_payloads.len(), 2);
+    assert_eq!(
+        transport.downloaded_urls,
+        vec!["https://p140-icloud-content.icloud.com/img-0945"]
+    );
+    assert!(transport.payloads.is_empty());
+}
+
+#[test]
+fn active_uploaded_heic_resolver_keeps_explicit_zero_marker_active() {
+    let session =
+        CloudKitDeleteSession::from_json(&valid_delete_session_json()).expect("session loads");
+    let bytes = b"explicit-zero-marker";
+    let mut asset = img_0945_redacted_uploaded_asset_response();
+    asset["records"][0]["fields"]["isDeleted"] = json!({"value": 0});
+    let mut transport = FakeCloudKitDeleteTransport::lookup_responses_with_downloads(
+        vec![
+            asset,
+            img_0945_redacted_uploaded_master_response(
+                bytes.len() as u64,
+                "https://p140-icloud-content.icloud.com/img-0945",
+            ),
+        ],
+        vec![bytes.to_vec()],
+    );
+
+    let resolved = CloudKitDeleteClient::new(&mut transport)
+        .resolve_uploaded_heic_asset(
+            &session,
+            &primary_uploaded_heic_resolve_request(
+                "CPLAsset-img-0945-redacted",
+                sha256_hex(bytes),
+                bytes.len() as u64,
+            ),
+        )
+        .expect("explicit isDeleted=0 with deleted:false stays active");
+    assert_eq!(
+        resolved.initial_remote_state,
+        CloudKitUploadedHeicInitialState::Active
+    );
+}
+
+#[test]
+fn active_uploaded_heic_resolver_fails_closed_on_deleted_malformed_or_conflicting_state() {
+    let session =
+        CloudKitDeleteSession::from_json(&valid_delete_session_json()).expect("session loads");
+    let bytes = b"must-not-resolve";
+    let base = img_0945_redacted_uploaded_asset_response();
+
+    // Omitted marker with a top-level tombstone.
+    let mut unmarked_tombstone = base.clone();
+    unmarked_tombstone["records"][0]["deleted"] = json!(true);
+    // Omitted marker with no top-level state at all.
+    let mut unmarked_no_top_level = base.clone();
+    unmarked_no_top_level["records"][0]
+        .as_object_mut()
+        .expect("asset record")
+        .remove("deleted");
+    // Omitted marker with a malformed top-level state.
+    let mut unmarked_malformed_top_level = base.clone();
+    unmarked_malformed_top_level["records"][0]["deleted"] = json!(0);
+    // Explicit marker deleted, top-level says active: conflicting.
+    let mut marked_deleted_top_level_active = base.clone();
+    marked_deleted_top_level_active["records"][0]["fields"]["isDeleted"] = json!({"value": 1});
+    // Explicit marker deleted, boolean form.
+    let mut marked_deleted_bool = base.clone();
+    marked_deleted_bool["records"][0]["fields"]["isDeleted"] = json!({"value": true});
+    // Explicit marker active, top-level tombstone: conflicting.
+    let mut marked_active_top_level_deleted = base.clone();
+    marked_active_top_level_deleted["records"][0]["fields"]["isDeleted"] = json!({"value": 0});
+    marked_active_top_level_deleted["records"][0]["deleted"] = json!(true);
+    // Explicit marker present but malformed.
+    let mut marked_malformed = base;
+    marked_malformed["records"][0]["fields"]["isDeleted"] = json!({"value": 2});
+
+    for (label, asset) in [
+        ("unmarked tombstone", unmarked_tombstone),
+        ("unmarked without top-level", unmarked_no_top_level),
+        ("unmarked malformed top-level", unmarked_malformed_top_level),
+        (
+            "marker deleted, top-level active",
+            marked_deleted_top_level_active,
+        ),
+        ("marker deleted bool", marked_deleted_bool),
+        (
+            "marker active, top-level deleted",
+            marked_active_top_level_deleted,
+        ),
+        ("marker malformed", marked_malformed),
+    ] {
+        let mut transport = FakeCloudKitDeleteTransport::lookup_responses_with_downloads(
+            vec![
+                asset,
+                img_0945_redacted_uploaded_master_response(
+                    bytes.len() as u64,
+                    "https://p140-icloud-content.icloud.com/img-0945",
+                ),
+            ],
+            vec![bytes.to_vec()],
+        );
+        let error = CloudKitDeleteClient::new(&mut transport)
+            .resolve_uploaded_heic_asset(
+                &session,
+                &primary_uploaded_heic_resolve_request(
+                    "CPLAsset-img-0945-redacted",
+                    sha256_hex(bytes),
+                    bytes.len() as u64,
+                ),
+            )
+            .expect_err(label);
+        assert!(
+            matches!(error, UploadError::InvalidCloudKitUploadedHeicResponse(_)),
+            "{label}: {error:?}"
+        );
+        assert_eq!(transport.lookup_payloads.len(), 1, "{label}");
+        assert!(transport.downloaded_urls.is_empty(), "{label}");
+        assert!(transport.payloads.is_empty(), "{label}");
+    }
+}
